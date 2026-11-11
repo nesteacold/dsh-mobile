@@ -1,0 +1,68 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# build output and generated native projects
+dist/
+build/
+out/
+.expo/
+.expo-shared/
+apps/mobile-companion/android/
+apps/mobile-companion/ios/
+apps/mobile-companion/artifacts/
+*.ipa
+*.apk
+*.aab
+*.dex
+*.jar
+*.class
+
+# artifacts and reports
+artifacts/
+coverage/
+.nyc_output/
+*.lcov
+
+# logs and scratch
+*.log
+*.log.*
+.focused.log*
+*.err.log
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# local build config (Mac host, Apple team id) — never in git
+apps/mobile-companion/scripts/remote-ios-build/.env*
+
+# local secrets and state — never in git
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+*.jks
+*.keystore
+tokens/
+credentials*
+*.credentials.yaml
+
+# editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# local tooling and generated docs
+.wiki-cache/
+.dsh-wiki/
+# Local list of strings that must never reach this repo (real addresses, device
+# and machine names). Read by tools/verify-publish.mjs; deliberately not committed.
+.publish-forbidden
