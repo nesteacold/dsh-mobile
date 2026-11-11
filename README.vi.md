@@ -133,5 +133,18 @@ khẳng định phía server rằng không có gì được gửi khi đáng l�
 
 ## Ghi công và giấy phép
 
-MIT. Xem [LICENSE](LICENSE) và [NOTICE.md](NOTICE.md) — gateway là bản fork và ngôn ngữ thị
-giác của app theo một dự án tham chiếu đã công bố, cả hai đều được ghi công ở đó.
+Dự án này không thể có nếu thiếu hai dự án mã nguồn mở của **Clarklevis1995**. Xin cảm ơn tác giả đã
+công bố chúng theo giấy phép MIT.
+
+- **[Clarklevis1995/dsh-plugin-mobile-gateway](https://github.com/Clarklevis1995/dsh-plugin-mobile-gateway)**
+  (MIT, © 2026 Clarklevis1995) — `plugins/mobile-gateway/` là bản fork từ v0.12.0: listener TLS, sổ
+  thiết bị, luồng ghép đôi và giao thức thiết bị đều lấy từ đây.
+- **[Clarklevis1995/dsh-mobile](https://github.com/Clarklevis1995/dsh-mobile)** (MIT, © 2026 Chaofan Li)
+  — ứng dụng iOS/Android gốc mà màn hình, bố cục và cách tương tác của app này dựa theo, viết lại bằng
+  React Native.
+
+Cảm ơn [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), Host mà các extension này
+chạy bên cạnh.
+
+Repo này dùng giấy phép MIT. Xem [LICENSE](LICENSE) và [NOTICE.md](NOTICE.md) — nơi chép nguyên văn
+giấy phép của các dự án gốc và ghi rõ đã lấy gì từ mỗi dự án.

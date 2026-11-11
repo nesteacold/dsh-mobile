@@ -138,5 +138,18 @@ should not have been.
 
 ## Credits and license
 
-MIT. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) — the gateway is a fork and the
-companion's visual language follows a published reference project, both credited there.
+This project would not exist without two open-source projects by **Clarklevis1995**. Thank you for
+publishing them under the MIT licence.
+
+- **[Clarklevis1995/dsh-plugin-mobile-gateway](https://github.com/Clarklevis1995/dsh-plugin-mobile-gateway)**
+  (MIT, © 2026 Clarklevis1995) — `plugins/mobile-gateway/` is a fork of its v0.12.0: the TLS listener,
+  device registry, pairing flow and device protocol come from there.
+- **[Clarklevis1995/dsh-mobile](https://github.com/Clarklevis1995/dsh-mobile)** (MIT, © 2026 Chaofan Li)
+  — the native iOS/Android client whose screens, layout and interaction this app follows, reimplemented
+  in React Native.
+
+Thanks also to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), the Host these
+extensions run beside.
+
+This repository is MIT-licensed. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md), which reproduces
+the upstream licence texts and lists exactly what was taken from each project.
