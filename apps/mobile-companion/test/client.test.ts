@@ -278,6 +278,35 @@ describe('CompanionClient over the fake gateway', () => {
     }
   });
 
+  it('spec 021: close 4412 (web re-lock) emits `locked`, keeps the credential, and retries', async () => {
+    const lockedGateway = await FakeGateway.create({ tokens: ['tok-close-4412'], closeAfterHello: 4412 });
+    try {
+      const client = makeClient();
+      const locked = deferred<{ code: number; reason: string }>();
+      const disconnected = deferred<{ code: number; retry: boolean }>();
+      let revokedFired = false;
+      client.on('locked', (payload) => locked.resolve(payload));
+      client.on('revoked', () => {
+        revokedFired = true;
+      });
+      client.on('disconnected', (payload) => {
+        if (payload.code === CLOSE_CODES.locked) disconnected.resolve(payload);
+      });
+      client.connect({ url: lockedGateway.endpoint, certSha256: lockedGateway.certSha256, token: 'tok-close-4412', ...TARGET });
+
+      assert.equal((await locked.promise).code, 4412);
+      // The distinction that matters: 4412 is NOT a revocation, and it IS retried so the gate can
+      // assert its passkey again. 4401 is the code that fires `revoked` and makes the caller wipe
+      // the credential.
+      assert.equal(revokedFired, false, 'a locked device must never look revoked');
+      assert.equal(client.state, 'closed', 'a 4412 leaves the client retryable, not revoked');
+      assert.equal((await disconnected.promise).retry, true, 'the owner can fix this on the Host');
+      client.close();
+    } finally {
+      await lockedGateway.close();
+    }
+  });
+
   it('stops reconnection on close code 4004 (gateway disabled)', async () => {
     const offGateway = await FakeGateway.create({ tokens: ['tok-off'], closeAfterHello: 4004 });
     try {

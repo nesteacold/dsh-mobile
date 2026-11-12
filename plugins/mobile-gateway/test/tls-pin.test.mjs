@@ -29,7 +29,9 @@ import { once } from 'node:events'
 import WebSocket from 'ws'
 import plugin from '../lib/index.mjs'
 import { loadOrCreateTlsIdentity } from '../lib/tls.mjs'
-import { assertOwnerOnly, ownerOnlyViolation, powerShellLiteral, windowsAclViolation } from '../lib/secure-file.mjs'
+import {
+  assertOwnerOnly, ownerOnlyViolation, powerShellLiteral, setOwnerOnlyProbeOverride, windowsAclViolation,
+} from '../lib/secure-file.mjs'
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
 import {
   connect, createImpostorCertificate, decodePairingPayload, observeServerTraffic, pair,
@@ -215,7 +217,8 @@ async function scenario2(instance, payload) {
   assert.equal(paired.hello.protocol, 3)
   assert.equal(paired.hello.companionProtocol, 1)
   assert.equal(paired.hello.minClientVersion, 1)
-  assert.deepEqual(paired.hello.capabilities, ['sessions-read', 'prompt', 'cancel', 'approval-v1'])
+  assert.deepEqual(paired.hello.capabilities,
+    ['sessions-read', 'prompt', 'cancel', 'approval-v1', 'browser-agent:1'])
   assert.equal(paired.hello.certSha256, payload.certSha256, 'hello carries the pinned fingerprint')
   assert.equal(paired.hello.gatewayId, payload.gatewayId)
   assert.equal(paired.hello.device.id, paired.device.id)
@@ -432,7 +435,7 @@ function scenario8AclDecision() {
 
   // Refused: an Allow for any SID that is not one of the three.
   assert.match(windowsAclViolation(listing(allow(userSid), allow(otherUserSid)), userSid), new RegExp(otherUserSid),
-    'another user SID is refused (HOST\\neste is not DOMAIN\\neste)')
+    'another user SID is refused (HOST\\alice is not DOMAIN\\alice)')
   assert.match(windowsAclViolation(listing(allow('S-1-1-0')), userSid), /S-1-1-0/, 'Everyone is refused')
   assert.match(windowsAclViolation(listing(allow('S-1-5-11')), userSid), /S-1-5-11/, 'Authenticated Users is refused')
   // The reported hole: one trusted ACE used to be enough to pass such a listing.
@@ -440,7 +443,7 @@ function scenario8AclDecision() {
     'one fine ACE does not mask a permissive ACE beside it')
 
   // Refused: anything that is not exactly one recognizable ACE per line.
-  assert.match(windowsAclViolation(listing(allow(userSid), 'C:\\data\\mobile-gateway-tls.key HOST\\neste:(F)'), userSid),
+  assert.match(windowsAclViolation(listing(allow(userSid), 'C:\\data\\mobile-gateway-tls.key HOST\\alice:(F)'), userSid),
     /unrecognized entry/, 'a line outside the grammar refuses instead of being skipped')
   assert.match(windowsAclViolation(listing(allow(userSid), '', allow(systemSid)), userSid), /unrecognized entry/,
     'a blank line inside the listing refuses')
@@ -489,6 +492,29 @@ function scenario8AclDecision() {
   passed('owner-only decision: foreign/everyone ACEs, unparseable listings and failed probes are refused')
 }
 
+// The process-wide probe override is a test seam. Production must only ever get the
+// real DACL, so installing one outside a node:test process is refused — and clearing
+// it stays allowed. (A `node:test` worker always carries NODE_TEST_CONTEXT, so this
+// test hides it for its own scope and restores it in a `finally`.)
+function scenario9OverrideIsTestOnly() {
+  const saved = process.env.NODE_TEST_CONTEXT
+  try {
+    delete process.env.NODE_TEST_CONTEXT
+    let refused = null
+    try { setOwnerOnlyProbeOverride(() => null) } catch (error) { refused = error }
+    assert.ok(refused, 'installing the probe override outside a node:test process must throw')
+    assert.match(refused.message, /NODE_TEST_CONTEXT/, 'the refusal names the missing test context')
+    // Clearing never needs the test context — and it is what keeps the real DACL the
+    // authority, so this also undoes any override an earlier scenario left behind.
+    assert.equal(setOwnerOnlyProbeOverride(undefined), undefined, 'clearing is always allowed')
+    assert.equal(setOwnerOnlyProbeOverride(null), undefined, 'a non-function clears too')
+  } finally {
+    if (saved === undefined) delete process.env.NODE_TEST_CONTEXT
+    else process.env.NODE_TEST_CONTEXT = saved
+  }
+  passed('the process-wide owner-only probe override cannot be installed outside a node:test process')
+}
+
 const instance = await startGateway()
 try {
   const lanStatus = await instance.waitForLan()
@@ -521,6 +547,7 @@ try {
   // Independent of the listening gateway: the refusal path and the ACL decision.
   await scenario7OwnerOnlyRefusal().catch((error) => failed('owner-only refusal', error))
   try { scenario8AclDecision() } catch (error) { failed('owner-only decision', error) }
+  try { scenario9OverrideIsTestOnly() } catch (error) { failed('override is test-only', error) }
 } finally {
   await instance.close()
   fs.rmSync(temp, { recursive: true, force: true })
@@ -530,4 +557,4 @@ if (failures.length > 0) {
   console.error(`\n${failures.length} TLS PIN SCENARIO(S) FAILED`)
   process.exit(1)
 }
-console.log('TLS PIN TESTS PASSED (9/9)')
+console.log('TLS PIN TESTS PASSED (10/10)')

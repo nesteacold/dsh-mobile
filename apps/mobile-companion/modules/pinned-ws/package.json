@@ -4,7 +4,7 @@
   "private": true,
   "description": "DSH Companion local Expo module: WebSocket-over-TLS pinned to the SHA-256 of the server leaf certificate. No CA trust, no hostname identity, wss:// only.",
   "license": "MIT",
-  "author": "neste <devsjvn@sunjin.com>",
+  "author": "DSH contributors",
   "homepage": "https://github.com/dsh-ext/dsh-ext/tree/main/apps/mobile-companion/modules/pinned-ws",
   "main": "index.ts",
   "types": "index.ts",

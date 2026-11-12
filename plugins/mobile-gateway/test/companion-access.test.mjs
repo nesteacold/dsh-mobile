@@ -74,9 +74,13 @@ const FULL = mobile(['sessions:read', 'prompt:send', 'approval:respond'])
 
 test('endpoint mapping: the companion reads, prompt/cancel and the spec 011 authoring set', () => {
   assert.deepEqual(Object.keys(COMPANION_ENDPOINTS).sort(), [
+    // Spec 018 item 3: the three READ-ONLY schedule endpoints; every mutation stays unlisted.
+    'schedule/catalog', 'schedule/list', 'schedule/view',
     'session/cancel', 'session/create', 'session/events', 'session/follow', 'session/list',
     'session/modelCatalog', 'session/page', 'session/projections', 'session/prompt',
-    'session/search', 'session/selectModel', 'workspace/follow',
+    'session/rename', 'session/search', 'session/selectModel',
+    // Revision 11: archive ONE session, on the same session resource.
+    'workspace/archiveSession', 'workspace/follow',
   ])
   for (const key of Object.keys(COMPANION_ENDPOINTS)) {
     const [namespace, method] = key.split('/')
@@ -91,12 +95,13 @@ test('endpoint mapping: spec 011 opens exactly four authoring endpoints, all on 
   // (it publishes the baseline as a stream) and `session/modelCatalog` is the
   // one catalog behind both `models` forms — no `workspace/list` or `llm/models`
   // endpoint is needed, and no workspace write is opened (FR-004).
+  // Revision 11 adds exactly one session's rename and archive to the same family.
   assert.deepEqual(
     Object.entries(COMPANION_ENDPOINTS)
       .filter(([, entry]) => entry.scope === contract.AUTHORING_SCOPE)
       .map(([action]) => action)
       .sort(),
-    ['session/create', 'session/modelCatalog', 'session/selectModel', 'workspace/follow'],
+    ['session/create', 'session/modelCatalog', 'session/rename', 'session/selectModel', 'workspace/archiveSession', 'workspace/follow'],
   )
   assert.equal(contract.AUTHORING_SCOPE, 'sessions:author')
   assert.equal(COMPANION_ENDPOINTS['workspace/follow'].resource, 'global')
@@ -104,6 +109,9 @@ test('endpoint mapping: spec 011 opens exactly four authoring endpoints, all on 
   assert.equal(COMPANION_ENDPOINTS['session/modelCatalog'].resource, 'global')
   // A session resource, so DSH refuses a session the device cannot address.
   assert.equal(COMPANION_ENDPOINTS['session/selectModel'].resource, SESSION_RESOURCE_KIND)
+  // Revision 11: same rule for rename and archive — never a global grant.
+  assert.equal(COMPANION_ENDPOINTS['session/rename'].resource, SESSION_RESOURCE_KIND)
+  assert.equal(COMPANION_ENDPOINTS['workspace/archiveSession'].resource, SESSION_RESOURCE_KIND)
 })
 
 test('endpoint mapping: every scope used is a contract scope and never harness:remote', () => {
@@ -121,12 +129,14 @@ test('endpoint mapping: every scope used is a contract scope and never harness:r
 })
 
 test('unknown and dangerous endpoints are denied by the positive guard', () => {
+  // Revision 11 removed `session/rename` and `workspace/archiveSession` from this list:
+  // both are mapped now (authoring endpoints on the session resource, see above).
   for (const [namespace, method] of [
-    ['session', 'fork'], ['session', 'rename'], ['session', 'updateQueue'],
+    ['session', 'fork'], ['session', 'updateQueue'],
     ['session', 'attachment'], ['session', 'canOpenWorkspacePath'],
     ['session', 'openWorkspacePath'], ['session', 'state'],
     ['settings', 'mutate'], ['pluginManager', 'installBundle'], ['commands', 'execute'],
-    ['permissions', 'set'], ['schedule', 'create'], ['workspace', 'create'],
+    ['permissions', 'set'], ['schedule', 'create'], ['workspace', 'create'], ['workspace', 'rename'],
     ['speech', 'transcribe'], ['fileUploads', 'upload'], ['goals', 'clear'], ['userQuestions', 'answer'],
     ['subagents', 'prompt'], ['subagents', 'interruptByParent'], ['remoteAccess', 'follow'], ['session', 'control'],
     ['*', '*'], ['session', '*'], ['session', ''], ['', 'list'], ['Session', 'list'], ['session', 'LIST'],
@@ -263,7 +273,7 @@ test('per-device isolation: another device\'s sessions are not visible', () => {
 test('unknown endpoint is denied even with full scopes and a visible session', () => {
   const { policy } = makePolicy({ devices: { 'dev-1': mobile(ALL_MOBILE_SCOPES) }, sessions: { 'dev-1': ['s1'] } })
   for (const action of ['session/fork', 'settings/mutate', 'commands/execute', 'fileUploads/upload',
-    'subagents/prompt', 'session/attachment', 'workspace/create', 'session/rename', 'goals/get',
+    'subagents/prompt', 'session/attachment', 'workspace/create', 'workspace/rename', 'goals/get',
     'event:api-session/unknown', 'nonsense']) {
     for (const resources of [[GLOBAL], [session('s1')]]) {
       const result = decide(policy, { principal: principalOf(), action, resources })
@@ -454,9 +464,11 @@ test('duplicate scopes in a stored record do not change the grant', () => {
 // ---------------------------------------------------------------------------
 
 const AUTHORING_ACTIONS = ['session/create', 'session/modelCatalog', 'workspace/follow']
+// Revision 11: `session/rename` and `workspace/archiveSession` left the carve-out list;
+// they are authoring endpoints on the session resource (asserted in the positive matrix).
 const CARVE_OUT_ENDPOINTS = [
-  'workspace/create', 'workspace/rename', 'workspace/archiveSession',
-  'session/fork', 'session/rename', 'session/updateQueue', 'session/attachment',
+  'workspace/create', 'workspace/rename',
+  'session/fork', 'session/updateQueue', 'session/attachment',
   'session/canOpenWorkspacePath', 'commands/execute', 'settings/mutate',
   'pluginManager/installBundle', 'schedule/create',
 ]
@@ -476,6 +488,13 @@ test('authoring positive matrix: sessions:author on EITHER device kind opens the
     assert.equal(decide(policy, { principal: p, action: 'session/selectModel', resources: [session('s1')] }).kind, 'allow', kind)
     // ... and on no other session, exactly like session/prompt.
     assert.equal(decide(policy, { principal: p, action: 'session/selectModel', resources: [session('s9')] }).kind, 'deny', kind)
+    // Revision 11: rename and archive follow the SAME session rule, each decided on
+    // `{kind:'session', id}` — visible session yes, any other id no, `global` never.
+    for (const action of ['session/rename', 'workspace/archiveSession']) {
+      assert.equal(decide(policy, { principal: p, action, resources: [session('s1')] }).kind, 'allow', `${kind} ${action} s1`)
+      assert.equal(decide(policy, { principal: p, action, resources: [session('s9')] }).kind, 'deny', `${kind} ${action} s9`)
+      assert.equal(decide(policy, { principal: p, action, resources: [GLOBAL] }).kind, 'deny', `${kind} ${action} global`)
+    }
     // The scope grants nothing else: no read, no prompt, no list filtering.
     for (const action of ['session/list', 'session/search', 'session/prompt', 'session/follow', 'session/events']) {
       const resources = ['session/list', 'session/search'].includes(action) ? [GLOBAL] : [session('s1')]
@@ -690,8 +709,8 @@ test('session/create on a workspace resource grants NOTHING else: every hard-blo
   })
   const principal = principalOf()
   const blocked = [
-    'workspace/create', 'workspace/rename', 'workspace/archiveSession',
-    'session/fork', 'session/rename', 'session/archive', 'session/updateQueue',
+    'workspace/create', 'workspace/rename',
+    'session/fork', 'session/archive', 'session/updateQueue',
     'session/attachment', 'settings/mutate', 'settings/update', 'commands/list', 'commands/execute',
     'pluginManager/installBundle', 'schedule/create', 'schedule/edit', 'goals/edit',
     'session/control', 'session/canOpenWorkspacePath',

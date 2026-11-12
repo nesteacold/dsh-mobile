@@ -25,7 +25,7 @@ import { test } from 'node:test'
 import WebSocket from 'ws'
 import plugin from '../lib/index.mjs'
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
-import { CLOSE_CODES, OP_RESPONSES, SCOPES, SCOPE_BY_TYPE } from '@dsh-ext/mobile-protocol'
+import { CLOSE_CODES, DESKTOP_DEFAULT_SCOPES, OP_RESPONSES, SCOPES, SCOPE_BY_TYPE } from '@dsh-ext/mobile-protocol'
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const UUID = 'desk0000-0000-4000-8000-000000000001'
@@ -277,7 +277,10 @@ test('T1: every mapped type is served with its scope and refused without it', as
         appVersion: '1.0.0', platform: 'ios', query: 'q', rpcId: 'rpc-x', approvalId: 'approval-x',
         argsHash: 'h', outcome: 'rejected', text: 'hi', clientMsgId: `m-${index}-${type}`,
         // Spec 011: the authoring frames' own arguments.
-        workspaceId: 'w1', provider: 'p', model: 'm' })
+        workspaceId: 'w1', provider: 'p', model: 'm',
+        // Revision 11: `session-rename` needs a valid title, else it answers
+        // `bad-request` before the scope gate is observable.
+        title: 'renamed' })
       // The `client-hello` exchange itself is not scope-gated: it is what makes
       // the connection ready (contract §3.6/§5a), so it is served before any
       // scope decision — otherwise a device whose grant lacks sessions:read
@@ -432,7 +435,9 @@ test('T7: a pairing string round-trips to the QR payload, and a used code fails'
   const decoded = JSON.parse(Buffer.from(body.pairingString, 'base64url').toString('utf8'))
   assert.deepEqual(decoded, body.payload)
   assert.equal(body.pairing.kind, 'desktop')
-  assert.deepEqual(body.pairing.scopes, ['sessions:read', 'prompt:send', 'approval:respond'])
+  // Spec 013 added `attachments:write`, so assert against the contract's own list:
+  // a hard-coded literal here breaks every time the default legitimately grows.
+  assert.deepEqual(body.pairing.scopes, [...DESKTOP_DEFAULT_SCOPES])
   assert.match(decoded.certSha256, /^[a-f0-9]{64}$/, 'the pin travels with the code')
   const ttl = decoded.expiresAt - Date.now()
   assert.ok(ttl > 0 && ttl <= 5 * 60 * 1000, `expiresAt must sit inside the 5-minute TTL, got ${ttl}`)

@@ -11,12 +11,13 @@
 //   controller change, not a UI change — P2), storage/logs/plugins/tailscale/about.
 
 import { useState } from 'react';
-import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Alert, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useRouter } from 'expo-router';
 
-import { useApp } from '../_layout';
-import { Card, Divider, Screen, SectionLabel, StatusDot } from '../../src/ui/components/ui';
-import { FONT_SCALES, space, useTheme } from '../../src/ui/theme';
+import { useApp } from './_layout';
+import { Card, Divider, Screen, SectionLabel, StatusDot } from '../src/ui/components/ui';
+import { FONT_SCALES, space, useTheme } from '../src/ui/theme';
+import { saveFontScale } from '../src/ui/font-scale-store';
 
 export default function SettingsScreen() {
   const { controller, snapshot, tr } = useApp();
@@ -25,6 +26,18 @@ export default function SettingsScreen() {
   const [busy, setBusy] = useState(false);
 
   const host = snapshot.activeHost;
+  /**
+   * Spec 018 item 3: `schedule:read` is explicit-only (never a default) and no `hello` capability
+   * advertises it, so the device's granted scopes are the gate. Without it the row is NOT drawn
+   * (the screen itself also refuses), instead of opening a page that could only say "not granted".
+   */
+  const canReadSchedules = controller.hasReadScope('schedule:read');
+  /**
+   * Spec 021: "Lock now" only exists where a passkey lock exists. The snapshot's `webLock` is
+   * non-null exactly for a device the Host locks (`web:unlock`), so a native install — which is
+   * never locked — draws no row for it, and the button is never dead.
+   */
+  const webLock = snapshot.webLock;
 
   const forget = (): void => {
     Alert.alert(tr('sessions.forget'), tr('sessions.forgetConfirm'), [
@@ -48,6 +61,23 @@ export default function SettingsScreen() {
 
       <View style={styles.group}>
         <SectionLabel style={{ paddingHorizontal: space.xl }}>{tr('settings.computer')}</SectionLabel>
+        {/* Spec 018 item 3: read-only scheduled tasks of this computer — only with `schedule:read`. */}
+        {canReadSchedules ? (
+          <View style={{ paddingHorizontal: space.xl, paddingTop: space.sm }}>
+            <Card>
+              <Pressable
+                testID="settings-schedules"
+                accessibilityRole="button"
+                accessibilityLabel={tr('schedules.open')}
+                onPress={() => router.push('/schedules')}
+                style={[styles.row, { minHeight: 48 }]}
+              >
+                <Text style={[settingsType.item, { color: colors.text, flex: 1 }]}>{tr('schedules.open')}</Text>
+                <Text style={[settingsType.item, { color: colors.textMuted }]}>›</Text>
+              </Pressable>
+            </Card>
+          </View>
+        ) : null}
         {host === null ? (
           <View style={{ paddingHorizontal: space.xl, paddingTop: space.sm }}>
             <Card>
@@ -94,9 +124,57 @@ export default function SettingsScreen() {
               >
                 <Text style={[settingsType.item, { color: colors.danger }]}>{tr('sessions.forget')}</Text>
               </Pressable>
+              {/* Spec 021: the web (PWA) "Lock" action — sends `passkey-lock` and closes the socket,
+                  so the next frame, reload or tab needs the passkey again. Web only: a native install
+                  never carries `web:unlock` and is never locked, so it draws no row. */}
+              {Platform.OS === 'web' && webLock !== null ? (
+                <>
+                  <Divider inset={0} />
+                  <Pressable
+                    testID="settings-lock-now"
+                    accessibilityRole="button"
+                    accessibilityLabel={tr('settings.lockNow')}
+                    onPress={() => {
+                      void controller.lockWebDevice();
+                    }}
+                    style={({ pressed }) => [styles.row, pressed && styles.pressed]}
+                  >
+                    <Text style={[settingsType.item, { color: colors.text }]}>{tr('settings.lockNow')}</Text>
+                  </Pressable>
+                </>
+              ) : null}
             </Card>
           </View>
         )}
+      </View>
+
+      <View style={styles.group}>
+        <SectionLabel style={{ paddingHorizontal: space.xl }}>{tr('storage.title')}</SectionLabel>
+        <View style={{ paddingHorizontal: space.xl, paddingTop: space.sm }}>
+          <Card>
+            <Pressable
+              testID="settings-storage"
+              accessibilityRole="button"
+              accessibilityLabel={tr('storage.title')}
+              onPress={() => router.push('/storage')}
+              style={[styles.row, { minHeight: 48 }]}
+            >
+              <Text style={[settingsType.item, { color: colors.text, flex: 1 }]}>{tr('storage.title')}</Text>
+              <Text style={[settingsType.item, { color: colors.textMuted }]}>›</Text>
+            </Pressable>
+            <Divider />
+            <Pressable
+              testID="settings-privacy"
+              accessibilityRole="button"
+              accessibilityLabel={tr('privacy.title')}
+              onPress={() => router.push('/privacy')}
+              style={[styles.row, { minHeight: 48 }]}
+            >
+              <Text style={[settingsType.item, { color: colors.text, flex: 1 }]}>{tr('privacy.title')}</Text>
+              <Text style={[settingsType.item, { color: colors.textMuted }]}>›</Text>
+            </Pressable>
+          </Card>
+        </View>
       </View>
 
       <View style={styles.group}>
@@ -109,10 +187,16 @@ export default function SettingsScreen() {
                 return (
                   <Pressable
                     key={scale}
+                    testID={`settings-font-${Math.round(scale * 100)}`}
                     accessibilityRole="button"
                     accessibilityLabel={`${Math.round(scale * 100)}%`}
                     accessibilityState={{ selected: active }}
-                    onPress={() => setFontScale(scale)}
+                    onPress={() => {
+                      setFontScale(scale);
+                      // Remembered across restarts (src/ui/font-scale-store.ts); a failed write only
+                      // means the choice is not persisted, it never breaks the screen.
+                      void saveFontScale(scale);
+                    }}
                     style={[
                       styles.scaleChip,
                       { borderColor: colors.border, borderRadius: radius.sm, backgroundColor: active ? colors.accent : 'transparent' },

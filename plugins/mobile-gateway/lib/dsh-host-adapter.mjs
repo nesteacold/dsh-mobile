@@ -328,7 +328,7 @@ export function createDshHostAdapter(typertGateway, peer, connection, options = 
   return {
     files: {
       available: uploadsAvailable,
-      async upload({ sessionId, name, data }, signal) {
+      async upload({ sessionId, name, data, mediaType }, signal) {
         if (!uploadsAllowed()) {
           onDenied('POST /api/session/uploadFileBinary')
           throw Object.assign(new Error('mobile-gateway: file upload is not available to a paired device'), { code: 'op/forbidden' })
@@ -336,7 +336,10 @@ export function createDshHostAdapter(typertGateway, peer, connection, options = 
         if (!uploadsAvailable()) throw Object.assign(new Error('The official file upload service is unavailable'), { code: 'file-upload-unavailable' })
         const url = new URL(uploadUrl)
         url.searchParams.set('sessionId', sessionId)
-        url.searchParams.set('name', name)
+        // Spec 013: `mediaType` is how the Host's own route stages the body as a
+        // prompt image instead of a verbatim file; `name` is optional there.
+        if (name !== undefined) url.searchParams.set('name', name)
+        if (mediaType !== undefined) url.searchParams.set('mediaType', mediaType)
         const uploadSignal = signal ? AbortSignal.any([signal, peer.signal]) : peer.signal
         uploadSignal.throwIfAborted()
         const source = Readable.from(data, { objectMode: false })
@@ -349,7 +352,8 @@ export function createDshHostAdapter(typertGateway, peer, connection, options = 
           if (!response.ok) throw Object.assign(new Error(`Official file upload returned HTTP ${response.status}`), { code: 'file-upload-unavailable' })
           const result = await response.json()
           if (result.ok !== true) throw Object.assign(new Error(result.error?.message || 'Official file upload failed'),
-            { code: result.error?.code || 'file-upload-failed' })
+            { code: result.error?.code || 'file-upload-failed',
+              ...(result.error?.details === undefined ? {} : { details: result.error.details }) })
           return requireRecord(result.value, 'file upload')
         } catch (error) {
           uploadSignal.throwIfAborted()
@@ -595,6 +599,15 @@ export function createDshHostAdapter(typertGateway, peer, connection, options = 
     commands,
     host: {
       describe: (_payload = {}, signal) => describeHost(signal),
+    },
+    // Spec 020 (web unlock): the ONLY way the gateway reads the Host account. It stays
+    // inside the adapter so the plugin never touches `typertGateway` directly (the
+    // invariant asserted by test/host-adapter.test.mjs), and it runs on whatever peer the
+    // adapter was created for — the mobile gateway passes its OWNER peer, so a device
+    // never reaches `account/*`.
+    account: {
+      getState: (signal) => invoke('account', 'getState', {}, signal),
+      getProfile: (signal) => invoke('account', 'getProfile', {}, signal),
     },
     describeHost,
     dshVersion,

@@ -4,8 +4,9 @@
 // companion's job: read sessions, read history, send a prompt, cancel a turn,
 // answer an approval, manage its own device. Everything the upstream gateway
 // exposed to any paired device — plugin management, settings, permission
-// presets, schedules, workspace mutations, file upload/download, speech,
-// session creation — is refused before it can touch the Host.
+// presets, schedules, workspace mutations, file upload/download, speech —
+// is refused before it can touch the Host; session create/rename/archive are
+// lifted per device by `sessions:author` below.
 //
 // Two lists exist:
 //  - COMPANION_V1_TYPES: the contract §4 operations, served for device-token
@@ -21,6 +22,9 @@
 // defined locally until it lands there.
 import * as contract from './vendor/mobile-protocol.mjs'
 
+/** Spec 018 item 3: the scope that lifts the read-only schedule endpoints. */
+const SCHEDULE_READ_SCOPE = contract.SCHEDULE_READ_SCOPE ?? 'schedule:read'
+
 /** Companion wire-protocol revision (contract §3.5/§3.6). TODO use @dsh-ext/mobile-protocol */
 export const COMPANION_PROTOCOL_VERSION = contract.COMPANION_PROTOCOL_VERSION ?? 1
 
@@ -29,6 +33,8 @@ export const MIN_CLIENT_VERSION = contract.MIN_CLIENT_VERSION ?? 1
 
 /** WebSocket close code for a revoked credential (contract §3, §6). */
 export const CLOSE_REVOKED = contract.CLOSE_CODES?.revoked ?? 4401
+/** Spec 020: a web:unlock device locked by the Host account. NOT 4401 (that wipes the credential). */
+export const CLOSE_LOCKED = contract.CLOSE_CODES?.locked ?? 4412
 
 /** Error code for a request outside the allowlist (contract §4, §6). */
 export const OP_FORBIDDEN = 'op/forbidden'
@@ -63,7 +69,9 @@ export const COMPANION_CAPABILITIES = Object.freeze(
  * even if a future contract version added the operation to the wire vocabulary:
  * plugin management, settings, permission presets, defaults, filesystem and
  * workspace mutations, commands, schedules, goals, session creation/forking/
- * renaming/queue control, speech and the file transfer surface.
+ * renaming/queue control, speech and the file transfer surface. (Session
+ * create/rename/archive leave this set through `sessions:author`, never by
+ * being deleted from it — see COMPANION_AUTHOR_DENIED_ENDPOINTS.)
  * The vocabulary is the union of the upstream `PLUGIN_REQUEST_TYPES`,
  * `SCHEDULE_REQUEST_TYPES`, `SPEECH_REQUEST_TYPES`, `FILE_UPLOAD_REQUEST_TYPES`
  * and the router's own `type` table, so the list stays in step with the router.
@@ -97,6 +105,10 @@ export const ADMIN_ONLY_TYPES = new Set([
   'schedule-update', 'schedule-delete',
   'goal', 'goal-edit', 'goal-pause', 'goal-resume', 'goal-clear',
   'models', 'select-model', 'providers', 'host', 'context-usage', 'session-stats', 'tasks',
+  // Spec 019 Wave 3: the two permission frames. They stay OUTSIDE the companion
+  // surface (nothing here is served without a scope) and reach a device only through
+  // the `permission:lower` gate, which is never a default.
+  'permission-options', 'permission-lower',
   // interactions the companion answers through `approval-response` only
   'question-answer', 'question-cancel',
 ])
@@ -128,17 +140,41 @@ export const AUTHOR_SCOPE = contract.AUTHORING_SCOPE
  * reach them. The denial is lifted by PERMISSION, never by deleting the entry,
  * so a device without the scope is denied here exactly as before — and a router
  * regression that skipped the scope gate still could not reach a create/model
- * write. These are the only two endpoint forms in the list that the scope
- * covers; `workspace/create`, `session/rename`, the plugin/schedule/settings
- * families and everything else stay denied for every device, whatever it holds.
+ * write. Revision 11 adds the same lift for ONE session's rename and archive
+ * (`session/rename`, `workspace/archiveSession`): their session-resource leg in
+ * `companion-access.mjs` is what keeps a device to sessions it can see.
+ * `workspace/create`, `workspace/rename`, the plugin/schedule/settings families
+ * and everything else stay denied for every device, whatever it holds.
  */
-export const COMPANION_AUTHOR_DENIED_ENDPOINTS = Object.freeze(['session/create', 'session/selectModel'])
+export const COMPANION_AUTHOR_DENIED_ENDPOINTS = Object.freeze([
+  'session/create', 'session/selectModel',
+  // Revision 11 (session rename/archive).
+  'session/rename', 'workspace/archiveSession',
+])
 
 /**
- * Spec 011: the four authoring message types. They remain in `ADMIN_ONLY_TYPES`
- * (the enumeration of everything outside the companion surface, kept intact so a
- * new router type cannot slip in unclassified) — the router now serves them to a
- * device that holds `sessions:author`, and refuses them by scope to any other.
+ * Spec 018 item 3 (revision 12): `schedule/*` stays in the denied list above, but the three
+ * READ-ONLY endpoints are lifted for a device that holds `schedule:read`.
+ *
+ * Same shape as the spec 011 author lift, and for the same reason: the entry is never deleted, so a
+ * device without the scope is denied here exactly as before, and a router regression that skipped
+ * the scope gate still could not reach a schedule MUTATION — those are not in this list.
+ */
+export const COMPANION_SCHEDULE_READ_DENIED_ENDPOINTS = Object.freeze([
+  'schedule/catalog', 'schedule/list', 'schedule/view',
+])
+
+/** Whether `scopes` grants the spec 018 schedule read scope (a malformed list grants nothing). */
+export function holdsScheduleReadScope(scopes) {
+  return typeof SCHEDULE_READ_SCOPE === 'string' && Array.isArray(scopes) && scopes.includes(SCHEDULE_READ_SCOPE)
+}
+
+/**
+ * Spec 011: the authoring message types (revision 7) plus revision 11's session
+ * rename/archive. They remain in `ADMIN_ONLY_TYPES` (the enumeration of everything
+ * outside the companion surface, kept intact so a new router type cannot slip in
+ * unclassified) — the router now serves them to a device that holds
+ * `sessions:author`, and refuses them by scope to any other.
  */
 export const SESSIONS_AUTHOR_TYPES = Object.freeze(
   Array.isArray(contract.AUTHORING_CLIENT_TYPES) ? [...contract.AUTHORING_CLIENT_TYPES] : [],
@@ -148,6 +184,26 @@ export const SESSIONS_AUTHOR_TYPES = Object.freeze(
 export function holdsAuthorScope(scopes) {
   if (typeof AUTHOR_SCOPE !== 'string') return false
   return Array.isArray(scopes) && scopes.includes(AUTHOR_SCOPE)
+}
+
+/**
+ * Spec 018 (revision 10): the read-only session-metric types, served only to a
+ * device that holds `stats:read`. Like the authoring types they stay in
+ * `ADMIN_ONLY_TYPES` (that list enumerates everything OUTSIDE the companion
+ * surface; deleting an entry would hide it from the enumeration the allowlist test
+ * walks), and they reach a device through the same scope gate as every other type.
+ * They only read the session's own projections, so the per-item rule is the ordinary
+ * "this device may see this session".
+ */
+export const STATS_READ_TYPES = Object.freeze(
+  Array.isArray(contract.STATS_READ_CLIENT_TYPES) ? [...contract.STATS_READ_CLIENT_TYPES] : ['session-stats', 'context-usage'],
+)
+
+/** Whether `scopes` grants the spec 018 metric scope (a malformed list grants nothing). */
+export function holdsStatsReadScope(scopes) {
+  const scope = contract.STATS_READ_SCOPE
+  if (typeof scope !== 'string') return false
+  return Array.isArray(scopes) && scopes.includes(scope)
 }
 
 /** Path prefixes of the shared Fetch channel a device token may never use (file upload). */
@@ -171,8 +227,10 @@ function matchesEndpoint(pattern, namespace, method) {
 export function hostEndpointAllowedForCompanion(namespace, method, scopes) {
   const denied = COMPANION_DENIED_HOST_ENDPOINTS.find((pattern) => matchesEndpoint(pattern, namespace, method))
   if (denied === undefined) return true
-  if (!COMPANION_AUTHOR_DENIED_ENDPOINTS.includes(`${namespace}/${method}`)) return false
-  return holdsAuthorScope(scopes)
+  const endpoint = `${namespace}/${method}`
+  if (COMPANION_AUTHOR_DENIED_ENDPOINTS.includes(endpoint)) return holdsAuthorScope(scopes)
+  if (COMPANION_SCHEDULE_READ_DENIED_ENDPOINTS.includes(endpoint)) return holdsScheduleReadScope(scopes)
+  return false
 }
 
 /** Whether a device-token caller may use this shared Fetch path (file upload). */
@@ -197,6 +255,131 @@ export function isSessionsAuthorType(type) {
 }
 
 /**
+ * Whether a request `type` is a spec 013 attachment-upload frame. Like the
+ * remote-bridge frames, they are outside the §4 vocabulary but ARE scoped
+ * (`attachments:write`) and must reach the scope gate.
+ */
+export function isRemoteUploadType(type) {
+  return typeof type === 'string' && Array.isArray(contract.REMOTE_UPLOAD_CLIENT_TYPES)
+    && contract.REMOTE_UPLOAD_CLIENT_TYPES.includes(type)
+}
+
+/**
+ * Spec 021: the PWA's own re-lock frame (contract §14.2). `packages/mobile-protocol` names the
+ * four ceremony frames only, so the literal lives here beside the gateway code that receives it
+ * and beside the app constant that sends it (`apps/mobile-companion/src/core/web-lock.ts`).
+ */
+export const PASSKEY_LOCK_TYPE = 'passkey-lock'
+
+/**
+ * Whether `type` is one of the spec 021 web passkey frames (scoped by `web:unlock`).
+ *
+ * `passkey-lock` belongs to the family: it needs the same scope, it is allowed on a locked
+ * socket (giving up a secret never needs a proof), and it is never a §4 op.
+ */
+export function isPasskeyType(type) {
+  if (typeof type !== 'string') return false
+  if (type === PASSKEY_LOCK_TYPE) return true
+  return Array.isArray(contract.PASSKEY_CLIENT_TYPES) && contract.PASSKEY_CLIENT_TYPES.includes(type)
+}
+
+/** The scope that gates the passkey frames and arms the server-side lock. */
+export const WEB_UNLOCK_SCOPE = typeof contract.WEB_UNLOCK_SCOPE === 'string'
+  ? contract.WEB_UNLOCK_SCOPE
+  : 'web:unlock'
+
+/** Whether scopes grants the web-unlock scope (a malformed list grants nothing). */
+export function holdsWebUnlockScope(scopes) {
+  return Array.isArray(scopes) && scopes.includes(WEB_UNLOCK_SCOPE)
+}
+
+export function isStatsReadType(type) {
+  return typeof type === 'string' && STATS_READ_TYPES.includes(type)
+}
+
+/**
+ * Spec 018 item 2 (revision 11, plan A): the read-on-demand agent-team and subagent-catalog types.
+ *
+ * They get NO scope of their own. The same projections already travel to every `sessions:read`
+ * device in `projection-baseline` and in the `agent-team-updated` / `subagents-updated` frames
+ * (measured 2026-11-11: 31/52 sessions carried `agentTeam`), so a dedicated scope would widen the
+ * pairing matrix without widening what a device can see — and gating the baseline on it would break
+ * the clients already running. Their entry in `ADMIN_ONLY_TYPES` stays: that list enumerates
+ * everything OUTSIDE the companion surface, and deleting an entry would hide it from the
+ * enumeration the allowlist test walks. They reach a device only through the scope gate, which
+ * answers `auth/forbidden-scope` with the ordinary session read scope.
+ */
+export const TEAM_READ_TYPES = Object.freeze(
+  Array.isArray(contract.TEAM_READ_CLIENT_TYPES) ? [...contract.TEAM_READ_CLIENT_TYPES] : ['agent-team', 'subagents'],
+)
+
+/** Whether `type` is one of the spec 018 team read-on-demand frames. */
+export function isTeamReadType(type) {
+  return typeof type === 'string' && TEAM_READ_TYPES.includes(type)
+}
+
+/**
+ * Spec 018 item 3 (revision 12): the READ-ONLY schedule frames, lifted by the explicit-only
+ * `schedule:read` scope.
+ *
+ * Unlike the team frames, this is real new visibility: measured 2026-11-11, NO schedule data
+ * travels in `projection-baseline` or in any broadcast (the baseline carries goal, todos,
+ * turnOutline, agentTeam, subagentCatalog, subagent, subagentTiming — nothing about schedules).
+ * That is why it gets its own never-default scope instead of riding `sessions:read`.
+ *
+ * Entries stay in `ADMIN_ONLY_TYPES`: that list enumerates everything outside the companion
+ * surface, and these reach a device only through the scope gate.
+ */
+export const SCHEDULE_READ_TYPES = Object.freeze(
+  Array.isArray(contract.SCHEDULE_READ_CLIENT_TYPES) ? [...contract.SCHEDULE_READ_CLIENT_TYPES] : ['schedule-catalog', 'schedule-list', 'schedule-view'],
+)
+
+/** Whether `type` is one of the spec 018 read-only schedule frames. */
+export function isScheduleReadType(type) {
+  return typeof type === 'string' && SCHEDULE_READ_TYPES.includes(type)
+}
+
+/**
+ * Spec 018 item 4 (revision 13): the two question frames, lifted by the EXISTING
+ * `approval:respond` scope.
+ *
+ * Answering a question is the same interaction as an approval card, so it does not get a scope of
+ * its own. They are served only to a device that holds `approval:respond` AND may see the asking
+ * session — the per-session check lives in the router (`respondToQuestion`), because the Host
+ * promise behind a question is resolved inside the gateway and no Host per-item check covers it.
+ */
+export const QUESTION_RESPONSE_TYPES = Object.freeze(
+  Array.isArray(contract.QUESTION_RESPONSE_TYPES) ? [...contract.QUESTION_RESPONSE_TYPES] : ['question-answer', 'question-cancel'],
+)
+
+/** Whether `type` is one of the spec 018 question frames. */
+export function isQuestionResponseType(type) {
+  return typeof type === 'string' && QUESTION_RESPONSE_TYPES.includes(type)
+}
+
+/**
+ * Spec 019 Wave 3 (permission control): `permission-options` (read the presets) and
+ * `permission-lower` (switch ONE session to a strictly stricter preset). Like the
+ * authoring and metric types they are NOT contract §4 ops, they stay in
+ * `ADMIN_ONLY_TYPES` (that list enumerates everything OUTSIDE the companion surface),
+ * and they reach a device only through the scope gate — `permission:lower`, which is
+ * never a default.
+ */
+export const PERMISSION_LOWER_TYPES = Object.freeze(
+  Array.isArray(contract.PERMISSION_LOWER_CLIENT_TYPES) ? [...contract.PERMISSION_LOWER_CLIENT_TYPES] : ['permission-options', 'permission-lower'],
+)
+
+/** The scope that lifts the spec 019 frames; explicit-only, never a default. */
+export const PERMISSION_LOWER_SCOPE = typeof contract.PERMISSION_LOWER_SCOPE === 'string'
+  ? contract.PERMISSION_LOWER_SCOPE
+  : 'permission:lower'
+
+/** Whether `type` is one of the spec 019 permission frames. */
+export function isPermissionLowerType(type) {
+  return typeof type === 'string' && PERMISSION_LOWER_TYPES.includes(type)
+}
+
+/**
  * Spec 005 FR2: scopes a device's own credential management cannot be gated on.
  * `device-forget` revokes the calling device (contract §4) — a leaked token must
  * always be able to remove itself, so it is never refused *by scope*.
@@ -218,15 +401,45 @@ export const SCOPE_EXEMPT_TYPES = new Set(['device-forget'])
  * @param {string} type
  */
 export function scopeDenial(device, type) {
+  return scopeDenialAgainst(contract.SCOPE_BY_TYPE, device, type)
+}
+
+/**
+ * The gate itself, parameterised by the scope map.
+ *
+ * Exported for the closure test (reviewer, spec 018 item 1): the pre-fix defect only
+ * shows for a mapped type whose FAMILY nobody had added, and no such type exists in
+ * today's contract — so the test supplies a synthetic map with one to prove the
+ * decision follows the map rather than a hand-maintained family list. Production
+ * callers use {@link scopeDenial}, which passes the contract's own frozen map.
+ *
+ * @param {Record<string, string>} scopeByType typed request type → required scope
+ * @param {{ scopes?: string[] }|undefined} device
+ * @param {string} type
+ */
+export function scopeDenialAgainst(scopeByType, device, type) {
   if (SCOPE_EXEMPT_TYPES.has(type)) return undefined
-  // Spec 008: the remote-bridge frames are not companion-v1 ops but they ARE
-  // scoped (`harness:remote`); they must not fall through as "not my business".
-  // Spec 011: the four authoring types are the same — outside `OPS`, but mapped
-  // to `sessions:author`, so a device without it is refused here (fail closed)
-  // instead of reaching the router's unknown-type refusal.
-  if (!isCompanionType(type) && !isRemoteBridgeType(type) && !isSessionsAuthorType(type)) return undefined
+  // Reviewer fix (spec 018, item 1): the contract map is the PRIMARY authority. Any
+  // type the map names is scoped, whatever family it belongs to — deciding this from a
+  // hand-maintained family list is what let a newly added, mapped type fall through as
+  // `undefined` (served) simply because nobody had added its family yet.
+  //
+  // Spec 008: the remote-bridge frames are outside `OPS` but mapped to `harness:remote`.
+  // Spec 011: the four authoring types are mapped to `sessions:author`. Spec 013 adds the
+  // four `remote-upload-*` frames (`attachments:write`). Spec 018 adds the two read-only
+  // metric frames (`stats:read`), spec 019 the two permission frames (`permission:lower`).
+  // All of them must reach the decision below so a device lacking the scope is refused
+  // here (fail closed), never `undefined` (serve).
+  const mapped = typeof type === 'string' && Object.hasOwn(scopeByType, type)
+  if (!mapped && !isCompanionType(type) && !isRemoteBridgeType(type) && !isSessionsAuthorType(type)
+    && !isRemoteUploadType(type) && !isStatsReadType(type) && !isTeamReadType(type) && !isScheduleReadType(type)
+    && !isQuestionResponseType(type) && !isPasskeyType(type) && !isPermissionLowerType(type)) return undefined
   const scopes = Array.isArray(device?.scopes) ? device.scopes : []
-  const scope = Object.hasOwn(contract.SCOPE_BY_TYPE, type) ? contract.SCOPE_BY_TYPE[type] : undefined
+  // Spec 021: `passkey-lock` is the one passkey frame the contract does not map, because
+  // `packages/mobile-protocol` names only the four ceremony frames. It still needs the SAME scope
+  // as the rest of its family (`web:unlock`) — a device that may not unlock may not lock either,
+  // and the literal is not in `SCOPE_BY_TYPE` to say so by itself.
+  const scope = mapped ? scopeByType[type] : (type === PASSKEY_LOCK_TYPE ? WEB_UNLOCK_SCOPE : undefined)
   if (scope && scopes.includes(scope)) return undefined
   return {
     kind: 'error',

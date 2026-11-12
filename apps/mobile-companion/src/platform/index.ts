@@ -7,3 +7,6 @@ export * from './biometrics';
 export * from './notifications';
 export * from './pinned-transport';
 export * from './random';
+export * from './unlock-copy';
+// Spec 021: the pairing's `web:unlock` grant (a no-op pair on native, the real store on web).
+export * from './web-grant';

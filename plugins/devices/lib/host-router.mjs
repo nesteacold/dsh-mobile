@@ -10,8 +10,19 @@
 //    lib/remote-client.mjs) and its result comes back renamed;
 //  - a call with no tagged id stays Local, unless the client passed the host hint
 //    `__dshHost` (needed for global endpoints such as llm/*, which have no id);
-//  - `session/list` and `workspace/follow` are merged: Local plus every connected
-//    remote, so the native sidebar shows one list.
+//  - `session/list`, `workspace/follow` and `session/modelCatalog` are merged:
+//    Local plus every connected remote, so the native sidebar shows one list and
+//    the native model picker one catalog (see `#mergeModelCatalog`). A merged
+//    remote Workspace carries its host in the title (`REA_Project · Sigma-DSH`),
+//    and that suffix is taken off again before a title travels back.
+//  - a PROVIDER is the second name that must not cross hosts, because it selects
+//    which Host runs the model. The picker compares a session's projected
+//    `provider` against the catalog's group ids and hands the matched id back to
+//    `session/selectModel`, so a remote provider is named `<provider>@<hostId>`
+//    everywhere the UI sees it (merged catalog group id, projected selection) and
+//    the tag is taken off before the call reaches that Host. The picker needs no
+//    new surface for this: it renders one section per group, so Local and each
+//    remote Host become their own section (see `#labelledGroups`).
 //
 // The invariants are the interesting part, not the routing:
 //  - a namespaced id never leaves this machine (`#assertNoNamespace`, asserted on
@@ -52,6 +63,23 @@ export const HOST_PREFIX = 'h:'
 export const HOST_HINT = '__dshHost'
 
 /**
+ * Separator between a remote Workspace's own title and its host name. The native
+ * browser renders Local and remote Workspaces as one list, so a remote title says
+ * which Host owns it (`REA_Project · Sigma-DSH`). The suffix is display only:
+ * `withoutWorkspaceTitle` takes it off again before a title travels back.
+ */
+const WORKSPACE_HOST_SEPARATOR = ' · '
+/**
+ * The stored title the native client replaces with the localized default name
+ * (`workspaceDisplayTitle` in dsh-client-ui-workspace). Only that EXACT string is
+ * translated, so a suffixed one would render verbatim; a remote default Workspace
+ * therefore reads as this plain word plus its host. A Host has no client language
+ * to localize with, so `Default · <host>` is the honest fallback.
+ */
+const DEFAULT_WORKSPACE_TITLE = 'default-workspace'
+const DEFAULT_WORKSPACE_LABEL = 'Default'
+
+/**
  * The ONE rename table (spec 008 P2a). Keys are field names that occur in the
  * DSH wire payloads; the value says how to rewrite what sits under that key.
  *   `id`      a single id string
@@ -63,7 +91,9 @@ export const HOST_HINT = '__dshHost'
  *             merely happens to call something a `header` is left alone)
  * Anything not listed here is copied structurally and kept verbatim, so an
  * unknown payload field keeps its value (never invent a rename for a field that
- * might not be an id: `callId`, `attachmentId`, `provider` … are opaque).
+ * might not be an id: `callId`, `attachmentId` … are opaque). `provider` is the one
+ * field handled outside this table: it is not an id but it does name a Host, so it
+ * is tagged by shape wherever it labels a model selection (see `namespaceIds`).
  */
 export const ID_FIELDS = Object.freeze({
   sessionId: 'id',
@@ -71,6 +101,13 @@ export const ID_FIELDS = Object.freeze({
   agentId: 'id',
   parentSessionId: 'id',
   childSessionId: 'id',
+  // `workspaceFiles/*` (`list`, `changes`, `read`, `readBytes`, `stat`) and
+  // `officeToPdf/render` name their scope with this field instead of `sessionId`:
+  // it is the wire name of their `workspaceFileScope` lookup parameter, and its
+  // value IS a SessionId (the Host resolves the workspace root from that session's
+  // header). Without the entry a tagged scope fell through to Local, so a remote
+  // session's Workspace files tab listed THIS machine's files.
+  workspaceFileScopeId: 'id',
   // Approval/question correlation ids: the card the local UI decides on carries
   // the same id, so tagging it is what lets `$events/result` route to the host
   // that issued it (and keeps two hosts' ids from colliding in one UI).
@@ -88,7 +125,7 @@ export const ID_FIELDS = Object.freeze({
 })
 
 /** Endpoints the wrapper answers with a merged view instead of routing. */
-export const MERGED_ENDPOINTS = Object.freeze(['session/list', 'workspace/follow'])
+export const MERGED_ENDPOINTS = Object.freeze(['session/list', 'workspace/follow', 'session/modelCatalog'])
 
 /** The endpoints whose cards carry an approval hash the bridge requires. */
 const APPROVAL_RESULT_ENDPOINT = '$events/result'
@@ -133,6 +170,40 @@ const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 const EVENTS_ENDPOINT = '$events'
 /** The per-session history stream: one opening snapshot, then increments. */
 const SESSION_FOLLOW_ENDPOINT = 'session/follow'
+/** The Host-generation model catalog the native picker loads (it takes no argument). */
+const MODEL_CATALOG_ENDPOINT = 'session/modelCatalog'
+/**
+ * The longest remote group header the merged catalog passes on. The header is the
+ * remote's own provider name plus a label this module mints, and it is the only
+ * text the picker renders for a provider, so it is bounded here instead of being
+ * trusted to be a tidy one-liner.
+ */
+const MAX_REMOTE_GROUP_NAME = 120
+/**
+ * `Remote · <host> — <provider name>`: the header of one remote provider group.
+ * The picker renders a group's `name` and nothing else (no per-host slot), so the
+ * host has to be part of that string for the sections to be tellable apart.
+ */
+const REMOTE_GROUP_LABEL = 'Remote'
+const REMOTE_PROVIDER_SEPARATOR = ' — '
+/**
+ * Separator between a provider route and the host that owns it: a remote
+ * provider is named `<provider>@<hostId>` wherever the local UI reads it.
+ *
+ * `@` cannot occur in a real provider id, so the tag is unambiguous: the only
+ * path that mints a new route is the custom-provider card, which validates it
+ * against `/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/` (dsh-client-ui-settings-models,
+ * `ROUTE_PATTERN`: lowercase letters, digits, single hyphens), and every shipped
+ * route (`deepseek-account`, `deepseek-official`, …) has the same shape.
+ */
+const PROVIDER_HOST_SEPARATOR = '@'
+/** The one endpoint that writes a session's model selection. */
+const MODEL_SELECT_ENDPOINT = 'session/selectModel'
+/**
+ * The local event the native picker reloads the catalog on (one of the four it
+ * subscribes to). It is an `emit` frame, forwarded to the client verbatim.
+ */
+const MODEL_CATALOG_REFRESH_EVENT = 'llm/models-updated'
 /** The two waterfall events whose cards the native UI renders and answers. */
 const APPROVAL_EVENT = 'approval/request'
 const QUESTION_EVENT = 'user-questions/request'
@@ -193,7 +264,7 @@ export function namespaceId(hostId, value) {
  * refused — returning the original subtree would hand back an unrenamed id, i.e. a
  * raw remote id in the local UI.
  */
-function rewriteIds(value, transform, seen = new Map(), depth = 0) {
+function rewriteIds(value, transform, seen = new Map(), depth = 0, selection) {
   if (depth > MAX_ID_DEPTH) {
     throw new HostRouterError('remote/payload-too-deep',
       `refusing a payload nested deeper than ${MAX_ID_DEPTH} levels`, { depth: MAX_ID_DEPTH })
@@ -202,7 +273,7 @@ function rewriteIds(value, transform, seen = new Map(), depth = 0) {
     if (seen.has(value)) return seen.get(value)
     const out = []
     seen.set(value, out)
-    for (const item of value) out.push(rewriteIds(item, transform, seen, depth + 1))
+    for (const item of value) out.push(rewriteIds(item, transform, seen, depth + 1, selection))
     return out
   }
   // Buffers, typed arrays, dates … are values, not structures: never touch them
@@ -221,25 +292,39 @@ function rewriteIds(value, transform, seen = new Map(), depth = 0) {
     } else if (rule === 'items:id') {
       out[key] = Array.isArray(item)
         ? item.map((entry) => (isPlainObject(entry) && typeof entry.id === 'string'
-          ? { ...rewriteIds(entry, transform, seen, depth + 1), id: transform(entry.id) }
-          : rewriteIds(entry, transform, seen, depth + 1)))
+          ? { ...rewriteIds(entry, transform, seen, depth + 1, selection), id: transform(entry.id) }
+          : rewriteIds(entry, transform, seen, depth + 1, selection)))
         : item
     } else if (typeof rule === 'string' && rule.startsWith('id@')) {
       const guard = rule.slice('id@'.length)
       out[key] = isPlainObject(item) && typeof item.id === 'string' && Object.hasOwn(item, guard)
-        ? { ...rewriteIds(item, transform, seen, depth + 1), id: transform(item.id) }
-        : rewriteIds(item, transform, seen, depth + 1)
+        ? { ...rewriteIds(item, transform, seen, depth + 1, selection), id: transform(item.id) }
+        : rewriteIds(item, transform, seen, depth + 1, selection)
     } else {
-      out[key] = rewriteIds(item, transform, seen, depth + 1)
+      out[key] = rewriteIds(item, transform, seen, depth + 1, selection)
     }
+  }
+  // A model selection's `provider` is not an id (it is not minted here), but it is
+  // the other name the local UI compares per host, so the same pass tags it: no
+  // caller can rename a remote payload's ids and forget its selection. The value
+  // is read from the source object: `provider` is not in the table, so it is
+  // copied verbatim and `out` holds the same string.
+  if (selection !== undefined
+    && typeof value.provider === 'string' && value.provider !== ''
+    && typeof value.model === 'string' && value.model !== '') {
+    out.provider = selection(value.provider)
   }
   return out
 }
 
-/** Local ids -> `h:<hostId>:<id>` (a remote result on its way to the local UI). */
+/**
+ * Local ids -> `h:<hostId>:<id>` (a remote result on its way to the local UI),
+ * and a model selection's provider -> `<provider>@<hostId>` for the same reason:
+ * a session on that Host must never read as a session on this one.
+ */
 export function namespaceIds(value, hostId) {
   if (typeof hostId !== 'string' || hostId === '') return value
-  return rewriteIds(value, (id) => namespaceId(hostId, id))
+  return rewriteIds(value, (id) => namespaceId(hostId, id), new Map(), 0, (provider) => tagProvider(hostId, provider))
 }
 
 /** `h:<hostId>:<id>` -> `<id>` (a local call on its way to that remote). */
@@ -247,6 +332,131 @@ export function stripHostIds(value, hostId) {
   if (typeof hostId !== 'string' || hostId === '') return value
   const prefix = `${HOST_PREFIX}${hostId}:`
   return rewriteIds(value, (id) => (id.startsWith(prefix) ? id.slice(prefix.length) : id))
+}
+
+/**
+ * The provider route a merged catalog uses for `provider`, which a remote Host
+ * named: `<provider>@<hostId>`. The picker matches a session's projected
+ * `provider` against these group ids, so both sides of that comparison carry it.
+ */
+function tagProvider(hostId, provider) {
+  return `${provider}${PROVIDER_HOST_SEPARATOR}${hostId}`
+}
+
+/**
+ * The host a provider is tagged for, or null when it carries no tag.
+ *
+ * A provider id cannot contain `@` (see PROVIDER_HOST_SEPARATOR), so the FIRST
+ * one is always the tag this module minted. An empty provider, and a string that
+ * starts with the separator, are untagged — never half-parsed into a host.
+ */
+function providerHostOf(provider) {
+  const at = provider.indexOf(PROVIDER_HOST_SEPARATOR)
+  return at <= 0 ? null : provider.slice(at + 1)
+}
+
+/**
+ * The provider a call routed to `hostId` must carry, or a `model/wrong-host`
+ * refusal. `hostId === null` means the call stays Local.
+ *
+ * The UI only ever sees merged ids, so a selection for a remote session arrives
+ * tagged with that host: the tag comes off here, and the Host never sees it. A
+ * tag naming another host — or an untagged provider handed to a remote session —
+ * is refused instead of being rerouted: silently running a model on the wrong
+ * machine is the one outcome this tag exists to prevent.
+ */
+function routedProvider(provider, hostId) {
+  const tagged = providerHostOf(provider)
+  if (hostId === null) {
+    if (tagged === null) return provider
+    throw new HostRouterError('model/wrong-host',
+      `provider "${provider}" belongs to remote host ${tagged}; a Local session cannot select it`,
+      { hostId: tagged })
+  }
+  if (tagged === null) {
+    throw new HostRouterError('model/wrong-host',
+      `provider "${provider}" is a Local provider; a session on ${hostId} must name its provider as "<provider>${PROVIDER_HOST_SEPARATOR}${hostId}"`,
+      { hostId })
+  }
+  if (tagged !== hostId) {
+    throw new HostRouterError('model/wrong-host',
+      `provider "${provider}" belongs to remote host ${tagged}, not to ${hostId}`,
+      { hostId: tagged })
+  }
+  return provider.slice(0, provider.length - tagged.length - 1)
+}
+
+/**
+ * Rewrite the provider of every model selection in a call's arguments.
+ *
+ * A selection is the `{provider, model}` pair the picker compares against the
+ * catalog. It is not in the id table (`provider` is a routing label, not an id
+ * this controller mints), so it is found by shape anywhere in the arguments — the
+ * flat shape and the nested `request` shape the gateway also accepts.
+ */
+function retargetSelections(value, hostId, depth = 0) {
+  if (depth > MAX_ID_DEPTH) {
+    throw new HostRouterError('remote/payload-too-deep',
+      `refusing a payload nested deeper than ${MAX_ID_DEPTH} levels`, { depth: MAX_ID_DEPTH })
+  }
+  if (Array.isArray(value)) return value.map((item) => retargetSelections(item, hostId, depth + 1))
+  if (!isPlainObject(value)) return value
+  const out = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (UNSAFE_KEYS.has(key)) continue
+    out[key] = retargetSelections(item, hostId, depth + 1)
+  }
+  if (typeof out.provider === 'string' && out.provider !== '' && typeof out.model === 'string' && out.model !== '') {
+    out.provider = routedProvider(out.provider, hostId)
+  }
+  return out
+}
+
+/**
+ * The title one remote Workspace carries in the merged sidebar: `<title> · <host>`.
+ * The native `WorkspaceBrowser` renders merged rows as they arrive, so this is the
+ * only place the host name can be attached without replacing the browser. The
+ * default-title sentinel — and a workspace that carries no title at all — is not
+ * carried through: it reads as `Default · <host>` (see DEFAULT_WORKSPACE_LABEL).
+ */
+function workspaceTitle(title, hostName) {
+  const own = typeof title === 'string' && title !== '' ? title : DEFAULT_WORKSPACE_LABEL
+  const base = own === DEFAULT_WORKSPACE_TITLE ? DEFAULT_WORKSPACE_LABEL : own
+  return `${base}${WORKSPACE_HOST_SEPARATOR}${hostName}`
+}
+
+/**
+ * One remote `session/list` row with `cwd` taken off (spec 012).
+ *
+ * A remote row's `cwd` is the working directory on the Host that owns the session,
+ * and the native UI treats a known `cwd` as the precondition of the "Show in folder"
+ * item: `ctx.sessions.list.getSnapshot().byId[sessionId]?.cwd` decides whether the
+ * item is enabled and is passed to the file manager (dsh-client-ui-open-in-app). A
+ * remote path would therefore enable a menu that opens THIS machine's file manager
+ * at a directory belonging to another machine. The key is omitted — never replaced
+ * with a path of ours — exactly the shape the core produces for a session whose
+ * working directory is unknown (`{...entry.cwd !== void 0 ? {cwd: entry.cwd} : {}}`
+ * in dsh-api-session-controller), which keeps the item disabled. Every other field
+ * (ids, title, projections) is left exactly as `#ingress` renamed it.
+ */
+function withoutRemoteCwd(row) {
+  if (!isPlainObject(row) || !Object.hasOwn(row, 'cwd')) return row
+  const { cwd: _cwd, ...rest } = row
+  return rest
+}
+
+/**
+ * The reverse, for the one payload that sends a title back: `workspace/rename`
+ * takes exactly `{workspaceId, title}`, and the native rename dialog starts from
+ * the title it displays, so an edited draft can still end with our suffix. The
+ * remote Host stores its own titles and must never receive our decoration. Only
+ * this host's exact suffix is removed; any other title passes through untouched.
+ */
+function withoutWorkspaceTitle(args, hostName) {
+  if (!isPlainObject(args) || typeof args.title !== 'string') return args
+  const suffix = `${WORKSPACE_HOST_SEPARATOR}${hostName}`
+  if (!args.title.endsWith(suffix) || args.title.length === suffix.length) return args
+  return { ...args, title: args.title.slice(0, -suffix.length) }
 }
 
 /** Every id string the rename table covers, at any depth (bounded like the walker). */
@@ -442,9 +652,10 @@ class ValueQueue {
 }
 
 /**
- * The merged workspace map. Local workspaces keep their ids; a remote workspace
- * is stored already renamed (`hostId` + `hostName` added) so the baseline, an
- * upsert and the sidebar group all agree on identity.
+ * The merged workspace map. Local workspaces keep their ids and titles; a remote
+ * workspace is stored already renamed (`hostId` + `hostName` added, ids tagged, and
+ * the host name in the title) so the baseline, an upsert and the sidebar all agree
+ * on identity and on which Host owns the row.
  */
 class MergeState {
   constructor() {
@@ -555,7 +766,8 @@ class MergeState {
 
   #renameWorkspace(host, item) {
     const renamed = namespaceIds(item, host.hostId)
-    return { ...renamed, hostId: host.hostId, hostName: host.hostName ?? host.hostId }
+    const hostName = host.hostName ?? host.hostId
+    return { ...renamed, hostId: host.hostId, hostName, title: workspaceTitle(renamed.title, hostName) }
   }
 
   #renameList(host, value) {
@@ -626,6 +838,8 @@ export class HostRouter {
   #merges = new Set()
   /** Push functions of the `$events` streams currently open in the native UI. */
   #eventSinks = new Set()
+  /** The connected-host set last announced (`#connectedKey`), so flapping stays quiet. */
+  #lastHostSet = null
   /**
    * Remote cards the native stream knows about, keyed `hostId\u0000<rpcId>`, with
    * the original ids and the Host's `argsHash`: the answer is routed back with
@@ -773,9 +987,42 @@ export class HostRouter {
     return this.#connectedHosts().find((host) => host.hostId === hostId)
   }
 
-  /** Strip the hint (and any id tag), then check that no tag survives. */
+  /** The connected hosts as one comparable key (order-independent). */
+  #connectedKey() {
+    return this.#connectedHosts().map((host) => host.hostId).sort().join('\u0000')
+  }
+
+  /**
+   * Tell the native UI to reload the merged model catalog when the SET of
+   * connected hosts changes. The picker keeps one catalog per Host generation
+   * (`ModelCatalogDirectory`, no session argument) and reloads it on
+   * `llm/models-updated`, so without this frame a host that connects later keeps
+   * its models — and the selection of its sessions — out of the picker until the
+   * page reloads. A state flap that leaves the set unchanged emits nothing.
+   *
+   * Called from the merged `$events` handler, after that host's cards are
+   * withdrawn: the frame can only reach the UI through that stream anyway, and the
+   * cards stay the first thing a disconnect delivers.
+   */
+  #announceHostSet() {
+    const key = this.#connectedKey()
+    if (key === this.#lastHostSet) return
+    this.#lastHostSet = key
+    // The emit frame's exact three keys are what the client's `$events` parser
+    // accepts; `args` is a list, empty here because every listener takes no
+    // argument that matters for a full reload.
+    this.#publishEvent({ type: 'emit', event: MODEL_CATALOG_REFRESH_EVENT, args: [] })
+  }
+
+  /**
+   * Strip the hint, the display suffix and any id tag, then check that no tag
+   * survives. `hostId` is the host the call was routed to, so its suffix is the
+   * only one that can be ours.
+   */
   #forwardArgs(payload, hostId) {
-    return stripHostIds(withoutHint(payloadArgs(payload)), hostId)
+    const args = withoutHint(payloadArgs(payload))
+    const host = this.#hostById(hostId)
+    return stripHostIds(host ? withoutWorkspaceTitle(args, host.hostName ?? hostId) : args, hostId)
   }
 
   #assertNoNamespace(args, hostId) {
@@ -794,6 +1041,9 @@ export class HostRouter {
    * namespace unconditionally — never trusted as already tagged. A payload that
    * already carries a tag is refused (`remote/id-leak`, logged without the value)
    * and a payload nested past MAX_ID_DEPTH is refused (`remote/payload-too-deep`).
+   * A model selection carried by the payload gets its provider tagged for the same
+   * host (`<provider>@<hostId>`, see `namespaceIds`): the picker compares it with
+   * the merged catalog, which names remote providers the same way.
    * @param {string} hostId the host the payload actually arrived from
    * @param {unknown} value the payload
    * @param {string} what endpoint or frame name, for the log line
@@ -867,21 +1117,36 @@ export class HostRouter {
     // page filters there). Only a tagged id could name one host — a list request
     // never carries one.
     if (endpoint === 'session/list' && hostIdsIn(payload).size === 0) return this.#mergeSessionList(payload, signal, peer)
+    // The picker loads this one globally (no session id, no host hint), so it is
+    // merged for the same reason `session/list` is.
+    if (endpoint === MODEL_CATALOG_ENDPOINT && hostIdsIn(payload).size === 0) return this.#mergeModelCatalog(payload, signal, peer)
     let target
     try {
       target = this.#route(payload)
     } catch (error) {
       return { ok: false, error: failureOf(error) }
     }
+    // A model selection names a provider, and a provider belongs to the Host that
+    // serves it. The UI sends the merged id (`<provider>@<hostId>`), so the tag is
+    // taken off for the Host it names, and a tag naming any other Host — or an
+    // untagged provider on a remote session — is refused rather than rerouted.
+    let args = payload
+    if (endpoint === MODEL_SELECT_ENDPOINT) {
+      try {
+        args = { ...payload, args: retargetSelections(payloadArgs(payload), target.kind === 'remote' ? target.hostId : null) }
+      } catch (error) {
+        return { ok: false, error: failureOf(error) }
+      }
+    }
     if (target.kind === 'local') {
       // Unchanged for Local.
-      return this.#localDispatch(endpoint, payload, signal, peer)
+      return this.#localDispatch(endpoint, args, signal, peer)
     }
     try {
       if (endpoint === APPROVAL_RESULT_ENDPOINT) return { ok: true, value: await this.#answerCard(target, payload, signal) }
-      const args = this.#forwardArgs(payload, target.hostId)
-      this.#assertNoNamespace(args, target.hostId)
-      const value = await target.connection.call(endpoint, args, { signal })
+      const forwarded = this.#forwardArgs(args, target.hostId)
+      this.#assertNoNamespace(forwarded, target.hostId)
+      const value = await target.connection.call(endpoint, forwarded, { signal })
       return { ok: true, value: this.#ingress(target.hostId, value, endpoint) }
     } catch (error) {
       return { ok: false, error: failureOf(error) }
@@ -997,6 +1262,10 @@ export class HostRouter {
    * merged view, so the request's `cursor` is dropped for both sides and the
    * complete merged list is returned. A failing remote contributes nothing (a
    * dead host must not break the local list); it is logged and shown by `status()`.
+   *
+   * A remote row is also stripped of its `cwd` (`withoutRemoteCwd`): the native
+   * "Show in folder" item is enabled by that field and would open this machine's
+   * file manager at a directory on the other machine. Local rows keep theirs.
    */
   async #mergeSessionList(payload, signal, peer) {
     const raw = { ...payloadArgs(payload) }
@@ -1014,7 +1283,7 @@ export class HostRouter {
         const rows = Array.isArray(value?.items) ? value.items : []
         // Each row is remote data: a row that names a host namespace is refused
         // and takes that host's whole contribution with it.
-        const renamed = rows.map((row) => this.#ingress(host.hostId, row, 'session/list row'))
+        const renamed = rows.map((row) => withoutRemoteCwd(this.#ingress(host.hostId, row, 'session/list row')))
         this.#hostErrors.delete(host.hostId)
         return renamed
       } catch (error) {
@@ -1027,6 +1296,123 @@ export class HostRouter {
     // Stable sort: equal `updatedAt` keeps Local first, then host order.
     items.sort((a, b) => Number(b?.updatedAt ?? 0) - Number(a?.updatedAt ?? 0))
     return { ...local, value: { ...(isPlainObject(local.value) ? local.value : {}), items } }
+  }
+
+  /**
+   * `session/modelCatalog` merged: Local's groups, then every connected host's.
+   *
+   * The native picker loads ONE catalog per Host generation — the endpoint takes no
+   * argument, so there is no way to ask it for a session's host only — and it
+   * decides whether a session's own selection is selectable by looking the
+   * projection's `provider`/`model` up in that catalog (`ModelDirectory.syncInputs`:
+   * `groups.some(group => group.id === selection.provider && …model.id === selection.model)`),
+   * which is also how it marks the current row (`state.current?.provider === group.id`)
+   * and how the reasoning table is keyed (`[group.id, model.id]`). Both sides of
+   * that comparison therefore have to carry the same provider id, and a remote
+   * provider must not share an id with a Local one — otherwise the picker would
+   * offer a remote model under an id that routes to this Host, or mark a remote
+   * selection as the Local current one.
+   *
+   * So a remote group is renamed `<provider>@<hostId>` and keeps all of its models
+   * (`#labelledGroups`); Local's groups are passed through untouched and stay
+   * first, so the picker's own order is Local, then one section per Host. The tag
+   * is the same one `namespaceIds` puts on a projected selection, and
+   * `session/selectModel` takes it off again (`routedProvider`).
+   *
+   * `catalog.default` stays Local's: the picker falls back to it when a session has
+   * no recorded selection (`projected.next ?? catalog.value.default`), and a remote
+   * default there would be a cross-host selection for every session that has not
+   * chosen yet. `routableProviders` is derived from the groups on the Host, so it
+   * is recomputed here rather than copied from Local; `failures` stays Local's,
+   * because a Host's own provider failures are that Host's business and are shown
+   * on its Devices row by `status()`.
+   *
+   * Nothing here is renamed as an id: the rename table covers DSH ids, and a
+   * catalog carries none (a provider/model id is a routing label, never an id this
+   * controller mints).
+   *
+   * A failing remote contributes nothing (a dead host must not break the local
+   * catalog); it is logged and shown by `status()`. The same holds for a remote
+   * whose catalog carries an id that already names a host namespace: the payload
+   * is refused (`remote/id-leak`) and that host contributes nothing.
+   */
+  async #mergeModelCatalog(payload, signal, peer) {
+    const args = withoutHint({ ...payloadArgs(payload) })
+    const local = await this.#localDispatch(MODEL_CATALOG_ENDPOINT, { args }, signal, peer)
+    if (!local || local.ok !== true) return local
+    const localValue = isPlainObject(local.value) ? local.value : {}
+    const groups = (Array.isArray(localValue.groups) ? localValue.groups : [])
+      .filter((group) => isPlainObject(group))
+      .map((group) => ({ ...group, models: Array.isArray(group.models) ? [...group.models] : [] }))
+    const hosts = this.#connectedHosts()
+    const answered = await Promise.all(hosts.map(async (host) => {
+      try {
+        const value = await host.connection.call(MODEL_CATALOG_ENDPOINT, args, { signal })
+        // An id that already names a namespace is a leak, never a rename target:
+        // the cursor-context merge performs no rename either.
+        this.#refuseTagged(host.hostId, value, MODEL_CATALOG_ENDPOINT)
+        this.#hostErrors.delete(host.hostId)
+        return { host, value }
+      } catch (error) {
+        this.#noteHostError(host.hostId, error)
+        this.#log(`session/modelCatalog from ${host.hostId} failed: ${error?.code ?? 'error'}`)
+        return { host, value: null }
+      }
+    }))
+    // Labelled in host order after every host answered, so the sections always
+    // follow the same host order. Two hosts offering the same provider/model stay
+    // two entries: they are two different selections.
+    for (const entry of answered) groups.push(...this.#labelledGroups(entry.host, entry.value))
+    const routableProviders = [...new Set(groups.map((group) => String(group.id)))]
+    return { ...local, value: { ...localValue, groups, routableProviders } }
+  }
+
+  /**
+   * One host's catalog groups, ready to merge: every group kept, its id tagged with
+   * the owning host and its header naming that host (`Remote · Sigma-DSH — R9
+   * Fallback`). A group with no usable model is dropped, so the menu never shows an
+   * empty provider.
+   *
+   * The header is the only field the picker renders for a provider and it has no
+   * separate slot for a host, so the host label has to fit inside it; the whole
+   * string is capped because the host name is user-set and the provider name is the
+   * remote's own text. Model labels are capped the same way; a model ID is not, since
+   * an id is what a selection sends back and a cut one would name nothing — a model
+   * whose id is over the cap is dropped instead.
+   *
+   * A group id that already contains the host tag separator is dropped, never
+   * re-tagged: `<provider>@<hostId>` is the shape this module mints, so a remote id
+   * carrying one is either a leak or a collision, and either way the picker would
+   * compare it against the wrong host.
+   * @param {object} host the connected host
+   * @param {unknown} value the Host's `session/modelCatalog` result, or null when it failed
+   */
+  #labelledGroups(host, value) {
+    if (!isPlainObject(value)) return []
+    const label = host.hostName ?? host.hostId
+    const prefix = `${REMOTE_GROUP_LABEL}${WORKSPACE_HOST_SEPARATOR}${label}${REMOTE_PROVIDER_SEPARATOR}`
+    const out = []
+    for (const group of Array.isArray(value.groups) ? value.groups : []) {
+      if (!isPlainObject(group) || typeof group.id !== 'string' || group.id === '') continue
+      if (group.id.includes(PROVIDER_HOST_SEPARATOR) || group.id.length > MAX_REMOTE_GROUP_NAME) continue
+      const models = []
+      for (const model of Array.isArray(group.models) ? group.models : []) {
+        if (!isPlainObject(model) || typeof model.id !== 'string' || model.id === '') continue
+        if (model.id.length > MAX_REMOTE_GROUP_NAME) continue
+        const name = typeof model.name === 'string' && model.name !== '' ? model.name : model.id
+        models.push({ ...model, name: name.length > MAX_REMOTE_GROUP_NAME ? name.slice(0, MAX_REMOTE_GROUP_NAME) : name })
+      }
+      if (models.length === 0) continue
+      const name = typeof group.name === 'string' && group.name !== '' ? group.name : group.id
+      const header = `${prefix}${name}`
+      out.push({
+        ...group,
+        id: tagProvider(host.hostId, group.id),
+        name: header.length > MAX_REMOTE_GROUP_NAME ? header.slice(0, MAX_REMOTE_GROUP_NAME) : header,
+        models,
+      })
+    }
+    return out
   }
 
   #openWireStream(endpoint, payload, uplink, peer, signal, control, uplinkWindow) {
@@ -1269,6 +1655,9 @@ export class HostRouter {
         }
       })()
       for (const host of this.#connectedHosts()) watch(host)
+      // The picker caches the merged catalog for this Host generation; a host
+      // appearing or leaving while the UI is up is announced below.
+      this.#lastHostSet = this.#connectedKey()
       unsubscribe = this.#onHostsChanged(() => {
         const hosts = this.#connectedHosts()
         const connected = new Set(hosts.map((host) => host.hostId))
@@ -1279,6 +1668,7 @@ export class HostRouter {
           watching.get(hostId)?.()
           watching.delete(hostId)
         }
+        this.#announceHostSet()
       })
       for await (const frame of queue) yield frame
     } finally {

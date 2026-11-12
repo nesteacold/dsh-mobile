@@ -462,6 +462,9 @@ describe('AppController connection lifecycle (M5 / M6)', () => {
         hosts: [host],
         activeHost: host,
         connection: 'reauth-required',
+        // Spec 011 P2 item 4: the snapshot now also carries the Host's capability statement. Nothing
+        // completed a handshake here, so the list is empty — an empty list, not `undefined`.
+        capabilities: [],
         banner: 'reauth',
         loading: true,
         sessions: [],
@@ -483,6 +486,9 @@ describe('AppController connection lifecycle (M5 / M6)', () => {
         pairing: null,
         pairingPending: null,
         pinnedTransportUnavailable: false,
+        // Spec 021: this pairing is a native one (no `web:unlock`), so nothing can lock it — the
+        // field exists and is `null`, which is exactly what "not a web device" means.
+        webLock: null,
         // Spec 011: the snapshot gained the authoring fields. In this state the credential was
         // refused at the upgrade, so there is no live device (grantedScopes is UNKNOWN, not a
         // grant) and nothing was fetched. This guard is updated rather than relaxed: the whole
@@ -497,6 +503,9 @@ describe('AppController connection lifecycle (M5 / M6)', () => {
         // looking like "this host has no models". In this state nothing was fetched.
         modelsState: 'idle',
         modelsError: null,
+        // Spec 018 item 5: the goal / task-list projections of the open session. No socket was
+        // authenticated and no baseline arrived, so nothing is projected — the empty panel, not `null`.
+        openSessionPanel: { todos: null, goal: null, todosAsOfSeq: null, goalAsOfSeq: null },
         lastError: null,
         locale: 'en',
       });

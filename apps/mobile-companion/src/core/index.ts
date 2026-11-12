@@ -44,7 +44,7 @@ export type {
 } from './approvals';
 export { Outbox, defaultClientMsgId } from './outbox';
 export type { CancelItem, OutboxDeps, OutboxFrame, OutboxItem, OutboxStatus, PromptItem } from './outbox';
-export { HistoryStore, coerceHistoryMessage } from './history';
+export { HistoryStore, coerceHistoryMessage, coerceHistoryEvent, coerceHistoryEvents, isHostInjectedUserText, SKIPPED_HISTORY_EVENT_TYPES } from './history';
 export type { HistoryMessage, HistoryPage, MessageRole } from './history';
 export { Reconnector, backoffDelayMs, planResync, realClock, BACKOFF_DELAYS_MS, MAX_BACKOFF_MS, RESTART_DELAY_MS } from './reconnect';
 export type { ReconnectClock, ReconnectSnapshot, ReconnectState, ResyncInput } from './reconnect';
@@ -56,3 +56,65 @@ export { parseSessionDeepLink, sessionDeepLink } from './deeplink';
 export type { SessionDeepLink } from './deeplink';
 export { DebugLog } from './debug-log';
 export type { LogLine, LogSink } from './debug-log';
+export { lowerPermission, readPermissionOptions, reasonMessage, toLowerOutcome, toOptionsView } from './permission-lower';
+export type {
+  PermissionLowerMessage,
+  PermissionLowerOutcome,
+  PermissionOptionsResult,
+  PermissionOptionsView,
+} from './permission-lower';
+// Spec 018: the read-only session metrics (`session-stats`, scope `stats:read`).
+export {
+  readSessionStats,
+  toStatsRead,
+  parseSessionStats,
+  parseTokenUsage,
+  parseContextPressure,
+  hasStatsReadScope,
+  STATS_READ_CLIENT_TYPES,
+  STATS_READ_SCOPE,
+} from './stats';
+export type {
+  ContextPressure,
+  SessionStats,
+  SessionStatsRead,
+  SessionStatsType,
+  TokenTotals,
+  TokenUsage,
+} from './stats';
+// Spec 018 item 3: the read-only schedule frames (`schedule:read`) — never a mutation.
+export {
+  SCHEDULE_PAGE_LIMIT,
+  SCHEDULE_READ_CLIENT_TYPES,
+  SCHEDULE_READ_SCOPE,
+  hasScheduleReadScope,
+  parseScheduledTask,
+  readScheduleCatalog,
+  readScheduleList,
+  readScheduleView,
+  toCatalog,
+  toScheduleList,
+  toScheduleView,
+} from './schedules';
+export type {
+  ScheduleCatalog,
+  ScheduleCatalogEntry,
+  ScheduleList,
+  ScheduleReadType,
+  ScheduleViewResult,
+  ScheduledTask,
+} from './schedules';
+// Spec 018 item 5: the session's read-only task list and goal (`projection-baseline` +
+// `tasks-updated` / `goal-updated`) — decode only, never a write.
+export {
+  EMPTY_SESSION_PANEL,
+  TODO_STATUSES,
+  panelFromBaseline,
+  panelFromUpdate,
+  parseGoal,
+  parseProjectionBaseline,
+  parseTodo,
+  parseTodos,
+  projectionUpdateKind,
+} from './projections';
+export type { GoalView, SessionPanel, TodoListItem, TodoStatus, TodoStatusView } from './projections';

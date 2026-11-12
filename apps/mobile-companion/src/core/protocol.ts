@@ -156,6 +156,12 @@ export const CLIENT_ERROR_CODES = [
   'client/pairing-expired',
   /** The Host asked for a one-time code; this app version has no OTP flow yet (contract §3.8). */
   'client/pairing-otp-unsupported',
+  /**
+   * The platform's credential store cannot be used at all (web: no IndexedDB or no WebCrypto).
+   * Distinct from `store/cleanup-failed` (a wipe that failed) and from "not paired": nothing can
+   * be stored, so pairing cannot finish on this browser.
+   */
+  'client/store-unavailable',
 ] as const;
 
 export type ClientErrorCode = (typeof CLIENT_ERROR_CODES)[number];

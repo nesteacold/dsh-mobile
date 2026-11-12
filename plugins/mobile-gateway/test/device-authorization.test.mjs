@@ -14,10 +14,10 @@
 //  R4  approval pushes AND replay (incl. the conversation-triggered fan-out) need
 //      a live approval:respond plus the session; a subscription filter is not an
 //      authorization; a re-paired/revoked generation gets nothing;
-//  R5  questions are the ADMIN channel's alone: the protocol gives them no
-//      device scope and `question-answer` is ADMIN_ONLY, so NO device principal
-//      receives a question push or a replay (whole-gateway review 2026-11-10;
-//      the 008 bridge reaches the same question separately over `$events`, which
+//  R5  Spec 018 item 4 (lead decision (a)): a question card follows the SAME rule as an
+//      approval card — admin always, a device only when it holds `approval:respond`
+//      AND may see the session. The 008 bridge reaches
+//      the same question separately over `$events`, which
 //      this suite does not exercise). A withheld card is audited by ids only.
 //  R6  the raw `session/event` fan-out (an unsubscribed legacy/conversation
 //      socket) takes the same per-recipient decision as every other session-keyed
@@ -32,7 +32,7 @@ import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
-import { test } from 'node:test'
+import { test, after } from 'node:test'
 
 import WebSocket from 'ws'
 import plugin from '../lib/index.mjs'
@@ -52,7 +52,11 @@ async function factory(t, options = {}) {
   const listCalls = []
   // `sessionList` is what the Host answers; tests swap it. `listGate` lets a test
   // hold a `session/list` open (and observe its AbortSignal).
-  const state = { sessionList: ['s1', 's2'], listGate: null, archives: [], projections: {}, queuesInbox: {} }
+  const state = {
+    sessionList: ['s1', 's2'], listGate: null, archives: [], projections: {}, queuesInbox: {},
+    // Spec 018 item 4 harness hook (OPT-IN, default off): see the list branch below.
+    listOverride: null, listOverrideRemaining: 0,
+  }
   let management
   let upgrade
   let dispose = () => {}
@@ -86,7 +90,15 @@ async function factory(t, options = {}) {
             })
           }
           if (state.listError) throw new Error(state.listError)
-          call.answered = [...state.sessionList]
+          // OPT-IN (spec 018 item 4, Q3): answer the NEXT N list calls with a chosen set, so a test
+          // can pair a device while the Host reports FEWER sessions than other devices receive.
+          // Default off: with no override every call answers `state.sessionList`, exactly as before.
+          let listed = state.sessionList
+          if (state.listOverrideRemaining > 0) {
+            listed = state.listOverride
+            state.listOverrideRemaining -= 1
+          }
+          call.answered = [...listed]
           return { items: call.answered.map((sessionId) => ({ sessionId })) }
         }
         if (request.namespace === 'session' && request.method === 'search') return { items: [], hasMore: false }
@@ -165,7 +177,14 @@ const seenOf = (ws) => frames.get(ws) ?? record(ws)
 async function take(ws, predicate, timeoutMs = 5_000) {
   const seen = seenOf(ws)
   const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const frame = seen.find(predicate); if (frame) return frame; await delay(5) }
+  while (Date.now() < deadline) {
+    // The first match is REMOVED: a later poll for the same predicate must wait for a NEW frame,
+    // never re-match one an earlier poll already consumed.
+    const hit = seen.find(predicate)
+    const at = hit === undefined ? -1 : seen.indexOf(hit)
+    if (at >= 0) { seen.splice(at, 1); return hit }
+    await delay(5)
+  }
   throw new Error(`timed out waiting for a frame (${seen.map((frame) => frame.kind).join(', ')})`)
 }
 let counter = 0
@@ -515,7 +534,7 @@ test('R4d: a revoked or re-paired generation is sent no approval push and no rep
 // R5: questions
 // ---------------------------------------------------------------------------
 
-test('R5: the admin socket is always sent a question', async (t) => {
+test('R5: a device holding approval:respond AND seeing the session IS sent the question', async (t) => {
   const instance = await factory(t, { config: { legacyAdmin: true } })
   await instance.start(); await ready(instance)
   // `legacyAdmin` makes a device-token socket the admin channel for the test, so
@@ -529,11 +548,11 @@ test('R5: the admin socket is always sent a question', async (t) => {
   answer.resolve({ answers: [{ id: 'q', selected: ['a'] }] }); await pending
 })
 
-test('R5b: a real device gets no question card and no question replay, whatever scopes it holds (audited)', async (t) => {
+test('R5b: a device WITHOUT approval:respond gets no question card and no question replay (audited)', async (t) => {
   const instance = await factory(t)
   await instance.start(); await ready(instance)
-  // No device scope grants questions: `question-answer` is ADMIN_ONLY, so a
-  // device is never sent a card it could not answer on this channel.
+  // Spec 018 item 4: the scope that lifts a question card is `approval:respond` (the approval
+  // scope, not a new one). Without it a device still gets nothing, live or on replay.
   const device = await pairDevice(instance, DEV_A, { scopes: ['sessions:read', 'prompt:send'] })
   await waitFor(() => visibleIds(instance, device.device.id).length === 2, 'snapshot')
   const answer = Promise.withResolvers()
@@ -545,47 +564,383 @@ test('R5b: a real device gets no question card and no question replay, whatever 
   answer.resolve({ answers: [{ id: 'q', selected: ['a'] }] }); await pending
 })
 
-test('R5c: a FULLY-scoped device receives no question push and no replay, while the admin channel still does', async (t) => {
-  // `legacyAdmin` turns a device-token socket into the admin channel, so the
-  // device half needs its own instance without it.
-  const adminInstance = await factory(t, { config: { legacyAdmin: true } })
-  await adminInstance.start(); await ready(adminInstance)
-  const admin = await pairDevice(adminInstance, DEV_A, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
-  const adminWs = await connectToken(adminInstance, admin.token, DEV_A)
-  await flush(adminWs) // the connect baseline is delivered
-  const adminAnswer = Promise.withResolvers()
-  const adminPending = requestQuestion(adminInstance, 's1', () => adminAnswer.promise)
-  try {
-    const card = await take(adminWs, (frame) => frame.kind === 'question-requested' && frame.sessionId === 's1')
-    assert.equal(card.questions[0].id, 'q', 'the admin channel is still served the card')
-    const adminSecond = await connectToken(adminInstance, admin.token, DEV_A)
-    await take(adminSecond, (frame) => frame.kind === 'question-requested' && frame.replay === true)
-  } finally {
-    adminAnswer.resolve({ answers: [{ id: 'q', selected: ['a'] }] }); await adminPending
-  }
-
+test('R5c: a device that holds approval:respond but CANNOT SEE the session gets no card and no resolved frame', async (t) => {
+  // Spec 018 item 4 (lead decision (a)): the card follows the approval rule — scope AND
+  // `clientMayReceive` (which includes "this device may see this session"). Knowing the session id
+  // is a routing hint, never an authorization.
   const instance = await factory(t)
   await instance.start(); await ready(instance)
-  // Every scope that could plausibly be read as "may answer": the device is
-  // fully scoped for approvals and prompts, and still gets nothing.
   const device = await pairDevice(instance, DEV_B, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  await waitFor(() => visibleIds(instance, device.device.id).length === 2, 'snapshot')
   const ws = await connectToken(instance, device.token, DEV_B)
   await flush(ws)
+  // A session the Host never listed to this device.
+  ws.send(JSON.stringify({ type: 'subscribe', sessionId: 'hidden-session', requestId: 'r5c-sub' }))
+  await take(ws, (frame) => frame.requestId === 'r5c-sub')
+  await flush(ws)
+  const answer = Promise.withResolvers()
+  const pending = requestQuestion(instance, 'hidden-session', () => answer.promise)
+  try {
+    await flush(ws)
+    assert.equal(seenOf(ws).some((frame) => frame.kind === 'question-requested'), false,
+      'a card for a session the device may not see must not be pushed')
+    // Answering it is refused too: the per-session boundary is the gateway's, not just the push.
+    const card = { rpcId: 'r5c-rpc' }
+    ws.send(JSON.stringify({ type: 'question-answer', requestId: 'r5c-answer', rpcId: card.rpcId,
+      sessionId: 'hidden-session', answers: [{ id: 'q', selected: ['a'] }] }))
+    const receipt = await take(ws, (frame) => frame.requestId === 'r5c-answer' || frame.kind === 'question-response')
+    assert.equal(receipt.accepted, false, JSON.stringify(receipt).slice(0, 220))
+  } finally {
+    answer.resolve({ answers: [{ id: 'q', selected: ['a'] }] }); await pending
+  }
+  // The resolved frame for that session must not reach it either.
+  await flush(ws)
+  assert.equal(seenOf(ws).some((frame) => frame.kind === 'question-resolved'), false,
+    'the resolution of a card the device never received must not be sent to it')
+})
+
+// ---------------------------------------------------------------------------
+// Spec 018 item 4 (lead decision (a)): answering / declining a question.
+// ---------------------------------------------------------------------------
+
+/**
+ * Open a device's CONTROL socket. Question and approval cards travel on the control channel only,
+ * and the per-recipient rule is `clientMayReceive(client, sessionId, 'approval:respond')`.
+ */
+const controlSocket = async (instance, device, deviceId) => {
+  const ws = await connectToken(instance, device.token, deviceId)
+  await flush(ws)
+  return ws
+}
+
+/** Answer a question on the wire and return the receipt. */
+const answerQuestion = async (ws, { rpcId, sessionId, action = 'answer', answers }) => {
+  const requestId = `qa-${Math.random().toString(36).slice(2, 10)}`
+  ws.send(JSON.stringify({
+    type: action === 'cancel' ? 'question-cancel' : 'question-answer',
+    requestId, rpcId, sessionId,
+    ...(action === 'cancel' ? {} : { answers }),
+  }))
+  return take(ws, (frame) => frame.requestId === requestId || (frame.kind === 'question-response' && frame.rpcId === rpcId))
+}
+
+test('Q1: without approval:respond the answer is refused BY SCOPE and the question stays open', async (t) => {
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  const device = await pairDevice(instance, DEV_A, { scopes: ['sessions:read', 'prompt:send'] })
+  await waitFor(() => visibleIds(instance, device.device.id).length === 2, 'snapshot')
+  const ws = await controlSocket(instance, device, DEV_A)
   const answer = Promise.withResolvers()
   const pending = requestQuestion(instance, 's1', () => answer.promise)
   try {
-    // Replay-on-connect is a separate path from the live push: both are withheld.
-    const second = await connectToken(instance, device.token, DEV_B)
-    await flush(ws); await flush(second)
+    await flush(ws)
     assert.equal(seenOf(ws).some((frame) => frame.kind === 'question-requested'), false,
-      'a device principal is never sent a question push')
-    assert.equal(seenOf(second).some((frame) => frame.kind === 'question-requested'), false,
-      'and a connecting device is sent no question replay')
+      'no card without approval:respond')
+    const receipt = await answerQuestion(ws, { rpcId: 'q1-rpc', sessionId: 's1', answers: [{ id: 'q', selected: ['a'] }] })
+    assert.equal(receipt.kind, 'error', JSON.stringify(receipt).slice(0, 220))
+    assert.equal(receipt.code, 'auth/forbidden-scope')
+    assert.equal(receipt.scope, 'approval:respond')
+    let done = false
+    void pending.then(() => { done = true })
+    await delay(60)
+    assert.equal(done, false, 'a scope refusal must not resolve the Host question')
   } finally {
     answer.resolve({ answers: [{ id: 'q', selected: ['a'] }] }); await pending
   }
 })
 
+test('Q2: an authorized device answers, the Host receives that answer, and the resolution is broadcast', async (t) => {
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  const device = await pairDevice(instance, DEV_A, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  await waitFor(() => visibleIds(instance, device.device.id).length === 2, 'snapshot')
+  const ws = await controlSocket(instance, device, DEV_A)
+  const answer = Promise.withResolvers()
+  const pending = requestQuestion(instance, 's1', () => answer.promise)
+  const card = await take(ws, (frame) => frame.kind === 'question-requested' && frame.sessionId === 's1')
+  const receipt = await answerQuestion(ws, { rpcId: card.rpcId, sessionId: 's1', answers: [{ id: 'q', selected: ['b'] }] })
+  assert.equal(receipt.kind, 'question-response', JSON.stringify(receipt).slice(0, 220))
+  assert.equal(receipt.accepted, true)
+  assert.equal(receipt.action, 'answer')
+  assert.deepEqual(await pending, { answers: [{ id: 'q', selected: ['b'] }] },
+    'the Host settles with exactly what the device chose')
+  const resolved = await take(ws, (frame) => frame.kind === 'question-resolved' && frame.rpcId === card.rpcId)
+  assert.equal(resolved.outcome, 'answered')
+})
+
+test('Q3: knowing the rpcId is NOT authority — a device that cannot see the session is refused', async (t) => {
+  // THE boundary for this item: `pending.resolve()` is a promise inside the gateway, so no Host
+  // per-item check stands behind it. The gateway's own rule is `clientMayReceive` =
+  // scope + "may see this session", so a device holding `approval:respond` but NOT
+  // `sessions:read` cannot see any session — it is sent no card and must not be able to answer
+  // one whose live rpcId it was handed. The card must survive that refusal.
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  // Holds the interaction scope but NO session read scope.
+  const blind = await pairDevice(instance, DEV_A, { scopes: ['approval:respond', 'prompt:send'] })
+  // NOTE: the blind device still receives the session BINDINGS at pairing. What stops it is
+  // `clientMayReceive`: `deviceMaySeeSession` requires `sessions:read`, which it does not hold. The
+  // assertions below therefore test what is SENT and what may be ANSWERED, not the binding set.
+  const reader = await pairDevice(instance, DEV_B, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  await waitFor(() => visibleIds(instance, reader.device.id).length === 2, 'reader sees s1+s2')
+
+  const blindWs = await controlSocket(instance, blind, DEV_A)
+  const readerWs = await controlSocket(instance, reader, DEV_B)
+  const answer = Promise.withResolvers()
+  const pending = requestQuestion(instance, 's1', () => answer.promise)
+  const settled = pending.then((value) => ({ value }), (error) => ({ error }))
+  const card = await take(readerWs, (frame) => frame.kind === 'question-requested' && frame.sessionId === 's1')
+  try {
+    await flush(blindWs)
+    assert.equal(seenOf(blindWs).some((frame) => frame.kind === 'question-requested'), false,
+      'a device that cannot see the session is sent no card')
+    // The LIVE rpcId, handed over deliberately: knowing it must not be authority.
+    const receipt = await answerQuestion(blindWs, { rpcId: card.rpcId, sessionId: 's1', answers: [{ id: 'q', selected: ['a'] }] })
+    assert.equal(receipt.kind, 'question-response', JSON.stringify(receipt).slice(0, 220))
+    assert.equal(receipt.accepted, false, 'a device that cannot see the session may not answer it')
+    assert.equal(receipt.reason, 'not-authorized',
+      'the per-session gate, not "no such card": ' + JSON.stringify(receipt).slice(0, 200))
+    // The card is STILL pending: a device that CAN see it answers, which proves the refusal
+    // consumed nothing, and that answer is what the Host settles with.
+    const readerReceipt = await answerQuestion(readerWs, { rpcId: card.rpcId, sessionId: 's1', answers: [{ id: 'q', selected: ['b'] }] })
+    assert.equal(readerReceipt.accepted, true, JSON.stringify(readerReceipt).slice(0, 220))
+    assert.deepEqual(await settled, { value: { answers: [{ id: 'q', selected: ['b'] }] } },
+      'the card survived the refused answer: the later answer is what the Host sees')
+  } finally {
+    answer.resolve({ answers: [{ id: 'q', selected: ['a'] }] })
+    await settled
+  }
+})
+
+test('Q4: two devices race — exactly one answer lands, the other is not-pending', async (t) => {
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  const first = await pairDevice(instance, DEV_A, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  const second = await pairDevice(instance, DEV_B, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  await waitFor(() => visibleIds(instance, first.device.id).length === 2, 'snapshot a')
+  await waitFor(() => visibleIds(instance, second.device.id).length === 2, 'snapshot b')
+  const wsA = await controlSocket(instance, first, DEV_A)
+  const wsB = await controlSocket(instance, second, DEV_B)
+  const answer = Promise.withResolvers()
+  const pending = requestQuestion(instance, 's1', () => answer.promise)
+  const card = await take(wsA, (frame) => frame.kind === 'question-requested' && frame.sessionId === 's1')
+  const answers = [{ id: 'q', selected: ['a'] }]
+  const [a, b] = await Promise.all([
+    answerQuestion(wsA, { rpcId: card.rpcId, sessionId: 's1', answers }),
+    answerQuestion(wsB, { rpcId: card.rpcId, sessionId: 's1', answers }),
+  ])
+  const accepted = [a, b].filter((receipt) => receipt.accepted === true)
+  const refused = [a, b].filter((receipt) => receipt.accepted === false)
+  assert.equal(accepted.length, 1, 'exactly one answer is accepted: ' + JSON.stringify([a, b]).slice(0, 240))
+  assert.equal(refused.length, 1)
+  assert.equal(refused[0].reason, 'not-pending')
+  await pending
+})
+
+test('Q5: answered first on the admin channel — the device gets not-pending and never overrides it', async (t) => {
+  const adminInstance = await factory(t, { config: { legacyAdmin: true } })
+  await adminInstance.start(); await ready(adminInstance)
+  const admin = await pairDevice(adminInstance, DEV_A, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  const adminWs = await connectToken(adminInstance, admin.token, DEV_A)
+  await flush(adminWs)
+  const answer = Promise.withResolvers()
+  const pending = requestQuestion(adminInstance, 's1', () => answer.promise)
+  const card = await take(adminWs, (frame) => frame.kind === 'question-requested' && frame.sessionId === 's1')
+  const first = await answerQuestion(adminWs, { rpcId: card.rpcId, sessionId: 's1', answers: [{ id: 'q', selected: ['a'] }] })
+  assert.equal(first.accepted, true, 'the first decision wins')
+
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  const device = await pairDevice(instance, DEV_B, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  await waitFor(() => visibleIds(instance, device.device.id).length === 2, 'snapshot')
+  const ws = await controlSocket(instance, device, DEV_B)
+  const late = await answerQuestion(ws, { rpcId: card.rpcId, sessionId: 's1', answers: [{ id: 'q', selected: ['b'] }] })
+  assert.equal(late.accepted, false, 'another instance never saw this card, so it is not-pending')
+  assert.equal(late.reason, 'not-pending')
+  await pending
+})
+
+test('Q6: a malformed answer is bad-response and never consumes the card', async (t) => {
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  const device = await pairDevice(instance, DEV_A, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  await waitFor(() => visibleIds(instance, device.device.id).length === 2, 'snapshot')
+  const ws = await controlSocket(instance, device, DEV_A)
+  const answer = Promise.withResolvers()
+  const pending = requestQuestion(instance, 's1', () => answer.promise)
+  const card = await take(ws, (frame) => frame.kind === 'question-requested' && frame.sessionId === 's1')
+  try {
+    for (const [label, answers] of [
+      ['wrong count', []],
+      ['wrong id', [{ id: 'nope', selected: ['a'] }]],
+      ['label not offered', [{ id: 'q', selected: ['zzz'] }]],
+      ['duplicate selection', [{ id: 'q', selected: ['a', 'a'] }]],
+      ['single-select two', [{ id: 'q', selected: ['a', 'b'] }]],
+      ['empty custom', [{ id: 'q', selected: [], custom: '   ' }]],
+      ['custom too long', [{ id: 'q', selected: ['a'], custom: 'z'.repeat(2001) }]],
+    ]) {
+      // Per case: the receipt, then the card's survival, so ONE regression fails on itself and
+      // not only through the loop. `take` CONSUMES the frame it returns, so a bad-code case
+      // cannot leave a `bad-response` behind that the NEXT case matches against its own id.
+      const receipt = await answerQuestion(ws, { rpcId: card.rpcId, sessionId: 's1', answers })
+      console.log('GOT', JSON.stringify(receipt))
+      assert.equal(receipt.kind, 'error', label + ': ' + JSON.stringify(receipt).slice(0, 220))
+      assert.equal(receipt.code, 'bad-response', label + ' must be bad-response, got ' + receipt.code)
+      let done = false
+      void pending.then(() => { done = true })
+      await delay(60)
+      assert.equal(done, false, label + ' must not consume the card')
+    }
+    // Owner decision 2026-11-11: a paired device answers from the offered options only — no free
+    // text, no empty selection — and the ONLY receipt it gets for either is the existing `label`
+    // refusal. Asserted on the MESSAGE because the code alone passes without this rule (a device
+    // used to be offered the admin free-text path). The card still survives every case.
+    for (const [label, answers] of [
+      ['free text', [{ id: 'q', selected: [], custom: 'verbatim' }]],
+      ['selected and free text', [{ id: 'q', selected: ['a'], custom: 'verbatim' }]],
+      ['empty selection', [{ id: 'q', selected: [] }]],
+    ]) {
+      const receipt = await answerQuestion(ws, { rpcId: card.rpcId, sessionId: 's1', answers })
+      assert.equal(receipt.kind, 'error', label + ': ' + JSON.stringify(receipt).slice(0, 220))
+      assert.equal(receipt.code, 'bad-response', label + ' must be bad-response, got ' + receipt.code)
+      assert.equal(receipt.message, 'selected values must match offered option labels', label + ': ' + receipt.message)
+      let done = false
+      void pending.then(() => { done = true })
+      await delay(60)
+      assert.equal(done, false, label + ' must not consume the card')
+    }
+    let done = false
+    void pending.then(() => { done = true })
+    await delay(60)
+    assert.equal(done, false, 'no malformed answer may consume the card')
+  } finally {
+    answer.resolve({ answers: [{ id: 'q', selected: ['a'] }] }); await pending
+  }
+})
+
+test('Q7: cancel DECLINES the question — the tool sees ASK_CANCELLED, not an empty answer', async (t) => {
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  const device = await pairDevice(instance, DEV_A, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  await waitFor(() => visibleIds(instance, device.device.id).length === 2, 'snapshot')
+  const ws = await controlSocket(instance, device, DEV_A)
+  const answer = Promise.withResolvers()
+  const pending = requestQuestion(instance, 's1', () => answer.promise)
+  const card = await take(ws, (frame) => frame.kind === 'question-requested' && frame.sessionId === 's1')
+  // Attach the rejection handler FIRST: a cancel rejects the Host promise by design.
+  const declined = pending.catch((error) => error)
+  const receipt = await answerQuestion(ws, { rpcId: card.rpcId, sessionId: 's1', action: 'cancel' })
+  assert.equal(receipt.accepted, true)
+  assert.equal(receipt.action, 'cancel')
+  const error = await declined
+  assert.equal(error?.code, 'ASK_CANCELLED', 'a cancel rejects the tool, it does not answer it')
+  const resolved = await take(ws, (frame) => frame.kind === 'question-resolved' && frame.rpcId === card.rpcId)
+  assert.equal(resolved.outcome, 'cancelled')
+})
+
+test('Q8: the card follows the approval rule exactly — scope AND visible session, on push and replay', async (t) => {
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  const allowed = await pairDevice(instance, DEV_A, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  const noScope = await pairDevice(instance, DEV_B, { scopes: ['sessions:read', 'prompt:send'] })
+  await waitFor(() => visibleIds(instance, allowed.device.id).length === 2, 'snapshot a')
+  await waitFor(() => visibleIds(instance, noScope.device.id).length === 2, 'snapshot b')
+  const allowedWs = await controlSocket(instance, allowed, DEV_A)
+  const noScopeWs = await controlSocket(instance, noScope, DEV_B)
+
+  const answer = Promise.withResolvers()
+  const pending = requestQuestion(instance, 's1', () => answer.promise)
+  try {
+    const card = await take(allowedWs, (frame) => frame.kind === 'question-requested' && frame.sessionId === 's1')
+    assert.equal(card.questions[0].id, 'q', 'the authorized device is served the card, with its questions')
+    await flush(noScopeWs)
+    assert.equal(seenOf(noScopeWs).some((frame) => frame.kind === 'question-requested'), false,
+      'a device without approval:respond gets no card')
+    // Replay-on-connect follows the same rule.
+    const replayWs = await connectToken(instance, allowed.token, DEV_A)
+    await flush(replayWs)
+    const replay = seenOf(replayWs).find((frame) => frame.kind === 'question-requested')
+    assert.equal(replay?.replay, true, 'a reconnecting authorized device is sent the replay')
+    const replayNoScope = await connectToken(instance, noScope.token, DEV_B)
+    await flush(replayNoScope)
+    assert.equal(seenOf(replayNoScope).some((frame) => frame.kind === 'question-requested'), false,
+      'a reconnecting device without the scope is sent no replay')
+  } finally {
+    answer.resolve({ answers: [{ id: 'q', selected: ['a'] }] }); await pending
+  }
+})
+
+test('Q9: the answer rule is per SOCKET — the admin socket answers the card it received, and a filtered socket that never got the card cannot answer it', async (t) => {
+  // The answer path used to require `hasQuestionClient(pending.sessionId)`: some OTHER socket had
+  // to be a recipient of the card. A subscription filter is a routing hint, never an authorization,
+  // so that requirement made the one socket that RECEIVEd the card unable to answer it. The rule is
+  // now exactly `clientMayReceive(fromSocket, session, 'approval:respond')`, as for approvals.
+  //
+  // MEASURED against lib/index.mjs (347b/4282): a subscribe filter DOES still gate the PUSH and the
+  // REPLAY (`broadcastInteractionFrame`/`replayPendingInteractions` skip a socket whose
+  // `filterSessionId` is another session), so "filtered to s2 but pushed the s1 card" is not
+  // reachable and is not asserted here. What IS per socket is the ANSWER: the socket that received
+  // the card may answer it, and a socket filtered elsewhere — one that never saw a card — is refused
+  // even when it names the live rpcId. Both halves run on ONE admin control socket.
+  const instance = await factory(t, { config: { legacyAdmin: true } })
+  await instance.start(); await ready(instance)
+  const device = await pairDevice(instance, DEV_A, { scopes: ['sessions:read', 'approval:respond', 'prompt:send'] })
+  await waitFor(() => visibleIds(instance, device.device.id).length === 2, 'snapshot')
+  // The admin/owner socket: the gateway-wide (never bundled) `legacyAdmin` option plus the per-frame
+  // marker make this one socket the admin channel, so it always passes the per-session gate. It must
+  // be a `legacy` socket — the gateway routes `subscribe` to the CONVERSATION lane, so a `control`
+  // socket answers every subscribe `wrong-channel` (and can never hold a filter).
+  const ws = await connectToken(instance, device.token, DEV_A, 'legacy')
+  const answer = Promise.withResolvers()
+  const pending = requestQuestion(instance, 's1', () => answer.promise)
+  const settled = pending.then((value) => ({ value }), (error) => ({ error }))
+  try {
+    const card = await take(ws, (frame) => frame.kind === 'question-requested' && frame.sessionId === 's1')
+    assert.equal(card.kind, 'question-requested', 'the admin socket is sent the s1 card live')
+    assert.deepEqual(seenOf(ws).filter((frame) => frame.kind === 'question-requested'), [],
+      'exactly ONE card reached this socket (no duplicate push)')
+    const receipt = await answerQuestion(ws, { rpcId: card.rpcId, sessionId: 's1', answers: [{ id: 'q', selected: ['a'] }] })
+    assert.equal(receipt.kind, 'question-response', JSON.stringify(receipt).slice(0, 220))
+    assert.equal(receipt.accepted, true, 'the admin socket that received the card may answer it: ' + JSON.stringify(receipt).slice(0, 200))
+    const resolved = await take(ws, (frame) => frame.kind === 'question-resolved' && frame.rpcId === card.rpcId)
+    assert.equal(resolved.outcome, 'answered')
+    assert.deepEqual(await settled, { value: { answers: [{ id: 'q', selected: ['a'] }] } },
+      'the Host settles with exactly what the admin socket chose')
+  } finally {
+    answer.resolve({ answers: [{ id: 'q', selected: ['a'] }] })
+    await settled
+  }
+  // Second half: the same socket is now FILTERED to s1, so the s2 question below is NOT pushed to it.
+  // The admin channel still passes the per-session gate, so a `not-authorized` refusal is not what is
+  // expected: what it answers is a card it was never given, which decides nothing (`not-pending`).
+  ws.send(JSON.stringify({ type: 'subscribe', sessionId: 's1', legacyAdmin: true, requestId: 'q9-sub-s1' }))
+  assert.equal((await take(ws, (frame) => frame.requestId === 'q9-sub-s1')).kind, 'subscribed',
+    'the s1 filter is installed for the second half')
+  const second = Promise.withResolvers()
+  const pendingSecond = requestQuestion(instance, 's2', () => second.promise)
+  const settledSecond = pendingSecond.then((value) => ({ value }), (error) => ({ error }))
+  try {
+    // The filter is in place, so no s2 card is pushed to this socket.
+    assert.equal(seenOf(ws).some((frame) => frame.kind === 'question-requested' && frame.sessionId === 's2'), false,
+      'a socket filtered to s1 is pushed no s2 card')
+    // Knowing the session is not authority for a card this socket was never handed.
+    const guessed = await answerQuestion(ws, { rpcId: 'q9-guessed-rpc', sessionId: 's2', answers: [{ id: 'q', selected: ['b'] }] })
+    assert.equal(guessed.kind, 'question-response', JSON.stringify(guessed).slice(0, 220))
+    assert.equal(guessed.accepted, false, 'an rpcId this socket was never handed decides nothing')
+    assert.equal(guessed.reason, 'not-pending')
+    // The s2 card is untouched: opening s2 on this socket replays it, and only then is it answered.
+    ws.send(JSON.stringify({ type: 'subscribe', sessionId: 's2', legacyAdmin: true, requestId: 'q9-sub-s2' }))
+    assert.equal((await take(ws, (frame) => frame.requestId === 'q9-sub-s2')).kind, 'subscribed')
+    const replayed = await take(ws, (frame) => frame.kind === 'question-requested' && frame.sessionId === 's2')
+    assert.equal(replayed.replay, true, 'the pending s2 card is replayed once the socket opens s2')
+    const acceptedSecond = await answerQuestion(ws, { rpcId: replayed.rpcId, sessionId: 's2', answers: [{ id: 'q', selected: ['b'] }] })
+    assert.equal(acceptedSecond.accepted, true, 'the refused guess consumed nothing: ' + JSON.stringify(acceptedSecond).slice(0, 200))
+    assert.deepEqual(await settledSecond, { value: { answers: [{ id: 'q', selected: ['b'] }] } })
+  } finally {
+    second.resolve({ answers: [{ id: 'q', selected: ['b'] }] })
+    await settledSecond
+  }
+})
 
 // ---------------------------------------------------------------------------
 // R6: the raw session/event fan-out (reviewer 537f M1)

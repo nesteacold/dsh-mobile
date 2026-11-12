@@ -81,6 +81,8 @@ const SCOPE_PROMPT = 'prompt:send'
 /** Spec 011: list workspaces/models, create a session, pick its model. Read from
  * the contract's own authoring mapping so the name is never a second literal. */
 const SCOPE_AUTHOR = contract.AUTHORING_SCOPE
+/** Spec 018 item 3: read the owner's schedules and each task's next run. Explicit-only. */
+const SCOPE_SCHEDULE_READ = contract.SCHEDULE_READ_SCOPE ?? 'schedule:read'
 
 /**
  * The positive endpoint table. `resource` says what the Gateway resolves for
@@ -92,8 +94,10 @@ const SCOPE_AUTHOR = contract.AUTHORING_SCOPE
  * endpoints the mobile message handlers reach through `lib/dsh-host-adapter.mjs`
  * — `workspace/follow` is how that adapter lists workspaces (the Host publishes
  * its workspace baseline as a stream), and both `models` forms read
- * `session/modelCatalog`. Nothing else about a workspace or a session was opened:
- * `workspace/create|rename|archiveSession`, `session/fork|rename|updateQueue`,
+ * `session/modelCatalog`. Revision 11 adds exactly one session's rename and
+ * archive (`session/rename`, `workspace/archiveSession`), each on the `session`
+ * resource. Nothing else about a workspace or a session was opened:
+ * `workspace/create|rename`, `session/fork|updateQueue`,
  * `session/attachment`, `session/canOpenWorkspacePath`, `session/control` and the
  * plugin/schedule/settings families stay unmapped (FR-004).
  */
@@ -119,6 +123,22 @@ export const COMPANION_ENDPOINTS = Object.freeze({
   // A session resource, exactly like `session/prompt`: a session the device
   // cannot address is refused by DSH itself, before the Host service runs.
   'session/selectModel': Object.freeze({ scope: SCOPE_AUTHOR, resource: SESSION_RESOURCE_KIND }),
+  // Revision 11: renaming and archiving ONE session. Same scope as the authoring
+  // surface, and the same session resource as `session/prompt`, so DSH answers
+  // `allows({kind:'session', id})` for the exact id before the Host runs: a device
+  // renames or archives only a session it can already see. The archive call reaches
+  // `workspace/archiveSession`, which carries the same `sessionId` first argument.
+  'session/rename': Object.freeze({ scope: SCOPE_AUTHOR, resource: SESSION_RESOURCE_KIND }),
+  'workspace/archiveSession': Object.freeze({ scope: SCOPE_AUTHOR, resource: SESSION_RESOURCE_KIND }),
+  // Spec 018 item 3 (revision 12), READ-ONLY schedule reads. These are the ONLY schedule endpoints
+  // mapped: every mutation (create/update/delete/run/deleteInactive/edit) and `schedule/history`
+  // stay unlisted, and unlisted means refused by the positive allowlist.
+  // `schedule/catalog` answers what CAN be scheduled (no owner data). `schedule/list` and
+  // `schedule/view` answer the owner's own tasks — host-wide, because a schedule is not a session
+  // resource; the scope alone decides, and it is never granted by default.
+  'schedule/catalog': Object.freeze({ scope: SCOPE_SCHEDULE_READ, resource: 'global' }),
+  'schedule/list': Object.freeze({ scope: SCOPE_SCHEDULE_READ, resource: 'global' }),
+  'schedule/view': Object.freeze({ scope: SCOPE_SCHEDULE_READ, resource: 'global' }),
 })
 
 /**
@@ -132,9 +152,7 @@ export const COMPANION_UNSUPPORTED_ENDPOINTS = Object.freeze({
   'remoteAccess/follow': 'always allowed by DSH for every Peer; not part of this mapping',
   'workspace/create': 'spec 011 FR-004: creating a workspace is not part of session authoring',
   'workspace/rename': 'spec 011 FR-004: renaming a workspace is not part of session authoring',
-  'workspace/archiveSession': 'spec 011 FR-004: archiving a session into a workspace is not part of session authoring',
   'session/fork': 'spec 011 FR-004: forking is not part of session authoring',
-  'session/rename': 'spec 011 FR-004: renaming is not part of session authoring',
   'session/updateQueue': 'spec 011 FR-004: queue control is not part of session authoring',
   'session/canOpenWorkspacePath': 'spec 011 FR-004: probing Host paths is not part of session authoring',
 })

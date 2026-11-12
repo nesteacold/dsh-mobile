@@ -19,10 +19,8 @@ env:
 ---
 # Spec 011 P1-A: the app opens on the Workspace home tab; the session list lives under Conversations.
 # Tapping an already-selected tab is a no-op, so this is safe for flows that are already there.
-- tapOn:
-    id: "tab-conversations"
-- tapOn:
-    id: "sessions-tab-${SESSION_TAB}"
+# parity: tab bar removed — the list is the default screen
+# parity: tab bar removed — the list is the default screen
 
 # The row hook (`app/index.tsx` renders session-row-<session id>): stable across title copy,
 # locale and row order, unlike the row's text.

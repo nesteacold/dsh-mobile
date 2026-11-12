@@ -74,8 +74,26 @@ describe('SessionsStore', () => {
     assert.deepEqual(store.search('网关').map((s) => s.id), ['session-abc']);
   });
 
-  it('derives idle from running:false and archived only from an explicit archive marker', () => {
+  it('parses the optional agentPreset (spec 018, view only) and omits anything outside the id charset', () => {
     const store = new SessionsStore({ now: () => NOW });
+    store.setAll([{ ...NORMATIVE_ROW, projections: { asOfSeq: 200, values: { title: 'T', agentPreset: 'standard' } } }]);
+    assert.equal(store.get('session-abc')?.agentPreset, 'standard');
+    // Absent stays absent: the key is never added as `undefined`, so the screen can hide the label.
+    assert.equal(Object.hasOwn(store.snapshot().items[0] as object, 'agentPreset'), true);
+    store.setAll([NORMATIVE_ROW]);
+    assert.equal(store.get('session-abc')?.agentPreset, undefined);
+    assert.equal(Object.hasOwn(store.snapshot().items[0] as object, 'agentPreset'), false);
+    // Same rule the gateway applies, enforced again here: path-like, YAML-ish, too long, non-string.
+    for (const agentPreset of ['C:\\x', '../a', '/etc', 'a/b', 'standard\n', 'x'.repeat(65), '', null, 1, {}]) {
+      store.setAll([{ ...NORMATIVE_ROW, projections: { values: { title: 'T', agentPreset } } }]);
+      assert.equal(store.get('session-abc')?.agentPreset, undefined, `agentPreset ${JSON.stringify(agentPreset)} must be omitted`);
+    }
+    // A maximal id (64 chars) is still a valid id, not a near-miss.
+    store.setAll([{ ...NORMATIVE_ROW, projections: { values: { title: 'T', agentPreset: 'a'.repeat(64) } } }]);
+    assert.equal(store.get('session-abc')?.agentPreset, 'a'.repeat(64));
+  });
+
+  it('derives idle from running:false and archived only from an explicit archive marker', () => {    const store = new SessionsStore({ now: () => NOW });
     store.setAll([
       { sessionId: 'r', running: true, updatedAt: NOW, projections: { values: { title: 'R' } } },
       { sessionId: 'i', running: false, updatedAt: NOW, projections: { values: { title: 'I' } } },

@@ -372,17 +372,19 @@ test('A-3 carve-outs: a device holding sessions:author still cannot mutate a wor
   const { ws } = await pairDevice(instance, 'auth-carve-0001', AUTHOR.mobile)
   const since = instance.hostCalls.length
   // Each of these is a router type outside the authoring family; with the scope
-  // held they must still be refused, and never reach the Host.
+  // held they must still be refused, and never reach the Host. Revision 11 moved
+  // ONE session's `session-rename` / `session-archive` into that family (covered
+  // by the revision 11 tests), so they are no longer here.
   for (const type of [
-    'workspace-create', 'session-rename', 'fork', 'queue-update', 'attachment', 'session-archive',
+    'workspace-create', 'fork', 'queue-update', 'attachment',
     'commands', 'command-execute', 'settings', 'settings-update', 'plugin-catalog', 'schedule-create',
   ]) {
     const reply = await ask(ws, { type, path: '/tmp/x', sessionId: 's1', title: 't', name: 'x' })
     assert.equal(reply.kind, 'error', `${type}: ${JSON.stringify(reply).slice(0, 200)}`)
     assert.equal(reply.code, OP_FORBIDDEN, `${type} must stay ${OP_FORBIDDEN}, got ${reply.code}`)
   }
-  for (const endpoint of ['workspace/create', 'workspace/rename', 'workspace/archiveSession', 'session/fork',
-    'session/rename', 'session/updateQueue', 'session/attachment', 'session/canOpenWorkspacePath',
+  for (const endpoint of ['workspace/create', 'workspace/rename', 'session/fork',
+    'session/updateQueue', 'session/attachment', 'session/canOpenWorkspacePath',
     'commands/execute', 'settings/mutate', 'pluginManager/installBundle', 'schedule/create']) {
     assert.equal(callsSince(instance, since, endpoint).length, 0, `${endpoint} must not reach the Host`)
   }
@@ -515,7 +517,9 @@ test('A-6 no-leak: no device token, Authorization header or pairing code logs du
 // The four types are the whole surface
 // ---------------------------------------------------------------------------
 
-test('A-7 the authoring type list is exactly the four contract types', () => {
-  assert.deepEqual([...SESSIONS_AUTHOR_TYPES].sort(), ['models', 'select-model', 'session-create', 'workspaces'])
+test('A-7 the authoring type list is exactly the contract types', () => {
+  // Revision 11 adds the two session-edit ops to the same `sessions:author` family.
+  assert.deepEqual([...SESSIONS_AUTHOR_TYPES].sort(),
+    ['models', 'select-model', 'session-archive', 'session-create', 'session-rename', 'workspaces'])
   for (const type of SESSIONS_AUTHOR_TYPES) assert.equal(type.includes('*'), false)
 })

@@ -133,13 +133,7 @@ The installed desktop build could not be compared (packed `app.asar`).
   control behind the plugin allowlist (defense in depth). If the gateway currently connects as owner, that
   must change.
 
-### V3 follow-up — T022a design, 2026-11-09
-- Source inspection confirms gateway `api` and `deviceApi` currently share `{kind:'owner'}`: Host-side policy defense is inert (b, `lib/index.mjs` owner peer construction).
-- Pinned DSH `0.2.2-rc.1` source/installed distribution: `registerPolicy(kind, {bindings, explain?})` returns a disposer, is effect-scoped and rejects duplicate kinds. Bindings match exact resource kind/id, not wildcard; unregistered principal is denied. Gateway validates arguments before policy evaluation; a bypass test must use descriptor-valid arguments to reach `remote-access/denied` (b).
-- Implementation direction: per-device non-owner Peer `{kind:'dsh-ext-mobile-device', deviceId}`, positive endpoint guard shared with policy roles, empty Fetch allowlist, dispose peer on disconnect/revoke, invalidate policy on device/session changes. Keep loopback owner peer separate. Session bindings must enumerate visible session ids; no wildcard assumption.
-- Proposed endpoint mapping requires runtime verification: session list/search/follow/page/events/control/prompt/cancel; subagent prompt/interrupt resource resolver and exact event action names remain unverified. Do not authorize speculative endpoints merely to make tests pass.
-- Evidence is source-only, not a live Host measurement; dedicated policy integration remains pending behind current approval writer.
-
 ## Still open
+- Which principal the upstream gateway uses toward the Host today (owner or own kind) — check in T022a.
 - Real-world arrival order over the network (measured in T024 tests with a delayed `tool/call`).
 - Whether an aborted stream can append `tool/call` with incomplete arguments (covered by parse-failure → null).

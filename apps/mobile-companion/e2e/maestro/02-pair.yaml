@@ -30,8 +30,7 @@ env:
 
 # Pairing succeeded when the session list replaces the pair screen: the fixture's running row.
 # Spec 011 P1-A: pairing lands on the Workspace home tab, so open the Conversations list first.
-- tapOn:
-    id: "tab-conversations"
+# parity: tab bar removed — the list is the default screen
 - extendedWaitUntil:
     visible:
       id: "session-row-sess-alpha"

@@ -21,17 +21,21 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const HOME = readFileSync(path.join(ROOT, 'app', '(tabs)', 'index.tsx'), 'utf8');
 const UI = readFileSync(path.join(ROOT, 'src', 'ui', 'components', 'ui.tsx'), 'utf8');
 
-describe('home hero — the four corners agree', () => {
-  it('rounds the card through ONE radius, never per-corner', () => {
-    const heroLine = HOME.split('\n').find((line) => line.includes('styles.hero')) ?? '';
-    assert.match(heroLine, /borderRadius: radius\.xl/, 'the hero takes a single radius token');
+// REWRITTEN for spec 011 parity: the navy hero card is gone (reference 01 has no hero), so the old
+// "four corners agree" guards became "no corner is ever specified per-corner". The intent is
+// unchanged and still worth guarding: per-corner radii rendered asymmetrically on Android (the
+// rounded-bottom-left / square-bottom-right notch the owner saw), so every rounded surface now takes
+// ONE radius token.
+describe('list header — rounded surfaces stay symmetric', () => {
+  it('never uses a per-corner radius anywhere in the list screen', () => {
     for (const prop of ['borderBottomLeftRadius', 'borderBottomRightRadius', 'borderTopLeftRadius', 'borderTopRightRadius']) {
       assert.equal(HOME.includes(prop), false, `${prop} must not be used: per-corner radii rendered asymmetrically on Android`);
     }
   });
 
-  it('clips the hero to its rounded outline', () => {
-    assert.match(HOME, /hero: \{[^}]*overflow: 'hidden'/, 'a painting child must not square off a rounded corner');
+  it('rounds the circular menu button and the chips through the pill token', () => {
+    assert.match(HOME, /menuButton: \{[^}]*borderRadius: 999/, 'the ⋯ button is a circle');
+    assert.match(HOME, /borderRadius: radius\.pill/, 'chips and the composer use the pill token');
   });
 });
 

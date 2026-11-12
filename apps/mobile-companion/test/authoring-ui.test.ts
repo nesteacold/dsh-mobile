@@ -240,12 +240,52 @@ describe('connection state is reported before any permission claim', () => {
     const home = readFileSync(path.join(APP_ROOT, 'app', '(tabs)', 'index.tsx'), 'utf8');
     assert.match(home, /connection: snapshot\.connection/);
     // "no sessions yet" may only appear for an empty list from a ready socket.
-    assert.match(home, /recent\.length === 0 && \(snapshot\.connection !== 'ready' \|\| snapshot\.loading\)/);
+    // Parity redesign: the old "no sessions yet" branch keyed on list emptiness + `loading`. The list
+    // screen now claims emptiness only when there is NO host; while a host exists the list simply
+    // renders what it has, so a not-ready socket can never produce the "no sessions" claim.
+    assert.match(home, /snapshot\.activeHost === null \? \(/, 'emptiness is tied to "no host", not to a list state');
+    assert.equal(
+      /home\.emptyTitle[^\n]*loading/.test(home),
+      false,
+      'the empty copy is never rendered because the list is merely still loading',
+    );
   });
 });
 // two pills whose text was literally "Mode" and "Model" — the row used the i18n LABEL as the VALUE
 // (`props.modeLabel ?? props.labels.mode`, `props.currentModel?.label ?? props.labels.model`). A
 // label is never a value, so the row is now data-only and the mode pill is gone entirely.
+// Device defect: the model sheet opened with NO rows. Cause was here — `PickerBody` rendered the
+// loading message and dropped `props.children` whenever the state was `loading`/`idle`, so a
+// catalogue that already had items painted nothing while a fetch was in flight.
+describe('picker body — items win over the load state', () => {
+  // Its own read: `AUTHORING` is scoped to the describe below.
+  const source = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'ui', 'components', 'authoring.tsx'), 'utf8');
+  const start = source.indexOf('function PickerBody');
+  const end = source.indexOf('const styles = StyleSheet.create');
+  const body = start === -1 || end === -1 ? '' : source.slice(start, end);
+
+  it('has the component', () => {
+    assert.notEqual(body, '', 'PickerBody is found in the source');
+  });
+
+  it('paints rows whenever the catalogue has any, before consulting the load state', () => {
+    const itemsBranch = body.indexOf('props.itemCount > 0');
+    const loadingBranch = body.indexOf("props.state.status === 'loading'");
+    assert.notEqual(itemsBranch, -1, 'the items branch exists');
+    assert.notEqual(loadingBranch, -1, 'the loading branch exists');
+    assert.ok(itemsBranch < loadingBranch, 'items are checked BEFORE the loading state');
+    assert.match(body, /if \(props\.itemCount > 0\) return <>\{props\.children\}<\/>;/, 'rows are returned as-is');
+  });
+
+  it('still explains itself when there is genuinely nothing to show', () => {
+    // The three degraded states must keep their copy: error (retryable), loading (nothing yet), empty.
+    assert.match(body, /props\.loadingLabel/, 'loading message kept');
+    assert.match(body, /props\.errorLabel/, 'error message kept');
+    assert.match(body, /props\.emptyLabel/, 'empty message kept');
+    assert.match(body, /onPress=\{props\.onRetry\}/, 'the error state still offers retry');
+  });
+});
+
 describe('composer leading row — every pill text comes from data', () => {
   const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const AUTHORING = readFileSync(path.join(ROOT, 'src', 'ui', 'components', 'authoring.tsx'), 'utf8');
@@ -278,8 +318,11 @@ describe('composer leading row — every pill text comes from data', () => {
       assert.equal(/labels=\{\{ mode/.test(source), false, 'the screen passes no label pair for the row');
     }
     // The mode slot is intentionally absent: the row renders exactly ONE pill (the model), and only
-    // when it has data — no second, stubbed or disabled pill takes its place.
-    assert.equal([...AUTHORING.matchAll(/styles\.pill/g)].length, 1, 'the composer row has a single pill');
+    // when it has data. Counted per LINE, because one expression may choose between `styles.pill` and
+    // `styles.pillStatic` — that is still a single pill, not two.
+    const pillSites = AUTHORING.split('\n').filter((line) => /styles\.pill/.test(line));
+    assert.equal(pillSites.length, 1, `one pill expression in the composer row, found ${pillSites.length}`);
+    assert.equal(/modeLabel|labels\.mode/.test(AUTHORING), false, 'no mode pill anywhere in the row');
   });
 
   it('still shows the current value through the data path the screen passes', () => {

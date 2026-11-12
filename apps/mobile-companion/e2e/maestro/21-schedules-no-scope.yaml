@@ -1,0 +1,51 @@
+# 21 — scheduled tasks WITHOUT the grant: the Settings row is not drawn (spec 018, `schedule:read`).
+#
+# SCENARIO: paired with exactly these four scopes — `sessions:read`, `sessions:author`, `prompt:send`,
+#           `approval:respond` — and NO `schedule:read`; the session list loaded.
+# HARNESS:  `--cert-mode ok`. Checkpoint T-22 in `run-e2e.mjs` arms that exact set immediately before
+#           this flow (`POST /scenario/scopes`). The SET MATTERS: `schedule:read` is explicit-only
+#           (`NEVER_DEFAULT_SCOPES`), but the fixture's own default set already carries
+#           `sessions:author` — that belongs to the authoring checkpoints, not to "the four defaults".
+#           A plain `maestro test` pairing is not armed at all, so this file states its precondition
+#           rather than inheriting one.
+# MANUAL:   biometric prompt only.
+#
+#[WHY] `schedule:read` is explicit-only (never granted by default) and no `hello` capability
+#      advertises it, so `Settings` draws NO row without it (`controller.hasReadScope('schedule:read')`)
+#      and the screen itself would refuse the read. A flow that only proves the granted branch would
+#      pass on a Host/month that broke the hidden case, which is the branch that keeps regressing
+#      (a refused read must never be offered).
+#
+#[HOOKS] `list-menu` (open the ⋯ menu), `tab-settings` (reach Settings by hook, not by copy),
+#        `settings-screen` (Settings really rendered), `settings-schedules` (the row under test) and
+#        its control neighbour `settings-storage` (proves the Settings card attached).
+#
+#[EXIT CRITERIA]
+#   1. the ⋯ menu opens (its Settings row is drawn) and Settings is reached by hook;
+#   2. the scheduled-tasks row is ABSENT while a control row on the same screen is present;
+#   3. zero schedule frames reached the Host (asserted by the orchestrator from `GET /state`,
+#      `evidence.readOnlyRequests`) — the screen was never pushed.
+
+appId: com.dshext.companion
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+
+- tapOn:
+    id: "list-menu"
+- tapOn:
+    id: "tab-settings"
+
+# 1) Settings is up.
+- extendedWaitUntil:
+    visible:
+      id: "settings-screen"
+    timeout: 20000
+
+# 2) The gated row is not drawn; the card that holds controls IS drawn on the same screen (it sits
+#    further down, but Maestro reads the rendered tree, not the viewport, so no scroll is needed —
+#    and a scroll would weaken "not rendered" into "not reached yet").
+- assertNotVisible:
+    id: "settings-schedules"
+- assertVisible:
+    id: "settings-storage"

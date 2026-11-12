@@ -28,7 +28,9 @@ import plugin from '../lib/index.mjs'
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
 import { COMPANION_PRINCIPAL_KIND, COMPANION_ENDPOINTS } from '../lib/companion-access.mjs'
 import { createDeviceAccess, devicePrincipal, deviceAccessAvailable } from '../lib/device-peers.mjs'
-import { COMPANION_AUTHOR_DENIED_ENDPOINTS, createPositiveDeviceGuard } from '../lib/allowlist.mjs'
+import {
+  COMPANION_AUTHOR_DENIED_ENDPOINTS, COMPANION_SCHEDULE_READ_DENIED_ENDPOINTS, createPositiveDeviceGuard,
+} from '../lib/allowlist.mjs'
 import { hostEndpointAllowedForDevice } from '../lib/companion-access.mjs'
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -271,8 +273,23 @@ test('U5: the positive guard composes the denied list AND the positive table, an
     // Spec 011: the two endpoints the deny layer CAN lift need the scope that lifts
     // them; every other mapped endpoint does not. A guard with no scopes at all
     // (the default) therefore still refuses them.
-    const liftable = COMPANION_AUTHOR_DENIED_ENDPOINTS.includes(key)
-    assert.equal(guard.hostEndpoint(namespace, method), !liftable, key)
+  const liftable = COMPANION_AUTHOR_DENIED_ENDPOINTS.includes(key)
+  // Spec 018 item 3: the read-only schedule endpoints are the second liftable family, and only
+  // `schedule:read` lifts them.
+  const scheduleLiftable = COMPANION_SCHEDULE_READ_DENIED_ENDPOINTS.includes(key)
+  assert.equal(guard.hostEndpoint(namespace, method), !(liftable || scheduleLiftable), key)
+  if (liftable) {
+    assert.equal(createPositiveDeviceGuard(hostEndpointAllowedForDevice, () => ['sessions:author'])
+      .hostEndpoint(namespace, method), true, `${key} with sessions:author`)
+    assert.equal(createPositiveDeviceGuard(hostEndpointAllowedForDevice, () => ['harness:remote'])
+      .hostEndpoint(namespace, method), false, `${key} with harness:remote alone`)
+  }
+  if (scheduleLiftable) {
+    assert.equal(createPositiveDeviceGuard(hostEndpointAllowedForDevice, () => ['schedule:read'])
+      .hostEndpoint(namespace, method), true, `${key} with schedule:read`)
+    assert.equal(createPositiveDeviceGuard(hostEndpointAllowedForDevice, () => ['sessions:read'])
+      .hostEndpoint(namespace, method), false, `${key} with sessions:read alone`)
+  }
     if (liftable) {
       assert.equal(createPositiveDeviceGuard(hostEndpointAllowedForDevice, () => ['sessions:author'])
         .hostEndpoint(namespace, method), true, `${key} with sessions:author`)

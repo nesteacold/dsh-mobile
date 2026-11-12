@@ -587,7 +587,7 @@ describe('withPinnedWsConfig (A031)', () => {
 
     // The EAS project identity must survive config edits.
     assert.equal(expo.slug, 'dsh-mobile');
-    assert.equal(expo.owner, 'example-owner');
+    assert.equal(expo.owner, 'nesteacolds-team');
     assert.equal(expo.extra?.eas?.projectId, '1352584f-32b4-4f00-9852-664315751e64');
 
     // A permission cannot be both requested and blocked; the manifest would get a grant and a

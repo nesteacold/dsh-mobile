@@ -6,28 +6,54 @@
 // routes a notification tap (deep link) to the right session/card after unlock (US6 §2).
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { AppState, StyleSheet, Text, TouchableOpacity, View, useColorScheme } from 'react-native';
+import { AppState, Platform, StyleSheet, Text, TouchableOpacity, View, useColorScheme } from 'react-native';
 import { Stack, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as Linking from 'expo-linking';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
-import { AppController, type AppStateSnapshot } from '../src/app-state';
+import { AppController, type AppStateSnapshot, type WebLockSnapshot } from '../src/app-state';
 import { parseSessionDeepLink, type UpdateRequired } from '../src/core';
 import { StartupSequence } from '../src/core/startup';
 import { UnlockAttempts } from '../src/core/unlock-attempt';
-import { authenticate, initialNotificationUrl, unlockCapability } from '../src/platform';
-import { detectLocale, t, type Interpolate, type Locale } from '../i18n';
+import { lockAction, unlockCopyKey } from '../src/core/web-lock';
+import { authenticate, initialNotificationUrl, unlockCapability, unlockUnavailableKey } from '../src/platform';
+import { detectLocale, t, type Interpolate, type Locale, type MessageKey } from '../i18n';
+import { PairPanel } from '../src/ui/pair-panel';
 // UI ported from Clarklevis1995/dsh-mobile androidApp/.../ui/DshTheme.kt (MIT).
 // The gate and the update screen sit outside the Stack, so they read the scheme directly; the
 // screens under the Stack read the same palette through `ThemeProvider` / `useTheme()`.
 import { ThemeProvider, paletteFor } from '../src/ui/theme';
+import { loadFontScale } from '../src/ui/font-scale-store';
 
 type GateStatus = 'checking' | 'locked' | 'unlocked' | 'unavailable';
 
 export default function RootLayout() {
+  /**
+   * The font scale is a saved preference (src/ui/font-scale-store.ts): read once at startup and handed
+   * to the theme, which applies it to every screen. `undefined` until it arrives, so the first frame
+   * renders at the default scale instead of waiting on storage.
+   */
+  const [fontScale, setFontScale] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    let alive = true;
+    void loadFontScale().then((saved) => {
+      if (alive) setFontScale(saved);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
   const locale = useMemo<Locale>(() => detectLocale(localeTag()), []);
   const tr = useCallback<Interpolate>((key, params) => t(locale, key, params), [locale]);
+  /**
+   * Spec 021 — a web (PWA) install has no OS biometric, and its passkey can only be asserted on a
+   * socket the Host has already paired: the platform gate below would call `authenticate()` before
+   * any socket exists and refuse itself (`passkey.web.ts` answers `locked` without a ready client),
+   * so the browser never reached the pairing screen at all. On web the Host's passkey lock IS the
+   * gate, and it renders from the bootstrap state below instead.
+   */
+  const isWeb = Platform.OS === 'web';
   const controller = useMemo(() => new AppController({ locale: () => locale }), [locale]);
   const [snapshot, setSnapshot] = useState<AppStateSnapshot>(() => controller.snapshot());
   const [gate, setGate] = useState<GateStatus>('checking');
@@ -95,32 +121,27 @@ export default function RootLayout() {
         if (!attempts.isCurrent(attempt)) return;
         if (capability === 'unavailable') {
           setGate('unavailable');
-          setGateMessage(tr('unlock.unavailable'));
+          // Platform-chosen copy: native points at the OS screen lock, web (which has none) points
+          // at signing in on the computer. See `src/platform/unlock-copy*.ts`.
+          setGateMessage(tr(unlockUnavailableKey()));
           return;
         }
-        const result = await authenticate(tr('unlock.prompt'));
+        const result = await authenticate(tr('unlock.prompt'), controller.passkeyConnection);
         // A020/M5: the platform prompt outlives a background lock, a newer attempt or an
         // unmount, so its answer is only usable while this attempt is still current. Acting on
         // a stale success would open the gate and read the credential in the background.
         if (!attempts.isCurrent(attempt)) return;
         if (!result.ok) {
           setGate('locked');
-          setGateMessage(
-            result.reason === 'user-cancel'
-              ? tr('unlock.cancelled')
-              : result.reason === 'locked-out'
-                ? tr('unlock.lockedOut')
-                : result.reason === 'unavailable'
-                  ? tr('unlock.unavailable')
-                  : tr('unlock.failed'),
-          );
+          setGateMessage(unlockFailureCopy(result.reason, tr));
           return;
         }
         setGateMessage(result.capability === 'passcode' ? tr('unlock.passcodeOnly') : null);
         setGate('unlocked');
         await controller.unlock();
-        // `unlock()` itself awaits the secure-store read in the controller: re-check before
-        // routing, so a lock during that read cannot navigate a backgrounded app.
+        // A web device is still LOCKED on its socket while the passkey asserts; the Host's `webLock`
+        // decides that, and the gate above it renders the lock screen (`WebLockGate`). A successful
+        // passkey assertion clears it in the snapshot, which re-renders this tree unstuck.
         if (!attempts.isCurrent(attempt)) return;
         const pending = controller.takeDeepLink() ?? (await initialNotificationUrl().then(parseLink));
         if (pending !== null && attempts.isCurrent(attempt)) {
@@ -155,8 +176,32 @@ export default function RootLayout() {
   }, [attempts, controller]);
 
   useEffect(() => {
-    if (gate === 'checking') void attemptUnlock(true);
-  }, [gate, attemptUnlock]);
+    if (gate === 'checking' && !isWeb) void attemptUnlock(true);
+  }, [gate, attemptUnlock, isWeb]);
+
+  /**
+   * Spec 021 — on web the Host's confirmed assertion is what opens the gate.
+   *
+   * `snapshot.unlocked` is set by the controller only after `passkey-assert` came back unlocked
+   * (§14.1), so this mirrors a Host decision rather than a local one; the platform-gate copy is
+   * skipped because there is no OS prompt to explain (`unlock.passcodeOnly` would be a lie).
+   */
+  useEffect(() => {
+    if (!isWeb || !snapshot.unlocked || gate === 'unlocked') return;
+    attempts.setForeground(true);
+    setGateMessage(null);
+    setGate('unlocked');
+  }, [attempts, gate, isWeb, snapshot.unlocked]);
+
+  /**
+   * Spec 021 — a reloaded web page needs a LIVE socket before it can assert anything (§14.2), and
+   * the Host locks every new connection, so one is opened here, locked: nothing is read through it
+   * until the assertion is confirmed. No-op on native.
+   */
+  useEffect(() => {
+    if (!isWeb || snapshot.activeHost === null || snapshot.unlocked) return;
+    void controller.startWebLockSession();
+  }, [controller, isWeb, snapshot.activeHost, snapshot.unlocked]);
 
   useEffect(() => {
     const subscription = Linking.addEventListener('url', (event) => {
@@ -177,31 +222,68 @@ export default function RootLayout() {
   const palette = paletteFor(useColorScheme() === 'light' ? 'light' : 'dark');
   const locked = gate === 'checking' || gate === 'locked' || gate === 'unavailable';
   const updateRequired = snapshot.updateRequired;
+  /**
+   * Spec 021 (contract §14.2): the HOST's passkey lock, above the platform gate. A web device that
+   * has paired but not asserted its passkey on this socket may see nothing else — no session list,
+   * no conversation — even though the credential is already readable.
+   */
+  const webLock = snapshot.webLock;
 
   return (
     <SafeAreaProvider>
-      <ThemeProvider>
+      <ThemeProvider initialFontScale={fontScale}>
       <StatusBar style={palette.isDark ? 'light' : 'dark'} />
       {locked ? (
-        <View style={[styles.gate, { backgroundColor: palette.bg }]}>
-          <Text style={[styles.title, { color: palette.text }]}>{tr('unlock.title')}</Text>
-          <Text style={[styles.subtitle, { color: palette.textMuted }]}>{tr('unlock.subtitle')}</Text>
-          {gateMessage !== null ? <Text style={[styles.message, { color: palette.warning }]}>{gateMessage}</Text> : null}
-          {gate === 'checking' ? null : (
-            <TouchableOpacity
-              style={[styles.button, { backgroundColor: palette.accent }]}
-              accessibilityRole="button"
-              accessibilityLabel={gate === 'unavailable' ? tr('common.ok') : tr('unlock.button')}
-              onPress={() => {
-                setGate('locked');
-                setGateMessage(null);
-                void attemptUnlock(false);
-              }}
-            >
-              <Text style={[styles.buttonText, { color: palette.onAccent }]}>{gate === 'unavailable' ? tr('common.ok') : tr('unlock.button')}</Text>
-            </TouchableOpacity>
-          )}
-        </View>
+        isWeb ? (
+          /*
+            Spec 021 — on web the Host's passkey lock IS the gate. `authenticate()` cannot answer
+            before a paired socket exists (`passkey.web.ts` refuses without a ready client), so the
+            platform gate below kept a fresh install shut forever, and the passkey screen inside the
+            unlocked branch was never reached. This bootstrap renders pairing / register / assert
+            from a state that needs no prior unlock and exposes no Host data; `snapshot.unlocked`
+            flips (and the gate opens, see the effect above) only when the Host confirms.
+          */
+          <WebBootstrap
+            controller={controller}
+            snapshot={snapshot}
+            tr={tr}
+            onRegister={() => void controller.registerAndUnlockWebPasskey()}
+            onUnlock={() => void controller.unlockWithPasskey()}
+          />
+        ) : (
+          <View style={[styles.gate, { backgroundColor: palette.bg }]}>
+            <Text style={[styles.title, { color: palette.text }]}>{tr('unlock.title')}</Text>
+            <Text style={[styles.subtitle, { color: palette.textMuted }]}>{tr('unlock.subtitle')}</Text>
+            {gateMessage !== null ? <Text style={[styles.message, { color: palette.warning }]}>{gateMessage}</Text> : null}
+            {gate === 'checking' ? null : (
+              <TouchableOpacity
+                style={[styles.button, { backgroundColor: palette.accent }]}
+                accessibilityRole="button"
+                accessibilityLabel={gate === 'unavailable' ? tr('common.ok') : tr('unlock.button')}
+                onPress={() => {
+                  setGate('locked');
+                  setGateMessage(null);
+                  void attemptUnlock(false);
+                }}
+              >
+                <Text style={[styles.buttonText, { color: palette.onAccent }]}>{gate === 'unavailable' ? tr('common.ok') : tr('unlock.button')}</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        )
+      ) : webLock !== null && webLock.state !== 'unlocked' ? (
+        // Spec 021 (contract §14.2): the HOST's passkey lock, inside the unlocked branch and above
+        // the navigator. The platform gate has opened, but a web socket that has not asserted its
+        // passkey may see nothing else — no session list, no conversation. Rendering it here (not
+        // before the gate) keeps the A020 rule that no route mounts until the platform unlock.
+        <WebLockGate
+          lock={webLock}
+          tr={tr}
+          // A registration opens no socket (§14.1), so the create action asserts in the same step:
+          // a device that has just made its passkey must not be left locked with only that button.
+          onRegister={() => void controller.registerAndUnlockWebPasskey()}
+          onUnlock={() => void controller.unlockWithPasskey()}
+        />
       ) : (
         <AppProvider controller={controller} snapshot={snapshot} tr={tr} locale={locale}>
           <Stack
@@ -214,6 +296,12 @@ export default function RootLayout() {
             }}
           >
             <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+        {/* Spec 011 parity: Settings is pushed from the ⋯ menu, not a tab. */}
+        <Stack.Screen name="settings" options={{ title: tr('settings.title') }} />
+        <Stack.Screen name="storage" options={{ title: tr('storage.title') }} />
+        <Stack.Screen name="privacy" options={{ title: tr('privacy.title') }} />
+        {/* Spec 018 item 3: read-only scheduled tasks; the row that opens it is drawn only with the grant. */}
+        <Stack.Screen name="schedules" options={{ title: tr('schedules.title') }} />
             <Stack.Screen name="pair" options={{ title: tr('pair.title') }} />
             <Stack.Screen name="session/[id]" options={{ title: tr('common.host') }} />
             <Stack.Screen name="s/[id]" options={{ headerShown: false }} />
@@ -241,8 +329,125 @@ export default function RootLayout() {
   );
 }
 
-/** N7 — the app and the host cannot talk until one side updates: say which, and offer a retry. */
-function UpdateRequiredScreen(props: {
+/**
+ * Spec 021 — the web bootstrap: what a browser may see BEFORE the Host has confirmed its passkey.
+ *
+ * Three states, and no Host data in any of them (a locked web socket sees no title, count or id):
+ *   * no paired host        -> the pair screen, so a fresh install can start at all;
+ *   * paired, lock reported -> the passkey register / assert / approval screen;
+ *   * paired, no socket yet -> the same action, which opens the locked socket it needs first.
+ *
+ * Nothing here reads the session list, and none of it waits on the platform gate: on web the
+ * Host's assertion is the gate. `snapshot.unlocked` flips only when the Host confirms (§14.1), at
+ * which point the root layout renders the navigator instead.
+ */
+function WebBootstrap(props: {
+  controller: AppController;
+  snapshot: AppStateSnapshot;
+  tr: Interpolate;
+  onRegister: () => void;
+  onUnlock: () => void;
+}) {
+  const { controller, snapshot, tr, onRegister, onUnlock } = props;
+  const palette = paletteFor(useColorScheme() === 'light' ? 'light' : 'dark');
+  if (snapshot.activeHost === null) {
+    // The pair panel takes the controller through props, so the bootstrap needs no `useApp` context
+    // (there is no navigator it could belong to) and the pairing rules stay in one place.
+    return <PairPanel controller={controller} snapshot={snapshot} tr={tr} />;
+  }
+  const lock: WebLockSnapshot = snapshot.webLock ?? {
+    // Paired but no `hello` yet (no socket): a web install waits for its passkey, which is the same
+    // state the Host reports on a fresh connection. Without this the screen would have no action
+    // and the install would deadlock on "unlocked but locked".
+    state: 'locked',
+    reason: 'locked',
+    approval: null,
+    error: null,
+  };
+  return <WebLockGate lock={lock} tr={tr} onRegister={onRegister} onUnlock={onUnlock} />;
+}
+
+/**
+ * Spec 021 — the passkey lock screen of a web (PWA) device.
+ *
+ * While locked the Host answers nothing but hello/ping and the passkey frames, so this screen is the
+ * only thing the browser can do anyway; showing it is the honest rendering of that server-side lock.
+ * The action comes from the lock state: `unregistered`/`not-registered` create a passkey,
+ * `already-registered` waits for the owner, everything else asserts.
+ */
+function WebLockGate(props: {
+  lock: WebLockSnapshot;
+  tr: Interpolate;
+  onRegister: () => void;
+  onUnlock: () => void;
+}) {
+  const { lock, tr, onRegister, onUnlock } = props;
+  const palette = paletteFor(useColorScheme() === 'light' ? 'light' : 'dark');
+  const action = lockAction(lock.state);
+  const copyKey = unlockCopyKey({ state: lock.state, error: lock.error });
+  const approval = lock.approval;
+  return (
+    <View style={styles.gate} testID="web-lock-gate">
+      <Text style={[styles.title, { color: palette.text }]}>{tr('unlock.title')}</Text>
+      <Text style={[styles.subtitle, { color: palette.textMuted }]} accessibilityLabel={copyKey === null ? undefined : 'web-lock-reason'}>
+        {copyKey === null ? tr('unlock.passkeyLocked') : tr(copyKey as MessageKey)}
+      </Text>
+      {approval === null ? null : (
+        <Text style={[styles.message, { color: palette.textMuted }]}>
+          {tr(approval.action === 'approve' ? 'unlock.passkeyApproval' : 'unlock.passkeyLocked')}
+        </Text>
+      )}
+      <TouchableOpacity
+        style={[styles.button, { backgroundColor: palette.accent }]}
+        accessibilityRole="button"
+        testID="web-lock-action"
+        accessibilityLabel={tr(action === 'register' || action === 'approve' ? 'unlock.passkeyRegister' : 'unlock.button')}
+        // The owner decides `already-registered` on the Host: pressing again re-asks for options,
+        // which is what reports whether the approval has landed (contract §14.3).
+        onPress={action === 'unlock' ? onUnlock : onRegister}
+      >
+        <Text style={[styles.buttonText, { color: palette.onAccent }]}>
+          {tr(action === 'unlock' ? 'unlock.button' : 'unlock.passkeyRegister')}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+/**
+ * The sentence one failed platform-gate attempt shows. Native reasons keep their own copy; a web
+ * passkey reason goes through `LOCK_COPY`, so no reason is ever shown as the generic failure.
+ */
+function unlockFailureCopy(reason: string | undefined, tr: Interpolate): string {
+  switch (reason) {
+    case 'user-cancel':
+      return tr('unlock.cancelled');
+    case 'locked-out':
+      return tr('unlock.lockedOut');
+    case 'unavailable':
+      return tr(unlockUnavailableKey());
+    case 'not-supported':
+      return tr('unlock.passkeyUnsupported');
+    case 'rate-limited':
+      return tr('unlock.passkeyRateLimited');
+    case 'challenge-expired':
+      return tr('unlock.passkeyExpired');
+    case 'verification-failed':
+      return tr('unlock.passkeyFailed');
+    case 'not-registered':
+      return tr('unlock.passkeyNotRegistered');
+    case 'already-registered':
+      return tr('unlock.passkeyApproval');
+    case 'unregistered':
+      return tr('unlock.passkeyRegister');
+    case 'locked':
+      return tr('unlock.passkeyLocked');
+    default:
+      return tr('unlock.failed');
+  }
+}
+
+/** N7 — the app and the host cannot talk until one side updates: say which, and offer a retry. */function UpdateRequiredScreen(props: {
   update: UpdateRequired;
   tr: Interpolate;
   onRetry: () => void;

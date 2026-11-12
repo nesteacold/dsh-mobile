@@ -60,10 +60,13 @@ export async function getItemAsync(key) {
 }
 export async function setItemAsync(key, value) {
   if (state.rule !== null) await gate(state.rule, key);
+  await passHold('write', key);
   store.set(key, value);
+  notifyWrite(key);
 }
 export async function deleteItemAsync(key) {
   if (state.deleteRule !== null) await gate(state.deleteRule, key);
+  await passHold('delete', key);
   store.delete(key);
 }
 export async function isAvailableAsync() { return true; }
@@ -77,6 +80,50 @@ export function __clearDelay() { state.rule = null; }
 export function __delayDelete(key, ms, onEnter) { state.deleteRule = { key, ms, onEnter }; }
 export function __clearDeleteDelay() { state.deleteRule = null; }
 export function __failGet(key, message) { state.failGet = { key, message }; }
+// HOLD (no clocks): park one write/delete of \`key\` until the test releases it. Same window as
+// __delay/__delayDelete, but the test decides when it ends — no millisecond count, no polling.
+// \`__holdWrite(key)\` / \`__holdDelete(key)\` resolve when the operation ACTUALLY reaches the store,
+// so the test knows it is parked instead of sleeping and hoping.
+const holds = new Map();
+export function __holdWrite(key) {
+  return makeHold('write', key);
+}
+export function __holdDelete(key) {
+  return makeHold('delete', key);
+}
+function makeHold(kind, key) {
+  let release;
+  let enter;
+  const wait = new Promise((resolve) => { release = resolve; });
+  const parked = new Promise((resolve) => { enter = resolve; });
+  holds.set(kind + ':' + key, { wait, enter, releaseRef: release });
+  return parked;
+}
+export function __releaseHold(kind, key) {
+  const hold = holds.get(kind + ':' + key);
+  holds.delete(kind + ':' + key);
+  if (hold) hold.releaseRef();
+}
+async function passHold(kind, key) {
+  const hold = holds.get(kind + ':' + key);
+  if (hold === undefined) return;
+  // The entry STAYS in the map until __releaseHold runs: deleting it here (as an earlier version
+  // did) made the hold unreleasable and hung the whole file.
+  hold.enter(); // tell the test it is now parked
+  await hold.wait;
+}
+// Write OBSERVER (no lock, no timer): report the token write as it happens instead of letting a test
+// poll the map. A lock here would be wrong — the pairing's own credential chain and \`forget()\`
+// both walk through this key, so holding a write open deadlocks them.
+const writeWatchers = new Map();
+export function __watchWrite(key, notify) { writeWatchers.set(key, notify); }
+export function __unwatchWrite(key) { writeWatchers.delete(key); }
+function notifyWrite(key) {
+  const notify = writeWatchers.get(key);
+  if (notify === undefined) return;
+  writeWatchers.delete(key); // one shot
+  notify();
+}
 `;
 
 const STORE_URL = `data:text/javascript;base64,${Buffer.from(STORE_SOURCE, 'utf8').toString('base64')}`;
@@ -96,7 +143,15 @@ interface DelayableStore {
   /** Park one key's delete (the credential removal), for a forget/revoke window. */
   __delayDelete(key: string, ms: number, onEnter?: () => void): void;
   __clearDeleteDelay(): void;
+  /** Fire `notify` once, when the FIRST write of `key` lands (an event, not a poll). */
+  __watchWrite(key: string, notify: () => void): void;
+  __unwatchWrite(key: string): void;
   __failGet(key: string, message: string): void;
+  /** Park the next WRITE of key; resolves once it is parked. Release with __releaseHold. */
+  __holdWrite(key: string): Promise<void>;
+  /** Park the next DELETE of key; resolves once it is parked. */
+  __holdDelete(key: string): Promise<void>;
+  __releaseHold(kind: 'write' | 'delete', key: string): void;
 }
 
 // Loaded in `before()` — i.e. after the hook above — so the app's `expo-secure-store` import
@@ -513,6 +568,54 @@ describe('AppController credential cleanup races (M5)', () => {
     }
   });
 
+  it('spec 018 item 5: a host switch clears the previous computer\'s cached projections', async () => {
+    const codeA = pairCode('X');
+    const codeB = pairCode('Y');
+    const gatewayA = await FakeGateway.create({ pairingCodes: [codeA], deviceScopes: ['sessions:read'] });
+    const gatewayB = await FakeGateway.create({ pairingCodes: [codeB], deviceScopes: ['sessions:read'] });
+    const controller = await unlockedController();
+    const SESSION = 's-shared-id';
+    try {
+      assert.equal((await controller.pair(pairingPayload(gatewayA, codeA, GATEWAY_A, 'pc-a'))).ok, true);
+      await waitFor(() => controller.snapshot().connection === 'ready', { label: 'host A ready' });
+      assert.equal((await controller.pair(pairingPayload(gatewayB, codeB, GATEWAY_B, 'pc-b'))).ok, true);
+      await waitFor(() => controller.snapshot().activeHost?.gatewayId === GATEWAY_B, { label: 'host B active' });
+
+      // Host B's one baseline names the same session id with ITS OWN list.
+      gatewayB.pushProjection({
+        kind: 'projection-baseline',
+        projections: { [SESSION]: { asOfSeq: 10, values: { todos: [{ content: 'from B', status: 'pending' }] } } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      controller.openSession(SESSION);
+      assert.deepEqual(controller.snapshot().openSessionPanel.todos?.map((todo) => todo.text), ['from B']);
+
+      // A stale frame from the switch's old socket, and then a different computer's baseline: neither
+      // may be mistaken for the new computer's host data.
+      await controller.selectHost(GATEWAY_A);
+      await waitFor(
+        () => controller.snapshot().activeHost?.gatewayId === GATEWAY_A && controller.snapshot().connection === 'ready',
+        { label: 'host A live again' },
+      );
+      controller.openSession(SESSION);
+      assert.deepEqual(
+        controller.snapshot().openSessionPanel.todos,
+        null,
+        'the previous computer\'s list is not shown for this one',
+      );
+      gatewayA.pushProjection({
+        kind: 'projection-baseline',
+        projections: { [SESSION]: { asOfSeq: 50, values: { todos: [{ content: 'from A', status: 'pending' }] } } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.deepEqual(controller.snapshot().openSessionPanel.todos?.map((todo) => todo.text), ['from A']);
+    } finally {
+      controller.stop();
+      await gatewayA.close();
+      await gatewayB.close();
+    }
+  });
+
   it('M5: a delayed revocation cleanup never clobbers a host paired while it is parked', async () => {
     const codeA = pairCode('N');
     const codeB = pairCode('O');
@@ -598,27 +701,35 @@ describe('AppController credential cleanup races (M5)', () => {
   });
 
   it('M5: a lock while the revocation waits for its token write still deletes the dead token', async () => {
+    // NEGATIVE CONTROL (what this test must catch, reasoned here because `src` must not be touched):
+    // the revoke cleanup decides which credential instance it owns BEFORE it settles the token write.
+    // If `src/app-state.ts` ever dropped that instance check (or bumped the revision on `lock()`),
+    // the cleanup would find "not mine any more" and skip the delete, leaving a dead token on disk —
+    // this test then fails on `tokenEntries()`, not on a timeout.
     const code = pairCode('R');
     const gateway = await FakeGateway.create({ pairingCodes: [code] });
     const controller = await unlockedController();
+    const TOKEN_KEY = `${TOKEN_PREFIX}${GATEWAY_A}`;
     try {
-      const entered = deferred<void>();
-      store.__delay(`${TOKEN_PREFIX}${GATEWAY_A}`, 250, () => entered.resolve());
+      const tokenParked = store.__holdWrite(TOKEN_KEY);
       const pairing = controller.pair(pairingPayload(gateway, code));
-      await entered.promise; // the one-time token write is in flight
+      await tokenParked; // the one-time token write is parked INSIDE the store (no timer)
       gateway.closeAll(4401, 'revoked');
       await waitFor(() => controller.snapshot().banner === 'revoked', { label: 'revocation started' });
       // Locking bumps the UI generation while the cleanup waits for the token write. Ownership is
       // per credential instance, so the revoked token must still be wiped (not kept as dead secret).
       controller.lock();
+      // From here the cleanup can drain: the write lands and the delete queued behind it runs.
+      store.__releaseHold('write', TOKEN_KEY);
       const result = await pairing;
 
       assert.equal(result.ok, false);
-      // Long enough for the delayed write: the cleanup settled it, then deleted the key (M5).
-      await new Promise((resolve) => setTimeout(resolve, 400));
+      // No sleep: `forget`/revoke cleanup is awaited by the pairing promise above, so the store is
+      // already settled by the time `pairing` resolves.
       assert.deepEqual(tokenEntries(), [], 'the revoked credential is gone');
       assert.deepEqual(storedHosts(), []);
     } finally {
+      store.__releaseHold('write', TOKEN_KEY);
       controller.stop();
       await gateway.close();
     }
@@ -713,15 +824,14 @@ describe('AppController credential cleanup races (M5)', () => {
       assert.equal(first.ok, true, JSON.stringify(first));
       await waitFor(() => controller.snapshot().connection === 'ready', { label: 'first pairing live' });
 
-      const entered = deferred<void>();
-      store.__delayDelete(`${TOKEN_PREFIX}${GATEWAY_A}`, 700, () => entered.resolve());
+      const deleted = store.__holdDelete(`${TOKEN_PREFIX}${GATEWAY_A}`);
       // The forget owns the credential instance of its own host; its delete is parked here.
       const forget = controller.forget();
-      await entered.promise;
+      await deleted;
       // The same gateway is paired again meanwhile: it registers a fresher revision and writes
       // `tok-2` while the parked delete still names the first instance.
       const fresh = controller.pair(pairingPayload(gateway, freshCode, GATEWAY_A, 'pc-a'));
-      store.__clearDeleteDelay();
+      store.__releaseHold('delete', `${TOKEN_PREFIX}${GATEWAY_A}`);
       const [forgetResult, freshResult] = await Promise.all([forget, fresh]);
 
       assert.equal(forgetResult, undefined);
@@ -745,19 +855,26 @@ describe('AppController credential cleanup races (M5)', () => {
     const controller = await unlockedController();
     try {
       // The interrupted attempt is parked between its token write and its host-record write (the
-      // first host-record write of the test: the unlock above listed an empty store).
-      const entered = deferred<void>();
-      store.__delay(HOSTS_KEY, 700, () => entered.resolve());
+      // first host-record write of the test: the unlock above listed an empty store). Held on a
+      // promise the test releases, not on a 700 ms sleep.
+      const hostWriteParked = store.__holdWrite(HOSTS_KEY);
       const interrupted = controller.pair(pairingPayload(gateway, staleCode, GATEWAY_A, 'pc-a'));
-      await entered.promise;
+      await hostWriteParked;
       assert.equal(tokenEntries().length, 1, 'the interrupted attempt persisted its one-time token');
       assert.equal(gateway.consumedPairingCodes.length, 1, 'the stale code is the one consumed so far');
 
+      // NEGATIVE CONTROL (reasoned, `src` untouched): `forget()` cancels the attempt captured at
+      // CALL time and deletes that attempt's credential instance. If it instead captured the attempt
+      // lazily (or cleaned up by gateway id only), it would also remove the NEWER pairing's token —
+      // the two assertions at the end (`tok-3` survives, count === 1) are what fail in that case.
       const forget = controller.forget();
+      // Release BEFORE awaiting anything: the interrupted pairing is parked in the host-record write
+      // and `forget()` drains that same chain, so waiting on `interrupted` first would wait on our
+      // own hold (the deadlock this file hit twice while being made deterministic).
+      store.__releaseHold('write', HOSTS_KEY);
       const result = await interrupted;
       // A pairing that starts *after* the forget was invoked is a new instance, not the one it
       // removes: nothing is parked any more, so it decides the outcome.
-      store.__clearDelay();
       const fresh = controller.pair(pairingPayload(gateway, freshCode, GATEWAY_A, 'pc-a'));
       await forget;
       const freshResult = await fresh;
@@ -862,6 +979,7 @@ describe('AppController credential cleanup races (M5)', () => {
     const code = pairCode('8');
     const gateway = await FakeGateway.create({ pairingCodes: [code] });
     const controller = await unlockedController();
+    const TOKEN_KEY = `${TOKEN_PREFIX}${GATEWAY_A}`;
     try {
       // The host list is still loading: `start()` has not installed anything yet, so the active
       // host is null when the forget runs, and the pairing attempt is the only target.
@@ -869,7 +987,14 @@ describe('AppController credential cleanup races (M5)', () => {
       const pending = controller.start();
       store.__clearDelay();
       const pairing = controller.pair(pairingPayload(gateway, code, GATEWAY_A, 'pc-a'));
-      await waitFor(() => tokenEntries().length === 1, { label: 'the cancelled attempt persisted its token' });
+      // The write is OBSERVED, not polled: waitFor returned at an arbitrary 5 ms tick of the pairing's
+      // continuation, which is why this case flaked under load (the forget then landed either before
+      // or after the attempt recorded its revision — two different branches). The observer fires
+      // exactly when the token lands in the store.
+      const tokenWritten = deferred<void>();
+      store.__watchWrite(TOKEN_KEY, () => tokenWritten.resolve());
+      await tokenWritten.promise;
+      store.__unwatchWrite(TOKEN_KEY);
       await controller.forget();
       await pending;
       const result = await pairing;
@@ -881,6 +1006,30 @@ describe('AppController credential cleanup races (M5)', () => {
       assert.deepEqual(storedHosts(), []);
       assert.equal(controller.snapshot().activeHost, null);
       await waitFor(() => gateway.openConnectionCount === 0, { label: 'the cancelled pairing closed' });
+    } finally {
+      store.__unwatchWrite(TOKEN_KEY);
+      controller.stop();
+      await gateway.close();
+    }
+  });
+
+  it('spec 021: close 4412 (web re-lock) KEEPS the credential and is never treated as 4401', async () => {
+    const code = pairCode('L');
+    const gateway = await FakeGateway.create({ pairingCodes: [code], suppressClientHelloAck: true });
+    const controller = await unlockedController();
+    try {
+      const pairing = controller.pair(pairingPayload(gateway, code, GATEWAY_A, 'pc-a'));
+      await waitFor(() => gateway.bearerClientHellos >= 1, { label: 'bearer socket awaiting the ack' });
+      assert.equal(tokenEntries().length, 1);
+      gateway.closeAll(4412, 'web-unlock-locked');
+      const result = await pairing;
+
+      // The pairing itself still fails (the socket is gone), but NOTHING is wiped: 4412 means "the
+      // device is re-locked", which the owner fixes on the Host; a re-pair is not required and
+      // deleting the credential would force one. 4401 is the code that wipes.
+      assert.equal(result.ok, false);
+      assert.equal(tokenEntries().length, 1, 'the credential must survive a 4412');
+      await waitFor(() => gateway.openConnectionCount === 0, { label: 'locked socket closed' });
     } finally {
       controller.stop();
       await gateway.close();

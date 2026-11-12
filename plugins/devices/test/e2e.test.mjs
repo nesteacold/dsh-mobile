@@ -12,6 +12,10 @@ import { createRequire } from 'node:module'
 import { check, delay, finish, mountPlugin, tempDir } from './helpers.mjs'
 import { requestJson } from './fixture-http.mjs'
 
+// The desktop offer default is the contract's own list, never a copy of it: a
+// scope added there (e.g. spec 013 attachments:write) must not fail this test.
+const { DESKTOP_DEFAULT_SCOPES } = await import('../../../packages/mobile-protocol/src/index.mjs')
+
 const require = createRequire(import.meta.url)
 const gatewayPlugin = (await import('../../mobile-gateway/lib/index.mjs')).default
 const { createTestConnection, createTestRemoteAccess } = await import('../../mobile-gateway/test/helpers/peer.mjs')
@@ -106,7 +110,7 @@ await check('gateway issues a desktop pairing string; devices plugin pairs over 
   assert.equal(answer.status, 201, answer.text)
   remoteId = answer.json.remote.id
   assert.equal(answer.json.remote.device.kind, 'desktop')
-  assert.deepEqual(answer.json.remote.device.scopes, ['sessions:read', 'prompt:send', 'approval:respond'])
+  assert.deepEqual(answer.json.remote.device.scopes, [...DESKTOP_DEFAULT_SCOPES])
   const registered = (await gateway.get('devices')).devices
   assert.equal(registered.length, 1)
   assert.equal(registered[0].kind, 'desktop')

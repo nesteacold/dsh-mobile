@@ -1,0 +1,31 @@
+#!/bin/sh
+# Pre-push gate: no personal information, credentials or tokens leave this repo.
+#
+# Install once per clone — a fresh clone does not enable this directory:
+#   git config core.hooksPath .githooks
+#
+# Bypass for an emergency is explicit and reported: `git push --no-verify`.
+# Never bypass to "just get the push out": scrub the hit, re-run, push again.
+
+set -u
+root="$(git rev-parse --show-toplevel)" || exit 1
+cd "$root" || exit 1
+
+# The scanner reads the tracked tree. A push sends committed history, and every
+# tracked file is what the next clone gets, so scanning the tree covers the push.
+if ! node tools/scan-pii.mjs --all; then
+  echo "" >&2
+  echo "pre-push: scan-pii found personal data or secrets. Fix the hits above" >&2
+  echo "pre-push: (or record a reviewed exemption in tools/pii-allowlist.txt), then push again." >&2
+  exit 1
+fi
+
+# Second opinion when gitleaks is installed; absence is not a failure.
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks detect --no-banner --redact --source . >/dev/null 2>&1; then
+    echo "pre-push: gitleaks reported a leak; run 'gitleaks detect --source .' to see it." >&2
+    exit 1
+  fi
+fi
+
+exit 0

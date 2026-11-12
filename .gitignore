@@ -25,6 +25,9 @@ coverage/
 .nyc_output/
 *.lcov
 
+# migration scratch (local only)
+.migration-report.md
+
 # logs and scratch
 *.log
 *.log.*
@@ -66,3 +69,6 @@ Thumbs.db
 # Local list of strings that must never reach this repo (real addresses, device
 # and machine names). Read by tools/verify-publish.mjs; deliberately not committed.
 .publish-forbidden
+# Local private literals (machine, tailnet and account names) read by tools/scan-pii.mjs;
+# deliberately not committed.
+tools/pii-private.txt

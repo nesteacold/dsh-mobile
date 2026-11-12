@@ -6,10 +6,13 @@
 //   T4  a missing harness:remote is refused (the frame types are not companion-v1 ops)
 //   T5  `$events/result`: wrong / missing argsHash refused and still pending; correct accepted once
 //   T5c/T5d  `$events` needs approval:respond; the Peer declares interactions:answer only then
-//   T5e  NO device principal receives a question card on the companion channel (admin-only), audited
+//   T5e  a question card follows the approval rule (owner 2026-11-11): scope AND visible session; ids-only audit
 //   T6  streams: credit and bufferedAmount backpressure, cancel
 //   T7  revoke / socket close abort Host-side streams (4401)
 //   T8  no carrier on the Host: a clear refusal, not a crash
+//   T11a–T11f  spec 012 amendments (owner 2026-11-11): session-menu parity, the
+//          host-UI boundary, device kind not being policy, and the last hard denies
+//          (initializeDefault / claudeCodeMods / remoteAccess) turned into scopes
 //
 // A real plugin over the pinned TLS listener, as scope-kind.test.mjs does; the
 // Host is a fake typertGateway that records every `dispatchRpc` / `openWireStream`.
@@ -27,7 +30,8 @@ import WebSocket from 'ws'
 import plugin from '../lib/index.mjs'
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
 import {
-  ENDPOINT_SCOPE, DENY_PATTERNS, authorizeEndpoint, denyReason, createRemoteBridge, splitBinary, iterateBinary,
+  ENDPOINT_SCOPE, DENY_PATTERNS, HOST_UI_ONLY_PATTERNS, authorizeEndpoint, denyReason, hostUiOnlyReason,
+  createRemoteBridge, splitBinary, iterateBinary,
   scopeForEndpoint, checkArguments, checkArgumentsWithHost, isRelativeWorkspacePath, MAX_GOAL_ROUNDS,
 } from '../lib/remote-bridge.mjs'
 import { scopeDenial } from '../lib/allowlist.mjs'
@@ -290,13 +294,17 @@ async function desktop(instance, scopes = ALL_REMOTE, deviceId = DESK) {
 const NEVER = [
   'credentials/describe', 'credentials/resolve', 'credentials/get', 'credentials/read', 'credentials/list',
   'credentials/export', 'credentials/anything',
-  'pluginInventory/list',
-  'remoteAccess/follow', 'claudeCodeMods/pressBand', 'claudeCodeMods/watchBand',
-  'workspace/insertBefore', 'workspace/insertSessionBefore', 'workspace/unarchiveSession',
-  'workspace/initializeDefault', 'workspace/pinSession', 'workspace/unpinSession',
+  // Spec 012 (owner 2026-11-11): remoteAccess/follow, claudeCodeMods/* and
+  // workspace/initializeDefault are scopes now (see SCOPE_TABLE). What stays refused
+  // is the rest of remoteAccess/* (device admin / pairing, Host-only) — T11f.
+  'remoteAccess/grant', 'remoteAccess/revoke', 'remoteAccess/pair', 'remoteAccess/anything',
   'workspaceFiles/readAll', 'workspaceFiles/readRelated', 'workspaceFiles/anything',
   'session/doesNotExist', 'brandNew/method', 'workspace/archive',
 ]
+
+// Endpoints that act on the Host's own screen. Refused for every device, whatever its
+// scope list: no scope may make the remote Host pop an OS chooser or a text editor.
+const HOST_UI = ['directoryPicker/pick', 'settings/openSettingsDocument']
 
 // Every scope -> the endpoints it (alone, on top of harness:remote) unlocks. The complete table.
 const SCOPE_TABLE = {
@@ -305,37 +313,60 @@ const SCOPE_TABLE = {
     'session/canOpenWorkspacePath', 'session/control', 'workspace/follow', 'subagents/list', 'job/list',
     'job/follow', 'skills/list', 'agentPresets/list', 'agentPresets/read', 'commands/list', 'llm/listProviders',
     'llm/listConfigurableProviders', 'llm/discoverModels', 'permissionPresets/catalog', 'messageFeedback/list',
-    'schedule/list', 'schedule/catalog', 'schedule/history', 'schedule/deliveryLimits', 'toolResults/watch'],
-  'prompt:send': ['session/prompt', 'session/create', 'session/fork', 'session/cancel', 'session/rename',
+    'schedule/list', 'schedule/catalog', 'schedule/history', 'schedule/deliveryLimits', 'schedule/view',
+    'goals/get', 'toolResults/watch',
+    // The caller's own grant snapshot; the only remoteAccess endpoint (T11f).
+    'remoteAccess/follow'],
+  'prompt:send': ['session/prompt', 'session/create', 'session/cancel',
     'session/updateQueue', 'session/modelCatalog',
     'subagents/interruptByParent', 'subagents/prompt', 'messageFeedback/put', 'messageFeedback/delete', 'job/kill',
     'goals/create', 'goals/edit', 'goals/pause', 'goals/resume', 'goals/clear', 'goals/complete',
-    'workspace/rename', 'workspace/archiveSession'],
+    'workspace/rename'],
   'approval:respond': ['userQuestions/answer', 'userQuestions/attachWait', '$events', '$events/result'],
   'files:read': ['workspaceFiles/list', 'workspaceFiles/stat', 'workspaceFiles/read', 'workspaceFiles/readBytes',
     'workspaceFiles/changes', 'officeToPdf/render', 'officeToPdf/generation', 'fileReferences/list',
     'sessionReferenceResolver/candidates'],
   'commands:execute': ['commands/execute'],
-  'workspace:manage': ['workspace/create', 'workspace/delete', 'directoryPicker/list', 'directoryPicker/pick',
-    'directoryPicker/browse'],
+  'workspace:manage': ['workspace/create', 'workspace/delete', 'workspace/initializeDefault', 'directoryPicker/list',
+    'directoryPicker/createDirectory', 'directoryPicker/browse'],
   // settings/* is the whole namespace (including methods a later DSH adds).
   'settings:write': ['settings/describe', 'settings/mutate', 'settings/replace', 'settings/update',
-    'settings/someFutureMethod', 'agentPresets/select', 'session/selectModel', 'session/initializeDefaultModel'],
+    'settings/someFutureMethod', 'agentPresets/select', 'session/initializeDefaultModel'],
+  // Spec 012 FR-007: selecting a session's model is a session action, not a settings write.
+  // First amendment: forking/renaming a session and the pin/archive/reorder bookkeeping
+  // of the workspace list are session authoring too — no longer hard-blocked.
+  // Revision 11: archiving ONE session moved here from prompt:send.
+  'sessions:author': ['session/selectModel', 'session/fork', 'session/rename', 'workspace/archiveSession',
+    'workspace/pinSession', 'workspace/unpinSession', 'workspace/unarchiveSession',
+    'workspace/insertBefore', 'workspace/insertSessionBefore'],
   'credentials:write': ['credentials/set', 'credentials/unset'],
   'plugins:manage': ['pluginManager/listBundles', 'pluginManager/listPlugins', 'pluginManager/setPluginEnabled',
-    'pluginManager/updateBundle', 'pluginManager/installBundle', 'pluginManager/someFutureMethod'],
+    'pluginManager/updateBundle', 'pluginManager/installBundle', 'pluginManager/someFutureMethod',
+    // Owner ruling 2026-11-11: the plugin inventory and the registry probe are plugin
+    // management, not a hard block. Whole namespaces, like pluginManager.
+    'pluginInventory/list', 'pluginInventory/someFutureMethod',
+    'pluginRegistryProbe/fastest', 'pluginRegistryProbe/someFutureMethod',
+    // Mods are plugins; pressBand runs a mod's onPress on the Host (spec 012, 2026-11-11).
+    'claudeCodeMods/watchBand', 'claudeCodeMods/pressBand', 'claudeCodeMods/someFutureMethod'],
   'schedule:write': ['schedule/create', 'schedule/update', 'schedule/delete', 'schedule/deleteInactive',
     'schedule/run', 'schedule/edit'],
   terminal: ['terminal/attach', 'terminal/follow', 'terminal/write', 'terminal/resize', 'terminal/environment',
     'terminal/retain'],
 }
-const FULL_DESKTOP = { kind: 'desktop', scopes: [...SCOPES] }
+// "Every scope a desktop can use". Spec 020's `web:unlock` is deliberately excluded: it belongs
+// to the browser PWA's Host-attested unlock, and a device that holds it is subject to that lock by
+// design (the lock applies to ALL its frames, including bridge ones — spec 020 review M2/M3).
+const FULL_DESKTOP = { kind: 'desktop', scopes: SCOPES.filter((scope) => scope !== 'web:unlock') }
+/** The same list, for the fixtures that pair a live desktop socket. */
+const EVERY_SCOPE = SCOPES.filter((scope) => scope !== 'web:unlock')
 const holding = (...scopes) => ({ kind: 'desktop', scopes: ['harness:remote', ...scopes] })
 
 test('T1: deny by default — endpoints no scope names, and unknown ones, are refused before the Host for every device', async (t) => {
   const instance = await factory(t)
-  // A device with EVERY scope: still nothing outside the table gets through.
-  const { ws } = await desktop(instance, [...SCOPES])
+  // A device with EVERY bridge/control scope: still nothing outside the table gets through.
+  // (`web:unlock` is excluded: it is the browser PWA unlock, and a device holding it is locked
+  // while the Host account is not signed in — see spec 020 and FULL_DESKTOP above.)
+  const { ws } = await desktop(instance, SCOPES.filter((scope) => scope !== 'web:unlock'))
   const before = instance.gateway.calls.length
   for (const endpoint of NEVER) {
     const reply = await call(ws, endpoint)
@@ -388,8 +419,11 @@ test('T2: scope mapping — each scope allows exactly its endpoints and refuses 
       assert.equal(noRemote.code, 'auth/forbidden-scope', endpoint)
       assert.equal(noRemote.scope, 'harness:remote', endpoint)
       assert.deepEqual(authorizeEndpoint(holding(scope), endpoint), { ok: true, scope }, endpoint)
-      // A mobile record that lists the scopes gets nothing.
-      assert.equal(authorizeEndpoint({ kind: 'mobile', scopes: ['harness:remote', scope] }, endpoint).ok, false, endpoint)
+      // Spec 012 rule 3: device kind is not policy. A `mobile` record with the same
+      // grant gets the same endpoint; one without the scope gets nothing.
+      assert.deepEqual(authorizeEndpoint({ kind: 'mobile', scopes: ['harness:remote', scope] }, endpoint),
+        { ok: true, scope }, endpoint)
+      assert.equal(authorizeEndpoint({ kind: 'mobile', scopes: [scope] }, endpoint).ok, false, endpoint)
       // Every OTHER scope together does not unlock it.
       const others = SCOPES.filter((name) => name !== scope)
       assert.equal(authorizeEndpoint({ kind: 'desktop', scopes: others }, endpoint).ok, false,
@@ -407,17 +441,24 @@ test('T2: scope mapping — each scope allows exactly its endpoints and refuses 
   }
 })
 
-test('T2a: the model catalog is prompt:send; selectModel/initializeDefaultModel write the Host global default, so settings:write', () => {
+test('T2a: the model catalog is prompt:send; selectModel is sessions:author (spec 012); initializeDefaultModel writes the Host global default, so settings:write', () => {
   assert.deepEqual(authorizeEndpoint(holding('prompt:send'), 'session/modelCatalog'), { ok: true, scope: 'prompt:send' })
   assert.equal(authorizeEndpoint(holding('sessions:read'), 'session/modelCatalog').ok, false)
-  for (const endpoint of ['session/selectModel', 'session/initializeDefaultModel']) {
-    // prompt:send (and every scope but settings:write) is not enough.
-    const others = SCOPES.filter((name) => name !== 'settings:write')
-    const refused = authorizeEndpoint({ kind: 'desktop', scopes: others }, endpoint)
-    assert.equal(refused.code, 'auth/forbidden-scope', endpoint)
-    assert.equal(refused.scope, 'settings:write', endpoint)
-    assert.deepEqual(authorizeEndpoint(holding('settings:write'), endpoint), { ok: true, scope: 'settings:write' }, endpoint)
-  }
+  // Selecting one session's model is a session action: `sessions:author`, and
+  // settings:write does NOT reach it any more (nor does it need to).
+  const selectOthers = SCOPES.filter((name) => name !== 'sessions:author')
+  const selectRefused = authorizeEndpoint({ kind: 'desktop', scopes: selectOthers }, 'session/selectModel')
+  assert.equal(selectRefused.code, 'auth/forbidden-scope')
+  assert.equal(selectRefused.scope, 'sessions:author')
+  assert.equal(authorizeEndpoint(holding('settings:write'), 'session/selectModel').ok, false,
+    'settings:write no longer reaches selectModel')
+  assert.deepEqual(authorizeEndpoint(holding('sessions:author'), 'session/selectModel'), { ok: true, scope: 'sessions:author' })
+  // initializeDefaultModel still writes the GLOBAL default, so it keeps settings:write.
+  const defaultOthers = SCOPES.filter((name) => name !== 'settings:write')
+  const defaultRefused = authorizeEndpoint({ kind: 'desktop', scopes: defaultOthers }, 'session/initializeDefaultModel')
+  assert.equal(defaultRefused.code, 'auth/forbidden-scope')
+  assert.equal(defaultRefused.scope, 'settings:write')
+  assert.deepEqual(authorizeEndpoint(holding('settings:write'), 'session/initializeDefaultModel'), { ok: true, scope: 'settings:write' })
   for (const endpoint of ['llm/listProviders', 'llm/listConfigurableProviders', 'llm/discoverModels']) {
     assert.equal(authorizeEndpoint(holding('sessions:read'), endpoint).ok, true, endpoint)
   }
@@ -753,7 +794,7 @@ test('T5d: a device without approval:respond cannot open $events, and its bridge
   assert.equal(record.peer?.principal?.kind, 'owner')
 })
 
-test('T5e: no device principal receives a question card on the companion channel (audited)', async (t) => {
+test('T5e: a question card follows the approval rule — scope AND visible session, audited ids-only', async (t) => {
   const instance = await factory(t)
   const answerer = await desktop(instance, ALL_REMOTE, 'deskqst0-0000-4000-8000-0000000000d1')
   const other = await desktop(instance, ['sessions:read', 'prompt:send', 'harness:remote'], 'deskqst1-0000-4000-8000-0000000000d2')
@@ -763,18 +804,27 @@ test('T5e: no device principal receives a question card on the companion channel
     agent: { id: 's1' }, questions, signal: controller.signal,
   }, () => undefined)
   try {
-    // Whole-gateway review 2026-11-10: questions are ADMIN_ONLY on the companion
-    // channel, so even a device holding `approval:respond` (ALL_REMOTE) is sent no
-    // card. Spec 008 reaches the same question over the separate `$events` stream
-    // (T5c/T5d), which this assertion deliberately does not exercise.
-    await delay(150)
-    assert.equal(framesOf(answerer.ws, (f) => f.kind === 'question-requested').length, 0,
-      'a device with approval:respond is still never sent a question on this channel')
+    // Owner decision 2026-11-11 (spec 018 item 4): a question card is gated by the scope, never
+    // by the device kind — `clientMayReceive(client, sessionId, 'approval:respond')`, exactly
+    // like the approval card. A device holding `approval:respond` (ALL_REMOTE) whose visible set
+    // contains `s1` IS sent the card; a device without the scope is still sent nothing. Spec 008
+    // reaches the same question over the separate `$events` stream (T5c/T5d), which this does
+    // not exercise.
+    await waitFor(() => framesOf(answerer.ws, (f) => f.kind === 'question-requested').length === 1,
+      { label: 'the approval:respond device is sent the question card' })
+    // The card names only what the frame carries: no question text is mirrored into the log.
+    assert.equal(framesOf(answerer.ws, (f) => f.kind === 'question-requested').length, 1,
+      'exactly one card, not one per broadcast')
     assert.equal(framesOf(other.ws, (f) => f.kind === 'question-requested').length, 0,
-      'nor a device without it')
+      'a device without approval:respond is sent no question card')
+    // The refusal is still audited, by ids only, and the card is NOT withheld from the
+    // authorized device (so only the no-scope device produces the line).
     const withheld = instance.logs.filter((line) => String(line).includes('question card withheld:'))
-    assert.ok(withheld.some((line) => String(line).includes(`device=${answerer.device.id}`)), 'the refusal is audited')
     assert.ok(withheld.some((line) => String(line).includes(`device=${other.device.id}`)), 'the refusal is audited')
+    assert.equal(withheld.some((line) => String(line).includes(`device=${answerer.device.id}`)), false,
+      'an authorized device is not logged as a withheld one')
+    for (const line of withheld) assert.match(line, /reason=missing-scope$/,
+      'the audit names the scope gate: ' + line)
     assert.equal(instance.logs.some((line) => String(line).includes('which one?')), false, 'question text is never logged')
   } finally {
     controller.abort()
@@ -1644,51 +1694,56 @@ test('T10f: file endpoints over the wire — ".." and absolute refused without w
   assert.deepEqual(instance.gateway.calls.at(-1).payload.args, { sessionId: 's1', path: '/etc/hosts', options: { baseFile: '../x' } })
 })
 
-test('T10g: session/selectModel and initializeDefaultModel change the Host global default, so they need settings:write; agentPresets/select too', async (t) => {
+test('T10g: session/selectModel is sessions:author (spec 012 FR-007); initializeDefaultModel still writes the Host global default, so settings:write; agentPresets/select too', async (t) => {
   const instance = await factory(t)
-  // The fake Host models what the real session-controller does: selectModel and
-  // initializeDefaultModel both end in `agentDefaultModel.saveSelection`
-  // (session-controller lib/index.js:716 and :3945), i.e. they write the GLOBAL default.
+  // The fake Host models what the real session-controller does for
+  // initializeDefaultModel: it writes the GLOBAL default. selectModel is a
+  // session-scoped action (owner decision, spec 012 FR-007), so what is asserted
+  // about it is the scope gate, not a global side effect.
   let globalDefault = { provider: 'deepseek', model: 'deepseek-chat' }
   const dispatch = instance.gateway.dispatchRpc
   instance.gateway.dispatchRpc = async (endpoint, payload, signal, peer) => {
-    if (endpoint === 'session/selectModel') {
-      const { provider, model } = payload.args.request
-      globalDefault = { provider, model }
-    }
     if (endpoint === 'session/initializeDefaultModel') globalDefault = { provider: 'deepseek-account', model: 'first' }
     return dispatch(endpoint, payload, signal, peer)
   }
   const { ws } = await desktop(instance, wsStandard)
   const startDefault = { ...globalDefault }
   const hostCalls = () => instance.gateway.calls.filter((c) => ['session/selectModel', 'session/initializeDefaultModel'].includes(c.endpoint)).length
-  // prompt:send (the standard preset) cannot touch the global default: refused before the Host.
-  for (const [endpoint, args] of [
-    ['session/selectModel', { request: { sessionId: 's1', provider: 'deepseek', model: 'deepseek-reasoner' } }],
-    ['session/selectModel', { request: { sessionId: 's1', provider: 'anything', model: 'anything' } }],
-    ['session/initializeDefaultModel', {}],
+  // The standard preset holds neither sessions:author nor settings:write: refused before the Host.
+  for (const [endpoint, args, scope] of [
+    ['session/selectModel', { request: { sessionId: 's1', provider: 'deepseek', model: 'deepseek-reasoner' } }, 'sessions:author'],
+    ['session/selectModel', { request: { sessionId: 's1', provider: 'anything', model: 'anything' } }, 'sessions:author'],
+    ['session/initializeDefaultModel', {}, 'settings:write'],
   ]) {
     const reply = await call(ws, endpoint, args)
     assert.equal(reply.ok, false, `${endpoint} ${JSON.stringify(args)}`)
     assert.equal(reply.error.code, 'auth/forbidden-scope')
-    assert.equal(reply.error.scope, 'settings:write')
+    assert.equal(reply.error.scope, scope)
   }
   assert.equal(hostCalls(), 0, 'refused calls never reached the Host')
   assert.deepEqual(globalDefault, startDefault, 'the Host global default is unchanged after the refused calls')
   // The model list stays under prompt:send.
   assert.equal((await call(ws, 'session/modelCatalog')).ok, true)
-  // With settings:write the call goes through and the global default does change.
-  const { ws: writer } = await desktop(instance, [...wsStandard, 'settings:write'], 'deskset0-0000-4000-8000-000000000013')
-  const free = await call(writer, 'session/selectModel', { request: { sessionId: 's1', provider: 'anything', model: 'anything' } })
+  // settings:write alone no longer reaches selectModel — it is a session action.
+  const { ws: settingsOnly } = await desktop(instance, [...wsStandard, 'settings:write'], 'deskset0-0000-4000-8000-000000000014')
+  const stillRefused = await call(settingsOnly, 'session/selectModel', { request: { sessionId: 's1', provider: 'anything', model: 'anything' } })
+  assert.equal(stillRefused.ok, false)
+  assert.equal(stillRefused.error.scope, 'sessions:author')
+  assert.equal(hostCalls(), 0, 'settings:write alone never reaches selectModel')
+  // With sessions:author the call goes through, whatever provider/model it names.
+  const { ws: author } = await desktop(instance, [...wsStandard, 'sessions:author'], 'deskseta-0000-4000-8000-000000000015')
+  const free = await call(author, 'session/selectModel', { request: { sessionId: 's1', provider: 'anything', model: 'anything' } })
   assert.equal(free.ok, true, JSON.stringify(free))
-  assert.deepEqual(globalDefault, { provider: 'anything', model: 'anything' }, 'with settings:write the Host default is written')
-  assert.equal((await call(writer, 'session/initializeDefaultModel')).ok, true)
-  assert.equal(hostCalls(), 2)
+  assert.equal(hostCalls(), 1)
+  // initializeDefaultModel keeps settings:write, and only there does the default change.
+  assert.equal((await call(author, 'session/initializeDefaultModel')).error.scope, 'settings:write')
+  assert.equal((await call(settingsOnly, 'session/initializeDefaultModel')).ok, true)
+  assert.deepEqual(globalDefault, { provider: 'deepseek-account', model: 'first' }, 'with settings:write the Host default is written')
   // agentPresets/select is a settings:write endpoint whatever the preset id.
   const noSettings = await call(ws, 'agentPresets/select', { agentId: 's1', agentPreset: 'any' })
   assert.equal(noSettings.error.code, 'auth/forbidden-scope')
   assert.equal(noSettings.error.scope, 'settings:write')
-  assert.equal((await call(writer, 'agentPresets/select', { agentId: 's1', agentPreset: 'any-id' })).ok, true)
+  assert.equal((await call(settingsOnly, 'agentPresets/select', { agentId: 's1', agentPreset: 'any-id' })).ok, true)
   assert.equal(checkArguments(holding('prompt:send'), 'agentPresets/select', {})?.code, 'auth/forbidden-scope')
 })
 
@@ -1788,7 +1843,7 @@ test('T10i: credentials are write-only — a value is never returned, never logg
   assert.equal(instance.logs.some((line) => String(line).includes(SECRET)), false, 'the secret is never logged')
   assert.ok(instance.logs.some((line) => String(line).includes('remote-bridge call: endpoint=credentials/set')), 'the call itself is audited (endpoint + device)')
   // Every credentials endpoint that could return a secret is refused even with every scope.
-  const everything = await desktop(instance, [...SCOPES], 'deskcred-0000-4000-8000-000000000014')
+  const everything = await desktop(instance, EVERY_SCOPE, 'deskcred-0000-4000-8000-000000000014')
   const callsBefore = instance.gateway.calls.length
   for (const endpoint of ['credentials/describe', 'credentials/resolve', 'credentials/get', 'credentials/list', 'credentials/read']) {
     const reply = await call(everything.ws, endpoint, { ref: 'DEEPSEEK_API_KEY' })
@@ -1883,9 +1938,218 @@ test('T10l: presets and the mobile boundary — standard/full are exactly as spe
   for (const scope of DESKTOP_ONLY_SCOPES) assert.equal(plain.data.pairing.scopes.includes(scope), false)
   const full = await instance.post('pair', { kind: 'desktop', scopes: [...SCOPE_PRESETS.full], publicUrl: instance.lanUrl })
   assert.deepEqual([...full.data.pairing.scopes].sort(), [...SCOPES].sort())
-  // authorizeEndpoint: a mobile record listing every scope still gets nothing.
+  // authorizeEndpoint: a mobile record holding a scope reaches exactly what a desktop
+  // record with the same grant reaches (spec 012 rule 3 — kind is not policy).
   const mobileRecord = { kind: 'mobile', scopes: [...SCOPES] }
+  const desktopRecord = { kind: 'desktop', scopes: [...SCOPES] }
   for (const endpoint of Object.values(SCOPE_TABLE).flat()) {
-    assert.equal(authorizeEndpoint(mobileRecord, endpoint).ok, false, endpoint)
+    assert.deepEqual(authorizeEndpoint(mobileRecord, endpoint), authorizeEndpoint(desktopRecord, endpoint), endpoint)
   }
+})
+
+// -- T11: spec 012 amendments (owner 2026-11-11) -----------------------------
+
+test('T11a: pin/unpin/unarchive/reorder are sessions:author and pluginInventory is plugins:manage, not a hard block', async (t) => {
+  // Unit: the six patterns left DENY_PATTERNS; each now maps to the one scope that
+  // governs its family, and that scope (not another one) is what unlocks it.
+  for (const endpoint of ['workspace/pinSession', 'workspace/unpinSession', 'workspace/unarchiveSession',
+    'workspace/insertBefore', 'workspace/insertSessionBefore']) {
+    assert.equal(denyReason(endpoint), undefined, `${endpoint} must not be denied outright`)
+    assert.equal(scopeForEndpoint(endpoint), 'sessions:author', endpoint)
+    assert.deepEqual(authorizeEndpoint(holding('sessions:author'), endpoint), { ok: true, scope: 'sessions:author' }, endpoint)
+    for (const other of ['prompt:send', 'workspace:manage']) {
+      const refused = authorizeEndpoint(holding(other), endpoint)
+      assert.equal(refused.code, 'auth/forbidden-scope', `${endpoint} with ${other}`)
+      assert.equal(refused.scope, 'sessions:author', endpoint)
+    }
+  }
+  // The whole plugin-inventory namespace, including a method a later DSH adds.
+  for (const endpoint of ['pluginInventory/list', 'pluginInventory/someFutureMethod']) {
+    assert.equal(denyReason(endpoint), undefined, endpoint)
+    assert.equal(scopeForEndpoint(endpoint), 'plugins:manage', endpoint)
+    assert.deepEqual(authorizeEndpoint(holding('plugins:manage'), endpoint), { ok: true, scope: 'plugins:manage' }, endpoint)
+    assert.equal(authorizeEndpoint(holding('sessions:author'), endpoint).code, 'auth/forbidden-scope', endpoint)
+  }
+  // Over the wire: the call reaches the Host for the device that holds the scope and
+  // never for the device that does not.
+  const instance = await factory(t)
+  const { ws } = await desktop(instance, [...ALL_REMOTE, 'sessions:author', 'plugins:manage'],
+    'deskpin0-0000-4000-8000-0000000000a1')
+  for (const endpoint of ['workspace/pinSession', 'pluginInventory/list']) {
+    const reply = await call(ws, endpoint, { sessionId: 's1', workspaceId: 'w1' })
+    assert.equal(reply.ok, true, `${endpoint}: ${JSON.stringify(reply)}`)
+    assert.ok(instance.gateway.calls.some((entry) => entry.endpoint === endpoint), `${endpoint} reached the Host`)
+  }
+  const before = instance.gateway.calls.length
+  const { ws: without } = await desktop(instance, ALL_REMOTE, 'deskpin1-0000-4000-8000-0000000000a2')
+  for (const endpoint of ['workspace/pinSession', 'pluginInventory/list']) {
+    const refused = await call(without, endpoint, { sessionId: 's1' })
+    assert.equal(refused.ok, false, endpoint)
+    assert.equal(refused.error.code, 'auth/forbidden-scope', endpoint)
+  }
+  assert.equal(instance.gateway.calls.length, before, 'a scope refusal must not reach the Host')
+})
+
+test('T11b: session/fork, session/rename and workspace/archiveSession are sessions:author; workspace/rename keeps prompt:send', () => {
+  // First amendment: the native session menu must work remotely, so forking and
+  // renaming are session authoring instead of a hard block.
+  for (const endpoint of ['session/fork', 'session/rename']) {
+    assert.equal(scopeForEndpoint(endpoint), 'sessions:author', endpoint)
+    assert.deepEqual(authorizeEndpoint(holding('sessions:author'), endpoint), { ok: true, scope: 'sessions:author' }, endpoint)
+    assert.equal(authorizeEndpoint(holding('prompt:send'), endpoint).code, 'auth/forbidden-scope', endpoint)
+  }
+  // Revision 11 moved archiving ONE session to sessions:author, together with the
+  // companion channel's `session-archive`; prompt:send no longer buys it.
+  assert.equal(scopeForEndpoint('workspace/archiveSession'), 'sessions:author')
+  assert.deepEqual(authorizeEndpoint(holding('sessions:author'), 'workspace/archiveSession'),
+    { ok: true, scope: 'sessions:author' })
+  assert.equal(authorizeEndpoint(holding('prompt:send'), 'workspace/archiveSession').code, 'auth/forbidden-scope')
+  // Owner instruction: do not narrow an existing grant — a workspace rename stays prompt:send.
+  for (const endpoint of ['workspace/rename']) {
+    assert.equal(scopeForEndpoint(endpoint), 'prompt:send', endpoint)
+    assert.deepEqual(authorizeEndpoint(holding('prompt:send'), endpoint), { ok: true, scope: 'prompt:send' }, endpoint)
+  }
+})
+
+test('T11c: new allowlist entries — createDirectory, schedule/view, goals/get and the registry probe', () => {
+  const expected = {
+    'directoryPicker/createDirectory': 'workspace:manage',
+    'schedule/view': 'sessions:read',
+    'goals/get': 'sessions:read',
+    'pluginRegistryProbe/fastest': 'plugins:manage',
+    'pluginRegistryProbe/someFutureMethod': 'plugins:manage',
+  }
+  for (const [endpoint, scope] of Object.entries(expected)) {
+    assert.equal(denyReason(endpoint), undefined, `${endpoint} must not be deny-listed`)
+    assert.equal(hostUiOnlyReason(endpoint), undefined, `${endpoint} opens no Host window`)
+    assert.equal(scopeForEndpoint(endpoint), scope, `${endpoint} needs ${scope}`)
+    assert.deepEqual(authorizeEndpoint(holding(scope), endpoint), { ok: true, scope }, endpoint)
+    // It needs its own scope on top of harness:remote, and no other scope buys it.
+    const bare = authorizeEndpoint(holding(), endpoint)
+    assert.equal(bare.code, 'auth/forbidden-scope', endpoint)
+    assert.equal(bare.scope, scope, endpoint)
+    const others = SCOPES.filter((name) => name !== scope)
+    assert.equal(authorizeEndpoint({ kind: 'desktop', scopes: ['harness:remote', ...others] }, endpoint).ok, false, endpoint)
+  }
+})
+
+test('T11d: host-UI endpoints are refused with op/host-ui-only for every device, even holding every scope', async (t) => {
+  assert.deepEqual([...HOST_UI_ONLY_PATTERNS], ['directoryPicker/pick', 'settings/openSettingsDocument'])
+  for (const endpoint of HOST_UI) {
+    // Not a DENY pattern: the refusal must carry its own reason, and no scope buys it.
+    assert.equal(denyReason(endpoint), undefined, endpoint)
+    assert.equal(hostUiOnlyReason(endpoint), endpoint)
+    const refused = authorizeEndpoint(FULL_DESKTOP, endpoint)
+    assert.equal(refused.code, 'op/host-ui-only', endpoint)
+    assert.match(refused.message, /opens a window on the Host machine/, endpoint)
+    // A phone with every scope is refused identically: the capability is the problem.
+    assert.equal(authorizeEndpoint({ kind: 'mobile', scopes: [...SCOPES] }, endpoint).code, 'op/host-ui-only', endpoint)
+  }
+  // Over the wire: the code reaches the client and the Host is never asked.
+  const instance = await factory(t)
+  const { ws } = await desktop(instance, EVERY_SCOPE, 'deskhost0-0000-4000-8000-0000000000b1')
+  const before = instance.gateway.calls.length
+  for (const endpoint of HOST_UI) {
+    const reply = await call(ws, endpoint)
+    assert.equal(reply.kind, 'remote-result', endpoint)
+    assert.equal(reply.ok, false, endpoint)
+    assert.equal(reply.error.code, 'op/host-ui-only', endpoint)
+  }
+  assert.equal(instance.gateway.calls.length, before, 'a host-UI refusal must not reach the Host')
+})
+
+test('T11f: initializeDefault is workspace:manage, claudeCodeMods/* is plugins:manage, remoteAccess/follow is a read; the rest of remoteAccess/* and credential reads stay Host-only', async (t) => {
+  // Unit: none of the three families is deny-listed any more, each maps to ONE scope,
+  // and no other scope (all of them together) unlocks it.
+  const expected = {
+    'workspace/initializeDefault': 'workspace:manage',
+    'claudeCodeMods/watchBand': 'plugins:manage',
+    'claudeCodeMods/pressBand': 'plugins:manage',
+    'claudeCodeMods/someFutureMethod': 'plugins:manage',
+    'remoteAccess/follow': 'sessions:read',
+  }
+  for (const [endpoint, scope] of Object.entries(expected)) {
+    assert.equal(denyReason(endpoint), undefined, `${endpoint} must not be deny-listed`)
+    assert.equal(hostUiOnlyReason(endpoint), undefined, endpoint)
+    assert.equal(scopeForEndpoint(endpoint), scope, `${endpoint} needs ${scope}`)
+    assert.deepEqual(authorizeEndpoint(holding(scope), endpoint), { ok: true, scope }, endpoint)
+    const bare = authorizeEndpoint(holding(), endpoint)
+    assert.equal(bare.code, 'auth/forbidden-scope', endpoint)
+    assert.equal(bare.scope, scope, endpoint)
+    const others = SCOPES.filter((name) => name !== scope)
+    assert.equal(authorizeEndpoint({ kind: 'desktop', scopes: ['harness:remote', ...others] }, endpoint).ok, false, endpoint)
+    // Kind is not policy: a phone holding the same grant gets the same verdict.
+    assert.deepEqual(authorizeEndpoint({ kind: 'mobile', scopes: ['harness:remote', scope] }, endpoint), { ok: true, scope }, endpoint)
+  }
+  // The justified exceptions: refused for every device, holding EVERY scope. Device
+  // admin / pairing is the rest of remoteAccess/*; credential reads never leave the Host.
+  const hostOnly = ['remoteAccess/grant', 'remoteAccess/revoke', 'remoteAccess/pair', 'remoteAccess/anything',
+    'credentials/describe', 'credentials/resolve', 'credentials/get', 'credentials/read', 'credentials/list', 'credentials/export']
+  for (const endpoint of hostOnly) {
+    assert.ok(denyReason(endpoint), `${endpoint} stays deny-listed`)
+    assert.equal(authorizeEndpoint(FULL_DESKTOP, endpoint).code, 'op/forbidden', endpoint)
+    assert.equal(authorizeEndpoint({ kind: 'mobile', scopes: [...SCOPES] }, endpoint).code, 'op/forbidden', endpoint)
+  }
+  // The deny list is now exactly those two exceptions, nothing else.
+  assert.deepEqual([...DENY_PATTERNS].sort(), ['credentials/describe', 'credentials/export', 'credentials/get',
+    'credentials/list', 'credentials/read', 'credentials/resolve', 'remoteAccess/*'].sort())
+  // Over the wire: the three families reach the Host for the device holding the scope,
+  // never for one that lacks it; the Host-only ones never reach it for any device.
+  const instance = await factory(t)
+  const { ws } = await desktop(instance, [...ALL_REMOTE, 'workspace:manage', 'plugins:manage'],
+    'deskf0000-0000-4000-8000-0000000000f1')
+  for (const endpoint of ['workspace/initializeDefault', 'claudeCodeMods/pressBand']) {
+    const reply = await call(ws, endpoint, { sessionId: 's1' })
+    assert.equal(reply.ok, true, `${endpoint}: ${JSON.stringify(reply)}`)
+    assert.ok(instance.gateway.calls.some((entry) => entry.endpoint === endpoint), `${endpoint} reached the Host`)
+  }
+  const before = instance.gateway.calls.length
+  const { ws: without } = await desktop(instance, ALL_REMOTE, 'deskf0001-0000-4000-8000-0000000000f2')
+  for (const endpoint of ['workspace/initializeDefault', 'claudeCodeMods/pressBand', 'claudeCodeMods/watchBand']) {
+    const refused = await call(without, endpoint, { sessionId: 's1' })
+    assert.equal(refused.ok, false, endpoint)
+    assert.equal(refused.error.code, 'auth/forbidden-scope', endpoint)
+  }
+  const { ws: everything } = await desktop(instance, EVERY_SCOPE, 'deskf0002-0000-4000-8000-0000000000f3')
+  for (const endpoint of hostOnly) {
+    const refused = await call(everything, endpoint)
+    assert.equal(refused.ok, false, endpoint)
+    assert.equal(refused.error.code, 'op/forbidden', endpoint)
+  }
+  assert.equal(instance.gateway.calls.length, before, 'a refused endpoint must never reach the Host')
+})
+
+test('T11e: device kind is not policy — the grant decides, and a phone without the scope still gets nothing', async (t) => {
+  // Unit: for every allow-listed endpoint, the same grant produces the same verdict
+  // on a phone as on a desktop.
+  for (const [scope, endpoints] of Object.entries(SCOPE_TABLE)) {
+    for (const endpoint of endpoints) {
+      assert.deepEqual(
+        authorizeEndpoint({ kind: 'mobile', scopes: ['harness:remote', scope] }, endpoint),
+        authorizeEndpoint({ kind: 'desktop', scopes: ['harness:remote', scope] }, endpoint),
+        endpoint,
+      )
+    }
+  }
+  // A phone that was not granted a scope gets nothing, whatever it calls itself.
+  for (const device of [{ kind: 'mobile', scopes: [] }, { kind: 'mobile', scopes: ['sessions:read'] }, { kind: 'mobile' }]) {
+    const refused = authorizeEndpoint(device, 'session/prompt')
+    assert.equal(refused.code, 'auth/forbidden-scope', JSON.stringify(device))
+    assert.equal(refused.scope, 'harness:remote', JSON.stringify(device))
+  }
+  // Over the wire: the narrower default a phone gets at pair time is what keeps it
+  // out — the bridge no longer refuses it a second time for being a phone. (The
+  // pairing layer still strips the desktop-only scopes from a mobile offer, spec 008;
+  // when that list is emptied, this very grant is what will decide.)
+  const instance = await factory(t)
+  const phoneId = 'mobibrg0-0000-4000-8000-0000000000c1'
+  const layout = await pairDevice(instance, phoneId, { kind: 'mobile', scopes: ['sessions:read', 'harness:remote'] })
+  assert.deepEqual(layout.device.scopes, ['sessions:read'], 'a mobile offer still loses harness:remote')
+  const ws = await connectToken(instance, layout.token, phoneId)
+  const before = instance.gateway.calls.length
+  const refused = await call(ws, 'session/list')
+  assert.equal(refused.kind, 'error')
+  assert.equal(refused.code, 'auth/forbidden-scope')
+  assert.equal(refused.scope, 'harness:remote')
+  assert.equal(instance.gateway.calls.length, before, 'the refused call must not reach the Host')
 })

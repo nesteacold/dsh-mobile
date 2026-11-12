@@ -21,7 +21,7 @@ const source = fs.readFileSync(path.join(here, '../lib/client.js'), 'utf8')
 
 console.log('client')
 
-function load({ locale = 'en-US', status, devices = [], remotes = [], pending, fail = {}, sessions, listenFailure, controlPersists } = {}) {
+function load({ locale = 'en-US', status, devices = [], remotes = [], pending, fail = {}, sessions, listenFailure, controlPersists, uploads, menu = false } = {}) {
   let api
   const calls = []
   const state = {
@@ -36,6 +36,11 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     // POST /devices/remotes/:id/connect: same two levers, so a test can see the row
     // while the dial is in flight and the reason the route answers with.
     connectGate: null, connectFailure: null,
+    // PATCH /devices/remotes/:id (address edit): the same two levers.
+    patchGate: null, patchFailure: null,
+    // Left undefined unless a test names it: the older-Host read, with no
+    // `uploads` key at all (see the /devices/remotes route below).
+    uploads,
   }
   const fetch = async (url, options = {}) => {
     const target = new URL(url)
@@ -80,7 +85,12 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     if (/^\/devices\/pairings\/p-1$/.test(route) && options.method === 'DELETE') { state.pairing = { ...state.pairing, state: 'cancelled' }; return reply({ pairing: state.pairing }) }
     if (route === '/mgw/pair') return reply({ pairing: { expiresAt: Date.now() + 90_000, kind: body.kind, scopes: body.scopes }, pairingString: 'PAIRSTRING' + (body.scopes ? '-' + body.scopes.join('+') : ''), payload: {} })
     if (/^\/mgw\/devices\/.+\/revoke$/.test(route)) return reply({ revoked: true })
-    if (route === '/devices/remotes' && (options.method ?? 'GET') === 'GET') return reply({ remotes: state.remotes })
+    if (route === '/devices/remotes' && (options.method ?? 'GET') === 'GET') {
+      // `uploads` is only present when a test sets it: omitting the key is the
+      // older-Host case, and the page must then claim nothing about attachments.
+      if (state.uploads === undefined) return reply({ remotes: state.remotes })
+      return reply({ remotes: state.remotes, uploads: state.uploads })
+    }
     if (route === '/devices/remotes' && options.method === 'POST') return reply({ remote: { id: 'r-new' } })
     if (/^\/devices\/remotes\/[^/]+\/connect$/.test(route) && options.method === 'POST') {
       if (state.connectGate) await state.connectGate
@@ -91,6 +101,17 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
       }
       const id = route.split('/')[3]
       return reply({ remote: state.remotes.find((entry) => entry.id === id) ?? null, state: 'online' })
+    }
+    // PATCH /devices/remotes/:id: the address edit. Same two levers as connect.
+    if (/^\/devices\/remotes\/[^/]+$/.test(route) && options.method === 'PATCH') {
+      if (state.patchGate) await state.patchGate
+      if (state.patchFailure) {
+        const failure = state.patchFailure
+        state.patchFailure = null
+        return reply(failure.body, false, failure.status)
+      }
+      const id = route.split('/')[3]
+      return reply({ remote: { ...(state.remotes.find((entry) => entry.id === id) ?? { id }), address: body.url }, state: 'online' })
     }
     if (/\/sessions$/.test(route)) return reply({ sessions: sessions ?? [{ sessionId: 's1', projections: { values: { title: 'Fix the build' } } }], approvals: state.remotes[0]?.approvals ?? [] })
     if (/\/history\?/.test(route)) return reply({ history: { kind: 'history', items: [{ seq: 1, role: 'user', text: 'hello remote' }] } })
@@ -115,6 +136,10 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     'conversation.input.left': 'list',
     'conversation.input.dock': 'list',
     'conversation.input.right': 'list',
+    // The sidebar's own row list and the layout's keyed main slot, as rc.1 declares
+    // them (client-ui-sidebar children table, client-ui-layout root children table).
+    'sidebar.panellist': 'list',
+    'main': 'keyed',
   }
   const occupants = new Map(Object.keys(SLOT_KINDS).map((slot) => [slot, []]))
   occupants.get('sidebar.workspaces').push({ meta: { name: 'sidebar.workspaces', priority: 0, registrant: 'tk' } })
@@ -136,9 +161,37 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
   vm.runInNewContext(source, { window, document, fetch, URL, console, setTimeout, clearTimeout,
     navigator: { language: locale, clipboard: { writeText: async (text) => { clipboard.push(text) } } } })
   const disposers = []
-  api.apply({
+  // The shell's context-menu registry (client-ui-context-menu), with the one rule that
+  // matters here: `${target}/${id}` is unique, so a second contribution must mint a
+  // fresh id instead of re-registering the shipped row.
+  const menuProviders = []
+  const contextMenus = {
+    register(input) {
+      if (menuProviders.some((entry) => entry.target === input.target && entry.id === input.id)) {
+        throw new Error(`Duplicate menu contribution: ${input.target}/${input.id}`)
+      }
+      menuProviders.push(input)
+      return () => { const at = menuProviders.indexOf(input); if (at >= 0) menuProviders.splice(at, 1) }
+    },
+  }
+  // The client services the shell would hand over. Only the menu is modelled here; the
+  // rest stay absent, which installRemoteSurfaces already copes with.
+  const services = { contextMenus }
+  const ctx = {
     locale: { getSnapshot: () => snapshot, subscribe: (listener) => { localeListeners.add(listener); return () => localeListeners.delete(listener) } },
     effect(fn) { disposers.push(fn()) },
+    // Only a `menu` shell hands out client services, the way rc.1's ctx.inject does
+    // (an optional service arrives as the scope's property, and the callback's return
+    // value is the disposer). Without it the fake is a shell that provides none, which
+    // is what the other tests assert.
+    ...(menu ? {
+      inject(deps, callback) {
+        const scope = {}
+        for (const dep of deps) scope[dep] = services[dep]
+        const out = callback(scope)
+        return typeof out === 'function' ? out : () => {}
+      },
+    } : {}),
     slots: {
       inject(slot, fn) { injects.push(slot); registered.push(fn()) },
       register(meta, component) {
@@ -172,8 +225,9 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
         return { meta, component }
       },
     },
-  })
-  return { api, calls, registered, injects, clipboard, state, intervals,
+  }
+  api.apply(ctx)
+  return { api, calls, registered, injects, clipboard, state, intervals, menuProviders,
     setLocale(active) { snapshot = { active }; for (const listener of localeListeners) listener() } }
 }
 
@@ -184,7 +238,8 @@ const { SCOPES: CONTRACT_SCOPES, SCOPE_PRESETS: CONTRACT_PRESETS, DESKTOP_ONLY_S
 // Order of the checkboxes in the UI (safe scopes first), as the contract lists the full desktop set.
 const ALL = ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote',
   'files:write', 'settings:write', 'commands:execute', 'workspace:manage',
-  'credentials:write', 'plugins:manage', 'schedule:write', 'terminal', 'sessions:author']
+  'credentials:write', 'plugins:manage', 'schedule:write', 'schedule:read', 'terminal', 'sessions:author',
+  'attachments:write', 'browser:control', 'stats:read', 'web:unlock', 'permission:lower']
 
 const text = (renderer) => JSON.stringify(renderer.toJSON())
 async function mount(element) {
@@ -201,12 +256,60 @@ await check('registers settings.section and settings.section.icon for the same i
   const ui = load()
   assert.equal(ui.api.id, '@dsh-ext/devices')
   assert.deepEqual([...ui.api.inject], ['slots', 'locale'])
-  assert.deepEqual(ui.injects, ['settings.section', 'settings.section.icon'])
+  assert.deepEqual(ui.injects, ['settings.section', 'settings.section.icon', 'sidebar.panellist', 'main'])
   const [section, icon] = ui.registered
   // JSON round trip: the objects were created inside the vm realm.
   assert.deepEqual(JSON.parse(JSON.stringify(section.meta)), { name: 'settings.section', id: 'dsh-ext.devices', order: 80, label: 'Devices' })
   assert.deepEqual(JSON.parse(JSON.stringify(icon.meta)), { name: 'settings.section.icon', id: 'dsh-ext.devices', order: 80, label: 'Devices' })
   assert.equal(typeof section.component, 'function')
+})
+
+await check('sidebar row: a `sidebar.panellist` entry directly below Repo Wiki, labelled in both languages', async () => {
+  const ui = load({ locale: 'vi' })
+  const row = ui.registered.find((entry) => entry.meta.name === 'sidebar.panellist')
+  assert.ok(row, 'the row is registered')
+  assert.equal(row.meta.id, 'dsh-ext.devices')
+  // The shipped rows sort ascending by `order`: Plugins 0
+  // (client-ui-plugin-manager), Automation tasks 10 (client-ui-schedule), Repo Wiki
+  // 20 (plugins/dsh-wiki). 21 is the next seat after Repo Wiki, so the list renders
+  // Plugins, Automation tasks, Repo Wiki, Devices — and the "More" launcher is not a
+  // row, so it still comes last.
+  assert.equal(ui.api.testing.PANEL_ORDER, 21)
+  assert.equal(row.meta.order, 21, 'one past Repo Wiki’s 20')
+  // A function label, because the shell re-resolves it on every locale change: the
+  // row must say "Thiết bị" on a Vietnamese Host and "Devices" on any other.
+  assert.equal(typeof row.meta.label, 'function')
+  assert.equal(row.meta.label(), 'Thiết bị')
+  ui.setLocale('en')
+  assert.equal(row.meta.label(), 'Devices')
+  const { DICT } = ui.api.testing
+  assert.equal(DICT.en.title, 'Devices', 'the row reuses the page title, not a second string')
+  assert.notEqual(DICT.vi.title, DICT.en.title)
+  // The glyph honours the size the shell asks for (16 wide, 18 on the rail).
+  const icon = await mount(React.createElement(row.component, { size: 18, active: false }))
+  const svg = icon.root.findAll((node) => node.type === 'svg')[0]
+  assert.equal(svg.props.width, 18)
+  assert.equal(svg.props.height, 18)
+  assert.equal(svg.props['aria-hidden'], true)
+})
+
+await check('sidebar panel: a `main` entry keyed by the same id renders the one DevicesPage', async () => {
+  const ui = load()
+  const { DevicesPage, PANEL_ID, DICT } = ui.api.testing
+  const panel = ui.registered.find((entry) => entry.meta.name === 'main')
+  assert.ok(panel, 'the main panel body is registered')
+  // The row's `layout.selectPanel(id)` only resolves an id that a `main` entry
+  // carries as its key, so the two halves must name the same value.
+  assert.deepEqual(JSON.parse(JSON.stringify(panel.meta)), { name: 'main', key: PANEL_ID })
+  assert.equal(PANEL_ID, 'dsh-ext.devices')
+  const page = await mount(React.createElement(panel.component))
+  // A seat, not a second page: the real DevicesPage is inside it exactly once, and
+  // its own header and tabs prove the page itself — not a copy — rendered.
+  assert.equal(page.root.findAllByType(DevicesPage).length, 1)
+  assert.equal(find(page, (node) => node.props['data-testid'] === 'devices-panel').length, 1)
+  assert.equal(find(page, (node) => node.props['data-testid'] === 'page-subtitle')[0].children.join(''), DICT.en.subtitle)
+  const tabs = page.root.findAll((node) => node.props.role === 'tab')
+  assert.deepEqual(tabs.map((tab) => tab.children.join('')), [DICT.en.tabAllow, DICT.en.tabConnect])
 })
 
 await check('static: the only fetch is the same-origin request() helper; no external URLs, sockets or beacons', () => {
@@ -233,6 +336,55 @@ await check('labels follow the host locale: vi for vi*, en otherwise, and switch
   // Every English key has a Vietnamese twin (and vice versa), so no label is silently English.
   const { DICT } = ui.api.testing
   assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort())
+})
+
+await check('session menu: a second "Copy original ID" row only for a remote session, and it copies the untagged id', async () => {
+  const ui = load({ menu: true })
+  const { DICT } = ui.api.testing
+  // One contribution, its own `${target}/${id}`: the shipped copy row is `session.id`
+  // at order 450 (dsh-client-ui-workspace lib/client.js:4375-4381) and the registry
+  // throws on a repeated pair, so this row is an addition, never a replacement.
+  assert.equal(ui.menuProviders.length, 1)
+  const provider = ui.menuProviders[0]
+  assert.equal(provider.target, 'session')
+  assert.equal(provider.id, 'session.devices-copy-raw')
+  assert.notEqual(provider.id, 'session.id')
+  // 451 renders directly BELOW the shipped 450 row (a smaller order would put it above).
+  assert.equal(provider.order, 451)
+  assert.equal(typeof provider.resolve, 'function')
+
+  // A remote session's id is tagged (`h:<hostId>:<rawId>`), so exactly one row appears
+  // and its label is the row's own string in the page language.
+  const remote = provider.resolve({ sessionId: 'h:r1:sess-42', displayTitle: 'Fix the build' })
+  assert.equal(remote.length, 1, 'exactly one row, not one per host')
+  assert.equal(remote[0].label, DICT.en.copyOriginalId)
+  assert.equal(DICT.en.copyOriginalId, 'Copy original ID')
+  assert.equal(remote[0].separatorBefore, undefined, 'it shares the shipped row\'s group instead of splitting it')
+
+  // Pressing it writes the Host's own id — the tag comes off, nothing else changes.
+  await remote[0].run()
+  assert.deepEqual(ui.clipboard, ['sess-42'], 'the clipboard holds only the untagged id')
+  // The tag is `<hostId>:` up to the FIRST colon (lib/host-router.mjs hostIdOfId), so a
+  // raw id that contains one keeps all of it.
+  const colon = provider.resolve({ sessionId: 'h:r9:a:b' })
+  assert.equal(colon.length, 1)
+  await colon[0].run()
+  assert.deepEqual(ui.clipboard, ['sess-42', 'a:b'])
+
+  // The same row in Vietnamese, resolved live because the label is read per opening.
+  ui.setLocale('vi')
+  const vi = provider.resolve({ sessionId: 'h:r1:sess-42', displayTitle: 'Fix the build' })
+  assert.equal(vi.length, 1)
+  assert.equal(vi[0].label, DICT.vi.copyOriginalId)
+  assert.equal(DICT.vi.copyOriginalId, 'Sao chép ID gốc')
+  assert.notEqual(DICT.vi.copyOriginalId, DICT.en.copyOriginalId, 'a real translation, not a copy')
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
+
+  // A Local session carries no tag: no row at all, so the shipped copy row is the only one.
+  assert.equal(provider.resolve({ sessionId: 'local-1', displayTitle: 'Local' }).length, 0)
+  assert.equal(provider.resolve({}).length, 0)
+  assert.equal(provider.resolve(undefined).length, 0)
+  assert.equal(ui.clipboard.length, 2, 'resolving never copies anything by itself')
 })
 
 await check('toggle on: remote-control, gateway (persistent), connection (lan); off: remote-control only', async () => {
@@ -327,7 +479,7 @@ await check('pending requests (Window 2): polled every 2 s; name, IP, editable s
   ui.calls.length = 0
   for (const tick of [...ui.intervals.values()]) await act(async () => { await tick() })
   assert.ok(ui.calls.some((call) => call.route === '/mgw/pending'), 'the poll hits /mgw/pending')
-  // ALL desktop scopes are listed (13); only those the device requested can be ticked.
+  // Every desktop scope is listed; only those the device requested can be ticked.
   const boxes = () => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
   assert.equal(boxes().length, ALL.length)
   // Approve defaults to Standard narrowed to the offer: the three requested standard scopes.
@@ -665,6 +817,89 @@ await check('connect tab: a remote whose certificate changed says so in danger (
   page.unmount()
 })
 
+await check('connect tab: the Host\'s attachment bridge is on the remote row — off is muted, a broken route is an alert with its reason, healthy and unreported stay silent', async () => {
+  // Spec 013: GET /devices/remotes carries `uploads` = { route, wrapped, reason,
+  // dshVersion, pinned }. A route that is not wrapped makes every tagged upload
+  // answer the native 404, so the row has to say so before the owner sends one.
+  const remotes = [{ id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'online', approvals: [], retry: null }]
+  const noteIn = (ui, page) => find(page, (node) => node.props['data-testid'] === 'remote-uploads')
+
+  // Broken (wrapped measured false after a file-upload reload): danger + reason.
+  const broken = load({ remotes, uploads: { route: '/api/session/uploadFileBinary', wrapped: false, reason: 'route-replaced', dshVersion: '0.2.2-rc.1', pinned: '0.2.2-rc.1' } })
+  const brokenPage = await mount(React.createElement(broken.api.testing.ConnectTab))
+  await flush()
+  const { DICT } = broken.api.testing
+  const alerts = noteIn(broken, brokenPage)
+  assert.equal(alerts.length, 1, 'one note per remote row')
+  assert.equal(alerts[0].props.role, 'alert', 'a broken bridge is a danger note')
+  assert.equal(alerts[0].props['data-reason'], 'route-replaced', 'the Host\'s own reason is kept')
+  assert.ok(alerts[0].children.join('').includes(DICT.en.uploadsBroken), 'the English sentence names the failure')
+  assert.ok(alerts[0].children.join('').includes('route-replaced'), 'and carries the reason verbatim')
+  assert.match(DICT.en.uploadsBroken, /will fail/)
+  assert.match(DICT.en.uploadsBroken, /not in place/)
+  assert.notEqual(DICT.vi.uploadsBroken, DICT.en.uploadsBroken, 'a real translation, not a copy')
+  await act(async () => { broken.setLocale('vi') })
+  assert.ok(noteIn(broken, brokenPage)[0].children.join('').includes(DICT.vi.uploadsBroken), 'the Vietnamese sentence renders too')
+  brokenPage.unmount()
+
+  // Off by configuration: muted, not an alarm — nothing is broken.
+  const off = load({ remotes, uploads: { route: null, wrapped: false, reason: 'disabled' } })
+  const offPage = await mount(React.createElement(off.api.testing.ConnectTab))
+  await flush()
+  const muted = noteIn(off, offPage)
+  assert.equal(muted.length, 1)
+  assert.equal(muted[0].props.role, 'status', 'off is news, not a failure')
+  assert.equal(muted[0].children.join(''), off.api.testing.DICT.en.uploadsOff, 'the off sentence is the whole line')
+  assert.notEqual(off.api.testing.DICT.vi.uploadsOff, off.api.testing.DICT.en.uploadsOff, 'a real translation, not a copy')
+  assert.deepEqual(Object.keys(off.api.testing.DICT.vi).sort(), Object.keys(off.api.testing.DICT.en).sort(), 'vi and en stay twins')
+  await act(async () => { off.setLocale('vi') })
+  assert.equal(noteIn(off, offPage)[0].children.join(''), off.api.testing.DICT.vi.uploadsOff)
+  offPage.unmount()
+
+  // Healthy: `wrapped` measured true — no noise at all.
+  const healthy = load({ remotes, uploads: { route: '/api/session/uploadFileBinary', wrapped: true, reason: null, dshVersion: '0.2.2-rc.1', pinned: '0.2.2-rc.1' } })
+  const healthyPage = await mount(React.createElement(healthy.api.testing.ConnectTab))
+  await flush()
+  assert.equal(noteIn(healthy, healthyPage).length, 0, 'a working bridge says nothing')
+  assert.ok(!text(healthyPage).includes(healthy.api.testing.DICT.en.uploadsOff))
+  healthyPage.unmount()
+
+  // An older Host sends no `uploads` key: claim nothing rather than guess.
+  const legacy = load({ remotes })
+  const legacyPage = await mount(React.createElement(legacy.api.testing.ConnectTab))
+  await flush()
+  assert.equal(noteIn(legacy, legacyPage).length, 0, 'no field, no claim')
+  legacyPage.unmount()
+})
+
+await check('connect tab: the remote row\'s notes (incl. the attachment-bridge note) are keyed — no React "unique key" warning', async () => {
+  // React reports a missing key once per owner per process, so a console spy here can
+  // be pre-empted by an earlier test. Assert the cause instead: every note rendered in
+  // the row's list carries a key, and none were logged by this test's own renders.
+  const remotes = [{ id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'online', approvals: [], retry: { attempt: 1 } }]
+  const warnings = []
+  const original = console.error
+  console.error = (...args) => { warnings.push(args.map(String).join(' ')) }
+  try {
+    for (const uploads of [
+      { route: '/api/session/uploadFileBinary', wrapped: false, reason: 'route-replaced' },
+      { route: null, wrapped: false, reason: 'disabled' },
+    ]) {
+      const ui = load({ remotes, uploads })
+      const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+      await flush()
+      const notes = find(page, (node) => ['remote-uploads', 'remote-retry'].includes(node.props['data-testid']))
+      assert.equal(notes.length, 2, 'the retry and the uploads notes rendered')
+      // test-renderer nodes hide `key`; read it off the live element tree instead.
+      const keyed = page.root.findAll((node) => ['remote-uploads', 'remote-retry'].includes(node.props?.['data-testid']) && node.type === 'div')
+      assert.ok(keyed.length >= 2)
+      for (const node of keyed) assert.ok(node._fiber.key !== null && node._fiber.key !== undefined, `${node.props['data-testid']} has a key`)
+      page.unmount()
+    }
+  } finally { console.error = original }
+  assert.deepEqual(warnings.filter((line) => /unique "key"|Each child in a list/.test(line)), [], 'no key warning')
+})
+
 const ONLINE = { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } }
 const checkboxes = (page) => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
 const ticked = (page) => checkboxes(page).map((node, index) => (node.props.checked ? ALL[index] : null)).filter(Boolean)
@@ -685,9 +920,11 @@ await check('the UI scope list mirrors the contract: every desktop scope, preset
 
 await check('every scope has vi + en labels, every dangerous one a risk hint; vi and en stay twins', () => {
   const ui = load()
-  const { DICT, ALL_SCOPES } = ui.api.testing
-  const dangerous = ['files:write', 'settings:write', 'commands:execute', 'workspace:manage', 'credentials:write',
-    'plugins:manage', 'schedule:write', 'terminal']
+  const { DICT, ALL_SCOPES, RISKY_SCOPES } = ui.api.testing
+  // Not a second list to curate: the very set the picker prints a risk line for. A
+  // scope it flags but has no sentence for renders an empty hint under its checkbox.
+  const dangerous = [...RISKY_SCOPES]
+  for (const scope of dangerous) assert.ok(ALL_SCOPES.includes(scope), `${scope} (risky) is a listed scope`)
   for (const lang of ['en', 'vi']) {
     for (const scope of ALL_SCOPES) assert.ok(DICT[lang][`scope.${scope}`], `${lang} label for ${scope}`)
     for (const scope of dangerous) assert.ok(DICT[lang][`risk.${scope}`], `${lang} risk hint for ${scope}`)
@@ -807,7 +1044,7 @@ const byTestId = (page, id) => find(page, (node) => node.props['data-testid'] ==
 const flatText = (node) => (typeof node === 'string' ? node : (node.children || []).map(flatText).join(' '))
 
 await check('listening on: a loopback bind shows the real bind + pin and warns that no other machine can connect, naming where to change it', async () => {
-  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['203.0.113.10'], urls: [] } } })
+  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.10'], urls: [] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
   const rendered = text(page)
@@ -851,14 +1088,14 @@ await check('listening on: a loopback bind shows the real bind + pin and warns t
 })
 
 await check('listening on: a non-loopback bind shows the address and, when it is a Tailscale address, the route chip says so', async () => {
-  const lan = { ...LAN_UP, host: '203.0.113.10', urls: ['wss://203.0.113.10:3081/ws/mobile'] }
-  const ui = load({ status: { ...ONLINE, lan, tailscale: { addresses: ['203.0.113.10'], urls: lan.urls } } })
+  const lan = { ...LAN_UP, host: '100.64.0.10', urls: ['wss://100.64.0.10:3081/ws/mobile'] }
+  const ui = load({ status: { ...ONLINE, lan, tailscale: { addresses: ['100.64.0.10'], urls: lan.urls } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
   const rendered = text(page)
   const { DICT } = ui.api.testing
   assert.equal(byTestId(page, 'listener-loopback').length, 0, 'no loopback warning off loopback')
-  assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://203.0.113.10:3081/ws/mobile')
+  assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://100.64.0.10:3081/ws/mobile')
   // The invariant the removed paragraph carried: the page still tells the owner this
   // bind is a Tailscale address. The route chip is now the one place that says it.
   assert.equal(byTestId(page, 'listener-route')[0].children.join(''), DICT.en.routeTailscale,
@@ -870,7 +1107,7 @@ await check('listening on: a non-loopback bind shows the address and, when it is
   assert.equal(byTestId(page, 'listener-reachable').length, 0, 'no "reachable" block')
   assert.equal(byTestId(page, 'listener-tailscale').length, 0, 'no tailnet line')
   // One statement per fact: the address row states the URL, and no note repeats it.
-  assert.equal(flatText(byTestId(page, 'listening-on')[0]).split('wss://203.0.113.10:3081/ws/mobile').length - 1, 1,
+  assert.equal(flatText(byTestId(page, 'listening-on')[0]).split('wss://100.64.0.10:3081/ws/mobile').length - 1, 1,
     'the URL is printed once')
   // The card is the chips plus two lines; the only note left is the port warning
   // (3081 sits in a dynamic range), not a re-statement of who can connect.
@@ -1023,11 +1260,11 @@ await check('listening on: every new string exists in vi and en; vi/en key sets 
     'routeLoopback', 'routeLan', 'routeTailscale', 'loopbackWarning', 'reachableNote']
   const states = [
     // loopback bind: the loopback route and its one long warning.
-    { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['203.0.113.10'], urls: [] } },
+    { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.10'], urls: [] } },
     // a plain LAN bind: the LAN route, the count-free "who can connect" line.
-    { ...ONLINE, lan: riskLan(30081), tailscale: { addresses: ['203.0.113.10'], urls: [] } },
+    { ...ONLINE, lan: riskLan(30081), tailscale: { addresses: ['100.64.0.10'], urls: [] } },
     // a tailnet bind: the Tailscale route, said once in the chip.
-    { ...ONLINE, lan: { ...LAN_UP, host: '203.0.113.10', urls: ['wss://203.0.113.10:3081/ws/mobile'] }, tailscale: { addresses: ['203.0.113.10'], urls: [] } },
+    { ...ONLINE, lan: { ...LAN_UP, host: '100.64.0.10', urls: ['wss://100.64.0.10:3081/ws/mobile'] }, tailscale: { addresses: ['100.64.0.10'], urls: [] } },
     { remoteControl: { enabled: false, accepting: false } },
   ]
   for (const locale of ['en-US', 'vi']) {
@@ -1052,7 +1289,7 @@ await check('listening on: every new string exists in vi and en; vi/en key sets 
 })
 
 await check('listening on: read-only — no write request and no input for this block, only the two copy buttons', async () => {
-  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['203.0.113.10'], urls: [] } } })
+  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.10'], urls: [] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
   assert.deepEqual([...new Set(ui.calls.map((call) => call.route))].sort(),
@@ -1492,7 +1729,9 @@ await check('authorized devices: one chip per scope with a count, the ScopePicke
   // prints a risk line for, so the chip tooltip and the checkbox hint cannot drift.
   const { DICT } = load().api.testing
   const risky = ALL.filter((scope) => typeof DICT.en[`risk.${scope}`] === 'string')
-  assert.equal(risky.length, 9, 'the nine dangerous scopes, as the picker classifies them')
+  // 13 = the twelve pre-019 scopes plus `permission:lower` (spec 019: lower-only, so it
+  // still gets its own amber hint next to the write scopes it sits beside).
+  assert.equal(risky.length, 13, 'the thirteen dangerous scopes, as the picker classifies them')
   const devices = [
     { id: 'd1', name: 'DNLP25-IT09', displayName: 'DNLP25-IT09', kind: 'desktop', scopes: ALL, createdAt: TS, lastSeenAt: TS, online: true },
     { id: 'd2', name: 'Pixel 8', displayName: 'Pixel 8', kind: 'mobile', scopes: ['sessions:read', 'prompt:send'], createdAt: TS, lastSeenAt: null, online: false },
@@ -1513,9 +1752,9 @@ await check('authorized devices: one chip per scope with a count, the ScopePicke
     const toggleOf = (item) => item.findAll((node) => node.type === 'button' && node.props.className === 'dshdev-scopes-toggle')[0]
     const whenOf = (item) => item.findAll((node) => node.props['data-testid'] === 'last-used')[0].children.join('')
 
-    // The owner's real case: 14 granted scopes, 14 chips, in the granted order.
+    // The owner's real case: every scope granted, one chip each, in the granted order.
     assert.deepEqual(chipsOf(items[0]).map((node) => node.props['data-scope']), ALL, `${lang}: every scope is its own chip`)
-    assert.equal(byTestId(page, 'scope-count')[0].children.join(''), DICT[lang].scopeCount.replace('{{n}}', '14'),
+    assert.equal(byTestId(page, 'scope-count')[0].children.join(''), DICT[lang].scopeCount.replace('{{n}}', String(ALL.length)),
       `${lang}: the count labels the list`)
     for (const chip of chipsOf(items[0])) {
       const scope = chip.props['data-scope']
@@ -1526,10 +1765,10 @@ await check('authorized devices: one chip per scope with a count, the ScopePicke
     }
 
     // Clamped to about two rows, and every chip stays in the DOM (CSS only).
-    assert.match(String(areaOf(items[0]).props.className), /clamped/, `${lang}: 14 chips clamp`)
+    assert.match(String(areaOf(items[0]).props.className), /clamped/, `${lang}: all ${ALL.length} chips clamp`)
     assert.equal(chipsOf(items[0]).length, ALL.length, `${lang}: clamping removes nothing`)
     assert.equal(toggleOf(items[0]).props['aria-expanded'], false)
-    assert.equal(toggleOf(items[0]).children.join(''), DICT[lang].showAllScopes.replace('{{n}}', '14'))
+    assert.equal(toggleOf(items[0]).children.join(''), DICT[lang].showAllScopes.replace('{{n}}', String(ALL.length)))
     await click(toggleOf(items[0]))
     assert.equal(toggleOf(items[0]).props['aria-expanded'], true, `${lang}: the toggle says it is open`)
     assert.doesNotMatch(String(areaOf(items[0]).props.className), /clamped/, `${lang}: open means no clamp`)
@@ -1596,4 +1835,351 @@ await check('authorized devices and the host popover: presentation is CSS + mark
   assert.doesNotMatch(source, /https?:\/\/[^\s'"`]+\.(?:png|jpg|svg|woff2?)/, 'no new asset')
 })
 
+// --- AddressEditor: change a paired host's address (PATCH keeps the pin) ---
+const REMOTE = { id: 'r-1', name: 'Laptop', address: 'wss://10.0.0.5:41234', status: 'online', approvals: [] }
+const editorOf = (page) => find(page, (node) => node.props['data-testid'] === 'address-editor')[0]
+const tid = (page, id) => find(page, (node) => node.props['data-testid'] === id)[0]
+const PATCHES = (ui) => ui.calls.filter((call) => call.method === 'PATCH')
+const typeInto = async (page, value) => { await act(async () => { tid(page, 'address-input').props.onChange({ target: { value } }) }) }
+const openEditor = async (page) => { await click(tid(page, 'address-edit')) }
+
+await check('address editor: opens prefilled with the current address, with the pin note and Save/Cancel', async () => {
+  const ui = load()
+  const page = await mount(React.createElement(ui.api.testing.AddressEditor, { remote: REMOTE, onDone: () => {} }))
+  assert.equal(editorOf(page), undefined, 'closed at first')
+  assert.equal(tid(page, 'address-edit').children.join(''), ui.api.testing.DICT.en.editAddress)
+  await openEditor(page)
+  assert.ok(editorOf(page))
+  assert.equal(tid(page, 'address-input').props.value, REMOTE.address)
+  assert.equal(tid(page, 'address-pin-note').children.join(''), ui.api.testing.DICT.en.addressPinNote)
+  assert.equal(tid(page, 'address-save').children.join(''), ui.api.testing.DICT.en.saveAddress)
+  assert.equal(tid(page, 'address-cancel').children.join(''), ui.api.testing.DICT.en.cancel)
+  page.unmount()
+})
+
+await check('address editor: Save issues exactly one PATCH carrying only the typed url, same-origin', async () => {
+  const ui = load()
+  const page = await mount(React.createElement(ui.api.testing.AddressEditor, { remote: REMOTE, onDone: () => {} }))
+  await openEditor(page)
+  await typeInto(page, 'wss://10.0.0.9:5555/x')
+  await click(tid(page, 'address-save'))
+  await flush()
+  const patches = PATCHES(ui)
+  assert.equal(patches.length, 1)
+  assert.equal(patches[0].route, '/devices/remotes/r-1')
+  assert.deepEqual(patches[0].body, { url: 'wss://10.0.0.9:5555/x' })
+  assert.equal(patches[0].origin, 'http://127.0.0.1:3080')
+  assert.equal(patches[0].credentials, 'same-origin')
+  assert.equal(ui.calls.length, 1, 'no other request')
+  page.unmount()
+})
+
+await check('address editor: success closes the editor and runs the refresh once', async () => {
+  const ui = load()
+  let done = 0
+  const page = await mount(React.createElement(ui.api.testing.AddressEditor, { remote: REMOTE, onDone: () => { done += 1 } }))
+  await openEditor(page)
+  await typeInto(page, '10.0.0.9:5555')
+  await click(tid(page, 'address-save'))
+  await flush()
+  assert.equal(done, 1)
+  assert.equal(editorOf(page), undefined, 'editor closed')
+  assert.ok(tid(page, 'address-edit'), 'the Edit address button is back')
+  page.unmount()
+})
+
+await check('address editor: a 4xx shows the server message inline and keeps the editor open, without refreshing', async () => {
+  const ui = load()
+  ui.state.patchFailure = { status: 409, body: { error: 'pin-immutable', message: 'The certificate pin cannot change.' } }
+  let done = 0
+  const page = await mount(React.createElement(ui.api.testing.AddressEditor, { remote: REMOTE, onDone: () => { done += 1 } }))
+  await openEditor(page)
+  await typeInto(page, 'wss://10.0.0.9:5555')
+  await click(tid(page, 'address-save'))
+  await flush()
+  assert.ok(editorOf(page), 'still open')
+  const alert = tid(page, 'address-error')
+  assert.equal(alert.props.role, 'alert')
+  assert.equal(alert.props.className, 'dshdev-err')
+  assert.equal(alert.children.join(''), 'The certificate pin cannot change.')
+  assert.equal(tid(page, 'address-input').props.value, 'wss://10.0.0.9:5555', 'what was typed is kept')
+  assert.equal(done, 0)
+  assert.equal(tid(page, 'address-save').props.disabled, false, 'usable again to retry')
+  page.unmount()
+})
+
+await check('address editor: Cancel sends nothing and closes', async () => {
+  const ui = load()
+  const page = await mount(React.createElement(ui.api.testing.AddressEditor, { remote: REMOTE, onDone: () => {} }))
+  await openEditor(page)
+  await typeInto(page, 'wss://elsewhere:1')
+  await click(tid(page, 'address-cancel'))
+  await flush()
+  assert.equal(ui.calls.length, 0)
+  assert.equal(editorOf(page), undefined)
+  page.unmount()
+})
+
+await check('address editor: input and both buttons are disabled while the save is in flight', async () => {
+  const ui = load()
+  let release
+  ui.state.patchGate = new Promise((resolve) => { release = resolve })
+  const page = await mount(React.createElement(ui.api.testing.AddressEditor, { remote: REMOTE, onDone: () => {} }))
+  await openEditor(page)
+  assert.equal(tid(page, 'address-save').props.disabled, false)
+  const saving = click(tid(page, 'address-save'))
+  await flush()
+  assert.equal(tid(page, 'address-input').props.disabled, true)
+  assert.equal(tid(page, 'address-save').props.disabled, true)
+  assert.equal(tid(page, 'address-cancel').props.disabled, true)
+  assert.equal(tid(page, 'address-save').children.join(''), ui.api.testing.DICT.en.addressSaving)
+  await click(tid(page, 'address-save'))
+  assert.equal(PATCHES(ui).length, 1, 'a second press does not send a second request')
+  release()
+  await saving
+  await flush()
+  assert.equal(editorOf(page), undefined)
+  page.unmount()
+})
+
+await check('address editor: renders in en and vi, the new strings are real translations, and the dictionaries stay twins', async () => {
+  const keys = ['editAddress', 'saveAddress', 'addressPinNote', 'addressSaving']
+  for (const [locale, lang] of [['en-US', 'en'], ['vi-VN', 'vi']]) {
+    const ui = load({ locale })
+    const { DICT } = ui.api.testing
+    for (const key of keys) assert.ok(DICT[lang][key], `${lang} ${key}`)
+    const page = await mount(React.createElement(ui.api.testing.AddressEditor, { remote: REMOTE, onDone: () => {} }))
+    assert.equal(tid(page, 'address-edit').children.join(''), DICT[lang].editAddress)
+    await openEditor(page)
+    assert.equal(tid(page, 'address-pin-note').children.join(''), DICT[lang].addressPinNote)
+    assert.equal(tid(page, 'address-save').children.join(''), DICT[lang].saveAddress)
+    assert.equal(tid(page, 'address-cancel').children.join(''), DICT[lang].cancel)
+    page.unmount()
+  }
+  const { DICT } = load().api.testing
+  for (const key of keys) assert.notEqual(DICT.vi[key], DICT.en[key], `${key}: a real translation, not a copy`)
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
+})
+
+await check('address editor: mounted on the remote card next to the address (not on a revoked host)', async () => {
+  const ui = load({ remotes: [REMOTE, { ...REMOTE, id: 'r-2', status: 'revoked' }] })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  assert.equal(find(page, (node) => node.props['data-testid'] === 'address-edit').length, 1)
+  page.unmount()
+})
+
+// ------------------------------------------------------------------ spec 016 Phase 1
+// The Start page's per-machine doorways. Loaded the way the shell loads the plugin (a
+// vm with __ModuleLoader__) against a fake shell that declares the three services the
+// surfaces need, so what is asserted is what the real registry would receive.
+function loadDoors({ remotes, locale = 'en-US' }) {
+  let api
+  const timers = { started: 0, cleared: 0 }
+  const live = { remotes }
+  const fetch = async (url) => {
+    const route = new URL(String(url), 'http://127.0.0.1:3080/').pathname
+    if (route === '/devices/remotes') {
+      return { ok: true, status: 200, json: async () => ({ remotes: live.remotes, routing: { remote: true, reason: null, hosts: [] } }) }
+    }
+    return { ok: true, status: 200, json: async () => ({}) }
+  }
+  const window = {
+    __ModuleLoader__: { load: ({ factory }) => { api = factory(() => React) } },
+    setInterval: () => { timers.started += 1; return timers.started }, clearInterval: () => { timers.cleared += 1 }, setTimeout: () => 1, clearTimeout: () => {},
+  }
+  const document = { baseURI: 'http://127.0.0.1:3080/', head: { appendChild() {} }, createElement: () => ({ remove() {} }) }
+  vm.runInNewContext(source, { window, document, fetch, URL, console, setTimeout, clearTimeout, Date, navigator: { language: locale } })
+  // The registry the shell hands over: rc.1's own rules for ids, a repeated kind, and
+  // the flat guide sorted by `order` (SidebarRightTabRegistry.register / refresh).
+  const types = new Map()
+  const registry = {
+    register(definition) {
+      if (types.has(definition.id)) throw new Error(`tab type id "${definition.id}" is already registered`)
+      if ([...types.values()].some((held) => held.kind === definition.kind)) throw new Error(`tab kind "${definition.kind}" is already registered`)
+      const guide = definition.guide ?? []
+      if (new Set(guide.map((entry) => entry.id)).size !== guide.length) throw new Error('duplicate guide entry id')
+      types.set(definition.id, definition)
+      return () => { types.delete(definition.id) }
+    },
+  }
+  const guide = () => [...types.values()]
+    .flatMap((definition) => (definition.guide ?? []).map((entry) => ({ ...entry, kind: definition.kind, providerId: definition.id })))
+    .sort((left, right) => left.order - right.order)
+  const bodies = new Map()
+  const disposers = []
+  // Shipped capsules, at the orders rc.1 gives them: the doors must land after all of these.
+  for (const [id, order] of [['files', 10], ['review', 15], ['terminal', 20], ['browser', 30], ['inspector', 60]]) {
+    registry.register({ id, kind: id, guide: [{ id: 'open', order, title: () => id }] })
+  }
+  const slots = {
+    inject(slot, factory) {
+      const registration = factory()
+      if (slot === 'sidebar.right.pane.tab') bodies.set(registration.meta.key, registration)
+      return () => { if (slot === 'sidebar.right.pane.tab') bodies.delete(registration.meta.key) }
+    },
+    register(meta, component) { return { meta, component } },
+  }
+  const services = { sessions: { refresh: async () => {} }, sidebarRight: { openTab() {} }, sidebarRightTabs: registry, contextMenus: { register: () => () => {} } }
+  const ctx = {
+    locale: { getSnapshot: () => ({ active: locale }), subscribe: () => () => {} },
+    effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out); return () => { out?.() } },
+    inject(deps, fn) {
+      const scope = {}
+      for (const dep of deps) scope[dep] = services[dep]
+      const out = fn(scope)
+      if (typeof out === 'function') disposers.push(out)
+      return () => { out?.() }
+    },
+    slots,
+  }
+  api.apply(ctx)
+  return { api, live, types, guide, bodies, disposers, timers, refresh: () => api.testing.hostsStore.refresh() }
+}
+
+const DOOR_REMOTES = [
+  { id: 'r-b', name: 'Desk-Box', address: '10.0.0.41:3081', status: 'online', createdAt: 2, device: { kind: 'desktop', scopes: [] } },
+  { id: 'r-a', name: 'Qoder-Sigma', address: '10.0.0.40:3081', status: 'online', createdAt: 1, device: { kind: 'desktop', scopes: [] } },
+]
+const doorGuide = (ui) => ui.guide().filter((entry) => entry.providerId.startsWith('dsh-ext.devices.r-'))
+
+await check('start page: every connected paired host gets its own entries, labelled "<item> · <host>", ids namespaced by host', async () => {
+  const ui = loadDoors({ remotes: DOOR_REMOTES })
+  await ui.refresh()
+  await flush()
+  const doors = doorGuide(ui)
+  assert.deepEqual(doors.map((entry) => entry.providerId).sort(), [
+    'dsh-ext.devices.r-a.devices', 'dsh-ext.devices.r-a.host', 'dsh-ext.devices.r-b.devices', 'dsh-ext.devices.r-b.host',
+  ], 'two doorways per host, id = dsh-ext.devices.<hostId>.<entry>')
+  const title = (id) => doors.find((entry) => entry.providerId === id).title()
+  assert.equal(title('dsh-ext.devices.r-a.host'), 'Remote machine · Qoder-Sigma')
+  assert.equal(title('dsh-ext.devices.r-a.devices'), 'Devices · Qoder-Sigma')
+  assert.equal(title('dsh-ext.devices.r-b.host'), 'Remote machine · Desk-Box')
+  for (const entry of doors) {
+    assert.equal(entry.kind, entry.providerId, 'the type id is its kind, so the capsule opens that machine\'s own tab')
+    assert.equal(typeof entry.icon, 'function', 'an icon component, rendered by the shell with { size }')
+    assert.equal(typeof entry.description(), 'string')
+    assert.ok(ui.types.get(entry.providerId).priority === 'extension' && ui.types.get(entry.providerId).multiple === false)
+    // The body is dispatched with the type id (rc.1 `sidebar.right.pane.tab`).
+    assert.equal(ui.bodies.get(entry.providerId).meta.name, 'sidebar.right.pane.tab')
+    assert.equal(typeof ui.bodies.get(entry.providerId).component, 'function')
+  }
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('start page order: every local capsule first, then one contiguous block per host (1000 + 100 per host, +1 per entry)', async () => {
+  const ui = loadDoors({ remotes: DOOR_REMOTES })
+  await ui.refresh()
+  const all = ui.guide()
+  const shippedMax = Math.max(...all.filter((entry) => !entry.providerId.startsWith('dsh-ext.devices.')).map((entry) => entry.order))
+  const doors = doorGuide(ui)
+  assert.ok(Math.min(...doors.map((entry) => entry.order)) > shippedMax, 'no per-host entry sorts among the local ones')
+  assert.deepEqual(doors.map((entry) => [entry.providerId, entry.order]), [
+    ['dsh-ext.devices.r-a.host', 1000], ['dsh-ext.devices.r-a.devices', 1001],
+    ['dsh-ext.devices.r-b.host', 1100], ['dsh-ext.devices.r-b.devices', 1101],
+  ], 'host ids are sorted, so the numbers do not depend on the order the Host listed them in')
+  // The merged list, as the Start page renders it: locals, then host A's block, then host B's.
+  const merged = all.map((entry) => entry.providerId)
+  assert.ok(merged.indexOf('inspector') < merged.indexOf('dsh-ext.devices.r-a.host'))
+  assert.ok(merged.indexOf('dsh-ext.devices.r-a.devices') + 1 === merged.indexOf('dsh-ext.devices.r-b.host'), 'one host\'s block is not interleaved with the other\'s')
+  const { HOST_DOOR_BASE, HOST_DOOR_STRIDE, hostDoorEntries } = ui.api.testing
+  assert.equal(HOST_DOOR_BASE, 1000)
+  assert.equal(HOST_DOOR_STRIDE, 100)
+  // Same set in another list order: identical numbers.
+  const flipped = hostDoorEntries([...DOOR_REMOTES].reverse()).map((entry) => [entry.id, entry.order])
+  assert.deepEqual(flipped, hostDoorEntries(DOOR_REMOTES).map((entry) => [entry.id, entry.order]))
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('start page: a removed host\'s entries and bodies disappear on the next refresh; the other host is untouched', async () => {
+  const ui = loadDoors({ remotes: DOOR_REMOTES })
+  await ui.refresh()
+  assert.equal(doorGuide(ui).length, 4)
+  const before = ui.types.get('dsh-ext.devices.r-b.host')
+  ui.live.remotes = DOOR_REMOTES.filter((remote) => remote.id !== 'r-a')
+  await ui.refresh()
+  assert.deepEqual(doorGuide(ui).map((entry) => entry.providerId), ['dsh-ext.devices.r-b.host', 'dsh-ext.devices.r-b.devices'])
+  assert.equal(ui.bodies.has('dsh-ext.devices.r-a.host'), false, 'the body seat goes with its type')
+  assert.equal(ui.bodies.has('dsh-ext.devices.r-a.devices'), false)
+  assert.equal(ui.types.get('dsh-ext.devices.r-b.host'), before, 'a host that stayed is not re-registered (no churn on every refresh)')
+  // Not re-registered, so its number is the one it got: still contiguous and after every local capsule.
+  assert.deepEqual(doorGuide(ui).map((entry) => entry.order), [1100, 1101])
+  // Adding it back brings the entries back.
+  ui.live.remotes = DOOR_REMOTES
+  await ui.refresh()
+  assert.equal(doorGuide(ui).length, 4)
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('start page: an offline host is OMITTED (spec: "per connected remote host"), and returns when it reconnects', async () => {
+  const ui = loadDoors({ remotes: DOOR_REMOTES.map((remote) => (remote.id === 'r-a' ? { ...remote, status: 'offline' } : remote)) })
+  await ui.refresh()
+  assert.deepEqual(doorGuide(ui).map((entry) => entry.providerId), ['dsh-ext.devices.r-b.host', 'dsh-ext.devices.r-b.devices'],
+    'no entry, disabled or not, for a host that cannot answer')
+  assert.equal(doorGuide(ui).find((entry) => entry.order === 1000).providerId, 'dsh-ext.devices.r-b.host', 'the block index counts connected hosts only')
+  ui.live.remotes = DOOR_REMOTES // r-a reconnects
+  await ui.refresh()
+  assert.equal(doorGuide(ui).length, 4)
+  ui.live.remotes = DOOR_REMOTES.map((remote) => ({ ...remote, status: 'revoked' }))
+  await ui.refresh()
+  assert.equal(doorGuide(ui).length, 0, 'a revoked pairing is not a doorway either')
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('start page: no new timer — the doorways ride the one shared refresh, and teardown removes every type and body', async () => {
+  const ui = loadDoors({ remotes: DOOR_REMOTES })
+  await ui.refresh()
+  assert.equal(doorGuide(ui).length, 4)
+  // startPoll is the plugin's one timer; two hosts and four doorways must not add another.
+  assert.equal(ui.timers.started, 1, 'exactly one interval, the shared host-list refresh')
+  for (let round = 0; round < 3; round += 1) await ui.refresh()
+  assert.equal(ui.timers.started, 1, 'refreshing again starts nothing')
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+  assert.equal(ui.timers.cleared, 1, 'teardown clears that one interval')
+  assert.equal(doorGuide(ui).length, 0, 'disposing the surfaces unregisters every doorway')
+  assert.equal([...ui.bodies.keys()].filter((key) => key.startsWith('dsh-ext.devices.r-')).length, 0)
+})
+await check('start page: malformed rows never become entries, and the pure helper needs no shell', async () => {
+  const ui = loadDoors({ remotes: DOOR_REMOTES })
+  await ui.refresh()
+  assert.ok(ui.api.testing.hostDoorEntries(DOOR_REMOTES).length === 4)
+  // (arrays built inside the vm are another realm's, so compare by length, not deepEqual)
+  assert.equal(ui.api.testing.hostDoorEntries(undefined).length, 0)
+  assert.equal(ui.api.testing.hostDoorEntries([null, { id: 3 }, { name: 'x', status: 'online' }]).length, 0, 'a malformed row never becomes an entry')
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('start page: the machine card renders the paired host\'s own sessions card; a host that is gone says so', async () => {
+  const ui = loadDoors({ remotes: DOOR_REMOTES })
+  await ui.refresh()
+  const { HostDoorTab } = ui.api.testing
+  const present = await mount(React.createElement(HostDoorTab, { hostId: 'r-a' }))
+  await flush()
+  assert.equal(find(present, (node) => node.props['data-testid'] === 'host-door').length, 1)
+  assert.match(text(present), /Qoder-Sigma/, 'it is that host\'s card')
+  assert.equal(find(present, (node) => node.type === 'button' && node.children.join('') === 'Back').length, 0, 'no inert Back button inside a tab')
+  present.unmount()
+  const gone = await mount(React.createElement(HostDoorTab, { hostId: 'r-zzz' }))
+  assert.equal(find(gone, (node) => node.props['data-testid'] === 'host-door-gone').length, 1)
+  assert.match(text(gone), /no longer paired/)
+  gone.unmount()
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('start page: the doorway strings exist in vi and en as real translations; vi/en key sets stay twins; the label follows the language', async () => {
+  const { DICT } = load().api.testing
+  const keys = ['hostDoor', 'hostDoorDescription', 'devicesDoorDescription', 'hostDoorGone']
+  for (const key of keys) {
+    assert.equal(typeof DICT.en[key], 'string', `${key} (en)`)
+    assert.equal(typeof DICT.vi[key], 'string', `${key} (vi)`)
+    assert.notEqual(DICT.vi[key], DICT.en[key], `${key}: a real translation, not a copy`)
+  }
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
+  const vi = loadDoors({ remotes: DOOR_REMOTES, locale: 'vi-VN' })
+  await vi.refresh()
+  const doors = doorGuide(vi)
+  assert.equal(doors.find((entry) => entry.providerId === 'dsh-ext.devices.r-a.host').title(), 'Máy từ xa · Qoder-Sigma')
+  assert.equal(doors.find((entry) => entry.providerId === 'dsh-ext.devices.r-a.devices').title(), 'Thiết bị · Qoder-Sigma')
+  for (const dispose of vi.disposers) { try { dispose() } catch { /* teardown */ } }
+})
 finish('client')

@@ -19,12 +19,40 @@ export interface SessionStatusPillProps {
   state: SessionState;
   /** Already-localized status word (e.g. `tr('tabs.running')`). */
   label: string;
+  /**
+   * Header variant (reference 04): NO capsule behind the word — just the coloured dot and the word,
+   * at the subline's own type size, so the metadata line reads "▢ host · ● running" instead of
+   * stacking a second pill next to the title.
+   */
+  plain?: boolean;
 }
 
-export function SessionStatusPill({ state, label }: SessionStatusPillProps) {
+export function SessionStatusPill({ state, label, plain = false }: SessionStatusPillProps) {
   const theme = useTheme();
   const running = state === 'running';
   const archived = state === 'archived';
+
+  if (plain) {
+    return (
+      <View
+        style={[styles.pill, { gap: theme.space.xxs }]}
+        accessible
+        accessibilityRole="text"
+        accessibilityLabel={label}
+      >
+        <StatusDot kind={running ? 'running' : archived ? 'muted' : 'idle'} />
+        <Text
+          style={[
+            theme.type.captionSmall,
+            { color: running ? theme.colors.text : theme.colors.textMuted },
+          ]}
+          numberOfLines={1}
+        >
+          {label}
+        </Text>
+      </View>
+    );
+  }
 
   return (
     <View

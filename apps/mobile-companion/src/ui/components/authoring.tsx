@@ -280,19 +280,23 @@ export function ComposerModelRow(props: {
   if (label === null) return null;
   return (
     <View style={styles.modeRow}>
+      {/* Without a catalogue there is nothing to open, so the pill is a STATIC LABEL: no "▾" (a
+          chevron promises a sheet) and no press. The ▾ appears only when the sheet has rows. */}
       <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={`${props.hint}: ${label}`}
-        onPress={props.onOpenModel}
+        accessibilityRole={props.hasCatalog ? 'button' : 'text'}
+        accessibilityLabel={props.hasCatalog ? `${props.hint}: ${label}` : label}
+        accessibilityState={props.hasCatalog ? undefined : { disabled: true }}
+        disabled={!props.hasCatalog}
+        onPress={props.hasCatalog ? props.onOpenModel : undefined}
         style={({ pressed }) => [
-          styles.pill,
-          { borderRadius: radius.sm, borderColor: colors.border },
-          pressed && styles.pressed,
+          props.hasCatalog ? styles.pill : styles.pillStatic,
+          props.hasCatalog ? { borderRadius: radius.sm, borderColor: colors.border } : null,
+          pressed && props.hasCatalog && styles.pressed,
         ]}
       >
-        <Text style={[type.caption, { color: colors.text }]} numberOfLines={1}>
+        <Text style={[type.caption, { color: props.hasCatalog ? colors.text : colors.textMuted }]} numberOfLines={1}>
           {label}
-          {'  ▾'}
+          {props.hasCatalog ? '  ▾' : ''}
         </Text>
       </Pressable>
     </View>
@@ -300,6 +304,34 @@ export function ComposerModelRow(props: {
 }
 
 /** Model sheet for the composer's leading row; same sheet language as the workspace picker. */
+/**
+ * Group a model catalogue by provider for the sheet (reference 07: one section per provider).
+ *
+ * Optional by design: when NO item carries a provider (an older Host, or a flat reply), this returns a
+ * single unnamed group and the sheet renders exactly as before — same order, no headers. Providers
+ * keep the order the catalogue listed them in, and an item without a provider lands in a trailing
+ * unnamed group rather than being dropped.
+ */
+export function groupModelsByProvider(
+  items: readonly ModelItem[],
+): Array<{ provider: string | null; items: readonly ModelItem[] }> {
+  const groups = new Map<string | null, ModelItem[]>();
+  for (const item of items) {
+    const key = item.provider === undefined || item.provider.trim() === '' ? null : item.provider.trim();
+    const bucket = groups.get(key);
+    if (bucket === undefined) groups.set(key, [item]);
+    else bucket.push(item);
+  }
+  if (![...groups.keys()].some((key) => key !== null)) {
+    const only = groups.get(null);
+    return [{ provider: null, items: only ?? [] }];
+  }
+  // Named providers first (catalogue order), the unnamed bucket last.
+  return [...groups.entries()]
+    .sort(([left], [right]) => (left === null ? 1 : right === null ? -1 : 0))
+    .map(([provider, grouped]) => ({ provider, items: grouped }));
+}
+
 export function ModelPicker(props: {
   visible: boolean;
   items: readonly ModelItem[];
@@ -312,32 +344,77 @@ export function ModelPicker(props: {
 }) {
   const { colors, type } = useTheme();
   return (
-    <Modal visible={props.visible} transparent animationType="fade" onRequestClose={props.onClose}>
-      <Pressable style={[styles.scrim, { backgroundColor: colors.overlay }]} accessibilityRole="button" accessibilityLabel={props.labels.close} onPress={props.onClose}>
-        <View style={[styles.sheet, { backgroundColor: colors.surfaceRaised, borderRadius: radius.lg, ...elevation(colors, 'sheet') }]}>
-          <SheetTitle>{props.labels.title}</SheetTitle>
+    // Reference 07: a sheet that SLIDES UP from the bottom edge, with a grab handle, a centred
+    // title and a ✕ on the right — not the floating centred card this used to be.
+    <Modal visible={props.visible} transparent animationType="slide" onRequestClose={props.onClose}>
+      <View style={styles.sheetRoot}>
+        <Pressable
+          style={[StyleSheet.absoluteFill, { backgroundColor: colors.overlay }]}
+          accessibilityRole="button"
+          accessibilityLabel={props.labels.close}
+          onPress={props.onClose}
+        />
+        <View
+          style={[
+            styles.bottomSheet,
+            {
+              backgroundColor: colors.surfaceRaised,
+              borderTopLeftRadius: radius.xl,
+              borderTopRightRadius: radius.xl,
+              ...elevation(colors, 'sheet'),
+            },
+          ]}
+        >
+          <View style={[styles.grabber, { backgroundColor: colors.border }]} />
+          <View style={styles.sheetHeader}>
+            {/* Equal-width sides keep the title optically centred whatever the ✕'s glyph width. */}
+            <View style={styles.headerSide} />
+            <Text style={[type.heading, styles.sheetHeaderTitle, { color: colors.text }]} numberOfLines={1}>
+              {props.labels.title}
+            </Text>
+            <Pressable
+              onPress={props.onClose}
+              accessibilityRole="button"
+              accessibilityLabel={props.labels.close}
+              hitSlop={8}
+              style={styles.headerSide}
+            >
+              <Text style={[type.heading, { color: colors.textMuted }]}>✕</Text>
+            </Pressable>
+          </View>
           <PickerBody state={props.state} itemCount={props.items.length}
             loadingLabel={props.labels.loading} emptyLabel={props.labels.empty}
             errorLabel={props.labels.error} retryLabel={props.labels.retry} onRetry={props.onRetry}>
-            <ScrollView style={{ maxHeight: 360 }}>{props.items.map((item) => {
-              const active = item.id === props.currentId;
-              return (
-                <Pressable
-                  key={item.id}
-                  accessibilityRole="button"
-                  accessibilityLabel={item.label}
-                  accessibilityState={{ selected: active }}
-                  onPress={() => props.onSelect(item)}
-                  style={({ pressed }) => [styles.sheetRow, pressed && styles.pressed]}
-                >
-                  <Text style={[type.body, styles.flex, { color: colors.text }]} numberOfLines={1}>{item.label}</Text>
-                  {active ? <Text style={[type.body, { color: colors.accent }]}>✓</Text> : null}
-                </Pressable>
-              );
-            })}</ScrollView>
+            <ScrollView style={styles.sheetList}>
+              {groupModelsByProvider(props.items).map((group) => (
+                <View key={group.provider ?? '\u0000none'}>
+                  {group.provider === null ? null : (
+                    <Text style={[type.captionSmall, styles.providerHeader, { color: colors.textMuted }]}>
+                      {group.provider}
+                    </Text>
+                  )}
+                  {group.items.map((item) => {
+                    const active = item.id === props.currentId;
+                    return (
+                      <Pressable
+                        key={item.id}
+                        accessibilityRole="button"
+                        accessibilityLabel={item.label}
+                        accessibilityState={{ selected: active }}
+                        onPress={() => props.onSelect(item)}
+                        style={({ pressed }) => [styles.sheetRow, pressed && styles.pressed]}
+                      >
+                        <Text style={[type.body, styles.flex, { color: colors.text }]} numberOfLines={1}>{item.label}</Text>
+                        {active ? <Text style={[type.body, { color: colors.accent }]}>✓</Text> : null}
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              ))}
+            </ScrollView>
           </PickerBody>
         </View>
-      </Pressable>
+      </View>
     </Modal>
   );
 }
@@ -366,9 +443,10 @@ function PickerBody(props: {
   children: ReactNode;
 }) {
   const { colors, type } = useTheme();
-  if (props.state.status === 'loading' || props.state.status === 'idle') {
-    return <View style={styles.sheetMessage}><Text style={[type.body, { color: colors.textMuted }]}>{props.loadingLabel}</Text></View>;
-  }
+  // ITEMS FIRST: a catalogue that already has rows must paint them, whatever the load state says.
+  // The loading message is only for "there is nothing to show yet" — a refresh in flight must never
+  // blank a list the user is looking at, which is exactly how the model sheet came up with no rows.
+  if (props.itemCount > 0) return <>{props.children}</>;
   if (props.state.status === 'error') {
     return (
       <Pressable accessibilityRole="button" accessibilityLabel={props.retryLabel} onPress={props.onRetry} style={styles.sheetMessage}>
@@ -376,10 +454,10 @@ function PickerBody(props: {
       </Pressable>
     );
   }
-  if (props.itemCount === 0) {
-    return <View style={styles.sheetMessage}><Text style={[type.body, { color: colors.textMuted }]}>{props.emptyLabel}</Text></View>;
+  if (props.state.status === 'loading' || props.state.status === 'idle') {
+    return <View style={styles.sheetMessage}><Text style={[type.body, { color: colors.textMuted }]}>{props.loadingLabel}</Text></View>;
   }
-  return <>{props.children}</>;
+  return <View style={styles.sheetMessage}><Text style={[type.body, { color: colors.textMuted }]}>{props.emptyLabel}</Text></View>;
 }
 
 const styles = StyleSheet.create({
@@ -394,10 +472,22 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
   },
   scrim: { flex: 1, justifyContent: 'center', paddingHorizontal: space.lg },
+  // Bottom sheet (reference 07): the root pins the sheet to the bottom edge and the scrim fills the
+  // rest of the screen behind it.
+  sheetRoot: { flex: 1, justifyContent: 'flex-end' },
+  bottomSheet: { paddingBottom: space.lg, paddingTop: space.xs },
+  grabber: { alignSelf: 'center', width: 40, height: 4, borderRadius: 2, marginBottom: space.xs },
+  sheetHeader: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: space.md, paddingVertical: space.sm },
+  sheetHeaderTitle: { flex: 1, textAlign: 'center' },
+  headerSide: { width: 32, alignItems: 'center', justifyContent: 'center', minHeight: 32 },
+  sheetList: { maxHeight: 440 },
   sheet: { paddingVertical: space.sm, paddingHorizontal: space.sm, gap: space.xxs },
   sheetTitle: { paddingHorizontal: space.md, paddingVertical: space.sm, textTransform: 'uppercase', letterSpacing: 0.6 },
+  providerHeader: { paddingHorizontal: space.sm, paddingTop: space.sm, paddingBottom: space.xxs, textTransform: 'uppercase', letterSpacing: 0.6 },
   sheetRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm, minHeight: 48, paddingHorizontal: space.md },
   sheetMessage: { minHeight: 48, justifyContent: 'center', paddingHorizontal: space.md, paddingVertical: space.sm },
   modeRow: { flexDirection: 'row', gap: space.sm },
   pill: { minHeight: 32, justifyContent: 'center', paddingHorizontal: space.sm, borderWidth: StyleSheet.hairlineWidth },
+  // Static label variant: no border, no chevron, no touch affordance.
+  pillStatic: { minHeight: 32, justifyContent: 'center', paddingHorizontal: 0 },
 });

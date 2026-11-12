@@ -671,7 +671,7 @@ let image = [
 
 | type | 参数 | 说明 |
 |---|---|---|
-| `sessions` | — | 会话列表（`updatedAt/running/blank/cwd/agentPreset`） |
+| `sessions` | — | 会话列表（`updatedAt/running/blank/cwd/agentPreset`，以及 **spec 011 追加的可选 `workspaceId`**，见 §19） |
 | `session-archive` | `sessionId` | 将 Session 加入 Host 的完整归档集合（隐藏但不删除） |
 | `session-rename` | `sessionId`, `title` | 写入用户指定的持久化 Session 名称 |
 | `history` | `sessionId`, `beforeSeq?`, `historyFormatVersion?`, `maxMessages?`, `maxBytes?`, `view?` | 历史事件页（见下） |
@@ -682,8 +682,8 @@ let image = [
 | `file-download-read` | `transferId`, `offset` | 拉取下载的下一块字节 |
 | `file-download-cancel` | `transferId` | 取消并关闭下载 |
 | `search` | `query` | 会话全文搜索 |
-| `session-stats` | `sessionId` | 执行统计投影（输入框统计条数据源） |
-| `context-usage` | `sessionId` | token 用量 + 上下文占用投影 |
+| `session-stats` | `sessionId` | 执行统计投影（输入框统计条数据源）；设备需 `stats:read`（spec 018） |
+| `context-usage` | `sessionId` | token 用量 + 上下文占用投影；设备需 `stats:read`（spec 018） |
 | `tasks` | `sessionId` | 当前任务列表（`todos` projection） |
 | `goal` | `sessionId` | 当前目标及其 CAS 版本（`goal` projection） |
 
@@ -1484,7 +1484,7 @@ history. Older gateways without the capability continue using one connection.
 | control | `subagents-updated` | `{sessionId,asOfSeq,subagentCatalog}`，父节点直接子目录完整替换，null 表示失效 |
 | control | `subagent-identity-updated` | `{sessionId,asOfSeq,subagent}`，该子会话身份完整值或 null |
 | control | `subagent-timing-updated` | `{sessionId,asOfSeq,subagentTiming}`，该子会话耗时完整值或 null |
-| control | `session-status` | `{sessionId,running}`，全局进程内运行状态；初始/重连用 sessions 刷新 |
+| control | `session-status` | `{sessionId,running,workspaceId?}`，全局进程内运行状态；初始/重连用 sessions 刷新。`workspaceId` 为 spec 011 追加的可选字段（见 §19） |
 
 两个查询都返回 `projectionState: ready | unavailable | migration-required`。没有投影是 null，空目录是 `[]`，空任务板是团队对象中的 `tasks:[]`；迁移提示没有 `asOfSeq`，不能当作精确基线。未找到会话返回 `session/not-found`。查询不激活 Agent、不调用模型。capability 仅表示网关理解协议，不保证 Host 已启用实验性团队插件。
 
@@ -1602,6 +1602,34 @@ history. Older gateways without the capability continue using one connection.
 依旧 `remote-access/denied`（`resource-not-allowed`）；而 Host 之后报告该会话被删除时，绑定会立刻消失
 （删除的 tombstone 规则照旧），后台按 `session/list` 的对账也照旧运行。
 
+**按工作区分组（spec 011 追加，2026-11-11；owner 决定＝选项 B，适用于**所有**可见该会话的设备）。** 会话列表的每一项、
+`session-status` 事件与 `session-created` 回执都**可以**带两个可选字段：`workspaceId`（就是 `workspaces` op 返回的同一个
+id）与 `workspaceLabel`（该工作区的显示名，与 `workspaces` op 的 `name` **同源**）。客户端据此像参考版 dsh-mobile 那样
+按工作区分组。两者都是**附加**字段，老客户端忽略即可：
+
+```json
+{ "kind": "sessions", "items": [
+  { "sessionId": "session-…", "updatedAt": 1794322974381, "running": false,
+    "workspaceId": "7df03885-fb65-43a1-bbe4-fdf2b65dac01", "workspaceLabel": "REA_Project" }
+] }
+{ "kind": "session-status", "sessionId": "session-…", "running": false,
+  "workspaceId": "7df03885-…", "workspaceLabel": "REA_Project" }
+{ "kind": "session-created", "sessionId": "session-…", "agentPreset": "standard",
+  "workspaceId": "7df03885-…", "workspaceLabel": "REA_Project" }
+```
+
+- **来源**：DSH 的 session 记录**没有** `workspaceId`（实测 `session/list` 只有 `cwd`）。网关用 Host 自己的归属关系
+  `workspace.sessionIds`（`workspace/follow` 基线里每个工作区的成员会话）在**服务端**建立映射；`workspaceLabel` 与
+  `workspaces` op 用**同一个函数**（`name` → `title` → `path` 的最后一段），只下发**标签与 id**，绝不下发路径。
+- **成对出现**：有 `workspaceId` 才可能有 `workspaceLabel`；标签不可得时**只发 id**（不是空串），两者都不可得时**两个字段都不发**。
+  Host 未把该会话归属到任何工作区时，两个字段**整个省略**（不是 `null`）。
+- **对每个能看见该会话的设备都发**（选项 B）：不限于持有 `sessions:author` 的设备 —— 这样 app 只有一条数据路径。
+  允许这么做的理由是 item 本来就带该会话的**绝对** `cwd`，workspace 的 basename 泄露得更少。
+- **只在有权看该会话的连接上出现**：会话列表逐项按策略过滤，`session-status` 逐客户端按 `mayReceive` 过滤，因此这两个字段
+  不会告诉设备任何它本来不知道的会话存在。
+- **子代理继承父会话的 id 与标签**：直接子代理会话的两项都取自其父会话的归属。
+- 与 `sessions:author` 无关：没有该 scope 的设备照样能分组、也有可读标签，只是仍然不能调用 `workspaces` op。
+
 规则：
 
 - **从不由默认授予。** 它既不在 `DESKTOP_DEFAULT_SCOPES` 里，也不在任何默认报价里：`desktop` 与 `mobile`
@@ -1618,4 +1646,122 @@ history. Older gateways without the capability continue using one connection.
   而那不是手机选择的目录。`cwd` 与 `agentPreset` 同理（出现即拒绝）。持有 `workspace:manage` 的设备与
   管理端/loopback 行为不变。
 - 权限在配对时固定：要改变已配对设备的权限，需要在 Devices 页面重新生成配对码并重新配对。
+
+
+**只读会话指标：`stats:read`（spec 018 第二波，revision 10，追加）。** `session-stats` 与 `context-usage` 两个
+**只读**帧改为对**持有 `stats:read` 的设备**开放（此前仅本机管理通道可用）。此 scope：
+
+- **永远不是默认**：不在 mobile 默认、不在 `DESKTOP_DEFAULT_SCOPES`、不在 `standard` 预设里；只有所有者显式勾选
+  （或显式使用 `full` 预设）才会授予，**不做任何迁移** —— 老设备升级后**不会**突然获得它。
+- 设备**没有**该 scope 时，两个类型得到 `auth/forbidden-scope`（`scope` 字段为 `stats:read`），
+  **不是** `op/forbidden`，且请求**不会**到达 Host。
+- 授予后仍受 Host **逐会话**判定：网关用**该设备自己的非 owner Peer** 读取该会话快照，DSH 的
+  `allows({kind:'session', id})` 说不行就返回 `remote-access/denied`。指标帧不引入任何新的可见性。
+- 回包形状**不变**（仍是既有的 `{kind, sessionId, asOfSeq, sessionStats, tokenUsage, contextPressure}`，
+  `context-usage` 不含 `sessionStats`）；投影不存在时对应字段是 `null`。
+- 两个类型**不在** `OPS` 里（contract §4 未变），与 `sessions:author`、`attachments:write` 的组织方式一致。
+
+**定时任务只读 —— `schedule-catalog` + `schedule-list` + `schedule-view`（spec 018 第 3 项，revision 12，追加）。**
+这三个 op 是 **只读** 的定时任务视图，挂在 **新 scope `schedule:read`**（显式授予，**永不默认**）：
+
+- 为什么需要新 scope（与第 2 项不同）：2026-11-11 实测，**没有任何** schedule 数据出现在
+  `projection-baseline` 或任何广播帧里（baseline 只有 goal / todos / turnOutline / agentTeam /
+  subagentCatalog / subagent / subagentTiming），所以这确实是设备原本看不到的可见性，不能搭在
+  `sessions:read` 上。
+- 该 scope 在 `NEVER_DEFAULT_SCOPES` 里，**不在** 任何 preset 中，没有迁移。
+- 三个帧：
+
+```json
+{ "type": "schedule-catalog", "requestId": "r-1" }
+{ "kind": "schedule-catalog", "items": [ { "kind": "..." } ] }     // 能排什么，不含用户数据
+
+{ "type": "schedule-list", "requestId": "r-2", "active": true, "limit": 50 }
+{ "kind": "schedule-list", "items": [
+  { "id", "kind", "title", "active", "scheduledAt", "afterSeconds", "everySeconds",
+    "time", "timeZone", "weekdays", "expression", "rrule", "nextRunAt",
+    "target": { "sessionId" }, "involvedSessionIds", "updatedAt" } ] }
+
+{ "type": "schedule-view", "requestId": "r-3", "id": "<task id>" }
+{ "kind": "schedule-view", ...同上一条任务记录... }
+```
+
+- **`nextRunAt`（下一次运行）随任务记录一起返回**，客户端不需要自己算时间。
+- `schedule-list` 是 **host-wide**：schedule 不是会话资源，scope 本身就是边界。可选 `active`
+  （boolean）与 `limit`（1..500）/ `offset`（≥0），三者只能用在 host-wide 列表上。
+- **写操作全部仍然不可用**：`schedule-create` / `schedule-update` / `schedule-delete` /
+  `schedule-edit` / `schedule-run` / `schedule-delete-inactive` / `schedule-history` 对设备
+  **始终** `op/forbidden`，与是否持有 `schedule:read` 无关（router、正允许表、适配器三层）。
+- 缺少该 scope ⇒ `auth/forbidden-scope` + `scope:"schedule:read"`，**不会到达 Host**。
+
+**智能体团队 / 子会话按需读取 —— `agent-team` + `subagents`（spec 018 第 2 项，revision 11，追加）。**
+这两个 op 是 **`sessions:read` 已经授予的数据的"按需读取"（read-on-demand）**，**不是新能力、不引入新 scope**：
+
+- 同一个投影（`agentTeam`、`subagentCatalog`）本来就已经通过 `projection-baseline` 与
+  `agent-team-updated` / `subagents-updated` 推送给每个持有 `sessions:read` 的设备
+  （2026-11-11 实测：52 个会话中 31 个带 `agentTeam`），所以**新增 scope 不会多看到任何数据**，
+  只会增加配对配置矩阵；若用新 scope 去 gate baseline，反而会让**正在运行的 app 丢失已有数据**（破坏性变更）。
+- 因此 `SCOPE_BY_TYPE['agent-team'] = SCOPE_BY_TYPE['subagents'] = 'sessions:read'`：
+  没有该 scope ⇒ `auth/forbidden-scope` + `scope:"sessions:read"`，**在到达 Host 之前**就被拒绝。
+- 这两个 type **不在 `OPS`**（contract §4 不变），条目**仍保留在 `ADMIN_ONLY_TYPES`**，只通过 scope gate 放行。
+- 请求 / 响应（与 baseline 形状**完全一致**，不做裁剪）：
+
+```json
+{ "type": "agent-team", "sessionId": "session-lead", "requestId": "r-1" }
+{ "kind": "agent-team", "sessionId": "session-lead", "requestId": "r-1",
+  "projectionState": "ready", "asOfSeq": 120,
+  "agentTeam": { "members": [ { "id", "name", "role", "phase" } ],
+                 "tasks": [ { "id", "revision", "subject", "description", "status",
+                              "ownerName", "blockedBy", "writeScopes", "ready", "writeScopeWarnings" } ] } }
+
+{ "type": "subagents", "sessionId": "session-lead", "requestId": "r-2" }
+{ "kind": "subagents", "sessionId": "session-lead", "requestId": "r-2",
+  "projectionState": "ready", "asOfSeq": 120,
+  "subagentCatalog": [ { "id", "label", "mode", "createdAt" } ] }
+```
+
+- `projectionState`：`ready` / `unavailable`（`agentTeam` = `null`）/ `migration-required`（无 `asOfSeq`）。
+  "没有团队" 和 "投影不可用" 不能混淆：前者是 `ready` + 空 `members/tasks`，后者是 `unavailable` + `null`。
+- **逐项授权仍然在 Host**：op 使用**该设备自己的 peer**，Host 判断"这台设备能否看这个会话"；
+  看不到 ⇒ `session/not-found`，**响应中不含任何投影数据**。scope 只说明"可读会话"，从不说明"哪个会话"。
+- 不裁剪字段：与 baseline 逐字相同（若只裁剪 op，同一个数据会出现两种形状 ⇒ app 出错）。
+  `writeScopes` 是**工作区相对路径**，不含绝对路径。
+
+**Web unlock — `account-attestation` / `web:unlock`（spec 020，revision 10；审查修订 1，追加）。**
+PWA（và mọi thiết bị `mobile`）chỉ dùng được khi **Host đang đăng nhập DeepSeek** **và** thiết bị đã **ghim đúng tài khoản đó**.
+Gateway đọc `account/getState` + `account/getProfile` bằng **peer owner** (thiết bị **không bao giờ** gọi `account/*`), rồi chỉ trả:
+
+```json
+// request
+{ "type": "account-attestation", "requestId": "r-1" }
+// reply (unlocked)
+{ "kind": "account-attestation", "requestId": "r-1", "signedIn": true, "fingerprint": "kQ7…（43 ký tự base64url）" }
+// reply (locked)
+{ "kind": "error", "code": "auth/locked", "requestType": "account-attestation", "requestId": "r-1",
+  "reason": "host-signed-out" }
+```
+
+- `fingerprint` = `base64url(HMAC-SHA256(secret cố định của gateway, profile.id))` — **43 ký tự**, ổn định qua restart và ghép đôi lại.
+  **Không bao giờ** trả `id`/`name`/`contact`/token. Secret là file owner-only `mobile-gateway-web-unlock.key`
+  cạnh `mobile-gateway-devices.json`, tạo **độc quyền** (`wx`); file hỏng/sai quyền **không** làm gateway không khởi động —
+  chỉ **vô hiệu web unlock** (mọi thiết bị `web:unlock` bị khoá với `reason:"unlock-unavailable"`, thiết bị thường không bị ảnh hưởng), log 1 lần.
+- `signedIn:true` ⇔ `getState.status === "credential-stored"` **và** `getProfile.status === "ready"`. Mọi trường hợp khác (kể cả Host lỗi) ⇒ **khoá** (fail closed).
+- `reason` (enum, **chỉ 4 giá trị**): `host-signed-out` · `account-mismatch` · `attestation-required` · `unlock-unavailable`.
+- **Ghim một lần, theo từng thiết bị**: lần attest thành công đầu tiên ghim fingerprint vào record (`webAccountPin`, additive).
+  Pin **không bao giờ bị ghi đè**. `attestation-required` = thiết bị **chưa** attest (chưa có pin) ⇒ bị khoá cho tới khi gọi `account-attestation`.
+  Đường phục hồi duy nhất khi sai tài khoản: **thu hồi/xoá thiết bị rồi ghép đôi lại** (record mới, không pin).
+- **Khoá phía server, không dựa vào UI**, và **theo từng thiết bị**: `host-signed-out` là trạng thái chung;
+  `account-mismatch`/`attestation-required` chỉ áp cho **đúng thiết bị đó** (một trình duyệt cũ/độc hại không thể khoá các thiết bị khác).
+- **Khoá cắt cả dữ liệu đang chảy**: khi chuyển sang khoá, gateway **đóng socket** của mọi thiết bị web bị khoá bằng
+  close code **`4412`** (`CLOSE_CODES.locked`) — **KHÔNG phải 4401**: không có gì bị thu hồi, client **giữ** credential và chỉ cần re-attest.
+  Ngoài ra một cổng gửi chặn mọi khung không nằm trong nhóm an toàn (`hello`, `paired`, `client-hello`, `pong`, `error`,
+  `account-attestation`, `device-info`, `device-forgotten`, `session-stream-reset`) khi thiết bị đang bị khoá.
+  Thiết bị **chưa attest** không bị đóng socket (nếu đóng, nó không bao giờ kịp attest); nó bị chặn ở cổng yêu cầu.
+- **Cổng khoá áp cho MỌI loại khung** của thiết bị giữ `web:unlock` — kể cả `remote-call`/`remote-stream-*` (remote bridge),
+  `remote-upload-*`, `browser-result`/`browser-cancel` — vì một thiết bị **có thể** giữ đồng thời `web:unlock` với
+  `harness:remote` (desktop) hoặc `attachments:write`/`browser:control` (mobile). Miễn trừ: `client-hello`, `ping`,
+  `device-forget`, `account-attestation`.
+- **Sự kiện Host**: `deepseek-account/signed-out` và `deepseek-account/session-expired` khoá **tức thì** (không chờ poll).
+  Ngoài ra gateway poll `account/*` định kỳ (`webUnlockProbeMs`, mặc định 30 s) để phát hiện **đổi tài khoản** mà Host không phát event.
+- `web:unlock` là scope **never-default**, mobile-holdable, có trong preset `full`, không ở `standard`/mặc định mobile, **không migration**.
+  Type này **không** nằm trong `OPS` (contract §4 không đổi).
 

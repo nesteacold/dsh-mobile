@@ -397,5 +397,4 @@ function createRegistry(file, options = {}) {
     },
   }
 }
-
 module.exports = { createRegistry, digest, clampPairingTtlMs, MAX_PAIRING_TTL_MS }

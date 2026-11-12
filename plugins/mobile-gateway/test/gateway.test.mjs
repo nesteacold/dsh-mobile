@@ -614,8 +614,11 @@ function openCompanionSocket(extraHeaders = {}) {
       { path: 'guide.pdf', description: 'PDF 攻略' }, { path: delivered.files[1].path },
     ] })
   // Contract §3.5: the companion `hello` carries exactly the package
-  // CAPABILITIES, not the upstream admin list of the legacy client.
-  assert.deepEqual(got.find(frame => frame.kind === 'hello').capabilities, ['sessions-read', 'prompt', 'cancel', 'approval-v1'])
+  // CAPABILITIES, not the upstream admin list of the legacy client. Revision 10 adds
+  // the OPTIONAL `browser-agent:1` (spec 016 Phase 3), so the exact set is the required
+  // four plus that one — anything else (an admin capability) still fails here.
+  assert.deepEqual(got.find(frame => frame.kind === 'hello').capabilities,
+    ['sessions-read', 'prompt', 'cancel', 'approval-v1', 'browser-agent:1'])
   interactionResults.push(['live delivery keeps paths and descriptions', true])
 
   const generatedRef = { attachmentId: 'generated-image', mediaType: 'image/png', bytes: 8, width: 1024, height: 768 }
@@ -631,7 +634,9 @@ function openCompanionSocket(extraHeaders = {}) {
     assert.deepEqual(got.find(frame => frame.seq === seq).event.images, [generatedRef])
     if (type !== 'tool/result') assert.equal(got.find(frame => frame.seq === seq).event.parentCallId, 'run-code')
   }
-  assert.deepEqual(got.find(frame => frame.kind === 'hello').capabilities, ['sessions-read', 'prompt', 'cancel', 'approval-v1'])
+  // Same exact-set rule as above (revision 10 adds the optional `browser-agent:1`).
+  assert.deepEqual(got.find(frame => frame.kind === 'hello').capabilities,
+    ['sessions-read', 'prompt', 'cancel', 'approval-v1', 'browser-agent:1'])
   interactionResults.push(['live generated tool images and subcalls', true])
 
   // Auxiliary queries must report the real failure with their own request identity.
@@ -772,7 +777,8 @@ function openCompanionSocket(extraHeaders = {}) {
       // Contract §3.5: the companion `hello` lists exactly the package
       // CAPABILITIES; split channels, projections, schedules and plugin
       // management are no longer advertised to a phone.
-      assert.deepEqual(controls.find(f => f.kind === 'hello').capabilities, ['sessions-read', 'prompt', 'cancel', 'approval-v1'])
+      assert.deepEqual(controls.find(f => f.kind === 'hello').capabilities,
+        ['sessions-read', 'prompt', 'cancel', 'approval-v1', 'browser-agent:1'])
       assert.equal(await waitFor(() => controls.some(f => f.kind === 'projection-baseline'), 2000), true)
       assert.deepEqual(controls.find(f => f.kind === 'projection-baseline').projections.s1.values.turnOutline, initialTurnOutline)
       assert.equal(conversations.some(f => f.kind === 'projection-baseline'), false)
@@ -1373,7 +1379,9 @@ function openCompanionSocket(extraHeaders = {}) {
     ['queue update missing itemId', admin({ type: 'queue-update', sessionId: 's1', action: 'remove' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'queue-update'],
     ['session archive', admin({ type: 'session-archive', sessionId: 's1' }), (m) => m.kind === 'session-archived' && m.sessionId === 's1' && m.archivedSessionIds.includes('s1') && api.archiveCalls.some((call) => call.sessionId === 's1')],
     ['session archive missing sessionId', admin({ type: 'session-archive' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'session-archive'],
-    ['session rename', admin({ type: 'session-rename', sessionId: 's1', title: ' App 新名称 ' }), (m) => m.kind === 'session-renamed' && m.sessionId === 's1' && m.title === 'App 新名称' && m.seq === 95 && api.renameCalls.some((call) => call.sessionId === 's1' && call.title === ' App 新名称 ')],
+    // Revision 11 (contract §4): the title is TRIMMED before it is stored, so both the
+    // Host and the receipt carry the trimmed value, never the padded request value.
+    ['session rename', admin({ type: 'session-rename', sessionId: 's1', title: ' App 新名称 ' }), (m) => m.kind === 'session-renamed' && m.sessionId === 's1' && m.title === 'App 新名称' && m.seq === 95 && api.renameCalls.some((call) => call.sessionId === 's1' && call.title === 'App 新名称')],
     ['session rename empty title', admin({ type: 'session-rename', sessionId: 's1', title: '   ' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'session-rename'],
     ['session rename missing sessionId', admin({ type: 'session-rename', title: '新名称' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'session-rename'],
     ['models global (no sessionId)', admin({ type: 'models' }), (m) => m.kind === 'models' && m.groups.length === 1 && m.groups[0].models[0].id === 'deepseek-chat' && m.current === undefined],

@@ -1,0 +1,66 @@
+# 27 — scheduled tasks WITH the grant but nothing scheduled: the empty answer, never a row (spec 018).
+#
+# SCENARIO: paired, ready socket, `hello.device.scopes` = the four scopes the hidden flow uses plus
+#           `schedule:read`. Checkpoint T-21 in `run-e2e.mjs` arms it immediately before this flow:
+#             POST /scenario/scopes {"scopes":["sessions:read","sessions:author","prompt:send","approval:respond","schedule:read"]}
+#             POST /scenario/schedule-list {"active":false}
+# HARNESS:  `--cert-mode ok`. With `active:false` the fixture serves `items: []`, which is what a Host
+#           with no scheduled work answers.
+# MANUAL:   biometric prompt only.
+#
+#[WHY] T-20 proves the list/detail path; this one proves the OTHER honest answer. The screen must
+#      distinguish "no active tasks" (`schedules-empty`) from "could not read" (`schedules-error`) and
+#      from "not available right now" (`schedules.notNow`), and must not invent a row or leave a detail
+#      sheet behind when there is nothing to show.
+#
+#[HOOKS] `list-menu` → `tab-settings` → `settings-schedules` → `schedules-screen` → `schedules-empty`
+#        (the empty answer), with `schedules-error`, `schedules-retry`, `schedules-detail` and
+#        `schedules-detail-close` asserted ABSENT.
+#
+#[EXIT CRITERIA]
+#   1. the grant draws the row and the screen;
+#   2. the screen says "no active tasks" and offers no retry (a read that succeeded has no failure);
+#   3. no detail sheet is drawn and no row was opened (asserted by the orchestrator: zero
+#      `schedule-view` frames).
+
+appId: com.dshext.companion
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+
+- tapOn:
+    id: "list-menu"
+- tapOn:
+    id: "tab-settings"
+
+- extendedWaitUntil:
+    visible:
+      id: "settings-screen"
+    timeout: 20000
+- assertVisible:
+    id: "settings-schedules"
+
+- tapOn:
+    id: "settings-schedules"
+- extendedWaitUntil:
+    visible:
+      id: "schedules-screen"
+    timeout: 20000
+
+# 1) The empty answer, not an error and not a busy line.
+- extendedWaitUntil:
+    visible:
+      id: "schedules-empty"
+    timeout: 20000
+- assertNotVisible:
+    id: "schedules-loading"
+- assertNotVisible:
+    id: "schedules-error"
+- assertNotVisible:
+    id: "schedules-retry"
+
+# 2) Nothing to open: the detail sheet and its close control cannot be up.
+- assertNotVisible:
+    id: "schedules-detail"
+- assertNotVisible:
+    id: "schedules-detail-close"

@@ -266,7 +266,10 @@ test('T7b: a pairing TTL above the contract window is clamped to five minutes at
 test('T2: the scope gate fails closed for a companion op with no mapping', () => {
   // FR2: a companion-v1 type with no entry in SCOPE_BY_TYPE must not run.
   // `scopeDenial` is what the router asks before any Host call.
-  const desktop = { scopes: ['sessions:read', 'prompt:send', 'approval:respond'] }
+  // Derive the granted set from the contract instead of a literal: spec 013 added
+  // `attachments:write` to the desktop default, and `SCOPE_BY_TYPE` maps
+  // `remote-upload-open` onto it. The gate's job is the mapping, not a frozen list.
+  const desktop = { scopes: [...DESKTOP_DEFAULT_SCOPES] }
   for (const [type, scope] of Object.entries(SCOPE_BY_TYPE)) {
     const denial = scopeDenial(desktop, type)
     assert.equal(denial === undefined, desktop.scopes.includes(scope), `${type} (${scope})`)
@@ -357,12 +360,27 @@ test('restart: a partial record (only one of kind/scopes) grants no default', (t
 
 test('the shared vocabulary is what the record uses', () => {
   assert.deepEqual([...DEVICE_KINDS], ['mobile', 'desktop'])
-  // Seven spec 005 scopes + the spec 011 author scope + seven spec 008 scopes
-  // (`harness:remote` and the six full-control scopes; explicit-only, desktop-only).
-  assert.equal(CONTRACT_SCOPES.length, 14)
+  // Six spec 005 scopes + the spec 011 author scope + seven spec 008 scopes
+  // (`harness:remote` and the six full-control scopes; explicit-only, desktop-only)
+  // + the spec 013 attachment scope + the spec 014 browser scope + the spec 018
+  // metric scope + the spec 020 `web:unlock` scope + the spec 018 item 3 `schedule:read`
+  // scope (read-only visibility of the Host's scheduled tasks; never a default)
+  // + the spec 019 `permission:lower` scope (rev 13; lower-only, so a mobile may hold it too).
+  assert.equal(CONTRACT_SCOPES.length, 20)
   assert.equal(DESKTOP_ONLY_SCOPES.length, 7)
-  assert.equal(SCOPES.length, 7)
-  assert.deepEqual(SCOPES.filter((scope) => NEVER_DEFAULT_SCOPES.includes(scope)), ['sessions:author'])
+  // A `mobile` device may hold every scope that is not desktop-only: the six spec
+  // 005 scopes plus spec 011 authoring, spec 013 `attachments:write`, spec 014
+  // `browser:control`, spec 018 `stats:read`, spec 020 `web:unlock`, spec 018 item 3
+  // `schedule:read`, and spec 019 `permission:lower` = 13. The other 7 of the 20 are
+  // the desktop-only set above.
+  assert.equal(SCOPES.length, 13)
+  // The never-default scopes, in `SCOPES` order, which is NOT the contract
+  // `NEVER_DEFAULT_SCOPES` order: spec 018 metrics and spec 020 `web:unlock` are
+  // declared up next to the mobile-holdable writes, `schedule:read` sits right after
+  // `schedule:write`, then spec 011 authoring, spec 013 attachments, spec 014 browser,
+  // and spec 019 `permission:lower` last.
+  assert.deepEqual(SCOPES.filter((scope) => NEVER_DEFAULT_SCOPES.includes(scope)),
+    ['stats:read', 'web:unlock', 'schedule:read', 'sessions:author', 'attachments:write', 'browser:control', 'permission:lower'])
 })
 
 test('spec 008 full control: a desktop can be granted every desktop-only scope; a mobile or legacy record never holds one', (t) => {

@@ -1,0 +1,51 @@
+# 23 — permission chip/sheet WITHOUT the Host's `permission-lower` capability (spec 019).
+#
+# SCENARIO: paired to the fixture (`hello.capabilities` = sessions-read, prompt, cancel, approval-v1,
+#           so NO `permission-lower`), opening `sess-alpha`.
+# HARNESS:  `--cert-mode ok`; nothing armed. The pairing prerequisite is the same one the other paired
+#           flows use: `subflows/pair-paste.yaml` (runFlow `when: visible` is skipped once the app is
+#           already paired), so a plain `maestro test` on a fresh install does not stop on the pair
+#           screen. `run-e2e.mjs` pairs first (`checkpoint.pair`); the subflow is what a manual run has.
+# NOTE:     the fixture has no control route for `CAPABILITIES` (only `/scenario/scopes`, which sets
+#           `hello.device.scopes`, not capabilities), so the GRANTED branch of this surface is a gap
+#           stated in `e2e/README.md` rather than faked here.
+# MANUAL:   biometric prompt only.
+#
+#[WHY] The chip is drawn ONLY when the socket is ready, the Host advertises the capability AND the
+#      Host projects a preset; anything else (older gateway, no preset service) draws NO chip instead
+#      of an invented default. So this flow proves the "hidden when the Host doesn't grant it" state,
+#      and that no sheet control can exist behind a chip that was never drawn.
+#
+#[HOOKS] `session-more` (a controlled header neighbour, proving the session screen is up),
+#        `permission-chip` (the header chip — its ABSENCE is the assertion), `permission-close` (the
+#        sheet's own close control, which cannot be up). `permission-sheet` and `permission-option-<preset>`
+#        live in `src/ui/components/permission-lower.tsx`, which `check-flows.mjs` does not resolve
+#        statically (see "Test hooks" in `e2e/README.md`).
+#
+#[EXIT CRITERIA]
+#   1. the session screen is up (header control present);
+#   2. no permission chip is drawn;
+#   3. no sheet is open (`permission-close` absent).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-alpha
+  SESSION_TAB: running
+  SESSION_TITLE: Refactor gateway TLS
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- runFlow: subflows/pair-paste.yaml
+- runFlow: subflows/open-session.yaml
+
+# 1) The session screen really rendered (a header control with a stable hook).
+- assertVisible:
+    id: "session-more"
+
+# 2) No capability ⇒ no chip.
+- assertNotVisible:
+    id: "permission-chip"
+
+# 3) No chip means no sheet: its close control cannot be up.
+- assertNotVisible:
+    id: "permission-close"

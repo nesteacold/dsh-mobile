@@ -1,0 +1,55 @@
+# 19 — session stats WITHOUT the grant: the entry is absent and nothing is asked of the Host (spec 018).
+#
+# SCENARIO: paired with the four scopes `sessions:read`, `sessions:author`, `prompt:send`,
+#           `approval:respond` (NO `stats:read`), opening `sess-alpha`.
+# HARNESS:  `--cert-mode ok`. This flow is checkpoint T-23 in `run-e2e.mjs`, which arms that explicit
+#           four-scope set immediately before it (`POST /scenario/scopes`): a plain `maestro test`
+#           pairs with whatever the gateway offers, and the fixture's own default scopes are the four
+#           plus nothing else, but `stats:read` is explicit-only (`NEVER_DEFAULT_SCOPES`) so the arm
+#           is what makes the run deterministic.
+# MANUAL:   biometric prompt only.
+#
+#[WHY] `stats:read` is explicit-only (never a default) and no `hello` capability advertises it, so
+#        the device's scopes are the only gate the app can rely on. Without it the ⋯ menu must offer
+#        NO stats row and the app must not send a `session-stats` frame. The granted branch is
+#        `20-session-stats-granted.yaml` (checkpoint T-19).
+#
+#[HOOKS] `session-more` (open the ⋯ menu), `session-stats` (the stats row — its ABSENCE is the
+#        assertion), and the always-present rows (`session-team`, `session-stop`) as proof the menu
+#        really opened, so "no stats row" cannot mean "the menu never opened".
+#
+#[EXIT CRITERIA]
+#   1. the ⋯ menu opens and offers no stats row;
+#   2. the stats sheet was never opened (`session-stats-close` absent — the close hook is the one
+#      stats hook that lives in `app/`, so it is the proof the sheet could not be up);
+#   3. no `session-stats` frame reached the Host (asserted by the orchestrator from `GET /state`,
+#      `evidence.readOnlyRequests`).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-alpha
+  SESSION_TAB: running
+  SESSION_TITLE: Refactor gateway TLS
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- runFlow: subflows/pair-paste.yaml
+- runFlow: subflows/open-session.yaml
+
+- tapOn:
+    id: "session-more"
+
+# 1) The controlled menu: both always-present rows are drawn…
+- assertVisible:
+    id: "session-team"
+- assertVisible:
+    id: "session-stop"
+# …and the stats row is NOT (a control the Host would refuse is absent, never disabled). The row sits
+# in the ⋯ sheet near the top of a 720-pt screen, so no scroll is needed and none is done: a scroll
+# here would only turn "not rendered" into "scrolled past", which is a weaker claim.
+- assertNotVisible:
+    id: "session-stats"
+
+# 2) No sheet: its close hook (rendered by the sheet itself) is absent.
+- assertNotVisible:
+    id: "session-stats-close"

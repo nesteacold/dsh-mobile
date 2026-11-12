@@ -26,3 +26,19 @@
         # being redialled at the first step forever. Clamped like the delays
         # ([100, 300000] ms; default 10000).
         reconnectStableMs: 10000
+        # Spec 016 Phase 3 (contract revision 10): the "Browser (agent)" tab. This
+        # machine lets a paired host drive an INSTALLED Chrome or Edge through
+        # `--remote-debugging-pipe` (never a TCP port, never a download), one profile
+        # per host under <dataDir>/agent-browser-profile/<remoteId>. Off by default and
+        # then enabled per host on the Devices page ("Allow <host> to drive a browser
+        # on this machine"). `false` removes the whole surface on this machine.
+        agentBrowser: true
+        # Optional explicit browser executable; empty = the standard Chrome/Edge
+        # locations for this platform.
+        agentBrowserPath: ''
+        # Close an unused browser after this many ms (0 = never). Default 120000.
+        agentBrowserIdleMs: 120000
+        # Extra `host:port` values the agent may never open (this machine's own DSH
+        # server is refused by default; the frame route also records the Host it is
+        # served from, so the running app blocks itself without configuration).
+        agentBrowserBlockedOrigins: []

@@ -15,7 +15,8 @@
 //   5. `assertVisible`/`tapOn` that reference an env var are paired with a default in `env:` or are
 //      documented as orchestrator-provided;
 //   6. every hook selector (`id:`) names a `testID` the app really renders — read out of
-//      `app/**/*.tsx` (`testID="pair-submit"` / `` testID={`session-row-${id}`} `` → a known prefix).
+//      `app/**` and `src/**` (`testID="pair-submit"` / `` testID={`session-row-${id}`} `` → a known
+//      prefix / `testID={testID}` → each call site's own argument, e.g. `testID="permission-chip"`).
 //      A typo in `session-row-sess-alpha` is otherwise a device-only failure that looks like an app
 //      bug; here it is a static failure with the known ids printed;
 //   7. a dynamic segment interpolated into an `id:` must be regex-safe (`[A-Za-z0-9._-]`), because
@@ -33,7 +34,10 @@ import { fileURLToPath } from 'node:url'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const flowDir = path.join(here, 'maestro')
-const appDir = path.join(here, '..', 'app')
+const rootDir = path.join(here, '..')
+// Both places the screens live: routes under `app/` and the components they mount from `src/`
+// (`src/ui/components/permission-lower.tsx` is only reachable through `app/session/[id].tsx`).
+const sourceDirs = ['app', 'src'].map((dir) => path.join(rootDir, dir))
 const verbose = process.argv.includes('--verbose')
 
 /** Vietnamese characters that only appear in the `vi` table (rough but sufficient). */
@@ -91,13 +95,15 @@ function isDeliberatelyWholeMatch (value) {
 // Hooks the app actually renders (`app/**/*.tsx` → `testID=`)
 // ---------------------------------------------------------------------------
 
-/** Every `.tsx` under `app/`, recursively. */
-function collectSources (dir) {
+/** Every `.tsx`/`.ts` under the given directories, recursively. */
+function collectSources (dirs) {
   const out = []
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name)
-    if (entry.isDirectory()) out.push(...collectSources(full))
-    else if (entry.name.endsWith('.tsx') || entry.name.endsWith('.ts')) out.push(full)
+  for (const dir of dirs) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) out.push(...collectSources([full]))
+      else if (entry.name.endsWith('.tsx') || entry.name.endsWith('.ts')) out.push(full)
+    }
   }
   return out
 }
@@ -106,12 +112,24 @@ function collectSources (dir) {
  * Read `testID="x"` (static) and `` testID={`prefix-${...}`} `` (templated) out of the app source.
  * The templated form is what the screens use for per-row/per-card hooks, so a flow may only rely on
  * its literal prefix — this is the contract instead of a hardcoded list drifting from the app.
+ *
+ * A shared component takes the hook as a PROP (`testID={testID}`, e.g. `ui.tsx` `Screen`), so that
+ * literal is not the id the screen renders: the id is whatever each call site passes
+ * (`<Screen testID="settings-screen">`). Those are collected by `collectTestIdProps`.
  */
+/**
+ * `testID={<expr> ? 'a' : 'b'}` — a ternary over two literals. Collected alongside the static ids so
+ * a state hook is checkable too; the stats panel picks its "nothing to show" hook exactly that way
+ * (`src/ui/components/stats-panel.tsx`), and a typo in `session-stats-unavailable` would otherwise
+ * be a device-only failure.
+ */
+const TERNARY_TEST_ID = /testID=\{[\w.]+ === (?:'[^']*'|[\w.]+|\d+) \? '([^']*)' : '([^']*)'\}/g
+
 function collectHookIds () {
   const staticIds = new Map()
   const templatePrefixes = new Map()
-  for (const file of collectSources(appDir)) {
-    const rel = path.relative(path.join(here, '..'), file).replaceAll('\\', '/')
+  for (const file of collectSources(sourceDirs)) {
+    const rel = path.relative(rootDir, file).replaceAll('\\', '/')
     const text = readFileSync(file, 'utf8')
     for (const match of text.matchAll(/testID=(?:"([^"]*)"|\{`([^`]*)`\})/g)) {
       const literal = match[1] ?? match[2]
@@ -122,23 +140,51 @@ function collectHookIds () {
       const prefix = literal.slice(0, literal.indexOf('${'))
       if (prefix !== '') templatePrefixes.set(prefix, rel)
     }
+    for (const match of text.matchAll(TERNARY_TEST_ID)) {
+      staticIds.set(match[1], rel)
+      staticIds.set(match[2], rel)
+    }
   }
   return { staticIds, templatePrefixes }
 }
 
-const { staticIds, templatePrefixes } = collectHookIds()
+/**
+ * `<Screen testID="settings-screen">` — a component that forwards its `testID` prop is a real hook
+ * at every call site. A spread (`{...props}`) or a computed value names nothing and is skipped.
+ */
+function collectTestIdProps () {
+  const ids = new Map()
+  for (const file of collectSources(sourceDirs)) {
+    const rel = path.relative(rootDir, file).replaceAll('\\', '/')
+    const text = readFileSync(file, 'utf8')
+    for (const match of text.matchAll(/<[A-Za-z][\w.]*(?=[\s/>])[^>]*?\stestID=(?:"([^"]*)"|'([^']*)')/g)) {
+      const literal = match[1] ?? match[2]
+      if (!literal.includes('${')) ids.set(literal, rel)
+    }
+  }
+  return ids
+}
+
+const hookIds = collectHookIds()
+for (const [id, where] of collectTestIdProps()) {
+  if (!hookIds.staticIds.has(id)) hookIds.staticIds.set(id, where)
+}
+const staticIds = hookIds.staticIds
+const templatePrefixes = hookIds.templatePrefixes
 
 /**
  * The finite sets a hook *tail* may come from, read out of the code that produces it:
  *   * `SESSION_ID` / `APPROVAL_ID` — the fixture ids in `harness/gateway.mjs` (BASE_SESSIONS /
  *     BASE_APPROVALS); a typo here is a device-only "row never appears";
- *   * `SESSION_TAB` — the tab enum in `app/index.tsx` (`sessions-tab-<tab>`).
+ *   * `SESSION_TAB` — `SESSION_STATES` in `src/core/protocol.ts`, the only tab enum left (spec 011
+ *     P1-A removed the tab bar and its `sessions-tab-<tab>` hooks; the subflows still carry a
+ *     `SESSION_TAB` default, and a value outside that enum is still a stale flow).
  * Any other env name is left to the prefix check only (it may be a real host id at run time).
  */
 function fixtureIdSets () {
   const gateway = readFileSync(path.join(here, 'harness', 'gateway.mjs'), 'utf8')
-  // Spec 011 P1-A: the list (and its `{ tab, key }` TABS array) moved to the Conversations tab.
-  const index = readFileSync(path.join(appDir, '(tabs)', 'conversations.tsx'), 'utf8')
+  const protocol = readFileSync(path.join(rootDir, 'src', 'core', 'protocol.ts'), 'utf8')
+  const sessionStates = /SESSION_STATES\s*=\s*\[([^\]]*)\]/.exec(protocol)
   return new Map([
     ['SESSION_ID', {
       values: new Set([...gateway.matchAll(/sessionId:\s*'([\w-]+)'/g)].map((match) => match[1])),
@@ -149,8 +195,22 @@ function fixtureIdSets () {
       source: 'e2e/harness/gateway.mjs BASE_APPROVALS',
     }],
     ['SESSION_TAB', {
-      values: new Set([...index.matchAll(/\{\s*tab:\s*'(\w+)',\s*key:/g)].map((match) => match[1])),
-      source: "app/(tabs)/conversations.tsx TABS (SessionTab enum)",
+      values: sessionStates === null
+        ? new Set()
+        : new Set([...sessionStates[1].matchAll(/'(\w+)'/g)].map((match) => match[1])),
+      source: 'src/core/protocol.ts SESSION_STATES (SessionTab enum)',
+    }],
+    // Spec 018: the one scheduled task the fixture serves (`SCHEDULE_TASK`), used as the
+    // `schedules-row-<id>` hook.
+    ['SCHEDULE_ID', {
+      values: new Set([...gateway.matchAll(/id:\s*'(sch-[\w-]+)'/g)].map((match) => match[1])),
+      source: 'e2e/harness/gateway.mjs SCHEDULE_TASK',
+    }],
+    // Spec 018: the agent-team read is served with `projectionState: unavailable`, so the panel draws
+    // `agent-team-state-<state>`; replaying the same value here keeps a typo a static failure.
+    ['AGENT_TEAM_STATE', {
+      values: new Set(['ready', 'unavailable', 'migration-required', 'failed']),
+      source: 'src/ui/conversation/AgentTeamPanel.tsx StateNotice (TeamViewState)',
     }],
   ])
 }
@@ -338,7 +398,7 @@ for (const file of files) {
       const name = match[1]
       if (['output', 'MAESTRO_'].some((prefix) => name.startsWith(prefix))) continue
       const declared = new RegExp(`^\\s+${name}:`, 'm').test(text)
-      const orchestrator = ['PAIR_QR', 'EXPIRED_QR', 'EXPECTED_UPGRADE_STATUS', 'EXPECTED_UPDATE_SIDE', 'SESSION_ID', 'SESSION_TITLE', 'SESSION_TAB', 'PROMPT_TEXT', 'APPROVAL_ID']
+      const orchestrator = ['PAIR_QR', 'EXPIRED_QR', 'EXPECTED_UPGRADE_STATUS', 'EXPECTED_UPDATE_SIDE', 'SESSION_ID', 'SESSION_TITLE', 'SESSION_TAB', 'PROMPT_TEXT', 'APPROVAL_ID', 'SCHEDULE_ID', 'SCHEDULE_TITLE']
       if (!declared && !orchestrator.includes(name)) {
         notes.push(`${rel}: env ${name} is neither declared in this flow nor a known orchestrator variable (line ${index + 1})`)
       }
@@ -366,7 +426,7 @@ for (const name of fileNames) {
 }
 
 process.stdout.write(`checked ${checked} flow files + ${checkedHooks} hook selectors + run-e2e.mjs checkpoint references\n`)
-process.stdout.write(`hooks known from app/: ${staticIds.size} static, ${templatePrefixes.size} templated\n`)
+process.stdout.write(`hooks known from app/ + src/: ${staticIds.size} static, ${templatePrefixes.size} templated\n`)
 if (verbose) for (const note of notes) process.stdout.write(`  note ${note}\n`)
 
 if (problems.length === 0) {

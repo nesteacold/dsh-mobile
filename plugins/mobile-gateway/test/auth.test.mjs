@@ -381,8 +381,9 @@ function upgradeOutcome(url, protocols, headers) {
   assert.equal(pairedSocket.protocol, 'dsh-mobile-v1')
   assert.equal(hello.authenticated, true)
   assert.equal(hello.protocol, 3)
-  // Contract §3.5: exactly the package CAPABILITIES, never the upstream list.
-  assert.deepEqual(hello.capabilities, ['sessions-read', 'prompt', 'cancel', 'approval-v1'])
+  // Contract §3.5: exactly the package CAPABILITIES, never the upstream list; revision 10
+  // adds the OPTIONAL `browser-agent:1`, so the exact set is those five and nothing else.
+  assert.deepEqual(hello.capabilities, ['sessions-read', 'prompt', 'cancel', 'approval-v1', 'browser-agent:1'])
   assert.equal(hello.companionProtocol, 1)
   assert.equal(hello.minClientVersion, 1)
   assert.equal(hello.certSha256, pairBody.payload.certSha256)

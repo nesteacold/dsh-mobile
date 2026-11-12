@@ -1,0 +1,3 @@
+# Item 4 (question answer/cancel) — ownership
+
+Owner confirmed 2026-11-12: the `OWNER DECISION 2026-11-11` in plugins/mobile-gateway/lib/index.mjs `respondToQuestion` is the owner's decision, made with another DSH session. That session owns `respondToQuestion`, `mayReceiveQuestion`, `hasQuestionClient` and the question classification in `lib/allowlist.mjs`. This team does not edit them. Lead observation passed on for that session to judge: `hasQuestionClient(pending.sessionId)` in the answer gate does not depend on the sender, so with no client connected an admin answer is refused (model probe, not a live run).

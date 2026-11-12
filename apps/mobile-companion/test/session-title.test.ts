@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 
 import { SessionsStore } from '../src/core/sessions';
 import { t } from '../i18n';
-import { sessionDisplayTitle, sessionTitleMissing } from '../src/ui/session-title';
+import { cleanSessionTitle, sessionDisplayTitle, sessionTitleMissing } from '../src/ui/session-title';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (...parts: string[]): string => readFileSync(path.join(ROOT, ...parts), 'utf8');
@@ -37,11 +37,25 @@ const tr = (locale: 'en' | 'vi') => (key: Parameters<typeof t>[1], params?: Reco
 
 describe('session display title', () => {
   it('shows a human label instead of the wire id when the Host has no title', () => {
-    const untitled = { title: '', updatedAt: NOW - 60_000 };
-    assert.equal(sessionDisplayTitle(untitled, tr('en'), 'en', NOW), 'New session · 1 min');
-    assert.equal(sessionDisplayTitle(untitled, tr('vi'), 'vi', NOW), 'Phiên mới · 1 phút');
+    // Parity: the label carries NO timestamp. On device an untitled row read "Phiên mới · 11 giờ",
+    // which a Vietnamese reader parses as "11 o'clock", and the reference list shows no times at all.
+    assert.equal(sessionDisplayTitle({ title: '', updatedAt: NOW - 60_000 }, tr('en'), 'en', NOW), 'New session');
+    assert.equal(sessionDisplayTitle({ title: '', updatedAt: NOW - 60_000 }, tr('vi'), 'vi', NOW), 'Phiên mới');
     assert.equal(sessionDisplayTitle({ updatedAt: 0 }, tr('en'), 'en', NOW), 'New session');
     assert.equal(sessionDisplayTitle({ updatedAt: 0 }, tr('vi'), 'vi', NOW), 'Phiên mới');
+    assert.equal(sessionDisplayTitle({ title: '   ' }, tr('vi'), 'vi', NOW), 'Phiên mới', 'blank is untitled');
+  });
+
+  it('strips the markdown heading markers a prompt-derived title carries', () => {
+    // Device evidence: four rows read "# dsh-wiki worker protocol (Host-pinned,".
+    assert.equal(cleanSessionTitle('# dsh-wiki worker protocol'), 'dsh-wiki worker protocol');
+    assert.equal(cleanSessionTitle('### Deep heading'), 'Deep heading');
+    assert.equal(cleanSessionTitle('   #   spaced   out  '), 'spaced out');
+    assert.equal(cleanSessionTitle('Keep # inner hash'), 'Keep # inner hash', 'inner text is untouched');
+    assert.equal(
+      sessionDisplayTitle({ title: '# dsh-wiki worker protocol (Host-pinned, v2)' }, tr('en'), 'en', NOW),
+      'dsh-wiki worker protocol (Host-pinned, v2)',
+    );
   });
 
   it('never renders an id-shaped fallback', () => {
@@ -76,10 +90,9 @@ describe('session display title', () => {
 
   it('every surface uses the helper (header, recent rows, conversation rows)', () => {
     assert.match(SESSION, /sessionDisplayTitle\(session, tr, locale\)/, 'conversation header');
-    assert.match(HOME, /sessionDisplayTitle\(session, tr, locale\)/, 'workspace recent rows');
-    assert.match(CONVERSATIONS, /title=\{sessionDisplayTitle\(item, tr, locale\)\}/, 'conversation rows');
+    assert.match(HOME, /sessionDisplayTitle\(item\.session, tr, locale\)/, 'the list rows');
     // The raw field may not be rendered as a name anywhere any more.
-    for (const [name, source] of [['home', HOME], ['conversations', CONVERSATIONS]] as const) {
+    for (const [name, source] of [['list', HOME]] as const) {
       assert.equal(/\{session\.title\}/.test(source), false, `${name}: raw title must not be rendered`);
       assert.equal(/label=\{session\.title\}/.test(source), false, `${name}: raw title must not label a control`);
     }

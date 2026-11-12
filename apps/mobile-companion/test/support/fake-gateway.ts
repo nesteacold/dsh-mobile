@@ -71,6 +71,13 @@ export interface FakeGatewayOptions {
    * UNKNOWN rather than "denied". Set it to drive the granted/denied paths.
    */
   deviceScopes?: string[];
+  /**
+   * Spec 021 — the lock state this Host reports in `hello.webLock`. Default **absent**: an older
+   * gateway without revision 14, which the app must read as "not locked" (native parity).
+   */
+  webLock?: 'unregistered' | 'locked' | 'unlocked';
+  /** Spec 021 — the passkey frames this fixture answers, and with what code (default: accepted). */
+  passkeyAnswers?: Partial<Record<'passkey-register-options' | 'passkey-register' | 'passkey-assert-options' | 'passkey-assert' | 'passkey-lock', { code: string } | 'ok'>>;
   /** Reject the HTTP upgrade with this status (401 / 403 scenarios). */
   upgradeStatus?: number;
   /** Close every new socket with this code right after `hello` (4003 / 4004 / 4401). */
@@ -156,8 +163,10 @@ interface Connection {
 // REAL Host/gateway sends (measured from the DSH artifact: catalog.js + lib/dsh-host-adapter.mjs:364-376
 // for the per-session form). A model entry is `{ id, name }` (no `label`/`provider`); the provider id
 // lives in `group.id`; the reply carries `current`, `routable` and `failures`.
-const FIXTURE_CURRENT_MODEL = { provider: 'deepseek', model: 'deepseek-v4-flash' }
+/** Spec 021 fixture: `base64url(32 bytes)` — the shape of a real passkey challenge. */
+const CHALLENGE = 'BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc'
 
+const FIXTURE_CURRENT_MODEL = { provider: 'deepseek', model: 'deepseek-v4-flash' }
 const FIXTURE_MODEL_GROUPS = [
   {
     id: 'deepseek',
@@ -306,6 +315,17 @@ export class FakeGateway {
     this.pairingCodes.add(code);
   }
 
+  /** How many frames of one `type` this server has received (spec 021: "was anything asked?"). */
+  requestCount(type: string): number {
+    return this.allReceivedFrames.filter((text) => {
+      try {
+        return (JSON.parse(text) as { type?: unknown }).type === type;
+      } catch {
+        return false;
+      }
+    }).length;
+  }
+
   /**
    * Test-only: refuse every *new* upgrade with `status` (`null` clears it). Used to turn a host
    * that accepted this device into one that refuses its credential (HTTP 401) from now on.
@@ -401,6 +421,16 @@ export class FakeGateway {
     this.broadcast({ kind: 'event', ...event });
   }
 
+  /**
+   * Spec 018 item 5: push a projection frame exactly as the gateway does — `projection-baseline`,
+   * `tasks-updated` or `goal-updated`, with no `requestId` (PROTOCOL.md:1197-1201,
+   * `lib/index.mjs:7013-7016`). The frame is forwarded verbatim so a test can also send a malformed
+   * one and prove the app tolerates it.
+   */
+  pushProjection(frame: Record<string, unknown>): void {
+    this.broadcast(frame);
+  }
+
   /** Force a network drop on every open connection (US5 test). */
   dropAllConnections(): void {
     for (const connection of this.connections) connection.socket.terminate();
@@ -460,6 +490,23 @@ export class FakeGateway {
     for (const connection of this.connections) {
       if (connection.socket.readyState === WebSocket.OPEN) connection.socket.send(text);
     }
+  }
+
+  /**
+   * The `paired` frame's device, shaped like the gateway's `publicDevice()` (`lib/devices.js`):
+   * `kind` + the granted `scopes` are part of the answer, and the app reads `web:unlock` from them
+   * to know a passkey must be created. Omitted entirely when the fixture models an older gateway
+   * (`deviceScopes` unset), so "absent" stays distinguishable from "reported an empty grant".
+   */
+  private pairedDevice(connection: Connection): Record<string, unknown> {
+    return {
+      id: connection.device.id,
+      name: connection.device.name,
+      createdAt: connection.device.createdAt,
+      ...(this.options.deviceScopes === undefined
+        ? {}
+        : { kind: 'mobile' as const, scopes: this.options.deviceScopes }),
+    };
   }
 
   private async listen(): Promise<void> {
@@ -635,6 +682,8 @@ export class FakeGateway {
       gatewayId: 'b3a4c2c9-5d2f-4a8e-9f2b-0c1d2e3f4a5b',
       dshVersion: '0.2.2-rc.1',
       certSha256: this.certificate.certSha256,
+      // Spec 021 (contract §14.2): present ONLY for a `web:unlock` device, exactly like the gateway.
+      ...(this.options.webLock === undefined ? {} : { webLock: this.options.webLock }),
     };
   }
 
@@ -734,7 +783,7 @@ export class FakeGateway {
       this.tokenDevices.set(token, connection.device.id);
       this.removePendingPairing(pairing.code);
       if (connection.socket.readyState !== WebSocket.OPEN) continue;
-      connection.socket.send(toFrame({ kind: 'paired', token, device: connection.device }));
+      connection.socket.send(toFrame({ kind: 'paired', token, device: this.pairedDevice(connection) }));
       this.sendHello(connection);
       if (this.options.closeAfterHello !== undefined) {
         connection.socket.close(this.options.closeAfterHello, 'close-after-hello');
@@ -852,6 +901,40 @@ export class FakeGateway {
     }
     if (connection.token === null) return fail('auth/required');
     if (!this.tokens.has(connection.token)) return fail('auth/revoked');
+
+    // Spec 021 (contract §14.1/§14.2): the five passkey frames, answered the way the fixture is
+    // configured. `passkey-lock` is the PWA's own re-lock request (not in the contract doc).
+    if (type === 'passkey-register-options' || type === 'passkey-register' || type === 'passkey-assert-options'
+      || type === 'passkey-assert' || type === 'passkey-lock') {
+      const answer = this.options.passkeyAnswers?.[type];
+      if (answer !== undefined && answer !== 'ok') return fail(answer.code);
+      switch (type) {
+        case 'passkey-register-options':
+          return send({
+            kind: type,
+            challenge: CHALLENGE,
+            rp: { id: 'localhost', name: 'DSH Companion' },
+            user: { id: 'ZGV2aWNlOmQx', name: 'phone', displayName: 'phone' },
+            pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+            excludeCredentials: [],
+            timeout: 60_000,
+          });
+        case 'passkey-register':
+          return send({ kind: type, ok: true });
+        case 'passkey-assert-options':
+          return send({
+            kind: type,
+            challenge: CHALLENGE,
+            rpId: 'localhost',
+            allowCredentials: [{ type: 'public-key', id: 'AwMDAwMDAwMDAwMDAwMDAw' }],
+            timeout: 60_000,
+          });
+        case 'passkey-assert':
+          return send({ kind: type, unlocked: true });
+        default:
+          return send({ kind: 'passkey-lock', locked: true });
+      }
+    }
 
     switch (type) {
       case 'sessions':

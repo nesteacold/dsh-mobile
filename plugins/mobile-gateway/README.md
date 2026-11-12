@@ -233,9 +233,41 @@ If a firewall blocks the connection, allow TCP `3081` only on private networks. 
 
 ### Device permissions: `sessions:author`
 
-Pairing carries an explicit scope list; no scope arrives unless the owner ticks it. `sessions:author` is the one that lets a paired device **create sessions and choose the model that runs them**: with it the device may list this Host's workspaces, read the model catalog, create an empty session in a workspace that exists on this Host, and select the provider/model (and reasoning effort) for a session it can address. The global `models` form (no `sessionId`) needs only `sessions:author`; the per-session form additionally needs `sessions:read`, because it reads that session's snapshot, and is refused without it. Everything else stays refused for every device: creating, renaming or archiving a workspace, forking or renaming a session, queue control, attachments, slash commands and `settings/*`.
+Pairing carries an explicit scope list; no scope arrives unless the owner ticks it. `sessions:author` is the one that lets a paired device **create sessions and choose the model that runs them**: with it the device may list this Host's workspaces, read the model catalog, create an empty session in a workspace that exists on this Host, and select the provider/model (and reasoning effort) for a session it can address. The global `models` form (no `sessionId`) needs only `sessions:author`; the per-session form additionally needs `sessions:read`, because it reads that session's snapshot, and is refused without it. Everything else stays refused for every device: creating, renaming or archiving a workspace, forking or renaming a session, queue control, slash commands and `settings/*`. Attachments are granted separately by `attachments:write` (below).
+
+### Device permissions: `attachments:write`
+
+`attachments:write` lets a **desktop** device send files and images into a session on this Host as chunked frames over the same pinned WebSocket — the `remote-upload-open | chunk | finish | cancel` frames of `@dsh-ext/mobile-protocol` revision 8 (see [`specs/001-gateway-hardening/contracts/mobile-protocol-v1.md`](../../specs/001-gateway-hardening/contracts/mobile-protocol-v1.md)). The bytes are staged through the Host's own upload service, so the receipt is exactly the one the desktop composer gets from `POST /api/session/uploadFileBinary` (`{receiptId, file}` or `{receiptId, image}`) and the file appears in the session like any other attachment.
+
+- It IS part of the desktop default set: a new `desktop` pairing gets it unless you untick it. It is never granted by a default to a `mobile` device, and a device paired before this scope existed keeps exactly the scopes it had — grant the new one through **Edit permissions**.
+- The frames additionally require a `desktop` device and a session that device may already see; a `mobile` record holding the scope still gets `auth/forbidden-scope`.
+- Limits: `fileUploadMaxBytes` (512 MiB by default) per file, chunks of at most 256 KiB (lowered to fit the WS payload budget), `fileUploadMaxTransfers` concurrent transfers per device, and a `fileUploadIdleMs` idle timeout that deletes the partial file. Images are checked against the Host's own accepted media types. The generic `fileUploads/upload` RPC stays refused over the remote bridge.
 
 It is **never granted by default** — not on a `desktop` offer, and deliberately not on a `mobile` offer either. Tick it in the pairing dialog, or in **Edit permissions** (which issues a new pairing code, because a grant is fixed when a device pairs), when the device is one you would let start work on this Host. The four operations it opens are `workspaces`, `session-create`, `models` and `select-model`; see [PROTOCOL.md](PROTOCOL.md#19-会话作者权限sessionsauthor-spec-011).
+
+### Device permissions: `approval:respond` (approvals AND questions)
+
+`approval:respond` is the interaction scope: it lets a paired device answer the cards this Host's agent is waiting on. Owner decision 2026-11-11: a **question** (`user-questions/request`, e.g. "Deploy target? staging-eu / prod-us") is gated by exactly this scope and never by the device kind — **every** paired device that holds `approval:respond` and may see the session receives the card and may answer it, desktop and mobile alike, as if sitting at the Host; a device without the scope is still sent nothing (the withholding is logged with device/session ids and the scope reason, never the question text). The answer must name a currently-pending card that this device was shown, for a session in its visible set; it is applied at most once (a duplicate or an unknown id gets the `not-pending` receipt approvals use), and a device may answer only from the offered options — no free text and no empty selection. Over the pinned link a device answers with `question-answer`/`question-cancel`; the desktop app answers a remote Host's question through the bridge's Host-validated `userQuestions/answer` (which additionally needs `harness:remote`).
+
+### Device permissions: `browser:control` (the host drives a browser on the client)
+
+Spec 016 Phase 3 (contract revision 10) makes the host the **requester** for the first time: a tool on this Host can drive a browser that lives on the paired client, over the same pinned WebSocket. Two independent keys are required, and neither implies the other:
+
+1. this Host holds `browser:control` on that device (`SCOPES` in `@dsh-ext/mobile-protocol`, part of the desktop default set, never a kind-independent default);
+2. the client's own setting **"allow the paired host to drive a browser on this machine"** is on for this Host (off by default, per host).
+
+The gateway half is two host services:
+
+| service key | shape | purpose |
+|---|---|---|
+| `remoteSessionScope` | `describe(session) → {driven: 'local'\|'remote', deviceId?, scopes?}` | spec 014 C6 signal for `plugins/sidebar-browser`: who prompted this session last. A session with no record, or an undeterminable one, answers `remote` (fail closed). |
+| `remoteBrowser` | `targets(sessionId)` → `[{id: 'host'\|deviceId, name, connected, capable, granted}]`, `send(target, sessionId, op, args, signal)` → `{ok, value}`/`{ok:false, error:{code, message}}` | places one `browser-command` on a device, with the contract's checks and limits. `target: 'auto'` means "the device that prompted this session, if connected, capable and granted — else `host`". |
+
+- **Who is the driver** is remembered per session from the prompts this gateway proxies (a remote-bridge `session/prompt`, or the companion `message` op). A `user/message` event with no device prompt outstanding is the local owner's. DSH 0.2.2-rc.1 carries no client identity on the tool path, which is why the record has to live here.
+- **Limits** (contract §10.3): one command in flight per device, a frame of at most 1 MiB, a deadline of 30 s default / 120 s maximum, screenshots ≤ 768 KiB decoded, `text`/`html` cut at 256 KiB. On deadline or abort the gateway sends `browser-cancel` before it answers.
+- **Immediate revocation**: revoking the device, unticking `browser:control`, or losing its last connection cancels a command already in flight (`browser/offline`, `browser/forbidden-scope`), and its late result is ignored.
+- The `host` target is **not** served by this service (`browser/not-supported`): the local browser is driven by the plugin that owns it, on this machine.
+
 
 ## Public-IP Pairing on Linux Servers
 

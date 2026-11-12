@@ -68,7 +68,9 @@ describe('session rows carry origin/parentSessionId', () => {
 });
 
 describe('both lists hide subagents but keep a way to reveal them', () => {
-  for (const [name, source] of [['workspace home', HOME], ['conversations', CONVERSATIONS]] as const) {
+  // Parity redesign: there is only ONE list now (the app's main screen); the old Conversations tab
+  // is a redirect, so the rule is stated once against the screen that really renders rows.
+  for (const [name, source] of [['list screen', HOME]] as const) {
     it(`${name}: filters subagent rows at render time`, () => {
       assert.match(source, /showSubagents \|\| !isSubagentSession\(session\)/, `${name} hides subagents by default`);
       assert.match(source, /home\.showSubagents/, `${name} offers the reveal affordance`);

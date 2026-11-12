@@ -7,9 +7,11 @@
 // `RemoteConnection`), so every assertion is about what the controller's own UI
 // sees and about what actually crosses the wire to a remote Host. The last two
 // cases run the REAL plugins/mobile-gateway in-process (as test/e2e.test.mjs
-// does): a question is withheld from a paired device — it is the owner's alone on
-// this channel — and an approval still reaches that device and is applied over
-// the pinned WSS + the bridge.
+// does). Two paths, two invariants (owner decision 2026-11-11): a question never
+// reaches a PAIRED DEVICE (it has no scope on this channel, and the withholding is
+// audited with ids only), while a remote Host's question card DOES reach the
+// OWNER's native `$events` stream with its payload so he can answer it — and an
+// approval still reaches that device and is applied over the pinned WSS + the bridge.
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -554,10 +556,10 @@ test('the Local $events frames pass through unchanged and unknown cards are igno
 //    stream plus `userQuestions/answer`, which is not this channel;
 //  - an APPROVAL is the device's (`approval:respond`): its card still reaches the
 //    device over the pinned WSS and the decision still applies on the Host.
-// The `$events` question path cannot be driven from a real gateway — the gateway
-// never sends a device a question card, so there is no card for the router to
-// bind. That path therefore stays covered by the stub-remote cases above (and by
-// the gateway's own tests); here the question is measured as withheld.
+// The two paths are asserted on separate witnesses, never through each other: the
+// device by the frames on its own socket, the owner UI by the `$events` card the
+// devices plugin merges in from the same Host push. Answering that UI card is
+// covered by the stub-remote cases above (and by the gateway's own tests).
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -726,6 +728,27 @@ function arrivesWithin(iterator, ms) {
   return Promise.race([watched, delay(ms).then(() => false)]).then((arrived) => ({ arrived, frame }))
 }
 
+/**
+ * The next `$events` frame `match` accepts, or `null` inside `ms`. Waits for THAT
+ * frame instead of for the stream to fall quiet: a test of one card must not pass
+ * (or fail) on how long an unrelated frame happens to take. Frames `skip` names are
+ * dropped while waiting; anything else that is not the wanted card is returned
+ * under `other`, so a call site can assert its absence.
+ */
+async function nextEvent(iterator, match, { skip = () => false, ms = 2000 } = {}) {
+  const deadline = Date.now() + ms
+  const others = []
+  for (;;) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return { frame: null, other: others }
+    const { arrived, frame } = await arrivesWithin(iterator, remaining)
+    if (!arrived) return { frame: null, other: others }
+    if (skip(frame)) continue
+    if (match(frame)) return { frame, other: others }
+    others.push(frame)
+  }
+}
+
 // The gateway's audit trail is its own log (lib/logging.mjs: one line to stdout and
 // one to a temp file). `apply()` takes no logger to inject, so the file is the only
 // thing a test can read — and it is the line the Host actually recorded.
@@ -747,10 +770,10 @@ function gatewayLogSince(offset) {
   } catch { return [] }
 }
 
-test('real gateway: a question card is withheld from a paired device, and question-answer stays refused', async (t) => {
+test('real gateway: a question card reaches an approval:respond device and is answered once, over the bridge', async (t) => {
   const gateway = await startRealGateway(t)
-  // Every scope a question could ask for, plus the one the bridge needs: the device
-  // is fully authorized — and a question is still not its to receive.
+  // Every scope a question could ask for, plus the one the bridge needs. Owner decision
+  // 2026-11-11: `approval:respond` IS the gate — such a device receives the card.
   const paired = await pairRealDevice(gateway, t, 'deskq-real-0000-4000-8000-000000000q01',
     ['sessions:read', 'approval:respond', 'harness:remote'])
   const harness = createHarness({ remotes: [{ hostId: HOST, hostName: 'Host B', connection: paired.connection }] })
@@ -762,40 +785,47 @@ test('real gateway: a question card is withheld from a paired device, and questi
   const logOffset = gatewayLogSize()
   const questions = [{ id: 'q1', header: 'Deploy target?',
     options: [{ label: 'staging-eu' }, { label: 'prod-us' }], multiSelect: false }]
-  // The desktop never answers, so the question stays pending on the Host: only a
-  // (forbidden) device frame could settle it.
   const question = askOnHost(gateway, 'call-77', questions)
   let settled = false
   void question.pending.then(() => { settled = true }, () => { settled = true })
   try {
-    // (1) The invariant, positively asserted: this device holds approval:respond +
-    // sessions:read + harness:remote and session `s1` is in its visible set (that
-    // is what the approval case below relies on), yet no question card appears —
-    // neither on the device socket nor in the native `$events` stream.
-    const quiet = await arrivesWithin(iterator, 2000)
-    assert.equal(quiet.arrived, false,
-      `a device must never be pushed a question card (got ${JSON.stringify(quiet.frame)})`)
-    assert.equal(wire.filter((frame) => frame.kind === 'question-requested').length, 0,
-      'a question card never crosses the wire to a device')
+    // (0) Wait for the OWNER UI card on its own witness (asserted in 2c below).
+    // A remote session's question is merged into the client's `$events` stream by
+    // the devices plugin from the same Host push the gateway sends to the device.
+    const uiQuestion = await nextEvent(iterator, (frame) => frame.event === 'user-questions/request')
+    // Bounded and total: every wire assertion below runs whether or not the card came.
+    assert.ok(uiQuestion.frame,
+      `the remote question reaches neither UI nor device (UI saw ${JSON.stringify(uiQuestion.other)})`)
 
-    // (2) The withholding is audited, with ids only — never the question text.
+    // (1) DEVICE path — ALLOWED (owner decision 2026-11-11): this device holds
+    // approval:respond + sessions:read + harness:remote and session `s1` is in its
+    // visible set, so the question card crosses its socket and carries the
+    // tool-call id the Host's question service keys it by. Read directly from the
+    // socket, so the UI-path assertion below is never the only witness.
+    for (let attempt = 0; attempt < 100 && wire.filter((frame) => frame.kind === 'question-requested').length === 0; attempt += 1) {
+      await delay(20)
+    }
+    const cards = wire.filter((frame) => frame.kind === 'question-requested')
+    assert.equal(cards.length, 1, 'exactly one question card crosses the wire to this device')
+    assert.equal(cards[0].sessionId, 's1')
+    assert.equal(cards[0].callId, 'call-77', 'the card names the tool call the question is keyed by')
+    assert.deepEqual(cards[0].questions, questions, 'the card carries the question payload')
+
+    // (2) No withholding is logged for an authorized device, and no question text is
+    // ever audited — the card is the only carrier, not the log.
     const logged = gatewayLogSince(logOffset)
     assert.ok(logged.some((line) => line.includes('question requested:') && line.includes('session=s1')),
       `the Host question was registered (${JSON.stringify(logged.slice(-6))})`)
     const withheld = logged.filter((line) => line.includes('question card withheld:')
       && line.includes(`device=${paired.device.id}`))
-    assert.ok(withheld.length >= 1, `the withholding is logged (${JSON.stringify(logged.slice(-6))})`)
-    for (const line of withheld) {
-      assert.match(line, /question card withheld: device=\S+ session=s1 reason=admin-only$/)
-    }
+    assert.equal(withheld.length, 0, `an authorized device is not logged as withheld (${JSON.stringify(logged.slice(-6))})`)
     for (const secret of ['Deploy target?', 'staging-eu', 'prod-us']) {
       assert.equal(logged.some((line) => line.includes(secret)), false,
         `the audit carries no question text (${secret})`)
     }
 
     // (2b) The positive control on the same socket and session: an approval card
-    // DOES arrive, so the silence above is the question type — not a device that
-    // cannot receive interaction frames at all.
+    // arrives too, so the question card is not a one-off of a broken socket.
     publishToolCall(gateway, 'call-88', '{"command":"ls"}')
     const control2 = askApprovalOnHost(gateway, 'call-88')
     let approvals = 0
@@ -803,27 +833,112 @@ test('real gateway: a question card is withheld from a paired device, and questi
       approvals = wire.filter((frame) => frame.kind === 'approval-requested').length
       if (approvals === 0) await delay(20)
     }
-    assert.equal(approvals, 1, 'an approval for the same session still reaches this device')
+    assert.equal(approvals, 1, 'an approval for the same session reaches this device')
+    // The same Host card merged into the owner's stream: one card, two witnesses.
+    const approvalCard = await nextEvent(iterator, (frame) => frame.event === 'approval/request')
+    assert.ok(approvalCard.frame, 'the approval reachable on the device is also on the owner UI path')
     control2.controller.abort()
     await control2.pending.catch(() => undefined)
 
-    // (3) The admin-only surface stays out of reach: a device's `question-answer`
-    // is refused before any handler runs, so the Host's question service is never
-    // driven through it — and the Host question is still pending afterwards.
-    const refusal = await paired.connection.request({
-      type: 'question-answer', rpcId: 'q-device', sessionId: 's1',
+    // (2c) OWNER UI path — a remote Host question reaches the client's `$events`
+    // stream with host-tagged ids AND the question payload, on its own witness.
+    const card = uiQuestion.frame
+    assert.equal(card.type, 'waterfall', JSON.stringify(uiQuestion.other))
+    assert.equal(card.event, 'user-questions/request')
+    assert.ok(card.eventId.startsWith(namespaceId(HOST, '')), `eventId must be host-tagged (${card.eventId})`)
+    assert.equal(card.agentId, namespaceId(HOST, 's1'))
+    assert.deepEqual(card.request, { questions })
+    // Bindable: the card addresses the Host's own pending question, so answering
+    // the eventId the UI shows cannot miss it.
+    const pendingRequests = gatewayLogSince(logOffset).filter((line) => line.includes('question requested: rpcId='))
+    assert.equal(pendingRequests.length, 1, JSON.stringify(pendingRequests))
+    const rpcId = pendingRequests[0].match(/question requested: rpcId=(\S+)/)[1]
+    assert.equal(card.eventId, namespaceId(HOST, rpcId), 'the card names the Host question it can be answered on')
+
+    // (3) A device holding approval:respond may ANSWER the card it was shown. The
+    // answer is applied at most once: the first frame settles the Host question, a
+    // duplicate gets `not-pending`, and the Host's own answer service is reached
+    // through the bridge (`userQuestions/answer`), never the companion frame alone.
+    const answerFrames = () => wire.filter((frame) => frame.kind === 'question-response')
+    const first = await paired.connection.request({
+      type: 'question-answer', rpcId: cards[0].rpcId, sessionId: 's1',
       answers: [{ id: 'q1', selected: ['staging-eu'] }],
     })
-    assert.equal(refusal.kind, 'error')
-    assert.equal(refusal.code, 'op/forbidden')
-    assert.equal(refusal.requestType, 'question-answer')
-    assert.equal(typeof refusal.requestId, 'string', 'the refusal echoes the request id')
-    assert.ok(gatewayLogSince(logOffset).some((line) => line.includes('op forbidden for device token: type=question-answer')),
-      `the refusal is audited (${JSON.stringify(gatewayLogSince(logOffset).slice(-6))})`)
-    await delay(100)
-    assert.equal(settled, false, 'the Host question was not completed through the refused frame')
+    assert.equal(first.kind, 'question-response', JSON.stringify(first).slice(0, 240))
+    assert.equal(first.accepted, true, 'the authorized device answer is accepted')
+    assert.deepEqual(await question.pending, { answers: [{ id: 'q1', selected: ['staging-eu'] }] },
+      'the Host question resolves with the device answer')
+    assert.equal(settled, true)
+    const duplicate = await paired.connection.request({
+      type: 'question-answer', rpcId: cards[0].rpcId, sessionId: 's1',
+      answers: [{ id: 'q1', selected: ['prod-us'] }],
+    })
+    assert.equal(duplicate.kind, 'question-response', JSON.stringify(duplicate).slice(0, 240))
+    assert.equal(duplicate.accepted, false, 'a duplicate never re-applies')
+    assert.equal(duplicate.reason, 'not-pending', 'the duplicate gets the approvals refusal shape')
+    assert.equal(answerFrames().length, 2, 'both receipts echoed this request id: ' + JSON.stringify(answerFrames()))
+    for (const frame of answerFrames()) assert.equal(typeof frame.requestId, 'string')
+    // The bridge's own answer endpoint is what a desktop uses; this frame path is the
+    // companion channel. Either way the answer is singular.
     assert.equal(gateway.calls.filter((call) => call.endpoint === 'userQuestions/answer').length, 0,
-      'the Host question service was never called')
+      'the companion frame answers in-process, it does not call the Host question service')
+    // (3b) An UNKNOWN id is refused with the same shape, never guessed.
+    const unknown = await paired.connection.request({
+      type: 'question-answer', rpcId: 'q-not-a-card', sessionId: 's1',
+      answers: [{ id: 'q1', selected: ['prod-us'] }],
+    })
+    assert.equal(unknown.accepted, false)
+    assert.equal(unknown.reason, 'not-pending')
+  } finally {
+    question.controller.abort()
+    await question.pending.catch(() => undefined)
+    control.abort()
+    await iterator.return()
+    try { paired.connection.ws?.terminate() } catch { /* already gone */ }
+  }
+})
+
+test('real gateway: a device paired WITHOUT approval:respond sees no question card on the wire', async (t) => {
+  const gateway = await startRealGateway(t)
+  // The NEGATIVE half of the owner decision: the gate is the scope, nothing else.
+  const paired = await pairRealDevice(gateway, t, 'deskq-real-0000-4000-8000-000000000q03',
+    ['sessions:read', 'harness:remote'])
+  const harness = createHarness({ remotes: [{ hostId: HOST, hostName: 'Host B', connection: paired.connection }] })
+  const { control, iterator } = await openEvents(harness)
+  const wire = []
+  paired.connection.ws.on('message', (data) => { try { wire.push(JSON.parse(data.toString())) } catch { /* ignore */ } })
+  const logOffset = gatewayLogSize()
+  const questions = [{ id: 'q1', header: 'Deploy target?',
+    options: [{ label: 'staging-eu' }, { label: 'prod-us' }], multiSelect: false }]
+  const question = askOnHost(gateway, 'call-79', questions)
+  try {
+    // The device cannot answer, so it cannot open `$events` either (that stream needs
+    // approval:respond — T5d of the gateway's bridge suite): NOTHING reaches it, on
+    // the interaction wire or through the owner UI merge, which is fed by the same
+    // `$events` stream. Both witnesses are asserted, so a silent leak on either one
+    // fails here.
+    for (let attempt = 0; attempt < 100 && wire.filter((frame) => frame.kind === 'question-requested').length === 0; attempt += 1) {
+      await delay(20)
+    }
+    await delay(200)
+    assert.equal(wire.filter((frame) => frame.kind === 'question-requested').length, 0,
+      'a device without approval:respond is sent no question card')
+    const uiQuestion = await nextEvent(iterator, (frame) => frame.event === 'user-questions/request', { ms: 300 })
+    assert.equal(uiQuestion.frame, null,
+      `no question card reaches the merged UI stream either (UI saw ${JSON.stringify(uiQuestion.other)})`)
+    // The withholding is audited with ids only, naming the scope gate — never the text.
+    const logged = gatewayLogSince(logOffset)
+    const withheld = logged.filter((line) => line.includes('question card withheld:')
+      && line.includes(`device=${paired.device.id}`))
+    assert.ok(withheld.length >= 1, `the withholding is logged (${JSON.stringify(logged.slice(-6))})`)
+    for (const line of withheld) {
+      assert.match(line, /question card withheld: device=\S+ session=s1 reason=missing-scope$/,
+        'the audit names the scope gate: ' + line)
+    }
+    for (const secret of ['Deploy target?', 'staging-eu', 'prod-us']) {
+      assert.equal(logged.some((line) => line.includes(secret)), false,
+        `the audit carries no question text (${secret})`)
+    }
   } finally {
     question.controller.abort()
     await question.pending.catch(() => undefined)

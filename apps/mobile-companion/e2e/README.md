@@ -13,8 +13,8 @@ map of what is here and what runs today.
 | Piece | Runs today on this machine? | Needs |
 |---|---|---|
 | `harness/selftest.mjs` — protocol self-test of the fixture | **Yes** — `node e2e/harness/selftest.mjs` (53 checks, 4 cert modes) | Node ≥ 24 |
-| `check-flows.mjs` — static check of every flow (appId/separator, subflow targets, locale coverage, tap anchoring, hook ids, no opaque matchers) | **Yes** — `node e2e/check-flows.mjs` (21 flows, every `id:` resolved against `app/**`) | Node ≥ 24 |
-| `run-e2e.mjs --dry-run` — wiring check of every checkpoint | **Yes** — 18/18 checkpoints wired, all control routes answered | Node ≥ 24 |
+| `check-flows.mjs` — static check of every flow (appId/separator, subflow targets, locale coverage, tap anchoring, hook ids, no opaque matchers) | **Yes** — `node e2e/check-flows.mjs` (30 flows, every `id:` resolved against `app/**` + `src/**`) | Node ≥ 24 |
+| `run-e2e.mjs --dry-run` — wiring check of every checkpoint | **Yes** — 23/23 checkpoints wired, all control routes answered | Node ≥ 24 |
 | `harness/options.test.mjs` — entry-point options: loopback defaults, explicit `--bind`/`--lan-host` opt-in, exposure warning | **Yes** — `node --test e2e/harness/options.test.mjs` | Node ≥ 24 |
 | Maestro flows (`maestro/*.yaml`) | **No** | a dev build + `maestro` CLI (+ `adb` for Android) |
 | Server-side assertions in `run-e2e.mjs` | **No** | the same, because they read state produced by the app |
@@ -46,6 +46,7 @@ e2e/
       open-session.yaml  open a fixture session
     01-launch-unlock.yaml         …  14-update-required.yaml
     15-authoring-create.yaml          …  18-authoring-not-connected.yaml
+    19-session-stats.yaml             …  27-schedules-granted-empty.yaml
   run-e2e.mjs        orchestrator: fixture + scenario arming + Maestro + server-side assertions
 ```
 
@@ -75,7 +76,7 @@ node e2e/harness/selftest.mjs --cert-mode not-yet
 # 2. Static check of the flows, including every hook id against app/**.
 node e2e/check-flows.mjs
 
-# 3. Wiring check of all 18 device checkpoints (fixture + control routes + flow files).
+# 3. Wiring check of all 23 device checkpoints (fixture + control routes + flow files).
 #    Loopback only by default: nothing on this machine is reachable from outside.
 node e2e/run-e2e.mjs --dry-run
 
@@ -156,6 +157,17 @@ address elements **by hook** instead of by placeholder/label guesswork:
 | `new-session-reason` | `app/(tabs)/index.tsx:212` | *why* authoring is unavailable — the line separates "not granted" from "connecting" |
 | `new-session-error` | `app/(tabs)/index.tsx:216` | the visible failure after a refused `session-create` (never a silent no-op) |
 | `session-title` | `app/session/[id].tsx:199` | the created session really opened (header title, not just a route push) |
+| `session-stats` / `session-stats-close` | `app/session/[id].tsx:965`, `:1017` | the ⋯ stats row (drawn only with `stats:read`) and the sheet's close control (spec 018) |
+| `session-stats-ready` / `session-stats-loading` / `session-stats-unavailable` / `session-stats-retry` | `src/ui/components/stats-panel.tsx:54`, `:27`, `:35`, `:45` | which stats answer the sheet is showing: served data, in flight, "not granted", or a failure with a retry |
+| `settings-schedules` | `app/settings.tsx:63` | the scheduled-tasks row (drawn only with `schedule:read`) |
+| `schedules-screen` / `schedules-hidden` | `app/schedules.tsx:104`, `:95` | the read-only screen vs the no-grant screen |
+| `schedules-row-<taskId>` | `app/schedules.tsx:151` | one task row (`schedules-row-sch-nightly-tests` — the fixture's task) |
+| `schedules-detail` / `schedules-detail-close` | `app/schedules.tsx:180`, `:190` | the detail sheet over the list and its close control |
+| `schedules-empty` / `schedules-error` / `schedules-retry` / `schedules-loading` | `app/schedules.tsx:134`, `:125`, `:127`, `:119` | the list's four honest answers: nothing scheduled, refused, failed-with-retry, in flight |
+
+`check-flows.mjs` resolves hooks from `app/**` **and** `src/**`, including `<Screen testID="…">` call
+sites and the literals of a `testID={cond ? 'a' : 'b'}` ternary, so a `src/`-side id is a static check
+too (the stats panel's state hooks are exactly that shape).
 
 ### Ids and escaping (read this before adding a selector)
 
@@ -220,6 +232,11 @@ that is not `vi`/`en` (`i18n/index.ts`, `detectLocale`), hence the alternation.
 | T-16 authoring without the grant | `16-authoring-no-scope.yaml` | **Spec 011** | **zero** authoring frames (no `session-create`, not even `workspaces`) |
 | T-17 `session-create` refused | `17-authoring-create-refused.yaml` | **Spec 011** | the tap reached the Host, nothing was created, the socket stayed up |
 | T-18 not connected | `18-authoring-not-connected.yaml` | **Spec 011** | no handshake, zero authoring frames, no permission accusation on screen |
+| T-19 stats granted | `20-session-stats-granted.yaml` | **Spec 018** | one `session-stats` for `sess-alpha`; `stats:read` armed before the flow |
+| T-20 schedules granted | `22-schedules-granted.yaml` | **Spec 018** | one `schedule-list`, one `schedule-view` for the served task; the row is a fixture id |
+| T-21 schedules granted, none exist | `27-schedules-granted-empty.yaml` | **Spec 018** | one `schedule-list`, **zero** `schedule-view`, no row invented |
+| T-22 schedules hidden | `21-schedules-no-scope.yaml` | **Spec 018** | **zero** schedule frames of any kind |
+| T-23 stats hidden | `19-session-stats.yaml` | **Spec 018** | **zero** `session-stats` frames; the session was really open |
 
 ## Session authoring (spec 011) — the journey these four checkpoints lock down
 
@@ -251,6 +268,48 @@ decision stays covered by the unit tests for `newSessionAvailability`. Asserting
 a device would need the home to render its action area while loading (an app change, not a flow
 change).
 
+## Read-only surface (spec 018) — why the granted flows need the orchestrator
+
+`stats:read` and `schedule:read` are in `NEVER_DEFAULT_SCOPES` (`packages/mobile-protocol/src/index.mjs`):
+a plain pairing never carries them, and no `hello` capability advertises them, so the device's
+`hello.device.scopes` is the only gate the app can rely on. That makes every flow here either
+**arm the scope** through the control API or assert the **hidden** branch — a flow that claims the
+granted branch without arming it would only ever prove the hidden one.
+
+| Flow | Scope state | Fixture answer |
+|---|---|---|
+| `19-session-stats.yaml` (T-23) | armed WITHOUT `stats:read` | — (the app must not send the read) |
+| `20-session-stats-granted.yaml` (T-19) | armed WITH `stats:read` | `session-stats` for `sess-alpha` = the contract's own example (`PROTOCOL.md:927-933`), so the sheet renders `session-stats-ready` |
+| `21-schedules-no-scope.yaml` (T-22) | armed WITHOUT `schedule:read` | — |
+| `22-schedules-granted.yaml` (T-20) | armed WITH `schedule:read` | one active task `sch-nightly-tests` ("Run the test suite", daily 09:00) from `schedule-list`, the same record from `schedule-view` |
+| `27-schedules-granted-empty.yaml` (T-21) | armed WITH `schedule:read` | `schedule-list` answers `items: []` |
+
+The "armed" set for the hidden flows is exactly `sessions:read`, `sessions:author`, `prompt:send`,
+`approval:respond`; the granted ones add one read scope. Both the SET and the arming are deliberate:
+the fixture's own default already includes `sessions:author`, which is the authoring checkpoints'
+grant, not "the four defaults" — a manual `maestro test` pairing has neither, so each flow's header
+names the precondition it needs instead of inheriting one.
+
+State that drives them (control API, token-guarded `POST`, on top of §"Session authoring"):
+
+| Route | Body | Effect |
+|---|---|---|
+| `/scenario/scopes` | `{"scopes":[ …, "stats:read" \| "schedule:read"]}` | what `hello.device.scopes` claims (see above; `null` omits the field) |
+| `/scenario/schedule-list` | `{"active":true}` / `{"active":false}` | serve the one fixture task, or an empty `schedule-list` |
+
+The fixture serves the read-only frames from `gateway.mjs` (`SESSION_STATS_REPLY`, `SCHEDULE_TASK`) and
+records every read in `GET /state` → `evidence.readOnlyRequests`, so "the row was absent AND the read
+was never sent" is provable rather than inferred from a screenshot. Its `state.readOnly` block repeats
+what it would answer, which is what T-20/T-21 compare their assertions against. The frames themselves
+follow the documented shapes: `schedule-view` identifies the record by its `id` (the gateway answers
+`{ kind: msg.type, ...record }`, `plugins/mobile-gateway/lib/schedule-management.mjs:96`), and a task
+it does not have is `{ id, code: 'schedule_not_found' }` instead of an error frame.
+
+**Still a gap, stated rather than faked:** the granted branch of the capability-gated surfaces
+(`permission-chip` in `23-permission-hidden.yaml`, the rename/archive blocks in `25`/`26`, the
+goal/task strip in `24`) needs a fixture control route for `hello.capabilities`, which does not exist;
+`/scenario/scopes` sets `device.scopes`, never capabilities, so those flows stay on the hidden branch.
+
 ## Notes and limits
 
 - **No credentials, no EAS spend.** The fixture generates a self-signed leaf in memory per run; no
@@ -266,15 +325,15 @@ change).
 - **Local emulator only** for T-08: airplane mode kills Wi-Fi, so a device driven over adb-over-
   network would disconnect its own test.
 - **Bundle id** in the flows is `com.dshext.companion` (`app.json`). Change it in `config.yaml` and
-  every flow if the app's id changes. `config.yaml` lists `01-*` … `14-*`; `check-flows.mjs` fails
+  every flow if the app's id changes. `config.yaml` lists `01-*` … `27-*`; `check-flows.mjs` fails
   if a numbered flow exists but is unlisted.
 - The orchestrator's `http` calls are Node `fetch`; the Maestro built-in `http` client is an
   alternative for flows that must act mid-run, but its environment-variable exposure inside
   `runScript` was not verified here, so this repo keeps server-side actions in `run-e2e.mjs`.
 - **No green run exists yet.** Nothing in this folder has been executed against a device, an
   emulator or Maestro on this machine: the flows are structurally checked (`check-flows.mjs`), their
-  hooks are checked against `app/**`, and the wiring is dry-run — that is all this machine can prove.
-  Do not report T-01…T-14 as passing without a `report.json` from a device run.
+  hooks are checked against `app/**` + `src/**`, and the wiring is dry-run — that is all this machine
+  can prove. Do not report T-01…T-23 as passing without a `report.json` from a device run.
 
 ## Two-party pairing controls (contract §3.8)
 

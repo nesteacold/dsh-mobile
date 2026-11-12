@@ -1,0 +1,49 @@
+# 26 — session archive: the block is absent when the Host does not advertise the op (spec 011 P2 item 4).
+#
+# SCENARIO: paired with the fixture's `hello.capabilities` (no `session-archive`), session list loaded.
+# HARNESS:  `--cert-mode ok`; nothing armed (see 25's header: no fixture route sets capabilities). The
+#           pairing prerequisite is `subflows/pair-paste.yaml`, the same no-op-once-paired subflow the
+#           other paired flows use; `run-e2e.mjs` pairs first.
+# MANUAL:   biometric prompt only.
+#
+#[WHY] Same rule as rename: the archive block only exists when the Host advertised `session-archive`,
+#      and only the `sess-gamma` row is archived in the fixture (so the confirm would act on a real
+#      row when a Host does grant it). The GRANTED branch (long press → archive confirm → the row
+#      leaves the list) is a documented gap: it needs a fixture capability override.
+#
+#[HOOKS] `session-row-${SESSION_ID}` (the fixture row really rendered), `session-archive-block` and
+#        `session-archive-confirm` (their ABSENCE after a long press is the assertion).
+#
+#[EXIT CRITERIA]
+#   1. the list shows the fixture row;
+#   2. a long press on it opens NO archive confirm (no block, no confirm control);
+#   3. the long press really landed on the list screen it started on: the same row is still drawn
+#      afterwards (a long press that navigated somewhere else would otherwise pass criteria 1-2
+#      vacuously, because both hooks are absent on any other screen too).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-beta
+  SESSION_TITLE: Release notes draft
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- runFlow: subflows/pair-paste.yaml
+
+# 1) The row is there.
+- assertVisible:
+    id: "session-row-${SESSION_ID}"
+- assertVisible: ".*${SESSION_TITLE}.*"
+
+# 2) Without the op a long press must open nothing.
+- longPressOn:
+    id: "session-row-${SESSION_ID}"
+- assertNotVisible:
+    id: "session-archive-block"
+- assertNotVisible:
+    id: "session-archive-confirm"
+
+# 3) …and the screen is unchanged, so "nothing opened" is a statement about this row and not about
+#    some other screen the press could have navigated to.
+- assertVisible:
+    id: "session-row-${SESSION_ID}"

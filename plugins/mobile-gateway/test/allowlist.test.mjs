@@ -29,8 +29,8 @@ import { connect, pair, upgradeStatus } from './client/pair.mjs'
 import * as contract from '@dsh-ext/mobile-protocol'
 import {
   ADMIN_ONLY_TYPES, AUTHOR_SCOPE, CLOSE_REVOKED, COMPANION_CAPABILITIES, COMPANION_DENIED_HOST_ENDPOINTS,
-  COMPANION_V1_TYPES, OP_FORBIDDEN, SESSIONS_AUTHOR_TYPES, fetchPathAllowedForCompanion,
-  hostEndpointAllowedForCompanion, isAdminOnlyType, isCompanionType,
+  COMPANION_V1_TYPES, OP_FORBIDDEN, PERMISSION_LOWER_TYPES, QUESTION_RESPONSE_TYPES, SESSIONS_AUTHOR_TYPES, SCHEDULE_READ_TYPES, STATS_READ_TYPES, TEAM_READ_TYPES, fetchPathAllowedForCompanion,
+  hostEndpointAllowedForCompanion, isAdminOnlyType, isCompanionType, scopeDenial,
 } from '../lib/allowlist.mjs'
 import { createDshHostAdapter } from '../lib/dsh-host-adapter.mjs'
 import { PLUGIN_REQUEST_TYPES } from '../lib/plugin-management.mjs'
@@ -346,7 +346,17 @@ try {
   // The client sends each type as an unknown op (its frame has no operation params).
   // Spec 011: the four authoring types are scoped instead of unknown, so they are
   // refused by the SCOPE gate (asserted separately below) and not here.
-  const forbidden = [...ROUTER_TYPES].filter((type) => !isCompanionType(type) && !SESSIONS_AUTHOR_TYPES.includes(type))
+  // Spec 018: the two read-only metric types are scoped too (`stats:read`), so they are
+  // refused by the SCOPE gate rather than as unknown ops — same treatment as the
+  // spec 011 authoring types above, and the spec 018 item 2 team types (scoped by
+  // `sessions:read`, so they are refused BY SCOPE — asserted just below).
+  // Revision 13: `question-answer` / `question-cancel` ride `approval:respond` and are
+  // refused by the SCOPE gate too (asserted separately below); the spec 019
+  // `permission-options` / `permission-lower` frames ride `permission:lower`.
+  const forbidden = [...ROUTER_TYPES].filter((type) => !isCompanionType(type)
+    && !SESSIONS_AUTHOR_TYPES.includes(type) && !STATS_READ_TYPES.includes(type)
+    && !TEAM_READ_TYPES.includes(type) && !SCHEDULE_READ_TYPES.includes(type)
+    && !QUESTION_RESPONSE_TYPES.includes(type) && !PERMISSION_LOWER_TYPES.includes(type))
   const hostCallsBefore = instance.hostRecords.length
   for (const type of forbidden) {
     const requestId = `forbid-${type}`
@@ -361,13 +371,16 @@ try {
     `a refused type must not reach the Host: ${JSON.stringify(instance.hostRecords.slice(hostCallsBefore)).slice(0, 400)}`)
   passed(`${forbidden.length} non-companion request types → ${OP_FORBIDDEN} with requestId, and never reach the Host`)
 
-  // Spec 011: a device WITHOUT `sessions:author` is refused all four by scope,
+  // Spec 011: a device WITHOUT `sessions:author` is refused all of them by scope,
   // with the requestId echoed, and the refusal happens before any Host call —
-  // the fake's call log is the evidence that no handler ran.
-  assert.deepEqual([...SESSIONS_AUTHOR_TYPES].sort(), ['models', 'select-model', 'session-create', 'workspaces'])
+  // the fake's call log is the evidence that no handler ran. Revision 11 adds
+  // `session-rename` / `session-archive` to the same family.
+  assert.deepEqual([...SESSIONS_AUTHOR_TYPES].sort(),
+    ['models', 'select-model', 'session-archive', 'session-create', 'session-rename', 'workspaces'])
   const authorCallsBefore = instance.hostRecords.length
   for (const type of SESSIONS_AUTHOR_TYPES) {
-    for (const extra of [{}, { sessionId: 's1' }, { workspaceId: 'w1' }, { sessionId: 's1', provider: 'p', model: 'm' }]) {
+    for (const extra of [{}, { sessionId: 's1' }, { workspaceId: 'w1' }, { sessionId: 's1', provider: 'p', model: 'm' },
+      { sessionId: 's1', title: 't' }]) {
       const requestId = `author-${type}-${Object.keys(extra).length}`
       const reply = await request(phoneConnection, { type, requestId, ...extra })
       assert.equal(reply.kind, 'error', `${type} must be refused without sessions:author, got ${JSON.stringify(reply).slice(0, 160)}`)
@@ -380,6 +393,66 @@ try {
   assert.equal(instance.hostRecords.length, authorCallsBefore,
     `an authoring frame without the scope must not reach the Host: ${JSON.stringify(instance.hostRecords.slice(authorCallsBefore)).slice(0, 400)}`)
   passed(`the ${SESSIONS_AUTHOR_TYPES.length} authoring types → auth/forbidden-scope without ${AUTHOR_SCOPE}, and never reach the Host`)
+
+  // Revision 13: answering a question card rides the approval scope, not a scope of its
+  // own — a device without `approval:respond` is refused BY SCOPE (not as an unknown op),
+  // and holding it passes the op gate.
+  assert.deepEqual([...QUESTION_RESPONSE_TYPES].sort(), ['question-answer', 'question-cancel'])
+  for (const type of QUESTION_RESPONSE_TYPES) {
+    for (const scopes of [[], ['prompt:send'], ['sessions:read', 'permission:lower']]) {
+      const refusal = scopeDenial({ kind: 'mobile', scopes }, type)
+      assert.equal(refusal?.code, 'auth/forbidden-scope', type + ' must be refused BY SCOPE without approval:respond')
+      assert.equal(refusal?.scope, 'approval:respond', type + ' must name the approval scope')
+    }
+    assert.equal(scopeDenial({ kind: 'mobile', scopes: ['approval:respond'] }, type), undefined,
+      type + ' must be allowed with approval:respond')
+  }
+  passed('the ' + QUESTION_RESPONSE_TYPES.length + ' question types are gated by approval:respond')
+
+  // Spec 019 (revision 13): the two permission frames are scoped by `permission:lower`,
+  // never a default, so a device without it is refused BY SCOPE and never reaches the Host.
+  assert.deepEqual([...PERMISSION_LOWER_TYPES].sort(), ['permission-lower', 'permission-options'])
+  for (const type of PERMISSION_LOWER_TYPES) {
+    const refusal = scopeDenial({ kind: 'mobile', scopes: ['sessions:read', 'approval:respond'] }, type)
+    assert.equal(refusal?.code, 'auth/forbidden-scope', type + ' must be refused BY SCOPE without permission:lower')
+    assert.equal(refusal?.scope, 'permission:lower', type + ' must name permission:lower')
+    assert.equal(scopeDenial({ kind: 'mobile', scopes: ['permission:lower'] }, type), undefined,
+      type + ' must be allowed with permission:lower')
+  }
+  passed('the ' + PERMISSION_LOWER_TYPES.length + ' permission types are gated by permission:lower')
+
+  // Spec 018 item 2: the team read-on-demand types need NO scope of their own — they are gated by
+  // the ORDINARY session read scope, so a device without it is refused BY SCOPE (not as an unknown
+  // op). Asserted on the gate itself: the socket above holds every scope by design, so the
+  // wire-level scope refusal with a non-owning device is covered by ADV-16a.
+  assert.deepEqual([...TEAM_READ_TYPES].sort(), ['agent-team', 'subagents'])
+  assert.equal(contract.TEAM_READ_SCOPE, 'sessions:read', 'the team frames ride the session read scope')
+  for (const type of TEAM_READ_TYPES) {
+    const refusal = scopeDenial({ kind: 'mobile', scopes: ['prompt:send'] }, type)
+    assert.equal(refusal?.code, 'auth/forbidden-scope', type + ' must be refused BY SCOPE')
+    assert.equal(refusal?.scope, 'sessions:read', type + ' must name the session read scope')
+    assert.equal(scopeDenial({ kind: 'mobile', scopes: ['sessions:read'] }, type), undefined,
+      type + ' must be allowed with the ordinary session read scope')
+  }
+  passed('the ' + TEAM_READ_TYPES.length + ' team types are gated by sessions:read (no scope of their own)')
+
+  // Spec 018 item 3: the three READ-ONLY schedule frames are lifted by the explicit-only
+  // `schedule:read` scope, so they are refused BY SCOPE (not as unknown ops) and every other
+  // schedule type stays op/forbidden.
+  assert.deepEqual([...SCHEDULE_READ_TYPES].sort(), ['schedule-catalog', 'schedule-list', 'schedule-view'])
+  assert.equal(contract.SCHEDULE_READ_SCOPE, 'schedule:read')
+  for (const type of SCHEDULE_READ_TYPES) {
+    const refusal = scopeDenial({ kind: 'mobile', scopes: ['sessions:read'] }, type)
+    assert.equal(refusal?.code, 'auth/forbidden-scope', type + ' must be refused BY SCOPE')
+    assert.equal(refusal?.scope, 'schedule:read', type + ' must name schedule:read')
+    assert.equal(scopeDenial({ kind: 'mobile', scopes: ['schedule:read'] }, type), undefined,
+      type + ' must be allowed with schedule:read')
+  }
+  for (const type of ['schedule-create', 'schedule-update', 'schedule-delete', 'schedule-run',
+    'schedule-edit', 'schedule-delete-inactive', 'schedule-history']) {
+    assert.equal(isAdminOnlyType(type), true, type + ' must stay admin-only (no read scope may lift a write)')
+  }
+  passed('the ' + SCHEDULE_READ_TYPES.length + ' schedule read types are gated by schedule:read; writes stay admin-only')
 
   // An unknown type ('plugin-manager', a future op) is refused the same way.
   for (const type of ['plugin-manager', 'sessions.list', 'not-an-operation', '']) {

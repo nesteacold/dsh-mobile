@@ -216,9 +216,11 @@ test('WebSocket 团队跨视图更新、重新连接基线和子视图切换', a
   const admin = (payload) => ({ ...payload, legacyAdmin: true })
   const control = await connect('control'), conversation = await connect('conversation')
   // Contract §3.5: the companion `hello` advertises exactly the package
-  // CAPABILITIES; team projections are delivered by the event stream and
-  // `projection-baseline` frames, which this suite asserts below.
-  assert.deepEqual(control.frames[0].capabilities, ['sessions-read', 'prompt', 'cancel', 'approval-v1'])
+  // CAPABILITIES (plus revision 10's OPTIONAL `browser-agent:1`); team projections are
+  // delivered by the event stream and `projection-baseline` frames, which this suite
+  // asserts below.
+  assert.deepEqual(control.frames[0].capabilities,
+    ['sessions-read', 'prompt', 'cancel', 'approval-v1', 'browser-agent:1'])
   conversation.socket.send(JSON.stringify(admin({ type: 'subscribe', ...child, assistantStream: true })))
   await waitUntil(() => conversation.frames.some(f => f.kind === 'session-snapshot' && f.sessionId === 'scout'))
   const snapshot = conversation.frames.find(f => f.kind === 'session-snapshot')

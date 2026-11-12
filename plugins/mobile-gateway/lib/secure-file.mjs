@@ -17,7 +17,7 @@
 // On Windows that inspection is structural, never textual: one non-interactive
 // PowerShell child process reports every ACE as `AccessControlType|SID|IsInherited`
 // and the verdict compares SIDs, because a display name is localized and
-// `HOST\neste`, `DOMAIN\neste` and a look-alike of `\SYSTEM` are not one principal.
+// `HOST\alice`, `DOMAIN\bob` and a look-alike of `\SYSTEM` are not one principal.
 import { execFile, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -40,6 +40,25 @@ const ACE_LINE_PATTERN = new RegExp(`^(Allow|Deny)\\|(${SID_SOURCE})\\|(True|Fal
 const TRUSTED_SIDS = new Set(['S-1-5-18', 'S-1-5-32-544'])
 // Any PowerShell error inside a probe is a non-zero exit, never a partial answer.
 const STRICT_POWERSHELL = "$ErrorActionPreference = 'Stop'; "
+
+// Two test-only seams answer the DACL probe. This one is process-wide: the probe
+// spawns a PowerShell child, so a test that runs many fixtures in one process asks
+// Windows for one DACL read per fixture, each with a 10 s deadline. Under load that
+// timed out (`ETIMEDOUT`) and failed a test for machine speed. A test harness may
+// install an override through `setOwnerOnlyProbeOverride`; in ADDITION, `assertOwnerOnly`
+// already accepts a per-call `ownerOnlyCheck` that `tls.mjs` passes through for the
+// TLS identity. Production installs neither, so the real DACL stays the only
+// authority there — installing the process-wide override outside a node:test process
+// is refused, so an ordinary run cannot have its guarantee swapped out for one.
+let ownerOnlyProbeOverride
+
+/** Install (or clear, with `undefined`) the DACL-probe override. Test harnesses only. */
+export function setOwnerOnlyProbeOverride(check) {
+  if (typeof check === 'function' && !process.env.NODE_TEST_CONTEXT) {
+    throw new Error('refusing to install the owner-only probe override outside a node:test process (NODE_TEST_CONTEXT is not set)')
+  }
+  ownerOnlyProbeOverride = typeof check === 'function' ? check : undefined
+}
 
 let logger
 const defaultLogger = (message) => { globalThis.console?.error?.(`mobile-gateway: ${message}`) }
@@ -128,7 +147,7 @@ let cachedUserSid = null
 
 /**
  * The SID of the account this process runs as, resolved once and never by name:
- * `HOST\neste` and `DOMAIN\neste` are different principals, and a bare `SYSTEM`
+ * `HOST\alice` and `DOMAIN\bob` are different principals, and a bare `SYSTEM`
  * is not LOCAL SYSTEM. A failure here is a refusal at every call site.
  * @throws when it cannot be resolved
  */
@@ -203,6 +222,9 @@ function failureDetail(error) {
 export function ownerOnlyViolation(target) {
   try {
     const resolved = path.resolve(target)
+    // Fail closed: the override answers only for the current process, and an
+    // override that throws is the same "cannot be inspected" refusal below.
+    if (ownerOnlyProbeOverride !== undefined) return ownerOnlyProbeOverride(resolved)
     if (process.platform !== 'win32') return posixViolation(resolved)
     return windowsAclViolation(runPowerShell(daclScript(resolved)), currentUserSid())
   } catch (error) {

@@ -21,7 +21,9 @@
 //   * a loopback-only control API so a test run can force the scenario (drop sockets, revoke,
 //     change an approval hash, refuse the upgrade with 401/403, gate the protocol version);
 //   * certificate modes (wrong / expired / not-yet-valid) built for the pin and validity checks;
-//   * `GET /state` evidence: what the phone actually sent, so "nothing was sent" is provable.
+//   * `GET /state` evidence: what the phone actually sent, so "nothing was sent" is provable;
+//   * spec 018's read-only frames (`session-stats`, `schedule-catalog`/`-list`/`-view`) served from
+//     the contract's own examples, so a scope-gated read has a real answer to render.
 //
 // SECURITY POSTURE (fixture only, still deliberate)
 //   * TLS only; the leaf is self-signed and generated per run, never written to disk.
@@ -110,6 +112,49 @@ const AUTHORING_SCOPES = ['sessions:read', 'sessions:author', 'prompt:send', 'ap
 
 /** Title of a session created through `session-create` (fixture data, not app copy). */
 const CREATED_SESSION_TITLE = 'Created from phone'
+
+/**
+ * Spec 018: the `session-stats` reply example from `plugins/mobile-gateway/PROTOCOL.md:927-933`, bound
+ * to the session under test. Without a reply the app's stats sheet can only time out, so the granted
+ * checkpoint (T-19) had nothing real to assert.
+ */
+const SESSION_STATS_REPLY = {
+  asOfSeq: 42,
+  sessionStats: {
+    turns: 6,
+    steps: 69,
+    llmMs: 2_280_000,
+    toolMs: 41_400,
+    ttftMs: 2_600,
+    ttftSteps: 1,
+    decodeMs: 5_000,
+    decodeTokens: 385,
+    lastTurn: 6,
+    openStep: null,
+    pendingCalls: {},
+  },
+  tokenUsage: { totals: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 0, reasoningTokens: 0 } },
+  contextPressure: { contextWindow: 128_000, pressureTokens: 1_500, surfaceTokens: 2_000 },
+}
+
+/**
+ * Spec 018 item 3: one active scheduled task (fixture data, not app copy) in the PROTOCOL.md:1679-1682
+ * record shape, so the granted checkpoint (T-20) can tap a real row into the detail sheet. A `pv-`
+ * fixture id keeps it distinguishable from the `sess-` session ids `check-flows.mjs` validates.
+ * `nextRunAt` is recomputed per request so the row always reads "next run" in the future.
+ */
+const SCHEDULE_TASK = {
+  id: 'sch-nightly-tests',
+  kind: 'daily',
+  title: 'Run the test suite',
+  status: 'active',
+  active: true,
+  time: '09:00',
+  timeZone: 'UTC',
+  weekdays: [],
+  nextRunOffsetMs: 6 * 60 * 60 * 1000,
+  target: { sessionId: 'sess-alpha' },
+}
 
 const BASE_SESSIONS = [
   { sessionId: 'sess-alpha', running: true, updatedAtOffsetMs: -60_000, title: 'Refactor gateway TLS', archived: false },
@@ -214,6 +259,13 @@ class FixtureGateway {
        */
       authoringRequests: [],
       sessionCreates: [],
+      /**
+       * Spec 018: every `stats:read` / `schedule:read` read the phone sent, so "the row was absent AND
+       * nothing was asked" (T-22/T-23) is provable instead of inferred from a screen. A frame that
+       * arrived therefore always means the app offered the control — the fixture never sends these
+       * reads on its own.
+       */
+      readOnlyRequests: [],
       openConnections: 0,
       peakOpenConnections: 0,
     }
@@ -255,6 +307,8 @@ class FixtureGateway {
       sessionCreateRefused: false,
       /** Code used for that refusal; a non-authoring code is what the app reports as "create failed". */
       sessionCreateErrorCode: 'internal',
+      /** Spec 018: `false` serves an empty `schedule-list` (the list's "no active tasks" answer). */
+      scheduleActive: true,
     }
   }
 
@@ -740,6 +794,44 @@ class FixtureGateway {
         return send({ kind: 'session-created', sessionId })
       }
 
+      // Spec 018: the read-only session metrics (`stats:read`). Shape and numbers are the contract's
+      // own example (PROTOCOL.md:927-933), so the sheet's sections are real data the flow can assert.
+      // A session this fixture does not serve answers like the gateway does (PROTOCOL.md:926-928).
+      case 'session-stats': {
+        const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId : ''
+        this.evidence.readOnlyRequests.push({ type: 'session-stats', sessionId })
+        if (sessionId === '') return fail('bad-request', 'sessionId required')
+        if (!this.sessionRows().some((row) => row.sessionId === sessionId)) return fail('session-not-found', 'no such session')
+        return send({ kind: 'session-stats', sessionId, ...SESSION_STATS_REPLY })
+      }
+
+      // Spec 018 item 3: the three read-only schedule frames (`schedule:read`). Host-wide, host data —
+      // the list carries exactly the one fixture task so a flow can assert a row and open it.
+      case 'schedule-catalog':
+        this.evidence.readOnlyRequests.push({ type: 'schedule-catalog', taskId: null })
+        return send({ kind: 'schedule-catalog', items: [{ kind: 'daily' }, { kind: 'every' }, { kind: 'cron' }] })
+
+      case 'schedule-list': {
+        this.evidence.readOnlyRequests.push({ type: 'schedule-list', taskId: null })
+        // `active` is only legal on a host-wide list (schedule-management.mjs:56); a bad page is the
+        // gateway's own `bad-request`, never quietly corrected here.
+        if (typeof frame.active !== 'boolean' && frame.active !== undefined) return fail('bad-request', 'active must be a boolean')
+        if (frame.limit !== undefined && !(Number.isSafeInteger(frame.limit) && frame.limit >= 1 && frame.limit <= 500)) {
+          return fail('bad-request', 'limit must be 1..500')
+        }
+        const items = this.scenario.scheduleActive === false || frame.active === false ? [] : [this.scheduleTask()]
+        return send({ kind: 'schedule-list', items, shown: items.length, total: items.length, limit: frame.limit ?? 500, offset: 0 })
+      }
+
+      case 'schedule-view': {
+        const id = typeof frame.id === 'string' ? frame.id : ''
+        this.evidence.readOnlyRequests.push({ type: 'schedule-view', taskId: id })
+        // The gateway identifies a view reply by the record's `id` (schedule-management.mjs:96), and a
+        // task it does not have is `{ id, code }` — a structured answer, not an error frame.
+        if (id !== SCHEDULE_TASK.id) return send({ kind: 'schedule-view', id, code: 'schedule_not_found' })
+        return send({ kind: 'schedule-view', ...this.scheduleTask() })
+      }
+
       case 'search': {
         const query = typeof frame.query === 'string' ? frame.query.toLowerCase() : ''
         const rows = this.sessionRows().filter((row) =>
@@ -931,6 +1023,12 @@ class FixtureGateway {
     return this.approvals.filter((approval) => approval.sessionId === sessionId)
   }
 
+  /** Spec 018 item 3: the one fixture task, with a fresh `nextRunAt` so it is never in the past. */
+  scheduleTask () {
+    const { nextRunOffsetMs, ...task } = SCHEDULE_TASK
+    return { ...task, nextRunAt: Date.now() + nextRunOffsetMs }
+  }
+
   // -- control API ----------------------------------------------------------
 
   onControlRequest (request, response) {
@@ -1110,7 +1208,7 @@ class FixtureGateway {
             : [...body.scopes].map((scope) => String(scope))
           return json(200, { scopes: this.scenario.deviceScopes })
         }
-        // Spec 011: refuse `session-create` so the flow can assert the visible failure line and
+        // Spec 018: refuse `session-create` so the flow can assert the visible failure line and
         // that the app stays on the screen (a refusal must never look like a silent no-op).
         case 'POST /scenario/session-create-refuse': {
           this.scenario.sessionCreateRefused = body.enabled !== false
@@ -1119,6 +1217,12 @@ class FixtureGateway {
             sessionCreateRefused: this.scenario.sessionCreateRefused,
             code: this.scenario.sessionCreateErrorCode,
           })
+        }
+        // Spec 018: empty the served `schedule-list`, so the granted screen's "no active tasks"
+        // answer is reachable without claiming a row that is not served.
+        case 'POST /scenario/schedule-list': {
+          this.scenario.scheduleActive = body.active !== false
+          return json(200, { scheduleActive: this.scenario.scheduleActive })
         }
         default:
           return json(404, { error: `no route: ${request.method} ${url.pathname}` })
@@ -1149,6 +1253,13 @@ class FixtureGateway {
       scenario: { ...this.scenario, mismatchOnce: [...this.scenario.mismatchOnce] },
       sessions: this.sessionRows(),
       approvals: this.approvals,
+      // Spec 018: what the read-only surfaces would answer, so the orchestrator's assertions compare
+      // against the served fixtures instead of a copy of them.
+      readOnly: {
+        sessionStats: { sessionId: 'sess-alpha', ...SESSION_STATS_REPLY },
+        scheduleTask: SCHEDULE_TASK.id,
+        scheduleItems: this.scenario.scheduleActive === false ? 0 : 1,
+      },
       evidence: {
         ...this.evidence,
         // Derived, so it is always the current truth: the fixture rows plus anything created

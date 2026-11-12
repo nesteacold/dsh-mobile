@@ -58,7 +58,7 @@ Owner approved and the lead installed the SDK: `C:\Android\sdk` (cmdline-tools 1
 - Note: prebuild rewrote the app's `package.json` dev scripts to `expo run:android` / `expo run:ios` (standard prebuild behaviour; keep now that a native project exists). EAS identity (`owner`, `slug`, `projectId`) unchanged.
 - **Kotlin module verified by the lead directly** (2026-11-09): `:dsh-ext-pinned-ws:compileDebugKotlin` → `BUILD SUCCESSFUL`, `:dsh-ext-pinned-ws:compileReleaseKotlin` → `BUILD SUCCESSFUL`, `e:` count 0 in both, 93 `.class` files produced. Single compiler fix was `PinnedWsModule.kt:30` renaming `registry` → `pinnedRegistry` (Expo's `Module.registry` is `ModuleRegistry`, not our socket registry). App-side `:app:compileDebugKotlin` also compiled (only a deprecation warning).
 - **Local APK build conclusively impossible on this Windows host** (environment, not product code). Root cause and evidence: CMake mirrors the absolute source path of out-of-tree sources into the object directory (`CMakeFiles/react_codegen_…dir/C_/…/node_modules/react-native-gesture-handler/shared/shadowNodes/react/renderer/components/rngesturehandler_codegen`). Even with `LongPathsEnabled=1`, the SDK `ninja` does not honour long paths. Measured attempts: (a) original path → fails in `react-native-screens` and `react-native-worklets`; (b) project copied to `C:\w\app` (real short path, real `node_modules` copy) → those pass, then fails in the `react-native-gesture-handler` codegen target whose mirrored path is ~250–300 chars; (c) `node_modules` relocated to a short real root with a junction → Node cannot resolve `@react-native/gradle-plugin` because the short root must end in `node_modules`, and even the shortest workable layout leaves the mirrored component over 260. All temporary state was reverted (`C:\mbapp`, `C:\w`, `C:\n` removed; `node_modules` back in place); verified afterwards: `require.resolve('react-native/package.json')` and the gradle-plugin resolve succeed, `npm run typecheck` exit 0, **451/451 tests pass**.
-- **Android emulator is provisioned and booted** as the device-verification target: `C:\Android\sdk` now has `emulator` 37.2.13 + `system-images;android-36;google_apis;x86_64`; AVD `dsh` created (pixel_6, x86_64); headless boot reached `sys.boot_completed=1`, `adb devices` = `the Android emulator device`, API 36. Ready to `adb install` the EAS APK.
+- **Android emulator is provisioned and booted** as the device-verification target: `C:\Android\sdk` now has `emulator` 37.2.13 + `system-images;android-36;google_apis;x86_64`; AVD `dsh` created (pixel_6, x86_64); headless boot reached `sys.boot_completed=1`, `adb devices` = `emulator-5554 device`, API 36. Ready to `adb install` the EAS APK.
 - **iOS project generation is blocked on Windows by Expo itself**: `expo prebuild --platform ios` prints "Skipping generating the iOS native project files. Run npx expo prebuild again from macOS or Linux" and exits 1. So the A033 pbxproj localization wiring can only be validated on macOS (fixture tests remain the only local evidence).
 - **Device-transport path verified on the running emulator** (2026-11-09): `adb reverse tcp:34444 tcp:34444` configures, and `nc` from inside the emulator to `127.0.0.1:34444` returns `EXIT=0` while the host listener is up — so the app under test can reach a host-side fixture gateway over loopback through `adb reverse` (TLS pinning works unchanged because the tunnel is transparent TCP). Device shell has `nc`/`toybox` at `/system/bin` but **no `curl`**. This is the transport the device runbook should use instead of LAN binding, and it needs no firewall change.
 
@@ -206,7 +206,7 @@ Found by testing the 403 path on hardware, then fixed and re-verified:
 
 ## BLOCKING PROTOCOL GAP found against the live gateway (2026-11-10) — **RESOLVED and verified against the live Host**
 
-**Status: FIXED and proven end-to-end against the real gateway, not a fixture.** The whole chain now runs: challenge → proof → pending → desktop approval → `paired` → `hello` → real session data. Measured frames from the live LAN listener (`wss://203.0.113.10:30081/ws/mobile`, pin `906be9d7…`):
+**Status: FIXED and proven end-to-end against the real gateway, not a fixture.** The whole chain now runs: challenge → proof → pending → desktop approval → `paired` → `hello` → real session data. Measured frames from the live LAN listener (`wss://100.64.0.10:30081/ws/mobile`, pin `906be9d7…`):
 
 ```
 +10ms  OPEN
@@ -214,7 +214,7 @@ Found by testing the 403 path on hardware, then fixed and re-verified:
 +12ms  <- {kind:'pairing-pending', verificationCode:'755490', requestId, expiresAt}
 +13ms  >>> desktop approves that requestId via the /mgw management API
 +88ms  <- {kind:'paired', token:'_4WVBaT8…', device:{id, name:'e2e-approval', kind:'mobile', scopes:[6]}}
-+98ms  <- {kind:'hello', gatewayId, gatewayName:'host-machine', protocol:3, companionProtocol:1,
++98ms  <- {kind:'hello', gatewayId, gatewayName:'dsh-host', protocol:3, companionProtocol:1,
              dshVersion:'0.2.2-rc.1', authenticated:true, capabilities:['sessions-read','prompt','cancel','approval-v1']}
 +99ms  <- {kind:'session-archives'}, {kind:'session-queues'}, {kind:'projection-baseline'}   ← real Host state
 ```
@@ -239,7 +239,7 @@ Build: `1BbthqmXKO2to0QV-WcP9ByhnE17pMWJbndBTAzCiWI.apk`, 114,442,613 bytes, SHA
 What happened, in order:
 1. `pm clear` + launch → the unlock gate, then the pairing screen.
 2. The app normally requires a screen lock before it will pair (correct: the credential must be protected); the emulator had none after a wipe, so a PIN was set.
-3. A LAN-pinned offer was minted with `{publicUrl:'wss://203.0.113.10:30081/ws/mobile', endpoints:[same]}` — 482-char pairing string — pasted into the app in 30-char chunks and confirmed **byte-exact (482/482)** before submitting.
+3. A LAN-pinned offer was minted with `{publicUrl:'wss://100.64.0.10:30081/ws/mobile', endpoints:[same]}` — 482-char pairing string — pasted into the app in 30-char chunks and confirmed **byte-exact (482/482)** before submitting.
 4. Submitting produced a **pending request on the Host**, auto-approved by a watcher through the same route the desktop UI uses (`POST /mgw/pending/<id>/approve`):
    ```
    PENDING  id=7fab35d5-446a-4e76-be92-67d6936606aa code=132822  16:12:57
@@ -258,7 +258,7 @@ The companion could not pair with the real gateway at all, and the cause was a m
 
 **The companion cannot pair with the real gateway, and the cause is a missing half of the pairing protocol — not the network.** Measured, not inferred.
 
-Reproducing the companion's exact first connection against the live LAN listener (`wss://203.0.113.10:30081/ws/mobile`, TLS pin matched) gives, frame by frame:
+Reproducing the companion's exact first connection against the live LAN listener (`wss://100.64.0.10:30081/ws/mobile`, TLS pin matched) gives, frame by frame:
 
 ```
 +   11ms OPEN -> {"type":"paired","requestId":"pair-1","pairingCode":"…","clientVersion":"1.0.0"}
@@ -298,9 +298,9 @@ Two landmines worth recording: adding the pairing close codes to `CLOSE_CODES` b
 ### MEASURED ON DEVICE — first real LAN/TLS connection to the owner's live gateway (2026-11-10)
 This is the acceptance test the review kept flagging as unproven, and it was run against the **real gateway in the running DSH host**, not the e2e fixture:
 
-- The live gateway reports `lan.enabled/listening true`, `tls true`, `host 203.0.113.10` (Tailscale), `port 30081`, `certSha256 906be9d7…dfbca`, and `pairingTtlMs 300000` — i.e. it is running today's code.
+- The live gateway reports `lan.enabled/listening true`, `tls true`, `host 100.64.0.10` (Tailscale), `port 30081`, `certSha256 906be9d7…dfbca`, and `pairingTtlMs 300000` — i.e. it is running today's code.
 - The emulator reaches that address directly (`ping` 1.9–3.5 ms) and its TCP port opens (`toybox nc -z` exit 0), so no `adb reverse` was involved.
-- `POST /mgw/pair` on the loopback management route returns 201 with a 523-char pairing string whose payload carries both endpoints and the real `certSha256`. Passing `{publicUrl, endpoints}` pinned to `wss://203.0.113.10:30081/ws/mobile` produces a 482-char string whose `publicUrl` is the LAN endpoint — this is how a phone-reachable offer is minted, because the gateway derives `publicUrl` from the address the management request arrived on and management routes are loopback-only by design (a request to the LAN listener on `/mgw/pair` correctly returns 404).
+- `POST /mgw/pair` on the loopback management route returns 201 with a 523-char pairing string whose payload carries both endpoints and the real `certSha256`. Passing `{publicUrl, endpoints}` pinned to `wss://100.64.0.10:30081/ws/mobile` produces a 482-char string whose `publicUrl` is the LAN endpoint — this is how a phone-reachable offer is minted, because the gateway derives `publicUrl` from the address the management request arrived on and management routes are loopback-only by design (a request to the LAN listener on `/mgw/pair` correctly returns 404).
 - **Two device attempts, and the native trace tells the whole story** (`PinnedWs`, release build):
   - loopback endpoint → `onFailure exception=java.net.ConnectException` immediately. Correct: inside the emulator `127.0.0.1` is the emulator, so this endpoint can never work from a phone, and the app surfaces "Could not reach that computer."
   - Tailscale endpoint → `tls pinMatched=true validityOk=true` → `onOpen protocolNegotiated=true` → then `close code=1006 reasonLen=17` about 9.5 s later, with the host reporting `connectedClients=0`.

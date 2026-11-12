@@ -1,0 +1,42 @@
+# 24 — goal/task panel absent when the Host projected neither (spec 018 item 5).
+#
+# SCENARIO: paired, opening `sess-alpha`, whose fixture row carries ONLY `projections.values.title`
+#           (no `goal`, no `todos`, and no `projection-baseline` frame is sent).
+# HARNESS:  `--cert-mode ok`; nothing armed. The pairing prerequisite is `subflows/pair-paste.yaml`
+#           (a no-op once paired), so a manual run on a fresh install reaches the list instead of
+#           stopping on the pair screen; `run-e2e.mjs` pairs first.
+# MANUAL:   biometric prompt only.
+#
+#[WHY] The strip is pinned under the header when the Host projected a goal or at least one task, and
+#      HIDES ENTIRELY otherwise (an empty card would promise work that does not exist). The fixture
+#      cannot project a goal (it has no `projection-baseline`/`tasks-updated`/`goal-updated` support),
+#      so the "hidden" branch is the one this machine can drive; the "visible" branch (and the open/
+#      close of the checklist) needs a fixture feature and is listed as a gap in `e2e/README.md`.
+#
+#[HOOKS] `session-panel-pin` (the strip's own pin wrapper — its ABSENCE is the assertion),
+#        `session-composer` (proof the transcript — where the strip would sit above — really
+#        rendered, so "no strip" cannot mean "the screen never loaded").
+#
+#[EXIT CRITERIA]
+#   1. the session screen is loaded (composer present);
+#   2. no goal/task strip is drawn (`session-panel-pin` absent).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-alpha
+  SESSION_TAB: running
+  SESSION_TITLE: Refactor gateway TLS
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- runFlow: subflows/pair-paste.yaml
+- runFlow: subflows/open-session.yaml
+
+# 1) The screen is loaded, not empty.
+- assertVisible:
+    id: "session-composer"
+
+# 2) No goal and no tasks ⇒ no strip at all. The strip would be pinned directly above the transcript,
+#    inside the viewport, so no scroll is done: a scroll would only make "not rendered" weaker.
+- assertNotVisible:
+    id: "session-panel-pin"

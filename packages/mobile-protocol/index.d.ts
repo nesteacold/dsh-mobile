@@ -1,5 +1,5 @@
 /**
- * TypeScript declarations for `@dsh-ext/mobile-protocol` (contract v1, revision 7).
+ * TypeScript declarations for `@dsh-ext/mobile-protocol` (contract v1, revision 12).
  *
  * Keep in step with `src/index.mjs`; `test/contract.test.mjs` checks the runtime values
  * against the contract document, and `types.test-d.ts` inside the companion app keeps a
@@ -51,6 +51,9 @@ export type Op =
   | 'session-create'
   | 'models'
   | 'select-model'
+  // Revision 11: rename / archive one session the device already sees.
+  | 'session-rename'
+  | 'session-archive'
 
 export const OPS: readonly Op[]
 
@@ -74,6 +77,9 @@ export type ResponseKind =
   | 'session-created'
   | 'models'
   | 'select-model'
+  // Revision 11.
+  | 'session-renamed'
+  | 'session-archived'
 
 export const OP_RESPONSES: Readonly<Record<Op, ResponseKind>>
 
@@ -94,6 +100,10 @@ export type Scope =
   | 'files:read'
   | 'files:write'
   | 'settings:write'
+  /** Spec 018 (revision 10) read-only session metrics; never a default. */
+  | 'stats:read'
+  /** Spec 020 (revision 10) web PWA Host-attested unlock; mobile-holdable, never a default. */
+  | 'web:unlock'
   /** Spec 008: remote-bridge channel; desktop only, never a default. */
   | 'harness:remote'
   /** Spec 008 full control (revision 5): desktop only, explicit only, never a default. */
@@ -102,6 +112,8 @@ export type Scope =
   | 'credentials:write'
   | 'plugins:manage'
   | 'schedule:write'
+  /** Spec 018 item 3 (revision 12) read-only schedule list/view; a new scope, never a default. */
+  | 'schedule:read'
   | 'terminal'
   /**
    * Spec 011: list this Host's workspaces, list the model catalog, create a session and
@@ -109,14 +121,35 @@ export type Scope =
    * device may hold it).
    */
   | 'sessions:author'
+  /**
+   * Spec 013: send attachment bytes into a session on this Host (`remote-upload-*`).
+   * Part of the desktop default set, never part of a kind-independent default, and
+   * the frames themselves require a `desktop` device.
+   */
+  | 'attachments:write'
+  /**
+   * Spec 014 C6: drive the Host's built-in side-panel browser from a device.
+   * Grantable like every other scope (no hard block); part of the desktop default
+   * set, never part of a kind-independent default.
+   */
+  | 'browser:control'
+  /**
+   * Spec 019 Wave 3: read this Host's permission presets and switch ONE session to a
+   * strictly stricter preset (`permission-options` / `permission-lower`). Explicit
+   * only, never a default; `full` includes it. It can never widen a preset.
+   */
+  | 'permission:lower'
 
 export const SCOPES: readonly Scope[]
 export const DESKTOP_DEFAULT_SCOPES: readonly Scope[]
 /**
- * Scopes no default grant may contain for any device kind (spec 011 FR-006).
+ * Scopes no kind-independent default may contain (spec 011 FR-006, spec 013).
  * `sessions:author` is grantable to a `mobile` device, so it is not desktop-only and
  * would otherwise fall into both default computations; it must be an explicit tick.
- * Explicit grants (an owner's tick, `SCOPE_PRESETS.full`) still include it.
+ * `attachments:write` is a desktop default in DESKTOP_DEFAULT_SCOPES, but the mobile
+ * default and the pre-005 migration must never acquire it.
+ * `browser:control` (spec 014 C6) is listed for the same reason.
+ * Explicit grants (an owner's tick, `SCOPE_PRESETS.full`) still include them.
  */
 export const NEVER_DEFAULT_SCOPES: readonly Scope[]
 /** Scopes only a `desktop` device may hold, and only when chosen explicitly. */
@@ -125,14 +158,153 @@ export type ScopePresetName = 'standard' | 'full'
 /** Devices UI presets: `standard` = default at Approve, `full` = every contract scope. */
 export const SCOPE_PRESETS: Readonly<Record<ScopePresetName, readonly Scope[]>>
 
-/** Spec 011 client types: the last four `Op`s, served only to a device holding `sessions:author`. */
+/**
+ * Spec 011 client types (revision 7) plus revision 11's session rename/archive — all
+ * served only to a device holding `sessions:author`.
+ */
 export type AuthoringType = 'workspaces' | 'session-create' | 'models' | 'select-model'
+  | 'session-rename' | 'session-archive'
 export const AUTHORING_CLIENT_TYPES: readonly AuthoringType[]
 /** The scope every authoring type requires (`sessions:author`). */
 export const AUTHORING_SCOPE: Scope
 
+/** Spec 018 (revision 10) read-only session-metric types. */
+export type StatsReadType = 'session-stats' | 'context-usage'
+/** Spec 018 item 2: read-on-demand team/subagent frames, under `sessions:read`. */
+export type TeamReadType = 'agent-team' | 'subagents'
+export const TEAM_READ_CLIENT_TYPES: readonly TeamReadType[]
+/** Their scope: the ordinary session read scope (`sessions:read`), not a new one. */
+export const TEAM_READ_SCOPE: Scope
+/** Spec 018 item 3: read-only schedule frames, under the explicit-only `schedule:read`. */
+export type ScheduleReadType = 'schedule-catalog' | 'schedule-list' | 'schedule-view'
+export const SCHEDULE_READ_CLIENT_TYPES: readonly ScheduleReadType[]
+/** Their scope: `schedule:read` — never granted by a preset default. */
+export const SCHEDULE_READ_SCOPE: Scope
+/** Spec 018 item 4: answer/decline a question, under the approval scope. */
+export type QuestionResponseType = 'question-answer' | 'question-cancel'
+export const QUESTION_RESPONSE_TYPES: readonly QuestionResponseType[]
+/** Their scope: `approval:respond` (no scope of their own). */
+export const QUESTION_RESPONSE_SCOPE: Scope
+/** Longest `custom` free-text answer. */
+export const QUESTION_CUSTOM_MAX_LENGTH: number
+export const STATS_READ_CLIENT_TYPES: readonly StatsReadType[]
+/** The scope both metric types require (`stats:read`); never a default. */
+export const STATS_READ_SCOPE: Scope
+
+// ---------------------------------------------------------------------------
+// Spec 021 (revision 14) — web passkey unlock (replaces the spec 020 account attestation)
+// ---------------------------------------------------------------------------
+
+/** The four web (PWA) passkey client frames; not §4 ops, all behind `web:unlock`. */
+export type PasskeyType =
+  | 'passkey-register-options'
+  | 'passkey-register'
+  | 'passkey-assert-options'
+  | 'passkey-assert'
+export const PASSKEY_REGISTER_OPTIONS_TYPE: 'passkey-register-options'
+export const PASSKEY_REGISTER_TYPE: 'passkey-register'
+export const PASSKEY_ASSERT_OPTIONS_TYPE: 'passkey-assert-options'
+export const PASSKEY_ASSERT_TYPE: 'passkey-assert'
+export const PASSKEY_CLIENT_TYPES: readonly PasskeyType[]
+
+/** The scope that gates the passkey frames and arms the server-side lock (`web:unlock`). */
+export const WEB_UNLOCK_SCOPE: Scope
+/** Frames a locked web device may still send (hello and ping are channel-neutral anyway). */
+export const WEB_UNLOCK_EXEMPT_TYPES: readonly PasskeyType[]
+/** The in-band refusal of a locked device: `auth/locked` (WS close `4412` is reserved for re-auth). */
+export const WEB_LOCK_ERROR: 'auth/locked'
+/** `hello.webLock` for a web device; absent for every device without `web:unlock`. */
+export type WebLockState = 'unregistered' | 'locked' | 'unlocked'
+export const WEB_LOCK_STATES: readonly WebLockState[]
+/** Why a `web:unlock` device was refused with `auth/locked` (`reason`). */
+export type WebLockReason = WebLockState | 'rate-limited'
+/** Challenge lifetime: one use, bound to the socket that asked for it. */
+export const PASSKEY_CHALLENGE_TTL_MS: number
+/** Failed-operation rate limits (per device 5 / 10 min, global 30 / hour). */
+export const PASSKEY_RATE_LIMITS: Readonly<{
+  perDevice: number
+  perDeviceWindowMs: number
+  global: number
+  globalWindowMs: number
+}>
+/** Inactivity bound of an unlock (15 min): a new connection always starts locked. */
+export const WEB_UNLOCK_IDLE_MS: number
+/** The passkey frames' error codes (contract §6). `already-registered` needs Host approval. */
+export type PasskeyErrorCode =
+  | 'passkey/not-registered'
+  | 'passkey/already-registered'
+  | 'passkey/challenge-expired'
+  | 'passkey/verification-failed'
+  | 'passkey/rate-limited'
+export const PASSKEY_ERROR_CODES: readonly PasskeyErrorCode[]
+/** Server frame announcing that the owner approved replacing this device's passkey. */
+export const PASSKEY_APPROVAL_KIND: 'passkey-approval'
+/** Approvals a desktop client may decide for a web device's passkey. */
+export const PASSKEY_APPROVAL_ACTIONS: readonly ('approve' | 'reject')[]
+
 /** Scope of each scoped inbound type; a type absent here is refused for a scoped device. */
-export const SCOPE_BY_TYPE: Readonly<Partial<Record<Op | RemoteClientType | AuthoringType, Scope>>>
+export const SCOPE_BY_TYPE: Readonly<Partial<Record<Op | RemoteClientType | AuthoringType | RemoteUploadType | StatsReadType | TeamReadType | ScheduleReadType | QuestionResponseType | PermissionLowerType | PasskeyType, Scope>>>
+
+// ---------------------------------------------------------------------------
+// Spec 019 Wave 3 — permission control, view + lower-only (additive)
+// ---------------------------------------------------------------------------
+
+/** The two spec 019 client frames (not §4 ops; both need `permission:lower`). */
+export type PermissionLowerType = 'permission-options' | 'permission-lower'
+export const PERMISSION_LOWER_CLIENT_TYPES: readonly PermissionLowerType[]
+/** Alias of `PERMISSION_LOWER_CLIENT_TYPES`, for the listed-but-not-§4 families. */
+export const PERMISSION_LOWER_TYPES: readonly PermissionLowerType[]
+/** The scope that lifts them (`permission:lower`); never a default, in `full`. */
+export const PERMISSION_LOWER_SCOPE: Scope
+/** Advertised in `hello` only for a device holding `permission:lower`. */
+export const PERMISSION_LOWER_CAPABILITY: 'permission-lower'
+/** The sandbox axis, strictest first (a higher index is looser). */
+export const SANDBOX_MODE_ORDER: readonly ('read-only' | 'workspace-write' | 'danger-full-access')[]
+/** The approval axis, strictest first (`ask` prompts, `never` does not). */
+export const APPROVAL_POLICY_ORDER: readonly ('ask' | 'never')[]
+/** Current values that are never comparable (`custom`, `auto`). */
+export const PERMISSION_INCOMPARABLE_CURRENTS: readonly ('custom' | 'auto')[]
+/** Why a `permission-lower` write was refused (the receipt's `reason`). */
+export type PermissionLowerReason = 'not-stricter' | 'custom-current' | 'raced' | 'unavailable'
+export const PERMISSION_LOWER_REASONS: readonly PermissionLowerReason[]
+/** The fixed sentence a device gets for each refusal — never the Host's text. */
+export const PERMISSION_LOWER_MESSAGES: Readonly<Record<PermissionLowerReason, string>>
+
+/** Read the current preset and the strictly-stricter presets this Host offers. */
+export interface PermissionOptionsFrame {
+  type: 'permission-options'
+  requestId: string
+  sessionId: string
+}
+
+/** Switch one session to a strictly stricter preset. */
+export interface PermissionLowerFrame {
+  type: 'permission-lower'
+  requestId: string
+  sessionId: string
+  preset: string
+}
+
+/** One offered target's knob pair, as the gateway resolved it. */
+export interface PermissionOption {
+  preset: string
+  sandbox: 'read-only' | 'workspace-write' | 'danger-full-access'
+  approval: 'ask' | 'never'
+}
+
+export interface PermissionOptionsReply {
+  kind: 'permission-options'
+  requestId: string
+  sessionId: string
+  /** The preset in effect (`custom`/`auto` included), or `null` when unresolvable. */
+  currentValue: string | null
+  /** Only presets stricter than `currentValue` on at least one axis, looser on none. */
+  options: PermissionOption[]
+}
+
+export type PermissionLowerReply =
+  | { kind: 'permission-lower'; requestId: string; sessionId: string; preset: string; currentValue: string; accepted: true }
+  | { kind: 'permission-lower'; requestId: string; sessionId: string; currentValue: string | null; accepted: false; reason: PermissionLowerReason }
 
 export interface WorkspacesFrame {
   type: 'workspaces'
@@ -165,6 +337,21 @@ export interface SelectModelFrame {
   provider: string
   model: string
   reasoningEffort?: string
+}
+
+/** Revision 11: rename one session the device may see. `title` trimmed, 1–200 code points. */
+export interface SessionRenameFrame {
+  type: 'session-rename'
+  requestId: string
+  sessionId: string
+  title: string
+}
+
+/** Revision 11: archive one session the device may see. The conversation stays on the Host. */
+export interface SessionArchiveFrame {
+  type: 'session-archive'
+  requestId: string
+  sessionId: string
 }
 
 // ---------------------------------------------------------------------------
@@ -235,19 +422,236 @@ export interface RemoteStreamClosedFrame {
 }
 
 // ---------------------------------------------------------------------------
+// Spec 013 — attachment upload (revision 8, additive)
+// ---------------------------------------------------------------------------
+
+export type RemoteUploadType =
+  | 'remote-upload-open'
+  | 'remote-upload-chunk'
+  | 'remote-upload-finish'
+  | 'remote-upload-cancel'
+
+export const REMOTE_UPLOAD_CLIENT_TYPES: readonly RemoteUploadType[]
+/** The single answer kind to every `remote-upload-*` frame. */
+export const REMOTE_UPLOAD_RESULT_KIND: 'remote-upload-result'
+/** Largest chunk (decoded bytes) per `remote-upload-chunk`; the open answer's `chunkBytes` wins. */
+export const REMOTE_UPLOAD_MAX_CHUNK_BYTES: 262144
+/** The scope every upload frame requires (`attachments:write`). */
+export const ATTACHMENTS_WRITE_SCOPE: Scope
+
+/** Which Host store the bytes end up in: a verbatim file, or a normalized prompt image. */
+export type RemoteUploadKind = 'file' | 'image'
+
+/**
+ * Start one transfer. `size` is the exact decoded byte count and `sha256` its
+ * 64 lowercase hex digest, verified against the received bytes at `finish`.
+ * `name` is an optional display name (a leaf filename). `mediaType` is required
+ * for `kind: 'image'` and must be one the Host accepts.
+ */
+export interface RemoteUploadOpenFrame {
+  type: 'remote-upload-open'
+  requestId: string
+  sessionId: string
+  kind: RemoteUploadKind
+  name?: string
+  mediaType?: string
+  size: number
+  sha256: string
+}
+
+export interface RemoteUploadChunkFrame {
+  type: 'remote-upload-chunk'
+  requestId: string
+  uploadId: string
+  /** Decoded byte offset; must equal the bytes already accepted (`nextOffset`). */
+  offset: number
+  /** Canonical base64 (standard alphabet, padded) of the chunk's bytes. */
+  data: string
+}
+
+export interface RemoteUploadFinishFrame {
+  type: 'remote-upload-finish'
+  requestId: string
+  uploadId: string
+}
+
+export interface RemoteUploadCancelFrame {
+  type: 'remote-upload-cancel'
+  requestId: string
+  uploadId: string
+}
+
+/** The Host's own upload failure: its stable code, its message and any `details`. */
+export interface RemoteUploadError {
+  code: string
+  message: string
+  details?: unknown
+}
+
+/** Answer to `remote-upload-open`. `chunkBytes` is the effective chunk limit for this transfer. */
+export interface RemoteUploadOpenedValue {
+  uploadId: string
+  sessionId: string
+  kind: RemoteUploadKind
+  name?: string
+  mediaType?: string
+  size: number
+  chunkBytes: number
+  maxBytes: number
+  idleTimeoutMs: number
+}
+
+export interface RemoteUploadChunkAcceptedValue {
+  uploadId: string
+  sessionId: string
+  nextOffset: number
+}
+
+export interface RemoteUploadCancelledValue {
+  uploadId: string
+  sessionId: string
+  cancelled: true
+}
+
+/**
+ * The Host's staged receipt, exactly as the native `POST /api/session/uploadFileBinary`
+ * route returns it: a `receiptId` and either a `file` or an `image` reference. The
+ * client passes it on unchanged (`{type:'file'|'image', receiptId}` in a `message`).
+ */
+export interface RemoteUploadReceiptValue {
+  receiptId: string
+  file?: Record<string, unknown>
+  image?: Record<string, unknown>
+}
+
+export type RemoteUploadResultFrame =
+  | { kind: 'remote-upload-result'; requestId: string; ok: true; value: unknown }
+  | { kind: 'remote-upload-result'; requestId: string; ok: false; error: RemoteUploadError }
+
+// ---------------------------------------------------------------------------
+// Spec 016 Phase 3 — the host drives a browser on the paired client (revision 10)
+// ---------------------------------------------------------------------------
+
+/** Advertised by the gateway in `hello` and by a client in `client-hello.capabilities`. */
+export const BROWSER_AGENT_CAPABILITY: 'browser-agent:1'
+/** The device scope a `browser-command` needs (`browser:control`, spec 014 C6). */
+export const BROWSER_CONTROL_SCOPE: Scope
+
+export type BrowserOp =
+  | 'navigate'
+  | 'click'
+  | 'type'
+  | 'press'
+  | 'scroll'
+  | 'open'
+  | 'close'
+  | 'snapshot'
+  | 'text'
+  | 'html'
+  | 'screenshot'
+  | 'tabs'
+
+/** Server → client kinds (`browser-command`, and `browser-cancel` in that direction). */
+export type BrowserHostKind = 'browser-command' | 'browser-cancel'
+/** Client → server types (`browser-result`, and `browser-cancel` in that direction). */
+export type BrowserClientType = 'browser-result' | 'browser-cancel'
+
+export const BROWSER_OPS: readonly BrowserOp[]
+export const BROWSER_HOST_KINDS: readonly BrowserHostKind[]
+export const BROWSER_CLIENT_TYPES: readonly BrowserClientType[]
+
+/** A complete frame, serialized, may not exceed this many bytes (either direction). */
+export const BROWSER_FRAME_MAX_BYTES: 1048576
+/** Deadline applied when a command omits `deadlineMs`. */
+export const BROWSER_DEADLINE_DEFAULT_MS: 30000
+/** Largest deadline a command may ask for; a larger value is clamped, not refused. */
+export const BROWSER_DEADLINE_MAX_MS: 120000
+/** Largest decoded `result.screenshot` (JPEG bytes, before base64). */
+export const BROWSER_SCREENSHOT_MAX_BYTES: 786432
+/** Largest `result.text` / `result.html` kept; longer text is cut and flagged `truncated`. */
+export const BROWSER_TEXT_MAX_BYTES: 262144
+/** A `commandId`: 1..64 characters of `[A-Za-z0-9._-]`. */
+export const BROWSER_COMMAND_ID: RegExp
+export const BROWSER_ERROR_CODES: readonly string[]
+
+export interface BrowserCommandFrame {
+  kind: 'browser-command'
+  commandId: string
+  /** The session whose agent asked; the client shows it in the "agent is driving" banner. */
+  sessionId: string
+  op: BrowserOp
+  args: Record<string, unknown>
+  /** 1..120000; absent means 30000. A larger value is clamped by the receiver. */
+  deadlineMs?: number
+}
+
+export interface BrowserError {
+  /** `browser/…`; a client may return its own `browser/...` code. */
+  code: string
+  message: string
+}
+
+export type BrowserResultFrame =
+  | { type: 'browser-result'; commandId: string; ok: true; result: unknown }
+  | { type: 'browser-result'; commandId: string; ok: false; error: BrowserError }
+
+/** Sent by either side: the host cancels a command, or the client declines one it was given. */
+export interface BrowserCancelFrame {
+  commandId: string
+  /** Present on the host → client frame. */
+  kind?: 'browser-cancel'
+  /** Present on the client → server frame. */
+  type?: 'browser-cancel'
+}
+
+/** `{ ok: true, value } | { ok: false, code, message }` — the validator result shape. */
+export type BrowserValidation<T> = { ok: true; value: T } | { ok: false; code: string; message: string }
+
+export function browserFrameBytes(frame: unknown): number
+export function validateBrowserCommand(frame: unknown): BrowserValidation<{
+  commandId: string
+  sessionId: string
+  op: BrowserOp
+  args: Record<string, unknown>
+  deadlineMs: number
+}>
+export function validateBrowserResult(frame: unknown): BrowserValidation<
+  | { commandId: string; ok: true; result: unknown }
+  | { commandId: string; ok: false; error: BrowserError }
+>
+export function validateBrowserCancel(frame: unknown): BrowserValidation<{ commandId: string }>
+/** Cut a text/html result to `maxBytes` of UTF-8 without splitting a code point. */
+export function truncateBrowserText(text: unknown, maxBytes?: number): { text: string; truncated: boolean; bytes: number }
+
+// ---------------------------------------------------------------------------
 // §3.5 / §5 / §6 — capabilities, close codes, errors, approvals
 // ---------------------------------------------------------------------------
 
 export type Capability = 'sessions-read' | 'prompt' | 'cancel' | 'approval-v1'
-export type OptionalCapability = 'push-v1'
+/** `browser-agent:1` (spec 016 Phase 3) is advertised only by a host/client that speaks it. */
+export type OptionalCapability = 'push-v1' | 'browser-agent:1' | 'session-rename' | 'session-archive'
+  /** Spec 019: advertised only for a device holding `permission:lower`. */
+  | 'permission-lower'
 
 export const CAPABILITIES: readonly Capability[]
 export const OPTIONAL_CAPABILITIES: readonly OptionalCapability[]
+/**
+ * Revision 11: the optional capabilities advertised PER DEVICE, only for a device holding
+ * the named scope (`session-rename` / `session-archive` → `sessions:author`,
+ * `permission-lower` → `permission:lower`, spec 019).
+ */
+export const SESSION_EDIT_CAPABILITY_SCOPE: Readonly<Record<'session-rename' | 'session-archive' | 'permission-lower', Scope>>
 
 export const CLOSE_CODES: Readonly<{
   gatewayDisabled: 4004
   reauth: 4003
   revoked: 4401
+  /**
+   * Spec 021 (revision 14): a web device whose passkey was replaced (or whose replacement was
+   * approved) re-asserts. KEEP the credential (unlike 4401). An ordinary locked socket is
+   * answered in band with `auth/locked`, never closed.
+   */
+  locked: 4412
 }>
 
 // ---------------------------------------------------------------------------
@@ -326,6 +730,17 @@ export type ContractErrorCode =
   | 'protocol/unsupported'
   | 'bad-request'
   | 'session-not-found'
+  /**
+   * Spec 021 (revision 14): a `web:unlock` device that has not passed a passkey assertion on
+   * this socket. `reason` is `WebLockReason`.
+   */
+  | 'auth/locked'
+  /** Spec 021: the passkey frames' refusals (in band, no detail beyond the code). */
+  | 'passkey/not-registered'
+  | 'passkey/already-registered'
+  | 'passkey/challenge-expired'
+  | 'passkey/verification-failed'
+  | 'passkey/rate-limited'
 
 export type PassthroughErrorCode = 'agent-busy' | 'internal'
 
@@ -373,6 +788,12 @@ export interface ClientHelloFrame {
   companionProtocol: number
   appVersion: string
   platform: 'ios' | 'android'
+  /**
+   * Spec 016 Phase 3 (revision 10): optional capabilities this client offers. Only
+   * `browser-agent:1` is read today — it says the client can answer `browser-command`.
+   * Absent/unknown values are ignored, so an older client keeps working unchanged.
+   */
+  capabilities?: string[]
 }
 
 export interface PingFrame {
@@ -491,6 +912,8 @@ export interface HelloFrame {
   gatewayId: string
   dshVersion?: string
   certSha256?: string
+  /** Spec 021: present only for a device holding `web:unlock`; see `WebLockState`. */
+  webLock?: WebLockState
 }
 
 export interface PairedFrame {

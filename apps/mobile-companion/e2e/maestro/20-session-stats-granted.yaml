@@ -1,0 +1,77 @@
+# 20 — session stats WITH the grant: the entry exists, the sheet shows the Host's numbers (spec 018).
+#
+# SCENARIO: paired, ready socket, `hello.device.scopes` = the four scopes the hidden flows use plus
+#           `stats:read`. Checkpoint T-19 in `run-e2e.mjs` arms it immediately before this flow:
+#             POST /scenario/scopes {"scopes":["sessions:read","sessions:author","prompt:send","approval:respond","stats:read"]}
+#           A plain `maestro test` pairing may lack the scope, which is why the scope is armed.
+# HARNESS:  `--cert-mode ok`. The fixture answers `session-stats` for `sess-alpha` with the contract's
+#           own example (`plugins/mobile-gateway/PROTOCOL.md:927-933`), so the sheet renders the `ready`
+#           branch: turns/steps (session view) and the token + context sections.
+# MANUAL:   biometric prompt only.
+#
+#[HOOKS] `session-more` (open the ⋯ menu), `session-stats` (the row the grant draws), `session-team`
+#        (the menu's fixed row, so the menu is controlled), `session-stats-close` (the sheet really
+#        opened and closes from its own control), and the sheet body's `stats-session` / `stats-tokens`
+#        / `stats-context` section hooks (rendered by `src/ui/components/stats-panel.tsx`).
+#
+#[EXIT CRITERIA]
+#   1. the ⋯ menu draws the stats row (the grant is honoured, not hidden);
+#   2. tapping it opens the sheet (its close hook is present) and the sheet leaves `loading`:
+#      the `ready` sections are drawn from the served reply — never the loading line forever;
+#   3. the sheet closes from that hook and the ⋯ menu is reachable again;
+#   4. the app sent exactly one `session-stats` for `sess-alpha` (asserted by the orchestrator from
+#      `GET /state`: `evidence.readOnlyRequests`).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-alpha
+  SESSION_TAB: running
+  SESSION_TITLE: Refactor gateway TLS
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- runFlow: subflows/pair-paste.yaml
+- runFlow: subflows/open-session.yaml
+
+- tapOn:
+    id: "session-more"
+
+# 1) With `stats:read` the row is drawn, and the menu is controlled (its fixed row is there too).
+- assertVisible:
+    id: "session-team"
+- assertVisible:
+    id: "session-stats"
+
+- tapOn:
+    id: "session-stats"
+
+# 2) The sheet is up…
+- extendedWaitUntil:
+    visible:
+      id: "session-stats-close"
+    timeout: 20000
+# …and it left the busy line for the served data: the `ready` body hook belongs to
+# `SessionStatsPanel`. A fixture that never answers would stay on `session-stats-loading` and fail
+# here, which is the regression this checkpoint watches (the per-section hooks the view builds —
+# `stats-tokens` / `stats-context` / `stats-session` — are `src/`-side ids the static checker does
+# not know, so this flow asserts the panel-level hook instead of guessing them).
+- extendedWaitUntil:
+    visible:
+      id: "session-stats-ready"
+    timeout: 20000
+- assertNotVisible:
+    id: "session-stats-loading"
+- assertNotVisible:
+    id: "session-stats-unavailable"
+- assertNotVisible:
+    id: "session-stats-retry"
+
+# 3) Close it from its own hook, then confirm the session screen is still the live screen.
+- tapOn:
+    id: "session-stats-close"
+- extendedWaitUntil:
+    visible:
+      id: "session-more"
+    timeout: 20000
+- assertNotVisible:
+    id: "session-stats-close"

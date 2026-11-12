@@ -19,6 +19,8 @@ import { createRequire } from 'node:module'
 import net from 'node:net'
 import tls from 'node:tls'
 
+import { BROWSER_AGENT_CAPABILITY, loadProtocol } from './agent-browser.mjs'
+
 // `ws` is not a dependency of this folder yet (no network install in this
 // workspace); it is resolved from the sibling gateway plugin, which pins it.
 // When @dsh-ext/devices is installed on its own, add "ws" to its dependencies
@@ -330,6 +332,209 @@ class StreamQueue {
 }
 
 /**
+ * The `client-hello` frame (contract §4). Spec 016 Phase 3 (revision 10): the
+ * optional `capabilities` array is present ONLY while the owner's per-host consent
+ * is on, so a host cannot even ask this machine to drive a browser otherwise.
+ */
+export function buildClientHello({ browserConsent = false } = {}) {
+  return {
+    type: 'client-hello',
+    requestId: nextRequestId(),
+    companionProtocol: COMPANION_PROTOCOL_VERSION,
+    appVersion: 'dsh-ext-devices/0.1.0',
+    platform: 'desktop',
+    ...(browserConsent ? { capabilities: [BROWSER_AGENT_CAPABILITY] } : {}),
+  }
+}
+
+/**
+ * One host → client `browser-command` at a time (contract revision 10, §10.2/§10.4),
+ * answered by exactly one `browser-result` (or none at all for a command the host
+ * cancelled). Transport-free on purpose: the connection owns the socket, this owns
+ * the state machine, and a test can drive the frames directly.
+ *
+ * Responsibilities, in the order the contract checks them:
+ *  - consent off → `browser/denied`, and the browser is never touched;
+ *  - a malformed frame → `browser/bad-request` (when a `commandId` can be echoed);
+ *  - a second command while one is in flight → `browser/busy`;
+ *  - the command's own deadline → abort the work and answer `browser/timeout`;
+ *  - `browser-cancel` from the host → abort and answer nothing;
+ *  - never more than one result per `commandId`, and never a frame over 1 MiB.
+ */
+export class BrowserChannel {
+  /**
+   * @param {object} options
+   * @param {() => boolean} options.consent the owner's per-host setting
+   * @param {(op: string, args: object, options: {signal: AbortSignal}) => Promise<object>} options.run
+   * @param {(frame: object) => void} options.send writes one client → host frame
+   */
+  constructor({ consent = () => false, run, send, log = () => {}, now = Date.now }) {
+    this.consent = consent
+    this.run = run
+    this.send = send
+    this.log = log
+    this.now = now
+    this.current = null
+    this.startedAt = null
+  }
+
+  /** The command id in flight, or null: the tab shows which session is driving from it. */
+  get commandId() {
+    return this.current ? this.current.commandId : null
+  }
+
+  /** Answer one server frame; unknown frames are ignored. Resolves once settled. */
+  async handle(frame) {
+    if (!frame || typeof frame !== 'object') return
+    if (frame.kind === 'browser-cancel') {
+      await this.#cancel(frame)
+      return
+    }
+    if (frame.kind !== 'browser-command') return
+    const id = typeof frame.commandId === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(frame.commandId) ? frame.commandId : ''
+    if (!this.consent()) {
+      // Consent off is the client's own refusal; nothing is validated or launched.
+      if (id) this.#sendError(id, 'browser/denied', 'the owner has not allowed this host to drive a browser on this machine')
+      return
+    }
+    let protocol
+    try { protocol = await loadProtocol() } catch {
+      if (id) this.#sendError(id, 'browser/not-supported', 'the browser agent is not available on this machine')
+      return
+    }
+    const checked = protocol.validateBrowserCommand(frame)
+    if (!checked.ok) {
+      if (id) this.#sendError(id, checked.code === 'browser/frame-too-large' ? 'browser/frame-too-large' : 'browser/bad-request', checked.message)
+      return
+    }
+    if (this.current) {
+      this.#sendError(checked.value.commandId, 'browser/busy', 'another browser command is still running')
+      return
+    }
+    await this.#run(checked.value, protocol)
+  }
+
+  async #run(command, protocol) {
+    const controller = new AbortController()
+    const state = { commandId: command.commandId, controller, settled: false, timer: null, sessionId: command.sessionId }
+    this.current = state
+    this.startedAt = this.now()
+    const settle = (frame) => {
+      if (state.settled) return
+      state.settled = true
+      if (state.timer) clearTimeout(state.timer)
+      state.timer = null
+      if (this.current === state) this.current = null
+      // Releases `handle()`: a command that settled by timeout or cancel must not
+      // keep its caller waiting for work that will never produce a result.
+      state.release?.()
+      if (!frame) return
+      this.send(frame)
+    }
+    state.settle = settle
+    const settled = new Promise((resolve) => { state.release = resolve })
+    state.timer = setTimeout(() => {
+      state.timer = null
+      try { controller.abort() } catch { /* already aborted */ }
+      // A host cancel already owns this command: it gets no result, not even a late
+      // one, and the timer that fires while it unwinds only frees the slot.
+      if (state.cancelled) { settle(null); return }
+      settle({ type: 'browser-result', commandId: command.commandId, ok: false,
+        error: { code: 'browser/timeout', message: `the browser did not finish within ${command.deadlineMs} ms` } })
+    }, command.deadlineMs)
+    state.timer.unref?.()
+    // The work and the settle race: whichever finishes first ends the command, and
+    // an aborted op that rejects later is already handled here (never unhandled).
+    const outcome = await Promise.race([
+      this.run(command.op, command.args ?? {}, { signal: controller.signal })
+        .then((value) => ({ value }), (error) => ({ error })),
+      settled.then(() => undefined),
+    ])
+    if (outcome === undefined) return
+    // The host cancelled it: whatever the op produced (a result, or its own
+    // `browser/cancelled`) is deliberately not sent.
+    if (state.cancelled) {
+      settle(null)
+      return
+    }
+    if (outcome.error !== undefined) {
+      const error = outcome.error
+      if (error?.code === 'browser/cancelled') {
+        // A kill switch or a host cancel: whoever asked already settled the command.
+        settle(null)
+        return
+      }
+      const code = typeof error?.code === 'string' && /^browser\//.test(error.code) ? error.code : 'browser/bad-request'
+      settle({ type: 'browser-result', commandId: command.commandId, ok: false,
+        error: { code, message: String(error?.message ?? 'the browser failed') } })
+      return
+    }
+    const frame = { type: 'browser-result', commandId: command.commandId, ok: true, result: outcome.value }
+    // A result the host would refuse for its size is refused here instead: the
+    // contract's 1 MiB bound applies to the whole frame, either direction.
+    if (protocol.browserFrameBytes(frame) > protocol.BROWSER_FRAME_MAX_BYTES) {
+      settle({ type: 'browser-result', commandId: command.commandId, ok: false,
+        error: { code: 'browser/frame-too-large', message: 'the result does not fit one frame' } })
+      return
+    }
+    settle(frame)
+  }
+
+  async #cancel(frame) {
+    let protocol
+    try { protocol = await loadProtocol() } catch { return }
+    const checked = protocol.validateBrowserCancel(frame)
+    if (!checked.ok) return
+    const state = this.current
+    // A cancel for a command that is not in flight (already settled, or another
+    // device's) is ignored: never applied and never answered.
+    if (!state || state.commandId !== checked.value.commandId) return
+    // The slot stays taken until the work actually unwinds: a cancelled op can still
+    // be midway through its own CDP calls, and letting a second command start on the
+    // same page would interleave two commands' clicks and their results. The abort
+    // makes the op give up at its next send, which is what frees the slot.
+    state.cancelled = true
+    if (state.timer) clearTimeout(state.timer)
+    state.timer = null
+    try { state.controller.abort() } catch { /* already aborted */ }
+  }
+
+  /**
+   * Answer the in-flight command with `browser/cancelled` (the tab's kill switch goes
+   * through the owner's consent route, so the host learns why no page came back).
+   */
+  cancelAll(reason = 'cancelled') {
+    const state = this.current
+    if (!state) return false
+    try { state.controller.abort() } catch { /* already aborted */ }
+    if (state.cancelled) {
+      // The host cancelled it first: that command is owed no answer at all.
+      state.settle?.(null)
+      return true
+    }
+    state.settle?.({ type: 'browser-result', commandId: state.commandId, ok: false,
+      error: { code: 'browser/cancelled', message: reason } })
+    return true
+  }
+
+  /** The transport is gone: fail the work, answer nothing (the host sees the close). */
+  disconnect() {
+    const state = this.current
+    if (!state) return
+    state.settled = true
+    if (state.timer) clearTimeout(state.timer)
+    state.timer = null
+    this.current = null
+    try { state.controller.abort() } catch { /* already aborted */ }
+    state.release?.()
+  }
+
+  #sendError(commandId, code, message) {
+    this.send({ type: 'browser-result', commandId, ok: false, error: { code, message } })
+  }
+}
+
+/**
  * One live, authenticated connection to one remote gateway. Emits:
  *  - `state`    (state, detail)   'connecting' | 'online' | 'offline' | 'revoked' | 'error'
  *  - `approval` (frame)           an `approval-requested` frame
@@ -342,13 +547,26 @@ export class RemoteConnection extends EventEmitter {
   // The `ws` implementation is not defaulted here on purpose: constructing a
   // connection must never resolve (and fail on) it — `openPinnedSocket` does at
   // dial time, so the missing dependency is reported by name, not at apply time.
-  constructor({ remote, readToken, log = () => {}, requestTimeoutMs = 10_000, WebSocketImpl }) {
+  constructor({ remote, readToken, log = () => {}, requestTimeoutMs = 10_000, WebSocketImpl, browserConsent, browserAgent }) {
     super()
     this.remote = remote
     this.readToken = readToken
     this.log = log
     this.requestTimeoutMs = requestTimeoutMs
     this.WebSocketImpl = WebSocketImpl
+    // Spec 016 Phase 3: the owner's per-host consent and the browser this machine
+    // may drive. Without a browser the channel is absent, so the frame is ignored
+    // and the hello advertises no capability.
+    this.browserConsent = typeof browserConsent === 'function' ? browserConsent : () => browserConsent === true
+    this.browserAgent = browserAgent
+    this.browser = typeof browserAgent === 'function'
+      ? new BrowserChannel({
+        consent: () => this.browserConsent(),
+        run: (op, args, options) => this.browserAgent().op(op, args, options),
+        send: (frame) => this.#sendFrame(frame),
+        log,
+      })
+      : null
     this.state = 'offline'
     this.ws = null
     this.waiters = new Map()
@@ -463,10 +681,18 @@ export class RemoteConnection extends EventEmitter {
     }
     this.hello = hello
     // Contract §4: declare the protocol revision we speak; a mismatch closes us with 4003.
-    ws.send(JSON.stringify({ type: 'client-hello', requestId: nextRequestId(), companionProtocol: COMPANION_PROTOCOL_VERSION,
-      appVersion: 'dsh-ext-devices/0.1.0', platform: 'desktop' }))
+    // Spec 016 Phase 3: the optional `browser-agent:1` capability is listed only while
+    // the owner's consent for THIS host is on (see buildClientHello).
+    ws.send(JSON.stringify(buildClientHello({ browserConsent: this.browserConsent() })))
     this.setState('online')
     return hello
+  }
+
+  /** One frame out on the adopted socket; a closed transport drops it. */
+  #sendFrame(frame) {
+    const ws = this.ws
+    if (!ws || ws.readyState !== 1) return
+    try { ws.send(JSON.stringify(frame)) } catch { /* closed */ }
   }
 
   /**
@@ -487,6 +713,13 @@ export class RemoteConnection extends EventEmitter {
     // multi-host router turns both into native `$events` cards (spec 008 P2c).
     if (frame.kind === 'question-requested') { this.emit('question', frame); return }
     if (frame.kind === 'question-resolved') { this.emit('questionResolved', frame); return }
+    // Spec 016 Phase 3 (revision 10): the first host-initiated request. The channel
+    // validates it with the shared protocol, keeps one in flight, and answers exactly
+    // once (or not at all for a cancelled command).
+    if (frame.kind === 'browser-command' || frame.kind === 'browser-cancel') {
+      this.browser?.handle(frame).catch(() => { /* one frame never breaks the link */ })
+      return
+    }
     if (frame.kind === 'remote-frame' || frame.kind === 'remote-stream-closed') {
       if (this.#onWireStreamFrame(frame)) return
       this.#onStreamFrame(frame)
@@ -536,6 +769,9 @@ export class RemoteConnection extends EventEmitter {
   #onClose(code, isCurrent) {
     if (!isCurrent()) return
     this.ws = null
+    // A command in flight cannot be answered on a closed link: fail its work and
+    // stay silent (the host already reports the device offline).
+    this.browser?.disconnect()
     this.#failPending(code)
     if (code === CLOSE_REVOKED) {
       this.setState('revoked')
@@ -547,8 +783,14 @@ export class RemoteConnection extends EventEmitter {
     }
   }
 
-  /** Send one request and await the frame echoing its `requestId`. */
-  async request(frame, { signal } = {}) {
+  /**
+   * Send one request and await the frame echoing its `requestId`.
+   * `timeoutMs` overrides the connection's default wait for callers whose answer
+   * legitimately takes longer than a UI round trip — a staged attachment upload
+   * (spec 013) reports its own budget, and a 512 MiB write must not be cut off by
+   * the 10 s default while the remote Host is still working.
+   */
+  async request(frame, { signal, timeoutMs = this.requestTimeoutMs } = {}) {
     await this.connect()
     const ws = this.ws
     if (!ws || ws.readyState !== 1) throw new Error('the connection to the remote is not open')
@@ -560,7 +802,7 @@ export class RemoteConnection extends EventEmitter {
         signal?.removeEventListener?.('abort', onAbort)
         fn(value)
       }
-      const timer = setTimeout(() => settle(reject, new Error('the remote did not answer in time')), this.requestTimeoutMs)
+      const timer = setTimeout(() => settle(reject, new Error('the remote did not answer in time')), timeoutMs)
       // A call the UI cancelled must stop waiting; the remote answer is ignored
       // when it lands (the waiter is gone).
       const onAbort = () => settle(reject, Object.assign(new Error('the request was cancelled'), { code: 'cancelled' }))
@@ -790,6 +1032,8 @@ export class RemoteConnection extends EventEmitter {
     try { this.ws?.close(1000, 'removed') } catch { /* already closed */ }
     try { this.ws?.terminate() } catch { /* already closed */ }
     this.ws = null
+    // A command still in flight belongs to a link that is gone.
+    this.browser?.disconnect()
     // Our own stop settles what the socket was carrying: nulling `this.ws` above makes
     // the socket's own close event stale, so a request in flight would otherwise wait
     // out `requestTimeoutMs` after the remote was deleted or the plugin torn down.

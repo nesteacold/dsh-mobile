@@ -50,7 +50,9 @@ import {
   PAIRING_CLOSE_CODES,
   PAIRING_NONCE,
   PAIRING_PROOF_TYPE,
+  PASSKEY_CLIENT_TYPES,
   PING_INTERVAL_MS,
+  WEB_LOCK_STATES,
   authSubprotocols,
   createClientNonce,
   pairingSubprotocols,
@@ -60,6 +62,7 @@ import {
   type HelloFrame,
   type Op,
   type PairedFrame,
+  type WebLockState,
 } from '@dsh-ext/mobile-protocol';
 
 import { CoreError, normaliseErrorCode, type CoreErrorCode } from './errors';
@@ -108,6 +111,13 @@ export interface ClientEventMap {
   approvalResolved: ApprovalResolvedFrame;
   /** Server push `event` (session updates); payload is passed through. */
   event: Record<string, unknown>;
+  /**
+   * Spec 018 — server push with projection data: `projection-baseline` (control set of every
+   * session's `values`) and the `tasks-updated` / `goal-updated` replacements. Payload is passed
+   * through; `src/core/projections.ts` decodes it. They are NOT request answers, so they would
+   * otherwise be dropped by the answer matcher once no request is waiting on them.
+   */
+  projection: Record<string, unknown>;
   /** Socket dropped (also emitted on a failed connect / pin mismatch / local close / handshake timeout). */
   disconnected: { code: number; reason: string; retry: boolean };
   /** Host speaks a version this app cannot talk to (typed, never silent). */
@@ -121,6 +131,17 @@ export interface ClientEventMap {
    * fine) or an HTTP 401 upgrade refusal (`auth/required` — permanent, so `retry: false`).
    */
   reauthRequired: { code: 4003 | 'auth/required' };
+  /**
+   * Spec 021: the Host re-locked this web device (close 4412) — e.g. its passkey was replaced on
+   * another socket. The credential is KEPT and the socket is retried; the gate shows its lock screen
+   * again and the next assertion unlocks it. NEVER treat this as a revocation (4401 wipes).
+   */
+  locked: { code: typeof CLOSE_CODES.locked; reason: string };
+  /**
+   * Spec 021 (contract §14.3): the owner approved or rejected replacing this device's passkey. The
+   * asking socket learns the owner's 8-character `verificationCode` only when it approves.
+   */
+  passkeyApproval: { approvalId: string; action: 'approve' | 'reject'; verificationCode?: string };
 }
 
 type Handler<K extends keyof ClientEventMap> = (payload: ClientEventMap[K]) => void;
@@ -447,6 +468,8 @@ export class CompanionClient {
   private pairingProofSent = false;
   /** `reason` of an in-band `pairing-rejected`, kept for the close-code error message. */
   private pairingRejectedReason: string | null = null;
+  /** Spec 021: `hello.webLock` of the current connection (see `get webLock`). */
+  private _webLock: WebLockState | null = null;
   /**
    * True once the end of the current connection was reported. The first terminal report wins
    * (local close, transport close or the handshake deadline), so listeners see exactly one
@@ -506,6 +529,15 @@ export class CompanionClient {
 
   get hello(): HelloFrame | null {
     return this._hello;
+  }
+
+  /**
+   * Spec 021 (contract §14.2): the lock state the Host reported in `hello.webLock`. Present ONLY for
+   * a device holding `web:unlock`; `null` means "this device is not locked" (native, or a Host that
+   * does not speak revision 14 yet).
+   */
+  get webLock(): WebLockState | null {
+    return this._webLock;
   }
 
   /** Device the host reports for this connection (`hello.device`), if any. */
@@ -577,6 +609,8 @@ export class CompanionClient {
     this.terminatingForListenerFailure = false;
     this._state = 'connecting';
     this._hello = null;
+    // Spec 021: every new connection starts from the Host's own statement, never the old socket's.
+    this._webLock = null;
     this._device = null;
     this._pairedToken = null;
     this.revokedFired = false;
@@ -641,8 +675,17 @@ export class CompanionClient {
    *
    * A failing `newRequestId` / `send` is rejected here (typed) rather than emitted: the caller is
    * awaiting this promise, so an additional `error` event would report the same failure twice.
+   *
+   * `allowNonOpType` exists for frames that are deliberately NOT contract §4 ops (`OPS` is
+   * unchanged) yet are normal request/answer frames: the spec 021 passkey frames, and the spec 018
+   * stats/schedule/team reads. It is an explicit opt-in per caller rather than a relaxation of the
+   * allowlist: the default stays "only OPS".
    */
-  async request(op: Op, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  async request(
+    op: Op,
+    params: Record<string, unknown> = {},
+    options: { allowNonOpType?: boolean } = {},
+  ): Promise<Record<string, unknown>> {
     if (this._state !== 'ready') {
       throw new CoreError({
         code: 'client/bad-state',
@@ -650,7 +693,7 @@ export class CompanionClient {
         details: { op, state: this._state },
       });
     }
-    if (!(OPS as readonly string[]).includes(op)) {
+    if (options.allowNonOpType !== true && !(OPS as readonly string[]).includes(op)) {
       // Client-side allowlist: the contract forbids anything outside `companion-v1`.
       throw new CoreError({ code: 'op/forbidden', message: `${op} is not in the companion-v1 allowlist`, details: { op } });
     }
@@ -715,6 +758,20 @@ export class CompanionClient {
         );
       }
     });
+  }
+
+  /**
+   * Spec 021 (contract §14.1): send one of the four passkey frames. They are not §4 ops, so this is
+   * the narrow, typed opt-in — a caller can send a passkey frame and nothing else through it.
+   */
+  passkeyRequest(
+    type: (typeof PASSKEY_CLIENT_TYPES)[number],
+    params: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown>> {
+    if (!(PASSKEY_CLIENT_TYPES as readonly string[]).includes(type)) {
+      return Promise.reject(new CoreError({ code: 'op/forbidden', message: `${type} is not a passkey frame` }));
+    }
+    return this.request(type as Op, params, { allowNonOpType: true });
   }
 
   /**
@@ -839,6 +896,17 @@ export class CompanionClient {
           this._state = 'reauth-required';
           this.emit('state', this._state, 'state');
           this.emit('reauthRequired', { code: 4003 }, 'close');
+          this.emit('disconnected', { code: closeCode, reason: event.reason, retry: true }, 'close');
+          return;
+        }
+        if (closeCode === CLOSE_CODES.locked) {
+          // Spec 021 (contract §14.2): the Host re-locked this web device — its passkey was replaced
+          // on another socket. NOT a revocation: the credential is KEPT and the socket is retried, so
+          // the gate can assert again. Deliberately distinct from 4401, which wipes the credential,
+          // and from the pairing codes 4403/4408/4410, which only happen before one exists.
+          this._state = 'closed';
+          this.emit('state', this._state, 'state');
+          this.emit('locked', { code: CLOSE_CODES.locked, reason: event.reason }, 'close');
           this.emit('disconnected', { code: closeCode, reason: event.reason, retry: true }, 'close');
           return;
         }
@@ -1006,6 +1074,29 @@ export class CompanionClient {
       }
       case 'event':
         this.emit('event', f, 'frame:event');
+        return;
+      // Spec 021 (contract §14.3): the owner's decision on replacing this device's passkey. It is a
+      // push for the asking socket only: a `reject` answers nothing, and either way it must never be
+      // mistaken for the `passkey-register` answer (that one is matched by requestId below).
+      case 'passkey-approval': {
+        const approvalId = typeof f.approvalId === 'string' ? f.approvalId : '';
+        const action = f.action;
+        if (approvalId === '' || (action !== 'approve' && action !== 'reject')) return;
+        this.emit(
+          'passkeyApproval',
+          { approvalId, action, ...(typeof f.verificationCode === 'string' ? { verificationCode: f.verificationCode } : {}) },
+          'frame:passkey-approval',
+        );
+        return;
+      }
+      // Spec 018 (PROTOCOL.md:1200-1201): projection pushes carry no `requestId`. The task list and
+      // goal follow the subscription filter, the baseline and turn outline go to the control
+      // connection; all of them arrive here as ordinary pushes and are decoded by the caller.
+      case 'projection-baseline':
+      case 'tasks-updated':
+      case 'goal-updated':
+      case 'turn-outline-updated':
+        this.emit('projection', f, `frame:${f.kind}`);
         return;
       default:
         // Responses to requests (`sessions`, `sent`, `approval-response`, ...) are matched by
@@ -1206,6 +1297,14 @@ export class CompanionClient {
       ...(typeof f.certSha256 === 'string' ? { certSha256: f.certSha256 } : {}),
     };
     this._hello = hello;
+    // Spec 021 (contract §14.2): `webLock` is present only for a `web:unlock` device; absent means
+    // "not locked" (native, or a Host without revision 14). A STRING the app cannot read is NOT
+    // treated as absent: an unknown lock state must fail shut, so it reads as `locked`.
+    this._webLock = f.webLock === undefined || f.webLock === null
+      ? null
+      : (WEB_LOCK_STATES as readonly unknown[]).includes(f.webLock)
+        ? (f.webLock as WebLockState)
+        : 'locked';
     this._device = parseDevice(f.device) ?? this._device;
     const incompatible =
       hello.companionProtocol !== COMPANION_PROTOCOL_VERSION ||
@@ -1351,7 +1450,21 @@ export class CompanionClient {
       if (pending) {
         this.pending.delete(requestId);
         if (pending.timer) clearTimeout(pending.timer);
-        pending.reject(new CoreError({ code, message, details: { op: pending.op } }));
+        // A refusal can carry the recovery instructions, not just a reason: `history-format-mismatch`
+        // is answered with `resetRequired: true` + the version the Host now requires
+        // (`plugins/mobile-gateway/lib/index.mjs:1398-1403`). Dropping them here left the app unable
+        // to reload the baseline, so they are forwarded verbatim to the caller.
+        pending.reject(
+          new CoreError({
+            code,
+            message,
+            details: {
+              op: pending.op,
+              ...(typeof f.resetRequired === 'boolean' ? { resetRequired: f.resetRequired } : {}),
+              ...(typeof f.historyFormatVersion === 'number' ? { historyFormatVersion: f.historyFormatVersion } : {}),
+            },
+          }),
+        );
         return;
       }
       // Contract §5a: an error frame with a `requestId` fails *that* request only. An id we do

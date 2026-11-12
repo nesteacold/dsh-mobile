@@ -1,9 +1,11 @@
 // Spec 008 P1 — the remote-bridge channel.
 //
-// A `desktop` device holding the explicit scope `harness:remote` may tunnel DSH
-// Gateway wire calls (`namespace/method`, `$events`) to THIS Host over the same
-// pinned, per-device-authenticated WebSocket the companion uses. The bridge is
-// an authorization boundary, not a pipe:
+// A device holding the explicit scope `harness:remote` may tunnel DSH Gateway
+// wire calls (`namespace/method`, `$events`) to THIS Host over the same pinned,
+// per-device-authenticated WebSocket the companion uses. Device `kind` is not a
+// policy input (spec 012 rule 3): the scopes written on the record decide, on a
+// phone exactly as on a desktop. The bridge is an authorization boundary, not a
+// pipe:
 //
 //   - DENY BY DEFAULT. Only endpoints in ENDPOINT_SCOPE / FAMILY_SCOPE are
 //     forwarded; anything else (including every name that is not listed, and the
@@ -68,24 +70,58 @@ const SESSIONS_READ = [
   'llm/listProviders', 'llm/listConfigurableProviders', 'llm/discoverModels',
   'permissionPresets/catalog',
   'messageFeedback/list',
+  // Spec 012 (owner 2026-11-11): the ONLY remoteAccess endpoint. DSH answers it for
+  // every Peer (`dsh-api-remote-access` index.js:224) and it streams the caller's OWN
+  // grant snapshot — it holds no pairing or device-admin operation, so it is a read.
+  // Any other `remoteAccess/*` method a later DSH adds stays unlisted (deny by default).
+  'remoteAccess/follow',
   'schedule/list', 'schedule/catalog', 'schedule/history', 'schedule/deliveryLimits',
+  // Reading one scheduled task does not activate its sessions, so it is a read.
+  'schedule/view',
+  // Reading the current goal of a live agent is a read of session state.
+  'goals/get',
   'toolResults/watch',
 ]
 const PROMPT_SEND = [
-  'session/prompt', 'session/create', 'session/fork', 'session/cancel', 'session/rename',
+  'session/prompt', 'session/create', 'session/cancel',
   'session/updateQueue',
   // Owner decision (models for remote sessions): the model list for a remote
-  // session lives on the Host and needs only prompt:send. selectModel and
-  // initializeDefaultModel are NOT here: both write the Host's GLOBAL default
-  // model (session-controller lib/index.js:716 and :3945, `saveSelection`), so
-  // they sit under settings:write (SETTINGS_WRITE below).
+  // session lives on the Host and needs only prompt:send. `session/selectModel` is
+  // a session action and moved to `sessions:author` (spec 012 FR-007, SESSIONS_AUTHOR
+  // below); `session/initializeDefaultModel` writes the Host's GLOBAL default and
+  // stays under settings:write (SETTINGS_WRITE below).
   'session/modelCatalog',
   'subagents/interruptByParent', 'subagents/prompt',
   'messageFeedback/put', 'messageFeedback/delete',
   'job/kill',
   // Goals: a goal is a prompt in a different shape; maxGoalRounds is capped below.
   'goals/create', 'goals/edit', 'goals/pause', 'goals/resume', 'goals/clear', 'goals/complete',
-  'workspace/rename', 'workspace/archiveSession',
+  // Owner ruling 2026-11-11 (spec 012 first amendment): renaming a workspace is an
+  // EXISTING grant — it stays under prompt:send. Archiving ONE session moved to
+  // `sessions:author` in revision 11 (SESSIONS_AUTHOR below), together with
+  // `session-rename` on the companion channel: both are per-session decisions on
+  // `{kind:'session', id}`, not a wider prompt grant.
+  'workspace/rename',
+]
+// Owner decision (spec 012 FR-007): selecting a model for ONE session is a session
+// action, not a Host-settings write. It sat under settings:write, but `settings/*` is
+// on the carve-out list, so that gate made model selection unreachable for every
+// device kind. `settings:write` keeps what it names: settings, defaults, presets.
+//
+// Spec 012 first amendment (owner 2026-11-11): the native session menu must work on
+// remote exactly as on the Host, so forking and renaming a session became grantable
+// here instead of being hard-blocked. The pin/archive/reorder bookkeeping of the
+// workspace list is the same argument: it edits a session's place in a list, not the
+// list's contents (`workspace/create` and `workspace/delete` stay under
+// workspace:manage). One scope per family, owner-tickable on the Permission page.
+const SESSIONS_AUTHOR = [
+  'session/selectModel',
+  'session/fork', 'session/rename',
+  // Revision 11: archiving ONE session of the workspace list.
+  'workspace/archiveSession',
+  'workspace/pinSession', 'workspace/unpinSession',
+  'workspace/unarchiveSession',
+  'workspace/insertBefore', 'workspace/insertSessionBefore',
 ]
 const APPROVAL_RESPOND = [
   'userQuestions/answer', 'userQuestions/attachWait',
@@ -104,16 +140,27 @@ const FILES_READ = [
 const COMMANDS_EXECUTE = ['commands/execute']
 const WORKSPACE_MANAGE = [
   'workspace/create', 'workspace/delete',
-  'directoryPicker/list', 'directoryPicker/pick', 'directoryPicker/browse',
+  // Spec 012 (owner 2026-11-11): first-use bootstrap of the Host's default workspace
+  // directory (`dsh-api-workspace-controller` initializeDefault). It registers a
+  // workspace and creates no session, i.e. it IS workspace creation, so it shares
+  // `workspace/create`'s scope instead of being a hard deny.
+  'workspace/initializeDefault',
+  // `directoryPicker/pick` is NOT here: it opens the Host's own OS chooser, which a
+  // remote device must never trigger (HOST_UI_ONLY_PATTERNS below). Creating a child
+  // directory from the in-app browser does not open a window, so it stays grantable.
+  'directoryPicker/list', 'directoryPicker/createDirectory', 'directoryPicker/browse',
 ]
 // settings/* is matched by prefix (see FAMILY_SCOPE): every method of the namespace.
-const SETTINGS_WRITE = ['agentPresets/select', 'session/selectModel', 'session/initializeDefaultModel']
+const SETTINGS_WRITE = ['agentPresets/select', 'session/initializeDefaultModel']
 // credentials/set|unset are WRITE-ONLY. There is deliberately no read endpoint
 // here: a credentials method that returns a value must never be forwarded.
 const CREDENTIALS_WRITE = ['credentials/set', 'credentials/unset']
 const SCHEDULE_WRITE = [
   'schedule/create', 'schedule/update', 'schedule/delete', 'schedule/deleteInactive', 'schedule/run', 'schedule/edit',
 ]
+// claudeCodeMods/* is matched by namespace (see FAMILY_SCOPE): the per-session "band"
+// a mod draws above the prompt (`watchBand`) and its buttons (`pressBand`, which runs
+// the mod's `onPress`).
 
 /**
  * Whole namespaces gated by one scope (every method, including ones a later DSH
@@ -122,12 +169,24 @@ const SCHEDULE_WRITE = [
 const FAMILY_SCOPE = Object.freeze({
   settings: 'settings:write',
   pluginManager: 'plugins:manage',
+  // Both are plugin-surface bookkeeping under the plugin-management scope: the
+  // plugin list/settings inventory and the registry latency probe behind the
+  // Plugin Manager page. They were denied outright before the owner ruling of
+  // 2026-11-11 (spec 012: no hard-block list, one scope per family).
+  pluginInventory: 'plugins:manage',
+  pluginRegistryProbe: 'plugins:manage',
+  // Spec 012 (owner 2026-11-11): mods are plugins (`ClaudeCodeMods.add` is called by
+  // `defineMod` when a mod plugin mounts) and `pressBand` executes a mod's `onPress`
+  // handler on the Host, so the closest existing scope is the plugin-management one.
+  // No new scope constant is needed.
+  claudeCodeMods: 'plugins:manage',
   terminal: 'terminal',
 })
 
 export const ENDPOINT_SCOPE = Object.freeze(Object.fromEntries([
   ...SESSIONS_READ.map((endpoint) => [endpoint, 'sessions:read']),
   ...PROMPT_SEND.map((endpoint) => [endpoint, 'prompt:send']),
+  ...SESSIONS_AUTHOR.map((endpoint) => [endpoint, 'sessions:author']),
   ...APPROVAL_RESPOND.map((endpoint) => [endpoint, 'approval:respond']),
   ...FILES_READ.map((endpoint) => [endpoint, 'files:read']),
   ...COMMANDS_EXECUTE.map((endpoint) => [endpoint, 'commands:execute']),
@@ -138,21 +197,46 @@ export const ENDPOINT_SCOPE = Object.freeze(Object.fromEntries([
 ]))
 
 /**
- * Families refused whatever the scope list says. They are absent from
+ * Endpoints refused whatever the scope list says. They are absent from
  * ENDPOINT_SCOPE / FAMILY_SCOPE (deny by default); the explicit list exists so a
  * future edit that adds one is caught by `denyReason` and by the tests.
  * Patterns are `namespace/method` with `*` for "any method".
+ *
+ * Spec 012, owner ruling 2026-11-11 ("no hard-block list"): the only entries left are
+ * the two justified exceptions —
+ *  - credential READS: secrets never leave the Host. `credentials/set|unset` are
+ *    write-only grants (`credentials:write`); nothing that could return a value is
+ *    forwardable, for any device, under any scope.
+ *  - `remoteAccess/*` except `follow` (mapped to `sessions:read` above): the rest of
+ *    that namespace is the device-admin / pairing surface, which spec 012 keeps on the
+ *    Host itself — a remote device must not grant itself or others scopes, pair, or
+ *    revoke. DSH rc.1 declares no such method yet; the pattern fences a future one.
+ *    `follow` is carved out of the pattern by DENY_EXEMPT_ENDPOINTS below, because
+ *    `authorizeEndpoint` consults `denyReason` before the scope table.
+ * `workspace/initializeDefault` and `claudeCodeMods/*` left this list: they are
+ * `workspace:manage` and `plugins:manage`.
  */
 export const DENY_PATTERNS = Object.freeze([
-  // credentials/set|unset are the only credentials endpoints; the rest (describe,
-  // resolve, anything that could return a secret) stays closed.
   'credentials/describe', 'credentials/resolve', 'credentials/get', 'credentials/read', 'credentials/list',
   'credentials/export',
-  // Not part of any scope: plugin inventory, reorder/pin bookkeeping, private channels.
-  'pluginInventory/*',
-  'workspace/insertBefore', 'workspace/insertSessionBefore',
-  'workspace/unarchiveSession', 'workspace/initializeDefault', 'workspace/pinSession', 'workspace/unpinSession',
-  'claudeCodeMods/*', 'remoteAccess/*',
+  // Device admin / pairing: every remoteAccess method except the read-only `follow`.
+  'remoteAccess/*',
+])
+
+/** Deny patterns that an exact, deliberately mapped endpoint is exempt from. */
+const DENY_EXEMPT_ENDPOINTS = Object.freeze(['remoteAccess/follow'])
+
+/**
+ * Endpoints that act on the Host's own screen: an OS folder chooser, a native text
+ * editor. Spec 012: "Show in folder" must never open a window on the remote Host, so
+ * these are refused for every device and every scope combination — the remote UI hides
+ * or disables the affordance and this list is the boundary behind it. Being on this
+ * list is a property of the capability, not of the caller, so no scope can buy it.
+ * Patterns are `namespace/method` with `*` for "any method".
+ */
+export const HOST_UI_ONLY_PATTERNS = Object.freeze([
+  'directoryPicker/pick', // "Open the host's OS chooser for a Remote caller."
+  'settings/openSettingsDocument', // "…open it in a native text editor."
 ])
 
 const ENDPOINT_SHAPE = /^(?:\$events(?:\/result)?|[A-Za-z0-9_$.-]{1,64}\/[A-Za-z0-9_$.-]{1,64})$/
@@ -166,7 +250,13 @@ function matches(pattern, endpoint) {
 
 /** The deny pattern an endpoint falls under, or `undefined`. */
 export function denyReason(endpoint) {
+  if (DENY_EXEMPT_ENDPOINTS.includes(endpoint)) return undefined
   return DENY_PATTERNS.find((pattern) => matches(pattern, endpoint))
+}
+
+/** The host-UI-only pattern an endpoint falls under, or `undefined`. */
+export function hostUiOnlyReason(endpoint) {
+  return HOST_UI_ONLY_PATTERNS.find((pattern) => matches(pattern, endpoint))
 }
 
 /**
@@ -191,12 +281,19 @@ export function authorizeEndpoint(device, endpoint) {
   }
   const deny = denyReason(endpoint)
   if (deny) return { ok: false, code: 'op/forbidden', message: `${endpoint} is never available over the remote bridge` }
+  const hostUi = hostUiOnlyReason(endpoint)
+  if (hostUi) {
+    return { ok: false, code: 'op/host-ui-only',
+      message: `${endpoint} opens a window on the Host machine and is never available over the remote bridge` }
+  }
   const scope = scopeForEndpoint(endpoint)
   if (!scope) return { ok: false, code: 'op/forbidden', message: `${endpoint} is not on the remote-bridge allowlist` }
   const scopes = Array.isArray(device?.scopes) ? device.scopes : []
-  // `kind` is re-checked here (not only at pair time) so a record that lists
-  // harness:remote without being a desktop still gets nothing.
-  if (device?.kind !== 'desktop' || !scopes.includes(REMOTE_SCOPE)) {
+  // Kind is not policy (spec 012 rule 3): what a device may reach is the scope list
+  // written on its record, whatever it calls itself. The list is read on every call,
+  // so an edit after pairing takes effect immediately — and a phone that was not
+  // granted a scope still gets nothing.
+  if (!scopes.includes(REMOTE_SCOPE)) {
     return { ok: false, code: 'auth/forbidden-scope', scope: REMOTE_SCOPE,
       message: `this device was not paired with ${REMOTE_SCOPE}` }
   }
@@ -398,8 +495,9 @@ export async function checkArgumentsWithHost(device, endpoint, args, host) {
     if (!ids) return refusal('session/create: the Host workspace list is unavailable', 'remote/unavailable')
     if (!ids.has(workspaceId)) return refusal('session/create: workspaceId is not a workspace of this Host')
   }
-  // session/selectModel needs settings:write outright (it saves the Host's global
-  // default), so no catalog pair check is left for a device that lacks it.
+  // session/selectModel is a `sessions:author` endpoint (spec 012 FR-007); this
+  // bridge only decides WHO may call it, and the Host resolves the provider/model
+  // against its own catalog, so no pair check belongs here.
   return undefined
 }
 
@@ -565,6 +663,19 @@ function serializedBytes(value) {
   } catch { return Number.POSITIVE_INFINITY }
 }
 
+/**
+ * The session a `session/prompt` call addressed, from either documented argument slot
+ * (`args.sessionId` or the `request` wrapper). `undefined` when the frame named none —
+ * a caller must not invent one, so the driver record simply stays as it was.
+ */
+function promptSessionId(args) {
+  for (const slot of [args, isRecord(args?.request) ? args.request : undefined]) {
+    const id = slot?.sessionId
+    if (typeof id === 'string' && id.trim() !== '') return id.trim()
+  }
+  return undefined
+}
+
 // -- the bridge -------------------------------------------------------------
 
 /**
@@ -577,6 +688,9 @@ function serializedBytes(value) {
  * @param {(request: object) => Promise<object>} deps.decideApproval
  *        hash-bound approval decision of the gateway (same path as `approval-response`)
  * @param {(line: string) => void} deps.log
+ * @param {(deviceId: string, sessionId: string) => void} [deps.onPrompt]
+ *        called after a `session/prompt` the Host accepted (spec 016: this device now
+ *        drives that session); never called for a frame that named no session
  * @param {number} [deps.maxPayloadBytes]
  * @param {number} [deps.defaultCredit]
  * @param {object} [deps.limits]  OPTIONAL per-DEVICE limits (all connections together);
@@ -830,6 +944,13 @@ export function createRemoteBridge(deps) {
             return
           }
           if (!result.ok) { reply({ ok: false, error: remoteError(result.error) }); return }
+          // Spec 016 / spec 014 C6: this device just drove that session. Recorded after
+          // the Host ACCEPTED the prompt (a refused one did not drive anything), and only
+          // when the frame named a session — a prompt without one records nothing.
+          if (msg.endpoint === 'session/prompt') {
+            const prompted = promptSessionId(args)
+            if (prompted !== undefined) deps.onPrompt?.(deviceId, prompted)
+          }
           const described = describeResultValue(result.value)
           // Transport, not a limit: a result that cannot ride one WS frame (binary,
           // or serialized above the single-frame budget) is delivered through the

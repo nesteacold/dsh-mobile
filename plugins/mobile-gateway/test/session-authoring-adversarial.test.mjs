@@ -11,6 +11,7 @@
 // reviewer's Minor 1 (`workspaces` must not leak Host filesystem paths) and the
 // null-form of Minor 2. Read-only: this file never patches the implementation.
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
@@ -19,10 +20,12 @@ import { once } from 'node:events'
 import { test } from 'node:test'
 
 import WebSocket from 'ws'
+import * as contract from '@dsh-ext/mobile-protocol'
 import plugin from '../lib/index.mjs'
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
 import { COMPANION_ENDPOINTS, createCompanionAccessPolicy } from '../lib/companion-access.mjs'
-import { AUTHOR_SCOPE } from '../lib/allowlist.mjs'
+import { AUTHOR_SCOPE, SCOPE_EXEMPT_TYPES, scopeDenial, scopeDenialAgainst } from '../lib/allowlist.mjs'
+import { setOwnerOnlyProbeOverride } from '../lib/secure-file.mjs'
 import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 
 const AUTHOR = AUTHOR_SCOPE
@@ -31,24 +34,30 @@ const WORKSPACE_ID = 'w-host-1'
 const SECRET_PATH = '/Users/owner/secret-tax-2025'
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** The Host endpoints spec 011 FR-004 keeps refused for EVERY device. */
+/** The Host endpoints spec 011 FR-004 keeps refused for EVERY device (revision 11
+ * moved ONE session's rename/archive to `sessions:author`, see ADV-2c). */
 const HARD_BLOCKED_ENDPOINTS = [
-  'workspace/create', 'workspace/rename', 'workspace/archiveSession',
-  'session/fork', 'session/rename', 'session/archive', 'session/updateQueue',
+  'workspace/create', 'workspace/rename',
+  'session/fork', 'session/updateQueue',
   'commands/list', 'commands/execute', 'settings/update', 'settings/mutate',
   'pluginManager/installBundle', 'pluginManager/setPluginEnabled',
   'schedule/create', 'schedule/edit', 'goals/set',
 ]
 
 /** Typed router ops that must stay `op/forbidden` even with `sessions:author`. */
+// Spec 018 item 2: `agent-team` and `subagents` are NOT here any more — they are read-on-demand
+// of data `sessions:read` already grants, so they are refused BY SCOPE (asserted by ADV-16a)
+// rather than as unknown operations. Every other family still stays op/forbidden here.
+// Revision 11: `session-rename` / `session-archive` left this list on purpose — they are
+// companion §4 ops now, refused BY SCOPE without `sessions:author` (ADV-2c / ADV-11).
 const HARD_BLOCKED_TYPES = [
-  'workspace-create', 'session-rename', 'session-archive', 'fork', 'queue-update',
+  'workspace-create', 'fork', 'queue-update',
   'commands', 'command-execute', 'settings', 'settings-update', 'settings-mutate',
   'plugin-catalog', 'plugin-install', 'schedule-create', 'schedule-edit', 'goal',
-  'goal-edit', 'attachment', 'subagents', 'agent-team', 'directories', 'directory-create',
+  'goal-edit', 'attachment', 'directories', 'directory-create',
 ]
 
-function fakeHost(hostCalls, workspaceRows) {
+function fakeHost(hostCalls, workspaceRows, sessionRows, options = {}) {
   const record = (kind, request) => hostCalls.push({
     kind, endpoint: `${request.namespace}/${request.method}`, principal: request.peer?.principal, args: request.args,
   })
@@ -56,16 +65,54 @@ function fakeHost(hostCalls, workspaceRows) {
     async invoke(request) {
       record('invoke', request)
       const { namespace, method } = request
-      if (namespace === 'session' && method === 'list') return { items: [{ sessionId: 's1' }] }
+      if (namespace === 'session' && method === 'list') return { items: sessionRows ?? [{ sessionId: 's1' }] }
       if (namespace === 'session' && method === 'modelCatalog') {
         return { default: { provider: 'p', model: 'm' }, routableProviders: ['p'], groups: [], failures: [] }
       }
       if (namespace === 'session' && method === 'create') return { sessionId: 's-new' }
-      if (namespace === 'session' && method === 'selectModel') {
-        return { provider: request.args?.request?.provider, model: request.args?.request?.model }
-      }
-      return {}
-    },
+    // Spec 018 item 2: the per-session projection snapshot the team/subagent frames read.
+    // `projectionResult` lets a test choose the shape (including `null` = "this device may not
+    // see that session", which is how the Host expresses per-item authorization).
+    // Spec 018 item 3: the read-only schedule surface.
+    if (namespace === 'schedule' && method === 'catalog') {
+      // The adapter reads this endpoint as a raw array (it wraps it into `{ items }` itself).
+      return options.scheduleCatalog === undefined ? [] : options.scheduleCatalog()
+    }
+    if (namespace === 'schedule' && method === 'list') {
+      return options.scheduleList === undefined ? { items: [] } : options.scheduleList(request.args)
+    }
+    if (namespace === 'schedule' && method === 'view') {
+      return options.scheduleView === undefined
+        ? { id: request.args?.request?.id, target: { sessionId: 's1' }, involvedSessionIds: ['s1'] }
+        : options.scheduleView(request.args)
+    }
+    if (namespace === 'session' && method === 'rename') {
+      return options.sessionRename === undefined
+        ? { title: request.args?.request?.title, seq: 95 }
+        : options.sessionRename(request.args)
+    }
+    if (namespace === 'workspace' && method === 'archiveSession') {
+      // Reviewer item 5(a): the REAL Host answers `workspace/archiveSession` with its
+      // COMPLETE archive set, not just the id it just archived (PROTOCOL.md §5). The
+      // default below mirrors that, so a test can verify the device never receives the
+      // ids of sessions it cannot see; a test may still override it.
+      return options.archiveSession === undefined
+        ? { archivedSessionIds: [request.args?.request?.sessionId, 's-hidden'] }
+        : options.archiveSession(request.args)
+    }
+    if (namespace === 'session' && method === 'projections') {
+      // A test may pass a FUNCTION so the mock decides per session — that is what makes the
+      // "session this device may not see" case discriminate from "the feature is broken".
+      if (typeof options.projectionResult === 'function') return options.projectionResult(request.args)
+      return options.projectionResult === undefined
+        ? { kind: 'sequenced', asOfSeq: 1, values: {} }
+        : options.projectionResult
+    }
+    if (namespace === 'session' && method === 'selectModel') {
+      return { provider: request.args?.request?.provider, model: request.args?.request?.model }
+    }
+    return {}
+  },
     async stream(request) {
       record('stream', request)
       return (async function* () {
@@ -86,8 +133,18 @@ function fakeHost(hostCalls, workspaceRows) {
         } else if (request.namespace === 'session' && request.method === 'follow') {
           const address = request.args?.request?.address
           const id = address?.kind === 'subagent' ? address.childSessionId : address?.sessionId
+          // Spec 018: exercise a Host-side per-item refusal (DSH's `allows()` says no).
+          if (options.denySessionFollow === true) {
+            throw Object.assign(
+              new Error('remote access: session/follow: access denied (resource-not-allowed)'),
+              { code: 'remote-access/denied' },
+            )
+          }
+          // Spec 018: the metric handlers read session projections, so the fixture
+          // has to be able to serve them (default: none, as a fresh Host session).
+          const values = options.projectionValues?.[id] ?? {}
           yield { type: 'snapshot', header: { version: 4, id }, cursor: 1, records: [], hasMore: false,
-            projections: { asOfSeq: 1, values: {} }, assistantStream: { revision: 0 } }
+            projections: { asOfSeq: 1, values }, assistantStream: { revision: 0 } }
         } else {
           yield { type: 'baseline', value: { projections: {} } }
         }
@@ -99,6 +156,16 @@ function fakeHost(hostCalls, workspaceRows) {
 
 async function factory(t, options = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-author-adv-'))
+  // One DACL read per fixture kept a 10 s PowerShell probe per warm-up, and under load
+  // several timed out (`ETIMEDOUT`), failing this file and stretching the run. The
+  // fixtures' data directories are created by this process seconds earlier, so they
+  // are owner-only exactly as the real probe requires; `tls-pin.test.mjs` still runs
+  // that probe for real on a generated key and its directory. Restored by the `t.after` below.
+  setOwnerOnlyProbeOverride(() => null)
+  // Registered HERE, not with the teardown below: `apply()` can throw, and the override
+  // must be cleared even then (a process-wide seam left installed would answer the
+  // owner-only check for every later fixture).
+  t.after(() => setOwnerOnlyProbeOverride(undefined))
   const sockets = []
   const hostCalls = []
   let management
@@ -123,7 +190,7 @@ async function factory(t, options = {}) {
     },
     connection: createTestConnection(),
     remoteAccess,
-    typertGateway: fakeHost(hostCalls, options.workspaceRows),
+    typertGateway: fakeHost(hostCalls, options.workspaceRows, options.sessionRows, options),
     agentDefaultModel: {},
     on(event, handler) {
       const list = events.get(event) ?? []
@@ -209,8 +276,13 @@ async function ask(ws, frame) {
 }
 const callsSince = (instance, since, endpoint) =>
   instance.hostCalls.slice(since).filter((call) => call.endpoint === endpoint)
+// What the DEVICE caused. A device peer can never be the owner principal, so an owner-attributed
+// call excluded here is never one a device asked for (spec 021: the gateway reads no account on
+// its own any more, so in practice every call below is device-attributed).
 const callsSinceSet = (instance, since) =>
-  [...new Set(instance.hostCalls.slice(since).map((call) => call.endpoint))]
+  [...new Set(instance.hostCalls.slice(since)
+    .filter((call) => call.principal?.kind !== 'owner')
+    .map((call) => call.endpoint))]
 
 /** Pair a device with an EXPLICIT grant, and return its live connection. */
 async function pairDevice(instance, deviceId, offer) {
@@ -228,6 +300,7 @@ async function pairDevice(instance, deviceId, offer) {
 const MOBILE_AUTHOR = { kind: 'mobile', scopes: ['sessions:read', 'prompt:send', 'approval:respond', AUTHOR] }
 const DESKTOP_AUTHOR = { kind: 'desktop', scopes: ['sessions:read', 'prompt:send', 'approval:respond', AUTHOR] }
 const MOBILE_NO_AUTHOR = { kind: 'mobile', scopes: ['sessions:read', 'prompt:send', 'approval:respond'] }
+/** Spec 018 item 4: the scope tuple that answers questions and approvals. */
 const DESKTOP_BRIDGE_NO_AUTHOR = {
   kind: 'desktop', scopes: ['sessions:read', 'prompt:send', 'approval:respond', 'harness:remote'],
 }
@@ -319,7 +392,13 @@ test('ADV-2b remote-bridge passthrough: the same endpoints are refused for a des
     assert.equal(typeof reply.error?.code, 'string', `${endpoint} must name a refusal code`)
     assert.notEqual(reply.error.code, 'internal')
   }
-  assert.deepEqual(callsSinceSet(instance, since), [], `the bridge must not forward a hard-blocked endpoint: ${callsSinceSet(instance, since)}`)
+  // The remote bridge forwards with the DEVICE's own peer, so what must never appear here is a
+  // hard-blocked endpoint forwarded ON BEHALF OF THE DEVICE.
+  const devicePeerCalls = instance.hostCalls.slice(since)
+    .filter((call) => call.principal?.kind !== 'owner')
+    .map((call) => call.endpoint)
+  assert.deepEqual([...new Set(devicePeerCalls)], [],
+    'the bridge must not forward a hard-blocked endpoint: ' + [...new Set(devicePeerCalls)].join(', '))
   ws.close()
 })
 
@@ -698,7 +777,7 @@ test('ADV-9b real-Host labelling: an empty name falls back to the last path segm
   // `path` populated. The picker must show "DXVK_Project", never the path.
   const rows = [
     { workspaceId: 'w-posix', name: '', path: '/home/me/DXVK_Project' },
-    { workspaceId: 'w-win', name: '', path: 'C:\\\\Users\\\\me\\Documents\\DXVK_Project\\' },
+    { workspaceId: 'w-win', name: '', path: 'C:\\Users\\me\\Documents\\DXVK_Project\\' },
     { workspaceId: 'w-default', name: '', path: '/home/me/default-workspace' },
     { workspaceId: 'w-named', name: 'Renamed by owner', path: '/home/me/other' },
     { workspaceId: 'w-title', title: 'Title wins', path: '/home/me/titled' },
@@ -728,7 +807,7 @@ test('ADV-9b real-Host labelling: an empty name falls back to the last path segm
   }
   assert.ok(lines.length > 0, 'the query still logs')
   const joined = lines.join('\n')
-  for (const forbidden of ['/home/me', 'Users\\neste', 'Documents']) {
+  for (const forbidden of ['/home/me', 'Users\\me', 'Documents']) {
     assert.equal(joined.includes(forbidden), false, `a log line leaked a Host path (${forbidden})`)
   }
   ws.close()
@@ -816,5 +895,733 @@ test('ADV-10c the cache still reconciles: when the Host reports the session remo
   await delay(150)
   assert.equal(boundSessionIds(instance, device.id).includes(created.sessionId), false,
     'a refresh must not bring a removed session back')
+  ws.close()
+})
+
+// ===========================================================================
+// (11) Additive `workspaceId` on session list items and session-update events
+// (2026-11-11): the companion groups conversations by workspace, like the
+// reference dsh-mobile app. DSH's session record has NO workspaceId (measured:
+// `session/list` rows carry `cwd` only), so the gateway attaches the id from the
+// Host's own attach relation (`workspace.sessionIds`). Only the id travels — never
+// a path — and a subagent inherits its parent's workspace.
+// ===========================================================================
+
+const WORKSPACE_ROWS = [{
+  workspaceId: WORKSPACE_ID,
+  title: 'proj',
+  path: SECRET_PATH,
+  sessionIds: ['s1', 's-hidden'],
+  archivedSessionIds: [],
+}]
+
+test('ADV-11a session items carry the workspace id from the Host attach relation, and never a path', async (t) => {
+  const instance = await factory(t, {
+    workspaceRows: WORKSPACE_ROWS,
+    sessionRows: [{ sessionId: 's1' }, { sessionId: 's-unknown' }],
+  })
+  const deviceId = 'adv-ws-0001'
+  const { ws } = await pairDevice(instance, deviceId, MOBILE_NO_AUTHOR)
+  // Let the startup workspace refresh land (it feeds the session->workspace map).
+  await delay(150)
+
+  const reply = await ask(ws, { type: 'sessions' })
+  assert.equal(reply.kind, 'sessions', JSON.stringify(reply).slice(0, 200))
+  const byId = Object.fromEntries(reply.items.map((item) => [item.sessionId, item]))
+  // A device WITHOUT sessions:author still groups: the field is not scope-gated.
+  assert.equal(byId.s1.workspaceId, WORKSPACE_ID, 'a related session carries its workspace id')
+  // Optional: a session the Host relates to no workspace omits the field entirely.
+  assert.equal(Object.hasOwn(byId['s-unknown'], 'workspaceId'), false)
+  // Only the id leaves the gateway; the workspace path stays inside.
+  const body = JSON.stringify(reply)
+  for (const forbidden of [SECRET_PATH, '/Users/owner', 'secret-tax', 'sessionIds']) {
+    assert.equal(body.includes(forbidden), false, `the session frame leaked ${forbidden}: ${body.slice(0, 300)}`)
+  }
+  ws.close()
+})
+
+test('ADV-11b a direct-subagent session inherits the workspace of the parent it was started from', async (t) => {
+  const instance = await factory(t, {
+    workspaceRows: WORKSPACE_ROWS,
+    sessionRows: [{ sessionId: 's1' }, { sessionId: 'sub-1', parentSessionId: 's1', origin: 'subagent' }],
+  })
+  const deviceId = 'adv-ws-0002'
+  const { ws } = await pairDevice(instance, deviceId, MOBILE_NO_AUTHOR)
+  await delay(150)
+
+  const reply = await ask(ws, { type: 'sessions' })
+  const child = reply.items.find((item) => item.sessionId === 'sub-1')
+  assert.ok(child, 'the subagent row is listed')
+  assert.equal(child.workspaceId, WORKSPACE_ID,
+    `a subagent must inherit its parent's workspace (got ${JSON.stringify(child.workspaceId)})`)
+  ws.close()
+})
+
+test('ADV-11c session-update events carry the same workspace id, and only to a client that may see the session', async (t) => {
+  const instance = await factory(t, { workspaceRows: WORKSPACE_ROWS, sessionRows: [{ sessionId: 's1' }] })
+  const deviceId = 'adv-ws-0003'
+  const { ws } = await pairDevice(instance, deviceId, MOBILE_NO_AUTHOR)
+  await delay(150)
+
+  // The Host's own session-update event: the plugin rebroadcasts it as `session-status`.
+  const handlers = instance.events.get('api-session/added') ?? []
+  assert.ok(handlers.length > 0, 'the plugin subscribes to api-session/added')
+  for (const handler of handlers) handler({ sessionId: 's1', running: false })
+  const status = await take(ws, (frame) => frame.kind === 'session-status' && frame.sessionId === 's1')
+  assert.equal(status.workspaceId, WORKSPACE_ID,
+    `the update event must carry the workspace id: ${JSON.stringify(status)}`)
+  ws.close()
+})
+
+test('ADV-12a EVERY device that can see the session gets workspaceLabel too — not only sessions:author devices (option B)', async (t) => {
+  const instance = await factory(t, {
+    workspaceRows: WORKSPACE_ROWS,
+    sessionRows: [{ sessionId: 's1' }],
+  })
+  // Two devices, same session: one with sessions:author, one without.
+  const author = await pairDevice(instance, 'adv-ws-label-0001', MOBILE_AUTHOR)
+  const plain = await pairDevice(instance, 'adv-ws-label-0002', MOBILE_NO_AUTHOR)
+  await delay(150)
+
+  for (const [label, connection] of [['author', author], ['non-author', plain]]) {
+    const reply = await ask(connection.ws, { type: 'sessions' })
+    const item = reply.items.find((row) => row.sessionId === 's1')
+    assert.equal(item.workspaceId, WORKSPACE_ID, `${label}: id present`)
+    // WORKSPACE_ROWS names the workspace only by `title` + `path`, so this also
+    // proves the label falls back through the SAME rule the `workspaces` op uses.
+    assert.equal(item.workspaceLabel, 'proj', `${label}: label present and identical for every device`)
+    assert.equal(JSON.stringify(item).includes(SECRET_PATH), false, `${label}: the path must not travel`)
+    connection.ws.close()
+  }
+})
+
+test('ADV-12b the pair travels together: no workspaceId means no workspaceLabel, and a label is never sent alone', async (t) => {
+  const instance = await factory(t, {
+    workspaceRows: [
+      // A workspace with NO label source at all (no name, no title, no path).
+      { workspaceId: WORKSPACE_ID, sessionIds: ['s1'], archivedSessionIds: [] },
+      // A workspace whose only label source is the basename of its path.
+      { workspaceId: 'w-basename', path: '/Users/owner/Tax2025', sessionIds: ['s2'], archivedSessionIds: [] },
+    ],
+    sessionRows: [{ sessionId: 's1' }, { sessionId: 's2' }, { sessionId: 's-orphan' }],
+  })
+  const deviceId = 'adv-ws-label-0003'
+  const { ws } = await pairDevice(instance, deviceId, MOBILE_NO_AUTHOR)
+  await delay(150)
+
+  const reply = await ask(ws, { type: 'sessions' })
+  const byId = Object.fromEntries(reply.items.map((item) => [item.sessionId, item]))
+
+  // Id known, label unknown: the id travels, the label is omitted (never '').
+  assert.equal(byId.s1.workspaceId, WORKSPACE_ID)
+  assert.equal(Object.hasOwn(byId.s1, 'workspaceLabel'), false, 'a workspace with no label must omit the field, not send empty')
+  // Basename fallback, and still only the label — the path stays behind.
+  assert.equal(byId.s2.workspaceId, 'w-basename')
+  assert.equal(byId.s2.workspaceLabel, 'Tax2025')
+  assert.equal(JSON.stringify(reply).includes('/Users/owner'), false, 'no absolute path may travel')
+  // A session in no workspace: neither field, never a lone label.
+  assert.equal(Object.hasOwn(byId['s-orphan'], 'workspaceId'), false)
+  assert.equal(Object.hasOwn(byId['s-orphan'], 'workspaceLabel'), false)
+  ws.close()
+})
+
+test('ADV-12c a subagent inherits BOTH the id and the label of its parent, and the update event carries the pair', async (t) => {
+  const instance = await factory(t, {
+    workspaceRows: WORKSPACE_ROWS,
+    sessionRows: [{ sessionId: 's1' }, { sessionId: 'sub-1', parentSessionId: 's1', origin: 'subagent' }],
+  })
+  const deviceId = 'adv-ws-label-0004'
+  const { ws } = await pairDevice(instance, deviceId, MOBILE_NO_AUTHOR)
+  await delay(150)
+
+  const reply = await ask(ws, { type: 'sessions' })
+  const child = reply.items.find((item) => item.sessionId === 'sub-1')
+  assert.equal(child.workspaceId, WORKSPACE_ID)
+  assert.equal(child.workspaceLabel, 'proj', 'the subagent inherits the label as well as the id')
+
+  const handlers = instance.events.get('api-session/added') ?? []
+  for (const handler of handlers) handler({ sessionId: 's1', running: false })
+  const status = await take(ws, (frame) => frame.kind === 'session-status' && frame.sessionId === 's1')
+  assert.equal(status.workspaceId, WORKSPACE_ID)
+  assert.equal(status.workspaceLabel, 'proj', 'the update event carries the same pair')
+  ws.close()
+})
+
+// ===========================================================================
+// (13) Spec 018 wave 2 item 1 — session-stats / context-usage behind `stats:read`
+//
+// MEASURED on the running Host (2026-11-11, session-f29c01e8-…):
+//   sessionStats   {turns,steps,llmMs,toolMs,ttftMs,ttftSteps,decodeMs,decodeTokens}
+//   tokenUsage     {uncachedInputTokens,outputTokens,cacheReadTokens,cacheWriteTokens}
+//   contextPressure{pressureTokens,projectedTokens,contextWindow}
+// Both frames only READ those projections from the session's own snapshot, so the
+// per-item rule is the ordinary "this device may see this session".
+// ===========================================================================
+
+const STATS = ['stats:read']
+const MOBILE_STATS = { kind: 'mobile', scopes: ['sessions:read', 'prompt:send', 'approval:respond', ...STATS] }
+const SESSION_STATS = {
+  turns: 315, steps: 2180, llmMs: 28077445, toolMs: 49314675,
+  ttftMs: 21566252, ttftSteps: 2175, decodeMs: 6510951, decodeTokens: 1241052,
+}
+const TOKEN_USAGE = {
+  uncachedInputTokens: 17173821, outputTokens: 1244697,
+  cacheReadTokens: 855798926, cacheWriteTokens: 13379526,
+}
+const CONTEXT_PRESSURE = { pressureTokens: 540862, projectedTokens: 541428, contextWindow: 872000 }
+
+test('ADV-13a a device holding stats:read gets the session metrics verbatim, both frames', async (t) => {
+  const instance = await factory(t, {
+    workspaceRows: WORKSPACE_ROWS,
+    sessionRows: [{ sessionId: 's1' }],
+    projectionValues: { s1: { sessionStats: SESSION_STATS, tokenUsage: TOKEN_USAGE, contextPressure: CONTEXT_PRESSURE } },
+  })
+  const deviceId = 'adv-stats-0001'
+  const { ws } = await pairDevice(instance, deviceId, MOBILE_STATS)
+
+  const stats = await ask(ws, { type: 'session-stats', sessionId: 's1' })
+  assert.equal(stats.kind, 'session-stats', JSON.stringify(stats).slice(0, 240))
+  assert.equal(stats.sessionId, 's1')
+  assert.equal(stats.asOfSeq, 1)
+  assert.deepEqual(stats.sessionStats, SESSION_STATS)
+  assert.deepEqual(stats.tokenUsage, TOKEN_USAGE)
+  assert.deepEqual(stats.contextPressure, CONTEXT_PRESSURE)
+
+  const usage = await ask(ws, { type: 'context-usage', sessionId: 's1' })
+  assert.equal(usage.kind, 'context-usage', JSON.stringify(usage).slice(0, 240))
+  assert.deepEqual(usage.tokenUsage, TOKEN_USAGE)
+  assert.deepEqual(usage.contextPressure, CONTEXT_PRESSURE)
+  // Null, not absent, when the Host has no such projection (a fresh session).
+  assert.equal(usage.asOfSeq, 1)
+  ws.close()
+})
+
+test('ADV-13b without stats:read the frames are refused BY SCOPE, not as unknown ops', async (t) => {
+  const instance = await factory(t, { workspaceRows: WORKSPACE_ROWS, sessionRows: [{ sessionId: 's1' }] })
+  const deviceId = 'adv-stats-0002'
+  // sessions:read but NOT stats:read — the exact case that must stay refused.
+  const { ws } = await pairDevice(instance, deviceId, MOBILE_NO_AUTHOR)
+  const since = instance.hostCalls.length
+
+  for (const type of ['session-stats', 'context-usage']) {
+    const reply = await ask(ws, { type, sessionId: 's1' })
+    assert.equal(reply.kind, 'error', JSON.stringify(reply).slice(0, 200))
+    assert.equal(reply.code, 'auth/forbidden-scope', `${type} must be refused by scope, got ${reply.code}`)
+    assert.equal(reply.scope, 'stats:read')
+  }
+  // The refusal is the scope gate: no host call the DEVICE caused, counted by endpoint rather than
+  // as a global total so an unrelated owner-attributed call can never make this pass or fail.
+  const deviceReads = instance.hostCalls.slice(since).filter((call) => call.principal?.kind !== 'owner'
+    && String(call.endpoint).startsWith('session/'))
+  assert.deepEqual(deviceReads.map((call) => call.endpoint), [], 'a scope refusal must not reach the Host')
+  ws.close()
+})
+
+test('ADV-13c per-item authorization is the Host: the metric read goes through the DEVICE peer, and a Host refusal propagates', async (t) => {
+  // The gateway adds no visibility of its own here: session-stats/context-usage
+  // read the session snapshot through the caller's own non-owner Peer, exactly like
+  // history, so DSH's per-item allows({kind: 'session', id}) decides. The fixture
+  // asserts the mechanism (which peer was used) and that a Host error is passed
+  // through rather than turned into metrics.
+  const instance = await factory(t, {
+    workspaceRows: WORKSPACE_ROWS,
+    sessionRows: [{ sessionId: 's1' }],
+    projectionValues: { s1: { sessionStats: SESSION_STATS } },
+  })
+  const deviceId = 'adv-stats-0003'
+  const { ws, device } = await pairDevice(instance, deviceId, MOBILE_STATS)
+  const since = instance.hostCalls.length
+
+  const stats = await ask(ws, { type: 'session-stats', sessionId: 's1' })
+  assert.equal(stats.kind, 'session-stats')
+
+  const reads = instance.hostCalls.slice(since)
+    .filter((call) => call.endpoint === 'session/follow')
+  assert.equal(reads.length, 1, 'exactly one snapshot read')
+  // The non-owner peer of THIS device: that is what makes DSH filter per item.
+  assert.notEqual(reads[0].principal?.kind, 'owner', 'a device must never read through the owner peer')
+  assert.deepEqual(reads[0].principal, { kind: 'dsh-ext-mobile-device', deviceId: device.id })
+  assert.deepEqual(reads[0].args?.request?.address, { kind: 'session', sessionId: 's1' })
+
+  // A Host-side refusal is surfaced, never silently nulled into a stats frame.
+  const instance2 = await factory(t, {
+    workspaceRows: WORKSPACE_ROWS,
+    sessionRows: [{ sessionId: 's1' }],
+    denySessionFollow: true,
+  })
+  const second = await pairDevice(instance2, 'adv-stats-0004', MOBILE_STATS)
+  const refused = await ask(second.ws, { type: 'session-stats', sessionId: 's1' })
+  assert.equal(refused.kind, 'error', JSON.stringify(refused).slice(0, 200))
+  assert.equal(refused.code, 'remote-access/denied')
+  second.ws.close()
+  ws.close()
+})
+test('ADV-13d contract: stats:read is a real scope, never a default, and maps exactly the two metric types', () => {
+  const stats = contract.STATS_READ_SCOPE
+  assert.equal(stats, 'stats:read')
+  assert.ok(contract.SCOPES.includes(stats), 'stats:read must be a contract scope')
+  assert.ok(contract.NEVER_DEFAULT_SCOPES.includes(stats), 'stats:read must never be a default')
+  assert.equal(contract.DESKTOP_DEFAULT_SCOPES.includes(stats), false)
+  assert.equal(contract.SCOPE_PRESETS.standard.includes(stats), false, 'the standard preset must not hand it out')
+  assert.equal(contract.DESKTOP_ONLY_SCOPES.includes(stats), false, 'a mobile device may hold it')
+  // Exactly two types map to it, and neither is a contract §4 op.
+  assert.deepEqual([...contract.STATS_READ_CLIENT_TYPES], ['session-stats', 'context-usage'])
+  const mapped = Object.entries(contract.SCOPE_BY_TYPE).filter(([, scope]) => scope === stats).map(([type]) => type).sort()
+  assert.deepEqual(mapped, ['context-usage', 'session-stats'])
+  assert.equal(contract.OPS.includes('session-stats'), false)
+  assert.equal(contract.OPS.includes('context-usage'), false)
+})
+
+// ===========================================================================
+// (14) Reviewer fix, spec 018 item 1: the scope gate is CLOSED over the contract map.
+//
+// The gate used to decide "is this type my business?" from a hand-maintained list of
+// families, so a type that the contract DID map, but whose family nobody had added
+// yet, returned `undefined` — i.e. it was SERVED without its scope. The map is now the
+// primary authority: every mapped type is decided, whatever family it belongs to.
+// ===========================================================================
+
+test('ADV-14 every type the contract maps is REFUSED for a device with no scopes (no type can fall out of the gate)', () => {
+  const emptyScopes = { kind: 'mobile', scopes: [] }
+  const mapped = Object.keys(contract.SCOPE_BY_TYPE).sort()
+  assert.ok(mapped.length > 20, `expected the contract to map many types, got ${mapped.length}`)
+  for (const type of mapped) {
+    // The only exemption is a type a device may always use on itself.
+    if (SCOPE_EXEMPT_TYPES.has(type)) continue
+    const denial = scopeDenial(emptyScopes, type)
+    assert.ok(denial !== undefined,
+      `${type} must be refused for a scopeless device, but the gate returned undefined (serve)`)
+    assert.equal(denial.code, 'auth/forbidden-scope', `${type} must be refused by scope`)
+    assert.equal(denial.scope, contract.SCOPE_BY_TYPE[type], `${type} must name its own scope`)
+    assert.equal(denial.requestType, type)
+  }
+  // And the converse: holding exactly the mapped scope opens exactly that type.
+  for (const type of mapped) {
+    if (SCOPE_EXEMPT_TYPES.has(type)) continue
+    const scope = contract.SCOPE_BY_TYPE[type]
+    assert.equal(scopeDenial({ kind: 'mobile', scopes: [scope] }, type), undefined,
+      `${type} must be served to a device holding ${scope}`)
+  }
+  // A device with a malformed record grants nothing (fail closed), even for a mapped type.
+  for (const broken of [undefined, {}, { scopes: undefined }, { scopes: null }, { scopes: 'sessions:read' }]) {
+    assert.equal(scopeDenial(broken, 'session-stats').code, 'auth/forbidden-scope')
+  }
+})
+
+test('ADV-14b an UNMAPPED type stays outside the gate (the router refuses it as unknown, not by scope)', () => {
+  // `map` and `ping`-style invented names are not in the contract: the gate must not
+  // claim them, so the router's `op/forbidden` remains the answer for a device.
+  // Revision 11: `session-rename` left this list on purpose — it is a §4 op mapped to
+  // `sessions:author` now (asserted by ADV-11 below).
+  for (const type of ['plugin-catalog', 'schedule-create', 'queue-update', 'not-a-real-op']) {
+    assert.equal(contract.SCOPE_BY_TYPE[type], undefined, `${type} must not be mapped by the contract`)
+    assert.equal(scopeDenial({ kind: 'mobile', scopes: [] }, type), undefined,
+      `${type} is not the scope gate's business`)
+  }
+})
+
+test('ADV-14c a MAPPED type from an UNKNOWN family is still gated (this is the exact pre-fix fail-open)', () => {
+  // No such type exists in today's contract, which is why the pre-fix logic could not be
+  // caught by the real map alone: every mapped type happened to belong to a known family.
+  // The seam lets the test add one — a scope-mapped type from a family nobody listed —
+  // and require the gate to decide it from the MAP, not from the family lists.
+  const synthetic = { 'future-op': 'stats:read', 'session-stats': 'stats:read' }
+  const scopeless = { kind: 'mobile', scopes: [] }
+  const denial = scopeDenialAgainst(synthetic, scopeless, 'future-op')
+  assert.ok(denial !== undefined,
+    'a mapped type outside every known family must be REFUSED, not served (this is the fail-open the reviewer found)')
+  assert.equal(denial.code, 'auth/forbidden-scope')
+  assert.equal(denial.scope, 'stats:read')
+  // Holding the scope opens it; an unmapped name stays outside the gate entirely.
+  assert.equal(scopeDenialAgainst(synthetic, { kind: 'mobile', scopes: ['stats:read'] }, 'future-op'), undefined)
+  assert.equal(scopeDenialAgainst(synthetic, scopeless, 'not-mapped'), undefined)
+})
+
+test('ADV-16a the team/subagent reads need no new scope: without sessions:read they are refused BY SCOPE and reach nothing', async (t) => {
+  const instance = await factory(t, { sessionRows: [{ sessionId: 's1' }] })
+  // A device with NO session read scope at all.
+  const { ws } = await pairDevice(instance, 'adv-team-0001', { kind: 'mobile', scopes: ['prompt:send', 'approval:respond'] })
+  const since = instance.hostCalls.length
+  for (const type of ['agent-team', 'subagents']) {
+    const reply = await ask(ws, { type, sessionId: 's1' })
+    assert.equal(reply.kind, 'error', JSON.stringify(reply).slice(0, 200))
+    assert.equal(reply.code, 'auth/forbidden-scope', type + ' must be refused by SCOPE, got ' + reply.code)
+    assert.equal(reply.scope, 'sessions:read', type + ' names the ordinary session read scope')
+    assert.equal(reply.requestType, type)
+    assert.equal(typeof reply.requestId, 'string', 'the refusal echoes the requestId')
+  }
+  // EVERY principal, not just non-owner ones: a regression that read the projection through the
+  // OWNER peer would still be a read the device caused, so filtering owner out would hide it.
+  const projectionReads = instance.hostCalls
+    .slice(since)
+    .filter((call) => call.endpoint === 'session/projections')
+  assert.deepEqual(projectionReads, [],
+    'a scopeless device must cause ZERO session/projections read, whatever peer: '
+    + JSON.stringify(projectionReads.map((call) => call.principal)).slice(0, 200))
+  ws.terminate()
+})
+
+test('ADV-16b with sessions:read both frames carry the projection, its asOfSeq and a projectionState', async (t) => {
+  const team = {
+    members: [{ id: 'session-lead', name: 'lead', role: 'lead', phase: 'active' }],
+    tasks: [{ id: 'task-1', revision: 2, subject: 's', description: 'd', status: 'pending',
+      ownerName: 'lead', blockedBy: [], writeScopes: ['src'], ready: true, writeScopeWarnings: [] }],
+  }
+  const catalog = [{ id: 'session-scout', label: 'scout', mode: 'continuable', createdAt: 1 }]
+  const instance = await factory(t, {
+    sessionRows: [{ sessionId: 's1' }],
+    projectionResult: { kind: 'sequenced', asOfSeq: 42, values: { agentTeam: team, subagentCatalog: catalog } },
+  })
+  const { ws } = await pairDevice(instance, 'adv-team-0002', MOBILE_NO_AUTHOR)
+
+  const teamReply = await ask(ws, { type: 'agent-team', sessionId: 's1' })
+  assert.equal(teamReply.kind, 'agent-team', JSON.stringify(teamReply).slice(0, 240))
+  assert.equal(teamReply.projectionState, 'ready')
+  assert.equal(teamReply.asOfSeq, 42, 'the exact projection cut travels')
+  assert.deepEqual(teamReply.agentTeam, team, 'the value is passed through verbatim (same shape as baseline)')
+
+  const subsReply = await ask(ws, { type: 'subagents', sessionId: 's1' })
+  assert.equal(subsReply.kind, 'subagents', JSON.stringify(subsReply).slice(0, 240))
+  assert.equal(subsReply.projectionState, 'ready')
+  assert.equal(subsReply.asOfSeq, 42)
+  assert.deepEqual(subsReply.subagentCatalog, catalog)
+  ws.terminate()
+})
+
+test('ADV-16c per-item authorization stays the HOST: a foreign session yields session/not-found, and the request is the device own', async (t) => {
+  // THE important test, and it has to discriminate. The mock answers for the session the device MAY
+  // see ('s1') and returns null ONLY for the one it may not. A gateway that rewrote the id, or that
+  // short-circuited to null itself, would then fail the assertions below instead of passing.
+  const visibleTeam = { members: [{ id: 'session-lead', name: 'lead', role: 'lead', phase: 'active' }], tasks: [] }
+  const instance = await factory(t, {
+    sessionRows: [{ sessionId: 's1' }],
+    projectionResult: (args) => {
+      const asked = args?.request?.sessionId
+      return asked === 's1'
+        ? { kind: 'sequenced', asOfSeq: 5, values: { agentTeam: visibleTeam, subagentCatalog: [] } }
+        : null
+    },
+  })
+  const paired = await pairDevice(instance, 'adv-team-0003', MOBILE_NO_AUTHOR)
+  const since = instance.hostCalls.length
+
+  for (const type of ['agent-team', 'subagents']) {
+    const reply = await ask(paired.ws, { type, sessionId: 'session-not-mine' })
+    assert.equal(reply.kind, 'error', JSON.stringify(reply).slice(0, 240))
+    assert.equal(reply.code, 'session/not-found', type + ' must surface the Host refusal, got ' + reply.code)
+    assert.equal(reply.sessionId, 'session-not-mine', 'the reply names the session that was asked for')
+    for (const leak of ['agentTeam', 'subagentCatalog', 'members', 'tasks']) {
+      assert.equal(Object.hasOwn(reply, leak), false, type + ' must not carry ' + leak)
+    }
+  }
+
+  // The session the device MAY see still works, so the refusal above was the Host's decision about
+  // that id and not a blanket failure of the feature.
+  const allowed = await ask(paired.ws, { type: 'agent-team', sessionId: 's1' })
+  assert.equal(allowed.kind, 'agent-team', JSON.stringify(allowed).slice(0, 240))
+  assert.deepEqual(allowed.agentTeam, visibleTeam)
+
+  // Every read the device caused carried the id the DEVICE named, and the DEVICE's own principal.
+  // Asserted exactly: "not owner" would also pass for a call with no principal at all.
+  const reads = instance.hostCalls.slice(since).filter((call) => call.endpoint === 'session/projections')
+  assert.equal(reads.length, 3, 'two foreign reads + one allowed read reached the Host')
+  assert.deepEqual(reads.map((call) => call.args?.request?.sessionId),
+    ['session-not-mine', 'session-not-mine', 's1'],
+    'the gateway forwards the id the device asked for, unchanged')
+  for (const call of reads) {
+    assert.equal(call.principal?.kind, 'dsh-ext-mobile-device', 'the read runs as a device principal: ' + JSON.stringify(call.principal))
+    assert.equal(call.principal?.deviceId, paired.device.id, 'and as THIS device')
+  }
+  paired.ws.terminate()
+})
+
+test('ADV-16d projectionState covers all three states, and an absent projection is null rather than an empty team', async (t) => {
+  const cases = [
+    ['ready', { kind: 'sequenced', asOfSeq: 7, values: { agentTeam: { members: [], tasks: [] }, subagentCatalog: [] } }, 'ready'],
+    ['unavailable', { kind: 'sequenced', asOfSeq: 7, values: {} }, 'unavailable'],
+    ['migration-required', { kind: 'migration-required', values: {} }, 'migration-required'],
+  ]
+  for (const [label, projectionResult, expected] of cases) {
+    const instance = await factory(t, { sessionRows: [{ sessionId: 's1' }], projectionResult })
+    const { ws } = await pairDevice(instance, 'adv-team-016d', MOBILE_NO_AUTHOR)
+    const reply = await ask(ws, { type: 'agent-team', sessionId: 's1' })
+    assert.equal(reply.projectionState, expected, label + ' state: ' + JSON.stringify(reply).slice(0, 200))
+    if (expected !== 'ready') {
+      assert.equal(reply.agentTeam, null, label + ': an absent projection is null, never an empty team')
+      assert.equal(Object.hasOwn(reply, 'asOfSeq'), expected !== 'migration-required', label + ': only a sequenced snapshot has asOfSeq')
+    }
+    ws.terminate()
+  }
+})
+
+test('ADV-16e CONSISTENCY ONLY: the projection is forwarded untrimmed, so the gateway does not scrub writeScopes', async (t) => {
+  // Deliberately NOT a security test, and labelled so. The gateway forwards the Host's projection
+  // verbatim — that is what keeps this op and `projection-baseline` byte-identical. This pins that
+  // down: a value the Host holds arrives unchanged, so if a path ever needs scrubbing it belongs in
+  // the projection itself, not in this frame.
+  const instance = await factory(t, {
+    sessionRows: [{ sessionId: 's1' }],
+    projectionResult: { kind: 'sequenced', asOfSeq: 3, values: {
+      agentTeam: { members: [], tasks: [{ id: 't1', revision: 1, subject: 's', description: 'd', status: 'pending',
+        ownerName: 'x', blockedBy: [], writeScopes: ['C:/Users/x/project/src'], ready: true, writeScopeWarnings: [] }] },
+      subagentCatalog: [{ id: 'session-a', label: 'b', mode: 'continuable', createdAt: 1 }],
+    } },
+  })
+  const { ws } = await pairDevice(instance, 'adv-team-0004', MOBILE_NO_AUTHOR)
+  const reply = await ask(ws, { type: 'agent-team', sessionId: 's1' })
+  assert.equal(reply.projectionState, 'ready')
+  assert.equal(reply.agentTeam.tasks[0].writeScopes[0], 'C:/Users/x/project/src',
+    'forwarded verbatim: the gateway neither rewrites nor filters writeScopes')
+  ws.terminate()
+})
+
+
+test('ADV-17a schedule reads need the explicit schedule:read scope, and a scopeless device reaches nothing', async (t) => {
+  const instance = await factory(t, { sessionRows: [{ sessionId: 's1' }] })
+  // Holds session read but NOT schedule:read — the case that matters, because schedule:read is
+  // never-default and must not be implied by any other scope.
+  const { ws } = await pairDevice(instance, 'adv-sched-0001', { kind: 'mobile', scopes: ['sessions:read', 'prompt:send'] })
+  const since = instance.hostCalls.length
+  for (const type of ['schedule-catalog', 'schedule-list', 'schedule-view']) {
+    const reply = await ask(ws, { type, ...(type === 'schedule-view' ? { id: 'task-1' } : {}) })
+    assert.equal(reply.kind, 'error', type + ': ' + JSON.stringify(reply).slice(0, 200))
+    assert.equal(reply.code, 'auth/forbidden-scope', type + ' must be refused BY SCOPE, got ' + reply.code)
+    assert.equal(reply.scope, 'schedule:read', type + ' must name schedule:read')
+    assert.equal(reply.requestType, type)
+    assert.equal(typeof reply.requestId, 'string', 'the refusal echoes the requestId')
+  }
+  // No schedule read of ANY kind reached the Host, whatever the principal.
+  const reads = instance.hostCalls.slice(since).filter((call) => String(call.endpoint).startsWith('schedule/'))
+  assert.deepEqual(reads, [], 'a device without schedule:read must cause zero schedule/* call')
+  ws.terminate()
+})
+
+test('ADV-17b session read alone never implies schedule read (the scope is not a superset)', async (t) => {
+  const instance = await factory(t, { sessionRows: [{ sessionId: 's1' }] })
+  const { ws } = await pairDevice(instance, 'adv-sched-0002', MOBILE_NO_AUTHOR)
+  // MOBILE_NO_AUTHOR holds sessions:read; the schedule frames must still be refused.
+  const reply = await ask(ws, { type: 'schedule-list' })
+  assert.equal(reply.code, 'auth/forbidden-scope', 'sessions:read must not lift schedule reads')
+  assert.equal(reply.scope, 'schedule:read')
+  ws.terminate()
+})
+
+test('ADV-17c with schedule:read the list and its next run are served, and the reply is the Host projection', async (t) => {
+  const items = [{
+    id: 'task-1', kind: 'recurring', title: 'nightly', active: true,
+    scheduledAt: null, everySeconds: 86_400, time: '03:00', timeZone: 'UTC', weekdays: [1, 2],
+    nextRunAt: 1_763_000_000_000, target: { sessionId: 's1' }, updatedAt: 'rev-1',
+  }]
+  const instance = await factory(t, {
+    sessionRows: [{ sessionId: 's1' }],
+    scheduleCatalog: () => [{ kind: 'recurring', label: 'recurring' }],
+    scheduleList: () => ({ items }),
+  })
+  const { ws } = await pairDevice(instance, 'adv-sched-0003', { kind: 'mobile', scopes: ['sessions:read', 'schedule:read'] })
+
+  const list = await ask(ws, { type: 'schedule-list', active: true, limit: 5 })
+  assert.equal(list.kind, 'schedule-list', JSON.stringify(list).slice(0, 240))
+  assert.deepEqual(list.items, items, 'the Host projection is passed through verbatim')
+  assert.equal(list.items[0].nextRunAt, 1_763_000_000_000, 'the next run travels with the task')
+
+  const catalog = await ask(ws, { type: 'schedule-catalog' })
+  assert.equal(catalog.kind, 'schedule-catalog', 'catalog reply: ' + JSON.stringify(catalog).slice(0, 300))
+  assert.deepEqual(catalog.items, [{ kind: 'recurring', label: 'recurring' }])
+  ws.terminate()
+})
+
+test('ADV-17d the read scope never unlocks a mutation: every schedule write stays admin-only', async (t) => {
+  const instance = await factory(t, { sessionRows: [{ sessionId: 's1' }], scheduleList: () => ({ items: [] }) })
+  const { ws } = await pairDevice(instance, 'adv-sched-0004', { kind: 'mobile', scopes: ['sessions:read', 'schedule:read'] })
+  const since = instance.hostCalls.length
+  const writes = [
+    { type: 'schedule-create', title: 't', prompt: 'p', timing: { kind: 'once', at: 1 } },
+    { type: 'schedule-update', id: 'task-1', patch: { title: 'x' } },
+    { type: 'schedule-delete', id: 'task-1' },
+    { type: 'schedule-edit', id: 'task-1' },
+    { type: 'schedule-run', id: 'task-1' },
+    { type: 'schedule-delete-inactive', confirm: true },
+    { type: 'schedule-history', id: 'task-1', limit: 10 },
+  ]
+  for (const frame of writes) {
+    const reply = await ask(ws, frame)
+    assert.equal(reply.kind, 'error', frame.type + ': ' + JSON.stringify(reply).slice(0, 200))
+    assert.equal(reply.code, 'op/forbidden', frame.type + ' must stay op/forbidden with schedule:read, got ' + reply.code)
+  }
+  const calls = instance.hostCalls.slice(since).filter((call) => String(call.endpoint).startsWith('schedule/'))
+  assert.deepEqual(calls, [], 'no mutating schedule call may reach the Host on a read scope')
+  ws.terminate()
+})
+
+test('ADV-17e schedule:read is never-default and is the scope of exactly the three read frames', async (t) => {
+  const contract = await import('@dsh-ext/mobile-protocol')
+  assert.equal(contract.SCHEDULE_READ_SCOPE, 'schedule:read')
+  assert.deepEqual([...contract.SCHEDULE_READ_CLIENT_TYPES].sort(), ['schedule-catalog', 'schedule-list', 'schedule-view'])
+  assert.equal(contract.NEVER_DEFAULT_SCOPES.includes('schedule:read'), true,
+    'schedule:read must never be granted by default')
+  // "Never-default" means the DEFAULT preset does not hand it out; `full` is the explicit
+  // "every scope a mobile may hold" choice (it carries stats:read and web:unlock the same way), so it
+  // is the only preset that may include it.
+  assert.equal(contract.SCOPE_PRESETS.standard.includes('schedule:read'), false,
+    'the default (standard) preset must not include schedule:read')
+  assert.equal(contract.SCOPE_PRESETS.full.includes('schedule:read'), true,
+    'full is the explicit every-scope choice, so it carries the explicit-only scopes')
+  assert.equal(contract.SCOPES.includes('schedule:read'), true, 'a mobile may hold it when it is granted explicitly')
+  const mapped = Object.entries(contract.SCOPE_BY_TYPE)
+    .filter(([, scope]) => scope === 'schedule:read').map(([type]) => type).sort()
+  assert.deepEqual(mapped, ['schedule-catalog', 'schedule-list', 'schedule-view'])
+})
+
+// ===========================================================================
+// (18) Revision 11 — session rename / archive join `sessions:author`
+//
+// The scope is the SAME never-default one the authoring surface already used: no new
+// grant, no new default, and the two ops add nothing else. `test/session-edit.test.mjs`
+// drives the positive path and the wire-level refusals; this item pins the adversarial
+// half — a device WITHOUT the scope, and a device that names no session, reach no Host.
+// ===========================================================================
+
+const SESSION_EDIT_TYPES = ['session-rename', 'session-archive']
+
+test('ADV-18a revision 11 adds exactly two types to the authoring family, and only on sessions:author', () => {
+  assert.deepEqual(
+    Object.entries(contract.SCOPE_BY_TYPE)
+      .filter(([, scope]) => scope === 'sessions:author').map(([type]) => type).sort(),
+    ['models', 'select-model', 'session-archive', 'session-create', 'session-rename', 'workspaces'],
+  )
+  // No new scope was introduced: the contract vocabulary and the presets are unchanged by
+  // revision 11, and `sessions:author` stays out of every default.
+  assert.equal(contract.NEVER_DEFAULT_SCOPES.includes('sessions:author'), true)
+  assert.equal(contract.SCOPE_PRESETS.standard.includes('sessions:author'), false,
+    'the standard preset must never hand out session authoring')
+  // Every §4 authoring row really is in OPS, and the two new ones map to their own kinds.
+  for (const type of SESSION_EDIT_TYPES) {
+    assert.equal(contract.OPS.includes(type), true, type + ' must be a §4 op')
+    assert.equal(contract.OP_RESPONSES[type], type === 'session-rename' ? 'session-renamed' : 'session-archived')
+  }
+})
+
+test('ADV-18b a device WITHOUT sessions:author is refused both ops by scope, and nothing reaches the Host', async (t) => {
+  const instance = await factory(t, { sessionRows: [{ sessionId: 's1' }] })
+  const { ws } = await pairDevice(instance, 'adv-edit-0001', MOBILE_NO_AUTHOR)
+  const since = instance.hostCalls.length
+  for (const frame of [
+    { type: 'session-rename', sessionId: 's1', title: 'ok' },
+    { type: 'session-archive', sessionId: 's1' },
+  ]) {
+    const reply = await ask(ws, frame)
+    assert.equal(reply.kind, 'error', frame.type + ': ' + JSON.stringify(reply).slice(0, 220))
+    assert.equal(reply.code, 'auth/forbidden-scope', frame.type + ' → ' + reply.code)
+    assert.equal(reply.scope, AUTHOR)
+    assert.equal(reply.requestType, frame.type)
+  }
+  assert.deepEqual(callsSinceSet(instance, since), [],
+    'no session-edit frame may reach the Host: ' + callsSinceSet(instance, since))
+  ws.close()
+})
+
+test('ADV-18c an AUTHOR device naming no session gets bad-request for both ops, and nothing reaches the Host', async (t) => {
+  const instance = await factory(t, { sessionRows: [{ sessionId: 's1' }] })
+  const { ws } = await pairDevice(instance, 'adv-edit-0002', MOBILE_AUTHOR)
+  const since = instance.hostCalls.length
+  for (const frame of [
+    { type: 'session-rename', title: 'ok' },
+    { type: 'session-archive' },
+    { type: 'session-rename', sessionId: 7, title: 'ok' },
+    { type: 'session-archive', sessionId: {} },
+  ]) {
+    const reply = await ask(ws, frame)
+    assert.equal(reply.kind, 'error', JSON.stringify(reply).slice(0, 220))
+    assert.equal(reply.code, 'bad-request', frame.type + ' → ' + reply.code)
+  }
+  assert.deepEqual(callsSinceSet(instance, since), [],
+    'a malformed session id must not reach the Host: ' + callsSinceSet(instance, since))
+  ws.close()
+})
+
+// ===========================================================================
+// (19) Reviewer item 5, MAJOR (a): the `session-archived` reply carries the
+// DEVICE's visible archive set, never the Host's complete one.
+//
+// `workspace/archiveSession` answers with every archived id the Host holds
+// (PROTOCOL.md §5). The broadcast `session-archives` already reduces that set to
+// the recipient's visible sessions (aggregateFrameFor); the direct reply must use
+// the SAME rule, or a phone learns the ids of sessions it was never listed.
+// The admin path is unchanged and still gets the complete set.
+// ===========================================================================
+
+test('ADV-19a a device archiving a VISIBLE session never receives an archived id it cannot see', async (t) => {
+  const instance = await factory(t, {
+    sessionRows: [{ sessionId: 's1' }, { sessionId: 's2' }],
+    // The Host's complete archive set after this call. Only `s2` is visible to the device.
+    archiveSession: () => ({ archivedSessionIds: ['s2', 's-hidden'] }),
+  })
+  const { ws } = await pairDevice(instance, 'adv-archive-0001', MOBILE_AUTHOR)
+  const since = instance.hostCalls.length
+  const reply = await ask(ws, { type: 'session-archive', sessionId: 's2' })
+  assert.equal(reply.kind, 'session-archived', JSON.stringify(reply).slice(0, 240))
+  assert.equal(reply.sessionId, 's2')
+  // The archive the device itself made stays in its set: the app merges it from this frame.
+  assert.deepEqual(reply.archivedSessionIds, ['s2'],
+    'the device gets its own archive entry and nothing else: ' + JSON.stringify(reply.archivedSessionIds))
+  // Belt and braces: the hidden id must not appear anywhere in the wire frame.
+  assert.equal(JSON.stringify(reply).includes('s-hidden'), false, 'the hidden id leaked: ' + JSON.stringify(reply).slice(0, 240))
+  const calls = callsSince(instance, since, 'workspace/archiveSession')
+  assert.equal(calls.length, 1, 'exactly one Host call')
+  assert.equal(calls[0].principal?.kind, 'dsh-ext-mobile-device', 'it runs as the device, never the owner')
+  // The SAME reduction the broadcast applies, read off the device's own baseline: the
+  // reply must agree with what the device is allowed to learn there.
+  const baseline = await take(ws, (frame) => frame.kind === 'session-archives')
+  assert.deepEqual(baseline.archivedSessionIds.filter((id) => id !== 's2'), [], 'sanity: the baseline names no hidden id')
+  ws.close()
+})
+
+// ===========================================================================
+// (20) Reviewer item 5, MINOR (b): a device never receives the Host's
+// `error.message` for the three READ-ONLY schedule frames. The structured `code`
+// survives; the text is a fixed sentence per code. (session-rename / session-archive
+// are covered in test/session-edit.test.mjs, which owns the admin-path parity case.)
+// ===========================================================================
+
+/** Text a real Host emits and that must never reach a phone. */
+const HIDDEN_HOST_TEXT = '$HOME/owner/secret-tax-2025/tax.db: permission denied'
+
+test('ADV-20b a Host refusal of the three schedule reads reaches a device as its code plus a fixed sentence', async (t) => {
+  for (const type of ['schedule-catalog', 'schedule-list', 'schedule-view']) {
+    // One instance per frame, so each read really reaches the Host and is refused there.
+    const options = { sessionRows: [{ sessionId: 's1' }] }
+    options[type === 'schedule-catalog' ? 'scheduleCatalog' : type === 'schedule-list' ? 'scheduleList' : 'scheduleView']
+      = () => { throw Object.assign(new Error(HIDDEN_HOST_TEXT), { code: 'schedule/denied' }) }
+    const instance = await factory(t, options)
+    const { ws } = await pairDevice(instance, `adv-text-${type}`, { kind: 'mobile', scopes: ['sessions:read', 'schedule:read'] })
+    const frame = type === 'schedule-view' ? { type, id: 'task-1' } : { type, ...(type === 'schedule-list' ? { active: true, limit: 5 } : {}) }
+    const reply = await ask(ws, frame)
+    assert.equal(reply.kind, 'error', type + ': ' + JSON.stringify(reply).slice(0, 240))
+    assert.equal(reply.code, 'schedule/denied', 'the structured code must survive: ' + JSON.stringify(reply))
+    assert.equal(reply.requestType, type)
+    assert.equal(String(reply.message).includes(HIDDEN_HOST_TEXT), false,
+      'the Host text must not reach the device: ' + String(reply.message))
+    assert.equal(String(reply.message).includes('/owner/'), false, 'no Host path may reach the device: ' + String(reply.message))
+    ws.close()
+  }
+})
+
+test('ADV-20c each frame keeps its own sentence for the same code (no one "bad-request" string)', async (t) => {
+  // These are the gateway's OWN argument refusals (schedule:read, malformed arguments), so
+  // they never reach the Host. They prove the table is keyed per frame as well as per code:
+  // collapsing every `bad-request` onto one sentence would fail here.
+  const instance = await factory(t, { sessionRows: [{ sessionId: 's1' }] })
+  const { ws } = await pairDevice(instance, 'adv-text-0003', { kind: 'mobile', scopes: ['sessions:read', 'schedule:read'] })
+  const notices = []
+  for (const frame of [
+    { type: 'schedule-list', sessionId: 's1', limit: 5 },
+    { type: 'schedule-view', id: 'task-1', sessionId: 7 },
+  ]) {
+    const reply = await ask(ws, frame)
+    assert.equal(reply.code, 'bad-request', frame.type + ': ' + JSON.stringify(reply).slice(0, 240))
+    notices.push(`${frame.type}: ${reply.message}`)
+  }
+  assert.equal(new Set(notices.map((notice) => notice.slice(notice.indexOf(': ') + 2))).size, notices.length,
+    'the two frames must not share one sentence: ' + JSON.stringify(notices))
   ws.close()
 })

@@ -1,0 +1,89 @@
+# 22 — scheduled tasks WITH the grant: Settings row → read-only screen → detail → close (spec 018).
+#
+# SCENARIO: paired, ready socket, `hello.device.scopes` = the four scopes the hidden flow uses plus
+#           `schedule:read`. Checkpoint T-20 in `run-e2e.mjs` arms it immediately before this flow:
+#             POST /scenario/scopes {"scopes":["sessions:read","sessions:author","prompt:send","approval:respond","schedule:read"]}
+#             POST /scenario/schedule-list {"active":true}
+#           (the second call keeps the served list at its one task; `{"active":false}` is the empty
+#           variant in `27-schedules-granted-empty.yaml`).
+# HARNESS:  `--cert-mode ok`. The fixture serves exactly one active task — `sch-nightly-tests`
+#           ("Run the test suite", daily 09:00) — from `schedule-list`, and the same record from
+#           `schedule-view`, so the row hook is a stable fixture id and the detail sheet renders the
+#           `ready` branch instead of a "no longer exists" line.
+# MANUAL:   biometric prompt only.
+#
+#[HOOKS] `list-menu` → `tab-settings` → `settings-schedules` (the row the grant draws) →
+#        `schedules-screen` (the read-only screen really pushed) → `schedules-row-sch-nightly-tests`
+#        (the served task) → `schedules-detail` (the sheet opened over the list) →
+#        `schedules-detail-close` (it closes from its own control).
+#
+#[EXIT CRITERIA]
+#   1. with `schedule:read` the Settings row is drawn (the grant is honoured, not hidden);
+#   2. tapping it pushes the scheduled-tasks screen and the served task is listed;
+#   3. tapping the row opens the detail sheet over it and that sheet closes by hook;
+#   4. the app stays connected and sent only reads (one `schedule-list`, one `schedule-view` for the
+#      served id — asserted by the orchestrator from `GET /state`).
+
+appId: com.dshext.companion
+env:
+  SCHEDULE_ID: sch-nightly-tests
+  SCHEDULE_TITLE: Run the test suite
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+
+- tapOn:
+    id: "list-menu"
+- tapOn:
+    id: "tab-settings"
+
+- extendedWaitUntil:
+    visible:
+      id: "settings-screen"
+    timeout: 20000
+
+# 1) The gated row is drawn on this pairing.
+- assertVisible:
+    id: "settings-schedules"
+
+# 2) The read-only screen, not the hidden variant, and the served task is in the list.
+- tapOn:
+    id: "settings-schedules"
+- extendedWaitUntil:
+    visible:
+      id: "schedules-screen"
+    timeout: 20000
+- assertNotVisible:
+    id: "schedules-hidden"
+- extendedWaitUntil:
+    visible:
+      id: "schedules-row-${SCHEDULE_ID}"
+    timeout: 20000
+- assertVisible: ".*${SCHEDULE_TITLE}.*"
+- assertNotVisible:
+    id: "schedules-retry"
+
+# 3) Tap the row → the detail sheet opens over the list → close it from its own hook.
+#    Tapping (not scrolling) is what this checkpoint is for: the fixture's one row sits at the top of
+#    a short list, so the tap never depends on a scroll position.
+- assertNotVisible:
+    id: "schedules-detail"
+- tapOn:
+    id: "schedules-row-${SCHEDULE_ID}"
+- extendedWaitUntil:
+    visible:
+      id: "schedules-detail-close"
+    timeout: 20000
+- assertNotVisible:
+    id: "schedules-detail-notfound"
+- assertNotVisible:
+    id: "schedules-detail-failed"
+
+- tapOn:
+    id: "schedules-detail-close"
+- extendedWaitUntil:
+    notVisible:
+      id: "schedules-detail"
+    timeout: 20000
+- assertVisible:
+    id: "schedules-row-${SCHEDULE_ID}"

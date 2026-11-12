@@ -1,0 +1,45 @@
+# 25 — session rename: offered ONLY when the Host advertises the op, absent here (spec 011 P2 item 4).
+#
+# SCENARIO: paired with the fixture's `hello.capabilities` (sessions-read, prompt, cancel,
+#           approval-v1 — no `session-rename`, no `session-archive`), session list loaded.
+# HARNESS:  `--cert-mode ok`; nothing armed. The pairing prerequisite is the one the other paired flows
+#           use (`subflows/pair-paste.yaml`, a no-op once paired), so a plain `maestro test` on a fresh
+#           install reaches the list instead of stopping on the pair screen; `run-e2e.mjs` pairs first.
+#           The fixture has no control route for capabilities (only `/scenario/scopes`, which sets
+#           `hello.device.scopes`, not capabilities).
+# MANUAL:   biometric prompt only.
+#
+#[WHY] "No button without something behind it": the rename block only exists when the Host advertised
+#      `session-rename` (`canRenameSession(snapshot.capabilities)`), and a long press does nothing
+#      otherwise. So the greeting path a device can prove today is the HIDDEN one. The GRANTED branch
+#      (long press → rename sheet → save) is listed as a gap in `e2e/README.md`: it needs a fixture
+#      capability override that does not exist yet.
+#
+#[HOOKS] `session-row-${SESSION_ID}` (the fixture row — it really rendered), `session-rename-block`
+#        and `session-rename-input` (their ABSENCE after a long press is the assertion).
+#
+#[EXIT CRITERIA]
+#   1. the list shows the fixture row;
+#   2. a long press on it opens NO rename sheet (no block, no input).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-alpha
+  SESSION_TITLE: Refactor gateway TLS
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- runFlow: subflows/pair-paste.yaml
+
+# 1) The row is there (the app opened on the list — spec 011 P1-A removed the tab bar).
+- assertVisible:
+    id: "session-row-${SESSION_ID}"
+- assertVisible: ".*${SESSION_TITLE}.*"
+
+# 2) A long press is the rename entry point; without the op nothing may open.
+- longPressOn:
+    id: "session-row-${SESSION_ID}"
+- assertNotVisible:
+    id: "session-rename-block"
+- assertNotVisible:
+    id: "session-rename-input"

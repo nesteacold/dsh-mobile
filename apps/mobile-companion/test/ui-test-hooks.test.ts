@@ -28,11 +28,15 @@ import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const APP_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'app');
-const PAIR = path.join(APP_DIR, 'pair.tsx');
+// Spec 021: the pair screen body moved to `src/ui/pair-panel.tsx` so the web bootstrap of the root
+// layout can render it before any route mounts (a browser whose passkey is not asserted yet has no
+// navigator). `app/pair.tsx` is the thin route wrapper, so the hooks are guarded where they are
+// rendered — same hooks, same counts, exactly like the list screen's move below.
+const PAIR = path.join(path.resolve(APP_DIR, '..', 'src', 'ui'), 'pair-panel.tsx');
 // Spec 011 P1-A: the session list moved from `app/index.tsx` to the Conversations tab
 // (`app/(tabs)/conversations.tsx`) when the app gained the bottom tab bar. The guard set is
 // unchanged — same hooks, same counts — only the file it reads moved with the screen.
-const INDEX = path.join(APP_DIR, '(tabs)', 'conversations.tsx');
+const INDEX = path.join(APP_DIR, '(tabs)', 'index.tsx');
 const SESSION = path.join(APP_DIR, 'session', '[id].tsx');
 
 /** Every `testID="…"` / `testID={`…`}` literal in a source file, in source order. */
@@ -49,12 +53,19 @@ function count(ids: string[], id: string): number {
 
 /** The dynamic hooks the flows are allowed to depend on, and what the variable must be. */
 const DYNAMIC_HOOKS = new Map<string, string>([
-  ['sessions-tab-${entry.tab}', 'a SessionTab value (running | idle | archived)'],
-  ['session-row-${session.id}', 'a host session id'],
+  // Parity redesign: the per-tab hook went away with the tab bar; these are the list screen's
+  // dynamic hooks, each keyed by a stable id (never by free text).
+  ['session-row-${item.session.id}', 'a host session id'],
+  ['chip-${host.gatewayId}', 'a paired gateway id'],
+  ['section-${key}', 'a workspace id (or the internal "other"/"all" bucket)'],
+  ['workspace-option-${workspace.id}', 'a host workspace id'],
+  ['menu-group-${mode}', 'a fixed group mode (workspace | none)'],
   ['approval-card-${card.approvalId}', 'a host approval id'],
   ['approval-state-${card.approvalId}', 'a host approval id'],
   ['approval-approve-${card.approvalId}', 'a host approval id'],
   ['approval-reject-${card.approvalId}', 'a host approval id'],
+  // Spec 018 item 3: one row per scheduled task, keyed by the task's own id (never a title).
+  ['schedules-row-${row.id}', 'a host scheduled-task id'],
 ]);
 
 describe('pair screen hooks', () => {
@@ -71,12 +82,20 @@ describe('session list hooks', () => {
   const source = readFileSync(INDEX, 'utf8');
   const ids = hooks(source);
 
-  it('exposes a hook per tab so selection does not depend on the locale', () => {
-    assert.equal(count(ids, 'sessions-tab-${entry.tab}'), 1);
+  it('exposes the header, source switcher, menu and composer hooks', () => {
+    // Parity redesign: the per-tab hooks are gone with the tab bar. The composer's send button keeps
+    // the LEGACY `new-session` hook (the lead's option (a)), so the authoring flows 15–18 did not have
+    // to be rewritten; the rest are the new list-level controls.
+    for (const id of ['list-source', 'list-menu', 'list-composer-input']) {
+      assert.equal(count(ids, id), 1, `${id} is rendered exactly once`);
+    }
+    for (const id of ['workspace-home', 'new-session', 'new-session-reason', 'new-session-error']) {
+      assert.equal(count(ids, id), 1, `${id} keeps the legacy authoring-flow contract`);
+    }
   });
 
   it('exposes a hook per row keyed by the session id', () => {
-    assert.equal(count(ids, 'session-row-${session.id}'), 1);
+    assert.equal(count(ids, 'session-row-${item.session.id}'), 1);
   });
 
   it('marks the banner and keeps its localized accessibility label', () => {

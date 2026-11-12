@@ -13,7 +13,7 @@
 // For a pure module (no React), use `paletteFor('dark' | 'light')` and `typeScale(fontScale)`.
 // `colors` below is the static dark palette, only for code that cannot use a hook.
 
-import { createContext, createElement, useContext, useMemo, useState, type ReactNode } from 'react';
+import { createContext, createElement, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useColorScheme, type TextStyle } from 'react-native';
 
 // ---------------------------------------------------------------------------
@@ -344,6 +344,11 @@ export function ThemeProvider(props: { children: ReactNode; initialFontScale?: n
   const system = useColorScheme();
   const scheme: ColorScheme = system === 'light' ? 'light' : 'dark';
   const [fontScale, setFontScale] = useState<number>(props.initialFontScale ?? 1);
+  // The saved scale is read asynchronously at startup, so the provider has to ADOPT it when it
+  // arrives; `initialFontScale` alone would only cover the very first render.
+  useEffect(() => {
+    if (props.initialFontScale !== undefined) setFontScale(props.initialFontScale);
+  }, [props.initialFontScale]);
   const value = useMemo<Theme>(() => {
     const palette = paletteFor(scheme);
     return {

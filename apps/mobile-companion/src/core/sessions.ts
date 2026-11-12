@@ -38,7 +38,24 @@ export interface SessionSummary {
   origin?: string;
   /** Upstream `parentSessionId` of a subagent row, when present. */
   parentSessionId?: string;
+  /**
+   * Workspace this session belongs to, when the Host reports it. ABSENT stays absent: the list must
+   * never invent a workspace, and rows without one fall into the trailing "Other" group.
+   */
+  workspaceId?: string;
+  /** Human workspace label (basename) the Host sends alongside the id — preferred as the group name. */
+  workspaceLabel?: string;
+  /**
+   * Spec 018: the agent preset id the session runs, from `projections.values.agentPreset`, view
+   * only. The gateway already withholds anything outside the id charset, and this parse repeats the
+   * check so the app never renders a path or YAML. ABSENT stays absent (a preset can be unknown,
+   * e.g. `broken`); the screen hides the label rather than guessing.
+   */
+  agentPreset?: string;
 }
+
+/** A preset id is a plain identifier: no path separators, no whitespace, at most 64 chars. */
+const AGENT_PRESET_ID = /^[A-Za-z0-9._:-]{1,64}$/;
 
 /**
  * True only when the Host SAID this is a subagent session. Absent `origin` is not evidence either
@@ -122,11 +139,19 @@ function projectState(row: Record<string, unknown>): SessionState {
   return 'idle';
 }
 
+function projectAgentPreset(row: Record<string, unknown>): string | undefined {
+  const projections = row.projections as { values?: { agentPreset?: unknown } } | undefined;
+  const projected = projections?.values?.agentPreset;
+  // A too-long id is a malformed Host value, not a label: drop the whole value, never cut it.
+  return typeof projected === 'string' && AGENT_PRESET_ID.test(projected) ? projected : undefined;
+}
+
 function coerceSummary(raw: unknown): SessionSummary | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
   const sessionId = projectSessionId(r);
   if (sessionId === null) return null;
+  const agentPreset = projectAgentPreset(r);
   return {
     id: sessionId,
     title: projectTitle(r, sessionId),
@@ -140,7 +165,38 @@ function coerceSummary(raw: unknown): SessionSummary | null {
     ...(typeof r.parentSessionId === 'string' && r.parentSessionId !== ''
       ? { parentSessionId: r.parentSessionId }
       : {}),
+    // Workspace binding: `workspaceLabel` is the basename the gateway sends with the id, so the app
+    // never has to derive a name from a path.
+    ...(typeof r.workspaceId === 'string' && r.workspaceId !== '' ? { workspaceId: r.workspaceId } : {}),
+    ...(typeof r.workspaceLabel === 'string' && r.workspaceLabel !== ''
+      ? { workspaceLabel: r.workspaceLabel }
+      : {}),
+    // Spec 018: view only. It rides `projections.values`, so it survives the gateway's title-only
+    // list filter exactly as the title does.
+    ...(agentPreset === undefined ? {} : { agentPreset }),
   };
+}
+
+/**
+ * Merge a workspace binding onto an EXISTING row (from `session-status` / `session-created` events).
+ *
+ * Deliberately not `upsert`: those events carry no title/projections, and `coerceSummary` would
+ * replace the row with an empty title. Unknown ids are ignored — the next `sessions` list carries
+ * the full row anyway.
+ */
+export function applyWorkspaceBinding(
+  existing: SessionSummary | undefined,
+  input: { readonly workspaceId?: string; readonly workspaceLabel?: string },
+): SessionSummary | undefined {
+  if (existing === undefined) return undefined;
+  const next: SessionSummary = {
+    ...existing,
+    ...(input.workspaceId === undefined || input.workspaceId === '' ? {} : { workspaceId: input.workspaceId }),
+    ...(input.workspaceLabel === undefined || input.workspaceLabel === ''
+      ? {}
+      : { workspaceLabel: input.workspaceLabel }),
+  };
+  return next;
 }
 
 export class SessionsStore {
@@ -202,8 +258,18 @@ export class SessionsStore {
     this.bump();
   }
 
-  /** Record a pending approval => the session row gets the needs-decision badge immediately. */
-  applyApprovalRequested(frame: ApprovalRequestedFrame): void {
+  /** Attach a workspace binding that arrived in a `session-status` / `session-created` event. */
+  applyWorkspace(
+    sessionId: string,
+    input: { readonly workspaceId?: string; readonly workspaceLabel?: string },
+  ): void {
+    const next = applyWorkspaceBinding(this.byId.get(sessionId), input);
+    if (next === undefined) return;
+    this.byId.set(sessionId, next);
+    this.bump();
+  }
+
+  /** Record a pending approval => the session row gets the needs-decision badge immediately. */  applyApprovalRequested(frame: ApprovalRequestedFrame): void {
     const map = this.approvalBySession.get(frame.sessionId) ?? new Map<string, ApprovalRequestedFrame>();
     // A replay after `subscribe` carries the server's current view (possibly a new argsHash);
     // the *card* keeps its captured hash until the user explicitly reloads it.

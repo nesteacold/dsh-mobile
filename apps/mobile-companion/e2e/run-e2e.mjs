@@ -308,6 +308,96 @@ const CHECKPOINTS = [
       { label: 'nothing was created', test: (s) => s.evidence.sessionCreates.length === 0 },
     ],
   },
+
+  // -------------------------------------------------------------------------
+  // Spec 018 — the read-only surfaces whose rows are gated by an explicit-only scope
+  //
+  // Both granted checkpoints ARM the scope before the flow runs: a plain `maestro test` pairs with
+  // whatever the gateway offers, and `stats:read` / `schedule:read` are in `NEVER_DEFAULT_SCOPES`,
+  // so without the arm the flow could only prove the hidden branch.
+  // -------------------------------------------------------------------------
+  {
+    id: 'T-19',
+    title: 'stats:read granted: the ⋯ row exists, the sheet shows the Host numbers',
+    flow: '20-session-stats-granted.yaml',
+    pair: true,
+    // The fixture's default set (authoring + the base scopes) plus `stats:read`; the fixture serves
+    // the contract's own `session-stats` example for `sess-alpha`.
+    arm: [{ route: '/scenario/scopes', body: { scopes: ['sessions:read', 'sessions:author', 'prompt:send', 'approval:respond', 'stats:read'] } }],
+    task: 'Spec 018 (stats:read granted)',
+    assert: [
+      { label: 'the device was really granted stats:read', test: (s) => s.scenario.deviceScopes?.includes('stats:read') === true },
+      { label: 'exactly one session-stats read, for sess-alpha', test: (s) => s.evidence.readOnlyRequests.filter((r) => r.type === 'session-stats').length === 1 && s.evidence.readOnlyRequests.find((r) => r.type === 'session-stats')?.sessionId === 'sess-alpha' },
+      { label: 'the app stayed connected (no socket fork)', test: (s) => s.evidence.openConnections === 1 },
+      { label: 'no protocol violations', test: (s) => s.evidence.protocolViolations.length === 0 },
+    ],
+  },
+  {
+    id: 'T-20',
+    title: 'schedule:read granted: Settings → list → detail → close',
+    flow: '22-schedules-granted.yaml',
+    pair: true,
+    // Fixture defaults (which grant authoring, unlike the real desktop defaults) plus `schedule:read`;
+    // the fixture serves exactly one active task so the flow can tap a real row.
+    arm: [
+      { route: '/scenario/scopes', body: { scopes: ['sessions:read', 'sessions:author', 'prompt:send', 'approval:respond', 'schedule:read'] } },
+      { route: '/scenario/schedule-list', body: { active: true } },
+    ],
+    task: 'Spec 018 (schedule:read granted)',
+    assert: [
+      { label: 'the device was really granted schedule:read', test: (s) => s.scenario.deviceScopes?.includes('schedule:read') === true },
+      { label: 'the list was read once, host-wide', test: (s) => s.evidence.readOnlyRequests.filter((r) => r.type === 'schedule-list').length === 1 },
+      { label: 'the tapped row was opened by its served id', test: (s) => s.evidence.readOnlyRequests.filter((r) => r.type === 'schedule-view').length === 1 && s.evidence.readOnlyRequests.find((r) => r.type === 'schedule-view')?.taskId === s.readOnly?.scheduleTask },
+      { label: 'only reads were sent (no schedule write)', test: (s) => s.evidence.readOnlyRequests.every((r) => ['schedule-list', 'schedule-view', 'schedule-catalog'].includes(r.type)) },
+      { label: 'the app stayed connected (no socket fork)', test: (s) => s.evidence.openConnections === 1 },
+    ],
+  },
+  {
+    id: 'T-21',
+    title: 'schedule:read granted but nothing scheduled: the empty answer, no detail',
+    flow: '27-schedules-granted-empty.yaml',
+    pair: true,
+    // Same grant as T-20, emptied list: the screen must say "no active tasks", never invent a row.
+    arm: [
+      { route: '/scenario/scopes', body: { scopes: ['sessions:read', 'sessions:author', 'prompt:send', 'approval:respond', 'schedule:read'] } },
+      { route: '/scenario/schedule-list', body: { active: false } },
+    ],
+    task: 'Spec 018 (schedule:read, empty list)',
+    assert: [
+      { label: 'the fixture really served an empty list', test: (s) => s.readOnly?.scheduleItems === 0 },
+      { label: 'the list was read once', test: (s) => s.evidence.readOnlyRequests.filter((r) => r.type === 'schedule-list').length === 1 },
+      { label: 'no row was opened (there is none to open)', test: (s) => s.evidence.readOnlyRequests.every((r) => r.type !== 'schedule-view') },
+    ],
+  },
+  {
+    id: 'T-22',
+    title: 'schedule:read NOT granted: no Settings row and no schedule frame',
+    flow: '21-schedules-no-scope.yaml',
+    pair: true,
+    // The four scopes these flows have always paired with (fixture default minus the two explicit-only
+    // reads). A plain pairing could carry `schedule:read`, so it is armed explicitly.
+    arm: [{ route: '/scenario/scopes', body: { scopes: ['sessions:read', 'sessions:author', 'prompt:send', 'approval:respond'] } }],
+    task: 'Spec 018 (schedule:read hidden)',
+    assert: [
+      { label: 'no schedule:read in the grant', test: (s) => s.scenario.deviceScopes?.includes('schedule:read') === false },
+      { label: 'zero schedule frames (not even the catalog)', test: (s) => s.evidence.readOnlyRequests.every((r) => !r.type.startsWith('schedule')) },
+    ],
+  },
+  {
+    id: 'T-23',
+    title: 'stats:read NOT granted: no ⋯ row and no stats frame',
+    flow: '19-session-stats.yaml',
+    pair: true,
+    // Same four-scope arm as T-22: without it, a pairing that happened to carry `stats:read` would
+    // draw the row and fail a flow whose point is the hidden branch.
+    arm: [{ route: '/scenario/scopes', body: { scopes: ['sessions:read', 'sessions:author', 'prompt:send', 'approval:respond'] } }],
+    task: 'Spec 018 (stats:read hidden)',
+    assert: [
+      { label: 'no stats:read in the grant', test: (s) => s.scenario.deviceScopes?.includes('stats:read') === false },
+      { label: 'zero session-stats frames', test: (s) => s.evidence.readOnlyRequests.every((r) => r.type !== 'session-stats') },
+      { label: 'the session screen was really open', test: (s) => s.evidence.frames.some((f) => f.includes('"type":"subscribe"') || f.includes('"type":"history"')) },
+    ],
+  },
 ]
 
 // ---------------------------------------------------------------------------

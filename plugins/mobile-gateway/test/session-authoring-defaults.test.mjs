@@ -33,7 +33,10 @@ const require = createRequire(import.meta.url)
 // ---------------------------------------------------------------------------
 
 test('D-1 contract: NEVER_DEFAULT_SCOPES names sessions:author and keeps it explicitly grantable', () => {
-  assert.deepEqual([...contract.NEVER_DEFAULT_SCOPES], [AUTHOR])
+  // The list may legitimately grow (spec 013 added `attachments:write`), so assert the
+  // property this test is about — the author scope is on it — not the exact array.
+  assert.ok(contract.NEVER_DEFAULT_SCOPES.includes(AUTHOR),
+    `sessions:author must be a never-default scope, got ${JSON.stringify([...contract.NEVER_DEFAULT_SCOPES])}`)
   assert.equal(Object.isFrozen(contract.NEVER_DEFAULT_SCOPES), true)
   // Every entry is a real scope, so a default filter can never hide a typo.
   for (const scope of contract.NEVER_DEFAULT_SCOPES) assert.ok(contract.SCOPES.includes(scope), `${scope} must be a scope`)

@@ -14,11 +14,14 @@ import path from 'node:path'
 
 import {
   CLOSE_REVOKED, PinMismatchError, RemoteConnection, RemoteInputError,
-  claimPairing, claimWithOtp, decodePairingString, formatVerificationCode, normalizeOtp, otpDialUrl, resolveDialUrl,
+  claimPairing, claimWithOtp, decodePairingString, formatVerificationCode, isPrivateAddress, normalizeOtp,
+  otpDialUrl, resolveDialUrl,
 } from './remote-client.mjs'
 import { assertCleanCard, createHostRouter } from './host-router.mjs'
+import { createAgentBrowserPool } from './agent-browser.mjs'
 import { resolveDshRuntimeVersion } from './dsh-runtime-version.mjs'
 import { createSessionCache } from './session-cache.mjs'
+import { createUploadRoute } from './upload-route.mjs'
 import {
   ensureOwnerOnlyDirectory, restrictToOwnerSync, setSecureFileLogger, writeSecretFile,
 } from './secure-file.mjs'
@@ -66,6 +69,18 @@ function sendJson(res, status, value) {
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
     'Content-Length': Buffer.byteLength(body),
+  })
+  res.end(body)
+}
+
+/** One binary body (a screencast frame); never cached, never sniffed. */
+function sendBytes(res, status, contentType, body) {
+  res.writeHead(status, {
+    'Content-Type': contentType,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Length': body.length,
   })
   res.end(body)
 }
@@ -181,6 +196,10 @@ export const plugin = {
     const options = {
       dataDir: '', allowPublicRemotes: false, remoteSessions: true,
       autoReconnect: true, reconnectDelaysMs: [1000, 2000, 5000, 10000, 30000], reconnectStableMs: 10000,
+      // Spec 016 Phase 3: the "Browser (agent)" tab drives an installed Chrome/Edge
+      // on THIS machine. Off by default at the per-host level (consent); this switch
+      // removes the whole surface, e.g. on a machine that must never run a browser.
+      agentBrowser: true, agentBrowserPath: '', agentBrowserIdleMs: undefined, agentBrowserBlockedOrigins: [],
       ...config,
     }
     // Messages here never include tokens, pairing codes or request headers.
@@ -189,6 +208,20 @@ export const plugin = {
     setSecureFileLogger(log)
     const dataDir = options.dataDir || path.join(os.homedir(), '.dsh', 'devices-page')
     const store = createStore(dataDir, log)
+    // Spec 016 Phase 3: the browser this machine lets a paired host drive. One
+    // process per host, spawned lazily on the first command or frame, own profile
+    // directory under the plugin's data, no TCP port (see lib/agent-browser.mjs).
+    const browsers = options.agentBrowser === false ? null : createAgentBrowserPool({
+      dataDir,
+      log,
+      configuredPath: options.agentBrowserPath,
+      idleMs: options.agentBrowserIdleMs,
+      blockedOrigins: Array.isArray(options.agentBrowserBlockedOrigins) ? options.agentBrowserBlockedOrigins : [],
+      // Test seam: a fake spawn lets the suite exercise the pipes without a browser.
+      spawn: options.spawnBrowser,
+      platform: options.testPlatform,
+      exists: options.testBrowserExists,
+    })
     // Spec 008 P2c: the offline copy of a remote session's transcript, one JSONL
     // file per (host, session) under sessions/. The session follower in
     // lib/host-router.mjs writes it; the router and `…/history` replay it read-only
@@ -355,6 +388,11 @@ export const plugin = {
         log,
         WebSocketImpl: options.WebSocketImpl,
         requestTimeoutMs: options.requestTimeoutMs,
+        // Spec 016 Phase 3: the owner's setting is read per dial (it decides whether
+        // the hello advertises `browser-agent:1`) and per command (a change applies
+        // at once, without waiting for a redial).
+        browserConsent: () => store.get(remote.id)?.browserConsent === true,
+        browserAgent: browsers ? () => browsers.forHost(remote.id) : undefined,
       })
       entry = { connection, state: 'offline', detail: null, approvals: new Map(), redial: null, retryAttempt: 0, stability: null, linkError: null }
       // A replaced entry (re-pair in place, DELETE, teardown) must be deaf: its
@@ -412,7 +450,11 @@ export const plugin = {
       // A terminal reason (a changed certificate) is the opposite of a retry: the
       // loop stopped, `retry` is null, and the row says why.
       const linkError = entry?.linkError ?? null
-      return { ...publicRemote(remote, entry, entry ? [...entry.approvals.values()] : []), hostError, retry, linkError }
+      // Spec 016 Phase 3: the owner's per-host consent and the browser's live state
+      // (so the card's toggle and the tab's Stop can tell "off" from "running").
+      const browserConsent = remote.browserConsent === true
+      const agentBrowser = browsers ? browsers.status(remote.id) : null
+      return { ...publicRemote(remote, entry, entry ? [...entry.approvals.values()] : []), hostError, retry, linkError, browserConsent, agentBrowser }
     }
 
     const requireRemote = (id) => {
@@ -558,6 +600,13 @@ export const plugin = {
     // addressed by tagging their ids (`h:<hostId>:<id>`, lib/host-router.mjs). The
     // router patches the gateway in place; on a carrier mismatch it patches
     // nothing and reports why, and the UI keeps working locally.
+    //
+    // Both A1.1 wrappers (the carrier and, since revision 8, the attachment route)
+    // are self-tested against the SAME pinned version, resolved once so the two
+    // can never disagree about which DSH they are running on. `testDshVersion` is
+    // the same kind of seam as the gateway's `testActivationHold`: test-only,
+    // never a config key.
+    const dshVersion = typeof options.testDshVersion === 'string' ? options.testDshVersion : resolveDshRuntimeVersion()
     const hostRouter = options.remoteSessions === false ? null : createHostRouter({
       gateway: typeof ctx.get === 'function' ? ctx.get('typertGateway', false) : undefined,
       // Only a live connection can serve a routed call; an offline or unknown id
@@ -596,13 +645,34 @@ export const plugin = {
       cache: sessionCache,
       // Constitution A1.1: the wrapper is enabled only on the pinned `engines.dsh`
       // the self-test was written for; an unknown or different version means no
-      // wrap and a reason the Devices page shows. `testDshVersion` is the same kind
-      // of seam as the gateway's `testActivationHold`: test-only, never a config key.
-      dshVersion: typeof options.testDshVersion === 'string' ? options.testDshVersion : resolveDshRuntimeVersion(),
+      // wrap and a reason the Devices page shows.
+      dshVersion,
       log,
     })
     hostRouter?.install()
     if (hostRouter) log(`multi-host routing: ${hostRouter.status().remote ? 'active' : `off (${hostRouter.status().reason})`}`)
+
+    // Spec 013 (contract revision 8, A1.1 amendment v1.3.0): the native composer
+    // uploads attachment bytes over `POST /api/session/uploadFileBinary`, outside
+    // `dispatchRpc`, so the carrier wrapper cannot see them. This one wraps that
+    // route's live record on the `connection` service — nothing else — and only a
+    // host-tagged `sessionId` leaves the local Host.
+    const uploadRoute = options.remoteSessions === false ? null : createUploadRoute({
+      connection: typeof ctx.get === 'function' ? ctx.get('connection', false) : undefined,
+      // The same guarded dial every other remote route uses: an unpaired, revoked
+      // or unreachable host throws, and the upload answers in the route's own
+      // envelope instead of waiting for bytes that will never go.
+      connect: async (hostId) => {
+        const remote = REMOTE_ID.test(hostId) ? store.get(hostId) : undefined
+        if (!remote) throw new RemoteInputError(`${hostId} is not one of this Host's paired remotes`, 404, 'not-found')
+        const entry = await connected(remote)
+        return { connection: entry.connection, name: remote.name }
+      },
+      dshVersion,
+      log,
+    })
+    uploadRoute?.install()
+    if (uploadRoute) log(`remote attachments: ${uploadRoute.status().wrapped ? 'active' : `off (${uploadRoute.status().reason})`}`)
 
     for (const remote of store.list()) if (!remote.revoked) attach(remote)
 
@@ -732,6 +802,38 @@ export const plugin = {
       return view(store.get(id))
     }
 
+    /**
+     * The `wss://` endpoint an address edit (`PATCH /devices/remotes/:id`) may store.
+     * Same rules the add-remote path applies (`otpDialUrl`/`resolveDialUrl`): wss only,
+     * no credentials/query/fragment, private networks unless public remotes are enabled.
+     * An edit names a listener rather than a pairing offer, so the port is mandatory —
+     * the port is exactly what a Tailscale move changes. A bare `host:port` keeps the
+     * pairing's own path, so a custom gateway path is not silently reset to `/ws/mobile`.
+     */
+    const editDialUrl = (value, remote) => {
+      const typed = typeof value === 'string' ? value.trim() : ''
+      if (!typed) throw new RemoteInputError('an address (ip:port) is required')
+      let url
+      try {
+        url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(typed) ? typed : `wss://${typed}`)
+        if (url.protocol !== 'wss:' || url.username || url.password || url.search || url.hash) throw new Error('parts')
+      } catch { throw new RemoteInputError('the address must look like 192.168.1.20:3081') }
+      // The URL parser drops a default port (`:443` -> ''), so test what was TYPED: an
+      // explicit `:<digits>` (after the optional `[v6]` bracket) in the authority counts.
+      const authority = typed.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[/?#]/)[0].replace(/^[^@]*@/, '')
+      // Bracketed IPv6 (`[::1]:3081`) or a single-colon `host:port`; a bare IPv6 has no port.
+      if (!/^(?:\[[^\]]*\]|[^:[\]]*):\d+$/.test(authority)) {
+        throw new RemoteInputError('the address must include a port')
+      }
+      if (!options.allowPublicRemotes && !isPrivateAddress(url.hostname)) {
+        throw new RemoteInputError('only private-network addresses are allowed (public addresses are disabled by default)', 403, 'forbidden')
+      }
+      if (url.pathname === '/' || url.pathname === '') {
+        try { url.pathname = new URL(remote.publicUrl).pathname } catch { /* keep the default path */ }
+      }
+      return url.toString()
+    }
+
     const handler = async (req, res) => {
       try {
         // FR5: every request, read or write, comes from this machine. The
@@ -780,6 +882,45 @@ export const plugin = {
           sendJson(res, 404, { error: 'not-found' })
           return
         }
+        // Spec 016 Phase 3: the "Browser (agent)" tab. `frame` is the screencast the
+        // tab polls, `stop` is the kill switch. Both are useless without this host's
+        // consent, which is re-read on every request.
+        if (parts[0] === 'devices' && parts[1] === 'browser') {
+          if (!browsers) throw new RemoteInputError('the agent browser is disabled on this machine', 404, 'not-found')
+          const remote = requireRemote(parts[2])
+          if (remote.browserConsent !== true) {
+            throw new RemoteInputError('this host is not allowed to drive a browser on this machine', 403, 'browser/denied')
+          }
+          if (parts.length === 4 && parts[3] === 'frame' && req.method === 'GET') {
+            // The tab polls from the DSH page itself, so this request's Host is the
+            // app's own origin: the agent may never open it (the same rule the native
+            // embedded browser applies to DSH itself).
+            browsers.blockOrigin(req.headers.host)
+            const frame = await browsers.forHost(remote.id).start().then((browser) => browser.frame(), (error) => {
+              throw error instanceof RemoteInputError ? error : new RemoteInputError(
+                error?.message ?? 'the agent browser could not start', 503, error?.code ?? 'browser/not-supported')
+            })
+            if (!frame) {
+              // No frame yet: the tab keeps its placeholder instead of an error.
+              res.writeHead(204, { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' })
+              res.end()
+              return
+            }
+            sendBytes(res, 200, 'image/jpeg', frame.data)
+            return
+          }
+          if (parts.length === 4 && parts[3] === 'stop' && req.method === 'POST') {
+            // Exactly one answer for a command in flight: the owner's Stop is a
+            // cancel, so the host learns why no result came instead of timing out.
+            live.get(remote.id)?.connection.browser?.cancelAll('the owner stopped the agent browser')
+            browsers.stopHost(remote.id)
+            log(`agent browser for ${remote.id}: stopped by the owner`)
+            sendJson(res, 200, { stopped: true })
+            return
+          }
+          sendJson(res, 404, { error: 'not-found' })
+          return
+        }
         if (parts[0] !== 'devices' || parts[1] !== 'remotes') { sendJson(res, 404, { error: 'not-found' }); return }
         const id = parts[2]
         const action = parts[3]
@@ -790,17 +931,55 @@ export const plugin = {
             sendJson(res, 200, {
               remotes: store.list().map(view),
               routing: hostRouter ? hostRouter.status() : { remote: false, reason: 'disabled', hosts: [], merged: [] },
+              // Spec 013: whether attachment bytes can reach a remote Host, and why
+              // not (A1.1 requires the failure mode to be visible).
+              uploads: uploadRoute ? uploadRoute.status() : { route: null, wrapped: false, reason: 'disabled' },
             })
             return
           }
           if (req.method === 'POST') { sendJson(res, 201, { remote: await addRemote(await readBody(req)) }); return }
         } else if (parts.length === 3) {
           if (req.method === 'GET') { sendJson(res, 200, { remote: view(requireRemote(id)) }); return }
+          // The other machine's Tailscale IP moved: edit the endpoint in place instead
+          // of forgetting the host and pairing it again. `id`, `name` and the pin stay
+          // exactly as the pairing recorded them — only `address`/`publicUrl` change.
+          if (req.method === 'PATCH') {
+            const remote = requireRemote(id)
+            const body = await readBody(req)
+            const publicUrl = editDialUrl(body.url, remote)
+            // The pin is what the pairing proved; an address edit must never re-pin
+            // (a different certificate then fails the dial as `pin-mismatch`).
+            if (body.certSha256 !== undefined && String(body.certSha256).toLowerCase() !== String(remote.certSha256).toLowerCase()) {
+              throw new RemoteInputError('an address edit never changes the certificate pin', 409, 'pin-immutable')
+            }
+            // Persist FIRST (one atomic rename, the same writer every other mutation
+            // uses): if the write throws, the record and the live link are untouched,
+            // so the edit cannot be half-applied.
+            const updated = store.update(id, { address: new URL(publicUrl).host, publicUrl })
+            // A DELETE can land while the body was being read (`requireRemote` ran before it).
+            if (!updated) throw new RemoteInputError('unknown remote device', 404, 'not-found')
+            // Then replace the live link: `attach()` captured the old `publicUrl` when
+            // the entry was built, so a surviving entry would keep dialling the address
+            // the owner just replaced. A revoked pairing has no token left to dial with.
+            const previous = live.get(id)
+            if (previous) { cancelRedial(previous); previous.connection.close() }
+            live.delete(id)
+            let entry = null
+            if (!updated.revoked) {
+              entry = attach(updated)
+              entry.connection.connect().catch((error) => { terminalFailure(store.get(id), entry, error) })
+            }
+            log(`remote ${id}: address updated to ${updated.address}`)
+            sendJson(res, 200, { remote: view(store.get(id)), state: entry ? entry.connection.state : 'offline' })
+            return
+          }
           if (req.method === 'DELETE') {
             requireRemote(id)
             const entry = live.get(id)
             if (entry) { cancelRedial(entry); entry.connection.close() }
             live.delete(id)
+            // A paired host that is forgotten must not leave its browser running.
+            browsers?.stopHost(id)
             store.remove(id)
             log(`removed remote ${id}`)
             sendJson(res, 200, { removed: true })
@@ -815,8 +994,30 @@ export const plugin = {
             sendJson(res, 200, { remote: view(store.get(id)), state: entry.connection.state })
             return
           }
-          if (req.method === 'GET' && action === 'sessions') {
-            const entry = await connected(remote)
+          // Spec 016 Phase 3: "Allow <host> to drive a browser on this machine".
+          // Off by default, per host, stored with the remote record. Turning it on or
+          // off redials the link when it is up, because the capability is advertised
+          // in `client-hello` and a stale hello would keep the host guessing.
+          if (req.method === 'POST' && action === 'browser') {
+            if (!browsers) throw new RemoteInputError('the agent browser is disabled on this machine', 404, 'not-found')
+            const body = await readBody(req)
+            if (typeof body.allow !== 'boolean') throw new RemoteInputError('allow must be true or false')
+            store.update(id, { browserConsent: body.allow })
+            if (!body.allow) {
+              live.get(id)?.connection.browser?.cancelAll('the owner withdrew browser consent')
+              browsers.stopHost(id)
+            }
+            const entry = live.get(id)
+            if (entry && entry.connection.state === 'online') {
+              // A fresh hello is the only way the capability changes on this link.
+              entry.connection.close()
+              entry.connection.connect().catch((error) => { terminalFailure(store.get(id), entry, error) })
+            }
+            log(`browser consent for ${remote.id}: ${body.allow ? 'on' : 'off'}`)
+            sendJson(res, 200, { remote: view(store.get(id)) })
+            return
+          }
+          if (req.method === 'GET' && action === 'sessions') {            const entry = await connected(remote)
             const frame = unwrap(await entry.connection.request({ type: 'sessions' }), 'sessions')
             sendJson(res, 200, { sessions: frame.items ?? [], approvals: [...entry.approvals.values()] })
             return
@@ -935,8 +1136,10 @@ export const plugin = {
 
     const teardown = () => {
       // First: stop routing, so no merged stream or remote call starts against
-      // connections that are about to be closed.
+      // connections that are about to be closed. The upload route goes with it, so
+      // a request that arrives after teardown reaches the native handler again.
       tearingDown = true
+      uploadRoute?.uninstall()
       hostRouter?.uninstall()
       hostListeners.clear()
       dispose?.()
@@ -945,6 +1148,8 @@ export const plugin = {
       }
       for (const entry of live.values()) { cancelRedial(entry); entry.connection.close() }
       live.clear()
+      // Spec 016 Phase 3: no browser outlives the plugin.
+      browsers?.dispose()
     }
     ctx.effect(() => teardown)
     // Cordis collects an `apply` result as a disposer: an async apply that
@@ -952,7 +1157,7 @@ export const plugin = {
     // (cordis lib/index.js `_execute` -> `safeCollect`). So the plugin exposes
     // its internals through this WeakMap instead of returning them, and the
     // teardown is registered exactly once, through the effect above.
-    internals.set(ctx, { store, live, handler, teardown, router: hostRouter })
+    internals.set(ctx, { store, live, handler, teardown, router: hostRouter, uploads: uploadRoute, browsers })
   },
 }
 
@@ -962,7 +1167,8 @@ export const plugin = {
  * the live profile read the same values through it.
  * @param {object} ctx the context `apply` was called with
  * @returns {{store: object, live: Map<string, object>, handler: Function,
- *   teardown: Function, router: object|undefined}|undefined}
+ *   teardown: Function, router: object|undefined, uploads: object|undefined,
+ *   browsers: object|null}|undefined}
  */
 export function internalsFor(ctx) {
   return internals.get(ctx)

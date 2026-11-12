@@ -49,6 +49,7 @@ const RUNTIME_CONSUMERS = [
   'lib/companion-access.mjs',
   'lib/index.mjs',
   'lib/remote-bridge.mjs',
+  'lib/remote-browser.mjs',
   'lib/devices.js',
 ]
 

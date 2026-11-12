@@ -82,6 +82,11 @@ export const TRANSPORT_ERROR = {
   insecureUrl: 'client/insecure-url',
   /** `pinned-ws` (A030): the HTTP upgrade was refused; `details.status` has 401/403/... */
   upgradeFailed: 'client/upgrade-failed',
+  /**
+   * The socket opened without the contract subprotocol (web build; a browser cannot pin, so the
+   * accepted `Sec-WebSocket-Protocol` is the one remaining proof that this is a companion Host).
+   */
+  protocolMismatch: 'client/protocol-mismatch',
 } as const;
 
 export type TransportErrorCode = (typeof TRANSPORT_ERROR)[keyof typeof TRANSPORT_ERROR];

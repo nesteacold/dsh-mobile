@@ -105,7 +105,7 @@ ported screen are placed next to the matching Clarklevis render for the owner, w
 
 ## Status 2026-11-10 (measured on the emulator against the live gateway)
 
-**Verified working end to end on a real device** — `the Android emulator`, app built from this tree, paired
+**Verified working end to end on a real device** — `emulator-5554`, app built from this tree, paired
 through the real `pairing-challenge` → `pairing-proof` → owner approval → `paired` → `hello` flow with a
 device holding `sessions:author`:
 

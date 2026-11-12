@@ -1,0 +1,48 @@
+# Allowlist for tools/scan-pii.mjs — one exemption per line: `category:substring`.
+# A finding is exempt only when its own line contains the substring (backslash escaping
+# is normalised first), so listing one path never hides another one on the line.
+# Keep this file short: an entry is a decision that a specific literal, in a specific
+# place, is a documented placeholder rather than personal information. Every entry
+# says where it comes from and why.
+#
+# Categories: email, tailscale_ip, tsnet, windows_user_path, hostname, private_key, token
+
+# Kubernetes-style "some user's home" used as an example path in document text and
+# fixtures (docs write `C:\Users\me\DXVK_Project`, and the tests use `x` to stand for
+# any user). Not a real account name.
+windows_user_path:Users\me
+windows_user_path:Users\x
+windows_user_path:Users\remote
+
+# The documented placeholder host for the remote iOS build; the script has to put
+# *some* well-formed tailnet name in its help line.
+tsnet:mac-host.tailnet.ts.net
+
+# RFC 2606 reserved domain, used in another project's fixture as a stand-in address.
+email:secret@example.com
+email:ops@example.com
+
+# Tailscale CGNAT addresses in *documentation* examples and test fixtures: they stand
+# in for "any tailnet peer" and were never a real machine (100.64.0.10 has been in
+# this gateway's docs and tests since the upstream fork, before this repo existed).
+# Real host addresses are still findings.
+tailscale_ip:100.64.0.1
+tailscale_ip:100.64.0.7
+tailscale_ip:100.64.0.8
+tailscale_ip:100.64.0.9
+tailscale_ip:100.64.0.10
+tailscale_ip:100.64.0.11
+tailscale_ip:100.64.0.12
+tailscale_ip:100.64.0.99
+tailscale_ip:100.64.1.1
+tailscale_ip:100.64.1.2
+tailscale_ip:100.64.256.1
+tailscale_ip:100.64.0.0
+tailscale_ip:100.99.0.1
+tailscale_ip:100.100.1.9
+tailscale_ip:100.100.10.20
+tailscale_ip:100.127.255.254
+tailscale_ip:100.127.255.255
+
+# RFC 6761 reserved .test domain: URL-userinfo fixture proving the passkey origin parser rejects credentials in an Origin (plugins/mobile-gateway/test/passkey.test.mjs).
+email:pass@host.example.test

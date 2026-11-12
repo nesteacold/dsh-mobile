@@ -125,6 +125,31 @@ test('断开连接、超时和停止清理；新请求不能绕过已关闭的�
   assert.equal((await f.open(Buffer.from('e'), {}, other)).code, 'file-upload-cancelled')
 })
 
+test('非网关错误只把通用文案返回给客户端，真实错误留在本地日志', async t => {
+  // A Host exception (or a filesystem error) is not a contract code, and its text
+  // can name a Host path: the device is told "File upload failed", the Host log
+  // keeps the real one.
+  const logged = []
+  const f = fixture({ log: line => logged.push(line) })
+  t.after(() => f.manager.dispose())
+  const bytes = Buffer.from('abc')
+  const { uploadId } = await f.open(bytes)
+  // A code this gateway mints keeps its own text, unchanged.
+  assert.equal((await f.chunk(uploadId, bytes, 1)).message, 'offset must equal the next expected byte')
+  await f.chunk(uploadId, bytes)
+  f.api.files.upload = async () => {
+    throw Object.assign(new Error("ENOENT: no such file or directory, open 'C:\\Temp\\dsh-mobile-upload-x\\payload'"),
+      { code: 'ENOENT' })
+  }
+  const failed = await f.send('file-upload-finish', { uploadId })
+  assert.equal(failed.kind, 'error')
+  assert.equal(failed.code, 'ENOENT', 'the code is reported as it came, not rewritten')
+  assert.equal(failed.message, 'File upload failed', 'no Host path reaches the device')
+  assert.equal(JSON.stringify(failed).includes('dsh-mobile-upload-x'), false)
+  assert.equal(logged.some(line => line.includes('file upload file-upload-finish failed: ENOENT')
+    && line.includes('dsh-mobile-upload-x')), true, 'the real failure is logged locally')
+})
+
 test('Host 提交中取消会传播 signal，不能产生完成帧；同上传并发 finish 被拒绝', async t => {
   const f = fixture()
   t.after(() => f.manager.dispose())

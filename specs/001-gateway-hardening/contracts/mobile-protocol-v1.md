@@ -60,7 +60,11 @@ QR/manual text = **unpadded base64url** of UTF-8 JSON (same encoding as upstream
   "gatewayId": "...", "dshVersion": "0.2.2-rc.1", "certSha256": "<hex>" }
 ```
    `capabilities` on the companion channel are exactly the package `CAPABILITIES` the gateway supports;
-   `push-v1` is added only when remote push is configured.
+   `push-v1` is added only when remote push is configured; `session-rename` and `session-archive` are
+   added only when the device holds `sessions:author` (revision 11); `permission-lower` is added only
+   when the device holds `permission:lower` (revision 13). Revision 14 adds `webLock` **only** when the
+   device holds `web:unlock`: `"unregistered"` (no passkey on this device yet), `"locked"` (a passkey
+   exists, this socket has not asserted yet) or `"unlocked"` (§14).
 6. Client sends `{ "type": "client-hello", "requestId": "...", "companionProtocol": 1, "appVersion": "x.y.z", "platform": "ios|android" }`.
    Server answers `{ "kind": "client-hello", "requestId": "...", "accepted": true }` or an error
    `protocol/unsupported` (with `minClientVersion`) and closes.
@@ -70,7 +74,7 @@ disabled **or any plaintext (non-TLS) source that is not loopback**. Companion d
 (`Authorization: Bearer`, `dsh-auth.`, `dsh-pair.`) are accepted **only on the gateway's own TLS
 listener**: on the shared plaintext web-server upgrade the same credential gets `401 auth/required`.
 This is not negotiable — the pin is only enforced on the TLS listener, so a plaintext token would
-bypass it. Close codes: `4004` gateway disabled (stop auto-reconnect), `4003` re-authenticate, `4401` revoked.
+bypass it. Close codes: `4004` gateway disabled (stop auto-reconnect), `4003` re-authenticate, `4401` revoked, `4412` locked (revision 14: this web device's passkey was replaced elsewhere, or its replacement was approved — re-assert; keep the credential, unlike `4401`).
 
 ### 3.7 Request framing rules (applies to every §4 operation)
 
@@ -160,7 +164,7 @@ The op identity is the `type` value. Anything else → error `op/forbidden`.
 |---|---|---|---|
 | `client-hello` | `companionProtocol`, `appVersion`, `platform` | `client-hello` | §3 |
 | `ping` | — | `pong` | keep-alive, every 25 s |
-| `sessions` | — | `sessions` `{items[]}` | upstream list projection (title in `projections.values.title`) |
+| `sessions` | — | `sessions` `{items[]}` | upstream list projection (title in `projections.values.title`; spec 018: optional `projections.values.agentPreset`, a preset id matching `^[A-Za-z0-9._:-]{1,64}$`, omitted otherwise — view only) |
 | `search` | `query` | `search` | |
 | `history` | `sessionId`, `beforeSeq?`, `maxMessages?`, `maxBytes?` | `history` | upstream paging |
 | `subscribe` | `sessionId` | `subscribed` | starts `event` pushes + replays pending approvals |
@@ -176,6 +180,8 @@ The op identity is the `type` value. Anything else → error `op/forbidden`.
 | `session-create` | `requestId`, `workspaceId?` \| `cwd?`, `title?` | `session-created` | revision 7, scope `sessions:author`; the workspace must exist on that Host. A device without `workspace:manage` MUST name a non-blank `workspaceId` and may not send `cwd` or `agentPreset` (any value, including `null`): refused `remote/argument-denied` with no Host call |
 | `models` | `sessionId?` | `models` | revision 7, scope `sessions:author`: the catalog, or one session's models |
 | `select-model` | `sessionId`, `provider`, `model`, `reasoningEffort?` | `select-model` | revision 7, scope `sessions:author`; session-scoped, never Host settings |
+| `session-rename` | `sessionId`, `title` | `session-renamed` `{sessionId, title, seq}` | revision 11, scope `sessions:author`; session-scoped (the session must be visible to the device); `title` trimmed, non-empty, at most 200 code points, else `bad-request`. Decided on `{kind:'session', id}` |
+| `session-archive` | `sessionId` | `session-archived` `{sessionId, archivedSessionIds}` | revision 11, scope `sessions:author`; session-scoped, a device may archive only a session it can see. Decided on `{kind:'session', id}` |
 
 ## 5. Approvals
 
@@ -227,6 +233,12 @@ Final state push: `{ "kind": "approval-resolved", "rpcId", "sessionId", "approva
 | `protocol/unsupported` | — | companion protocol version mismatch |
 | `bad-request` | — | invalid params |
 | `session-not-found` | — | host error passthrough |
+| `auth/locked` | — | revision 14: a `web:unlock` device that has not passed a passkey assertion on this socket; `reason` one of `locked`, `unregistered`, `rate-limited` (§14.5) |
+| `passkey/not-registered` | — | revision 14: `passkey-assert` on a device with no passkey (§14.4) |
+| `passkey/already-registered` | — | revision 14: `passkey-register` when this device already has one — replacing it needs the owner's approval on the Host (§14.4) |
+| `passkey/challenge-expired` | — | revision 14: no live challenge for this socket (expired, already used or never requested) |
+| `passkey/verification-failed` | — | revision 14: the attestation/assertion did not verify; no detail beyond the code |
+| `passkey/rate-limited` | — | revision 14: failed passkey operations exceeded §14.5's rate limits |
 
 Other host error codes (e.g. `agent-busy`, `internal`) may be passed through unchanged; clients show a
 generic error for codes they do not know.
@@ -266,7 +278,8 @@ as a bare id. An absolute path, member session ids, timestamps and the archive l
 device without `workspace:manage`.
 
 Everything else stays refused for every device, whatever scopes it holds: creating, renaming or
-archiving a workspace; forking, renaming or archiving a session; queue control; attachments; slash
+archiving a workspace; forking a session (renaming and archiving a session join in revision 11);
+queue control; attachments; slash
 commands; `settings/*`; the plugin and schedule families. Feature 012 turns that list into the single
 hard blocklist and makes every other capability grantable per device.
 
@@ -304,3 +317,458 @@ workspace binding at all, so it can neither list nor create. Every workspace-ind
 refused for every device.
 
 
+
+## Revision 8 (spec 013, additive)
+
+Attaching files and images from the desktop client to a session on a **remote** Host. The bytes travel
+over the existing pinned, per-device-authenticated WebSocket as chunked frames — no new listener, no
+new port, no HTTP route. The Host stages them through its own upload service, so the result is exactly
+what the native `POST /api/session/uploadFileBinary` route returns.
+
+### 8.1 Scope
+
+One new scope, `attachments:write`:
+
+- It is **grantable to a `desktop` device** and is part of `DESKTOP_DEFAULT_SCOPES` — a desktop offer
+  gets it unless the owner unticks it on the Devices page (spec 012: everything grantable is on by
+  default). It is not in `DESKTOP_ONLY_SCOPES`, because that list means "explicit only".
+- It is in `NEVER_DEFAULT_SCOPES`, so no **kind-independent** default acquires it: the mobile-offer
+  default and the pre-005 migration (a record written before `kind`/`scopes` existed) never contain it.
+  **Existing paired devices are not migrated to it**: a record keeps exactly the scopes it holds, and an
+  owner grants the new one through the Devices page.
+- It is in `SCOPE_PRESETS.full` (every contract scope) and not in `standard`.
+- Frame types `remote-upload-open|-chunk|-finish|-cancel` are the only four types that map to it
+  (`SCOPE_BY_TYPE`). A device without the scope is answered `auth/forbidden-scope` with
+  `scope: "attachments:write"` before any Host work.
+
+### 8.2 Frames
+
+All four frames are **not** §4 operations: `OPS` is unchanged, and `op/forbidden` remains the answer for
+any type outside the vocabulary. They require `client-hello` to have been accepted, and a `requestId`
+of 1–64 characters from `[A-Za-z0-9._-]` (§3.7). Each frame is answered with exactly one
+`remote-upload-result` that echoes its `requestId`:
+
+```json
+{ "kind": "remote-upload-result", "requestId": "...", "ok": true, "value": { } }
+{ "kind": "remote-upload-result", "requestId": "...", "ok": false,
+  "error": { "code": "file-upload-offset", "message": "...", "details": { } } }
+```
+
+`error.code` is the gateway's stable transfer code or the Host's own code, `error.message` is short
+display text, and `error.details` is present only when the Host supplied details (for example
+`{ "reason": "UNSUPPORTED_IMAGE_TYPE" }`). A failure never arrives as a `kind: "error"` frame: it is a
+normal result with `ok: false`.
+
+#### `remote-upload-open` → opened value
+
+```json
+{ "type": "remote-upload-open", "requestId": "...", "sessionId": "s-1", "kind": "file",
+  "name": "report.pdf", "size": 123456, "sha256": "<64 lowercase hex>" }
+{ "type": "remote-upload-open", "requestId": "...", "sessionId": "s-1", "kind": "image",
+  "name": "photo.png", "mediaType": "image/png", "size": 2048, "sha256": "<64 lowercase hex>" }
+```
+
+- `sessionId` is the **untagged, remote-local** session id (never `h:<host>:<id>`): the id this Host
+  listed to that device. `kind` is `file` or `image`. `name` is an optional display name (a leaf
+  filename, 1–255 characters, no control characters, no `/` or `\`). `mediaType` is REQUIRED for
+  `kind: "image"` and MUST be absent otherwise. `size` is the exact decoded byte count of the whole
+  file, `sha256` its digest over the whole file (verified at `finish`).
+
+```json
+{ "kind": "remote-upload-result", "requestId": "...", "ok": true,
+  "value": { "uploadId": "<uuid>", "sessionId": "s-1", "kind": "file", "name": "report.pdf",
+             "size": 123456, "chunkBytes": 262144, "maxBytes": 536870912, "idleTimeoutMs": 120000 } }
+```
+
+`chunkBytes` is the effective chunk limit for this transfer (`min(256 KiB, the gateway's payload
+budget)`); `maxBytes` is the configured `fileUploadMaxBytes` (512 MiB by default); `idleTimeoutMs` is
+`fileUploadIdleMs` (2 minutes by default). `mediaType` is echoed for `kind: "image"`.
+
+#### `remote-upload-chunk` → accepted value
+
+```json
+{ "type": "remote-upload-chunk", "requestId": "...", "uploadId": "<uuid>", "offset": 0, "data": "<base64>" }
+{ "kind": "remote-upload-result", "requestId": "...", "ok": true,
+  "value": { "uploadId": "<uuid>", "sessionId": "s-1", "nextOffset": 262144 } }
+```
+
+`data` MUST be **canonical** standard base64 of at most `chunkBytes` decoded bytes, and `offset` MUST
+equal the bytes already accepted (`nextOffset`, starting at 0). Chunks are strictly sequential: the
+client waits for `nextOffset` before sending the next one; there is no pipelining and no resumption
+across connections.
+
+#### `remote-upload-finish` → the Host's receipt
+
+```json
+{ "type": "remote-upload-finish", "requestId": "...", "uploadId": "<uuid>" }
+{ "kind": "remote-upload-result", "requestId": "...", "ok": true,
+  "value": { "receiptId": "<opaque>",
+             "file": { "attachmentId": "sha256:...", "name": "report.pdf", "bytes": 123456 } } }
+```
+
+or, for `kind: "image"`:
+
+```json
+{ "kind": "remote-upload-result", "requestId": "...", "ok": true,
+  "value": { "receiptId": "<opaque>",
+             "image": { "attachmentId": "sha256:...", "mediaType": "image/png",
+                        "bytes": 2048, "width": 640, "height": 480 } } }
+```
+
+`value` is the **remote Host's own upload result, passed through opaque** — the very object the native
+`POST /api/session/uploadFileBinary` route answers with. The client MUST NOT rebuild it: it sends
+`{ "type": "file" | "image", "receiptId": "..." }` in its next `message` and the Host resolves the
+receipt for that session's agent. Repeating `finish` for the same `uploadId` on the same connection
+returns the same receipt and stores nothing twice.
+
+#### `remote-upload-cancel` → cancelled value
+
+```json
+{ "type": "remote-upload-cancel", "requestId": "...", "uploadId": "<uuid>" }
+{ "kind": "remote-upload-result", "requestId": "...", "ok": true,
+  "value": { "uploadId": "<uuid>", "sessionId": "s-1", "cancelled": true } }
+```
+
+Cancelling is idempotent only in the sense that a second `cancel` answers `file-upload-not-found`: the
+partial spool is already gone. Closing the socket, revoking the device or an idle timeout frees the
+partial data the same way; a cancelled or expired transfer never produces a receipt.
+
+### 8.3 Mandatory checks
+
+Each one is refused before the next step runs, and each has a named test in
+`plugins/mobile-gateway/test/remote-upload.test.mjs`:
+
+| # | Check | Refusal |
+|---|---|---|
+| 1 | `attachments:write` on a **live** credential (`scopeDenial`) | `auth/forbidden-scope` (`scope: "attachments:write"`) |
+| 2 | the device kind is `desktop` | `auth/forbidden-scope` (`scope: "attachments:write"`) |
+| 3 | the session is visible to this device (`sessions:read` + the Host's visible set) | `session-not-found` |
+| 4 | `offset` equals the bytes already accepted (monotonic) | `file-upload-offset` |
+| 5 | `data` is canonical base64 of at most `chunkBytes` decoded bytes | `file-upload-invalid-data` |
+| 6 | the whole-file `sha256` matches at `finish` | `file-upload-checksum` |
+| 7 | `size` ≤ `fileUploadMaxBytes` | `file-too-large` |
+| 8 | a chunk never exceeds `size` | `file-upload-size` |
+| 9 | at most `fileUploadMaxTransfers` (default 4) concurrent transfers **per device** | `file-upload-limit` |
+| 10 | an idle transfer (no frame for `fileUploadIdleMs`) is expired and its spool deleted | `file-upload-not-found` afterwards |
+| 11 | `kind: "image"`: `mediaType` is one the Host accepts (`ctx.attachments.imageLimits.mediaTypes`: `image/png`, `image/jpeg`, `image/webp`, `image/gif`) | `session/attachment-invalid` (`details.reason: "UNSUPPORTED_IMAGE_TYPE"`) |
+
+The Host's own admission still runs on top: its attachment store enforces `maxImageBytes`,
+`maxImagePixels` and `maxImageDimension` for images, its normalizer may re-encode an image (so the
+receipt's `bytes`/`width`/`height` are the stored image, not the uploaded bytes), and a session that
+disposed mid-transfer is refused `session/not-found`. Every Host failure reaches the client as
+`ok: false` with the Host's `code` and `details`.
+
+The generic RPC `fileUploads/upload` stays **denied** over the remote bridge (it is not on the
+endpoint allowlist, so it answers `op/forbidden`), and so does every entry of the existing deny list.
+`session/attachment` — the read used to render an image preview — stays on the allowlist under
+`sessions:read` (revision 4) and needs no change for this revision.
+
+### 8.4 Error codes
+
+| code | Meaning | Client behaviour |
+|---|---|---|
+| `auth/forbidden-scope` | no `attachments:write`, or the device is not a `desktop` | hide the attach control |
+| `session-not-found` | the session is not visible to this device | treat as a gone session |
+| `bad-request` | malformed frame (missing/invalid `requestId`, `kind`, `name`, `size`, `sha256`, `offset`) | fix the request; never retry blindly |
+| `file-upload-disabled` | the owner disabled uploads (`fileUploadsEnabled: false`) | show "attachments are off" |
+| `file-upload-unavailable` | the Host's upload service is missing or not streaming | show "this Host cannot receive attachments" |
+| `file-too-large` | `size` exceeds `fileUploadMaxBytes` | show the limit, refuse the file |
+| `file-upload-limit` | too many concurrent transfers for this device | queue the transfer |
+| `file-upload-not-found` | unknown, foreign, expired or cancelled `uploadId` | restart the transfer |
+| `file-upload-offset` | `offset` is not the next expected byte | restart the transfer |
+| `file-upload-invalid-data` | not canonical base64, or longer than `chunkBytes` | restart the transfer |
+| `file-upload-size` | the chunk would exceed `size` | restart the transfer |
+| `file-upload-incomplete` | `finish` before every declared byte arrived | keep sending, then finish again |
+| `file-upload-checksum` | the bytes do not match the declared `sha256` | restart the transfer |
+| `file-upload-busy` | another operation on the same transfer is running | wait and retry |
+| `file-upload-timeout` | the Host's staging call timed out | show "the computer is slow", retry |
+| `file-upload-cancelled` | cancelled by either side, or the socket closed | drop the transfer |
+| `file-upload-failed`, `file-upload-invalid-response` | the Host could not stage the bytes, or its answer was not a receipt | show a generic error |
+| `session/attachment-invalid` | the Host refused the image (`details.reason`) or the session disposed | show the reason, refuse the file |
+| `gateway/internal` | unexpected Host failure | show a generic error |
+
+Any code a client does not know gets the same generic "could not attach the file" treatment, exactly
+as §5a says for unknown error codes.
+
+## Revision 9 (companion parity with Clarklevis dsh-mobile, additive)
+
+### 9.1 Workspace identity on session rows
+
+Optional fields `workspaceId` (string, the id op `workspaces` returns) and `workspaceLabel` (string,
+the same basename as that op's `name`) on: each item of op `sessions`, each `session-status` event, and
+`session-created`. Rules:
+
+- Source is the Host's own attach relation (`workspace.sessionIds`), resolved server-side; DSH session
+  records carry no `workspaceId` (measured 2026-11-11). A sub-agent inherits its parent's workspace.
+- A session the Host attributes to no workspace carries **neither** field (absent, never `null`).
+- Only an id and a basename — never a path. Granted to every device that may already see the row
+  (rows already carry `cwd`, so the basename discloses nothing new); independent of `sessions:author`.
+  `workspaces.sessionIds` stays stripped for devices without `workspace:manage`.
+
+### 9.2 History wire shape (correction of §4 / clarification §5a)
+
+The `history` reply carries the Host's DSH events verbatim — `{kind:"history", events:[{type, seq,
+time, data}]}` — and **not** `{seq, role, text, createdAt}` rows; `items`/`messages` are absent
+(measured). Live pushes are `kind:"event"` frames reshaped by the gateway (`user/message`,
+`assistant/message` with `text`), likewise without `role`. Clients derive the role from `type`:
+`user/message` → user, `assistant/message` → assistant, `tool/call`/`tool/result` → tool; turn, step,
+llm, title, job and other bookkeeping events are not rendered. Rows that already carry `role` keep the
+old meaning.
+
+## Revision 10 (spec 016 Phase 3 — the host drives a browser on the client, additive)
+
+The first **host-initiated** request/response on the link: until now every request came from the
+client. Additive — `OPS` (§4) does not change, no type gains a `SCOPE_BY_TYPE` entry, and the wire
+protocol stays v1. Owner decision 2026-11-11 (spec 016 Phase 3, option 2): the browser a host drives
+lives on the CLIENT, in the plugin's own tab with its own storage partition, driven over the pinned
+link. Two keys are required, neither implies the other (§10.5).
+
+### 10.1 Capability
+
+`browser-agent:1` is an **optional** capability, never part of the required `CAPABILITIES`:
+
+- the gateway adds it to `hello.capabilities` when its browser bridge is available;
+- a client lists it in the optional `capabilities` array of `client-hello` when it can answer a
+  `browser-command` (a client that omits the field is simply not a target). Unknown names in that
+  array are ignored, so an older gateway and an older client keep working unchanged.
+
+### 10.2 Frames
+
+| direction | frame | shape |
+|---|---|---|
+| host → client | `browser-command` | `{ "kind": "browser-command", "commandId": "c1", "sessionId": "s1", "op": "screenshot", "args": {}, "deadlineMs": 30000 }` |
+| client → host | `browser-result` | `{ "type": "browser-result", "commandId": "c1", "ok": true, "result": { … } }` or `{ "type": "browser-result", "commandId": "c1", "ok": false, "error": { "code": "browser/denied", "message": "…" } }` |
+| host → client | `browser-cancel` | `{ "kind": "browser-cancel", "commandId": "c1" }` |
+| client → host | `browser-cancel` | `{ "type": "browser-cancel", "commandId": "c1" }` |
+
+- `commandId` is 1..64 characters of `[A-Za-z0-9._-]` — the same shape as a `requestId` — and it is
+  the ONLY correlation key: these frames are not §4 operations, so the §1 `requestId` echo rule does
+  not apply to them.
+- `op` is exactly one of `navigate`, `click`, `type`, `press`, `scroll`, `open`, `close`, `snapshot`,
+  `text`, `html`, `screenshot`, `tabs`. Any other value is refused `bad-request` before a device sees
+  the frame; a client MUST NOT invent an op.
+- `args` is an object (absent ⇒ `{}`). `sessionId` is the session whose agent asked, so the client can
+  show which session is driving.
+- Exactly one `browser-result` per `commandId`. A result whose id is unknown, already settled, or
+  issued to a different device is ignored (never applied, never answered).
+- `browser-cancel` may arrive from either side: the host abandons a command (deadline, abort, device
+  revoked), or the client declines one it was given. A cancelled command gets no result.
+
+### 10.3 Limits
+
+| limit | value | enforced where |
+|---|---|---|
+| complete frame, serialized | ≤ 1048576 bytes (1 MiB), either direction | host before send (`browser/frame-too-large`), client before answering |
+| deadline | default 30000 ms, maximum 120000 ms | host; a larger `deadlineMs` is clamped, not refused |
+| screenshot | JPEG, ≤ 786432 decoded bytes (768 KiB) | client shrinks it; the host refuses an oversized frame |
+| `text` / `html` | cut at 262144 bytes (256 KiB) | client cuts and sets `truncated: true`; the host cuts again rather than storing more |
+
+### 10.4 Mandatory checks (host side, in this order, before a frame is sent)
+
+1. the target device is paired and its credential is live (`browser/unknown-target` otherwise);
+2. the device has a ready connection (`browser/offline`) — checked before the capability,
+   because the capability is advertised on a live connection;
+3. the device advertised `browser-agent:1` in its `client-hello` (`browser/not-supported`);
+4. the device's live grant includes `browser:control` (`browser/forbidden-scope`);
+5. no other command is in flight for that device (`browser/busy`) — one at a time per device;
+6. the frame fits §10.3 (`browser/frame-too-large`);
+7. the deadline starts when the frame is sent; on expiry the host sends `browser-cancel` and answers
+   `browser/timeout`.
+
+A revocation, or the removal of `browser:control`, takes effect **immediately**: an in-flight command
+is cancelled (`browser/forbidden-scope` when the grant went away, `browser/offline` when the device's
+connection closed) and its late result is ignored.
+
+### 10.5 Error codes
+
+| code | meaning | who sends it |
+|---|---|---|
+| `browser/not-supported` | the device never advertised `browser-agent:1`, or this host has no bridge | host |
+| `browser/forbidden-scope` | no `browser:control` on the device, or the grant was removed mid-flight | host |
+| `browser/offline` | the device is not connected | host |
+| `browser/timeout` | the deadline expired; a `browser-cancel` was sent | host |
+| `browser/cancelled` | either side cancelled | host |
+| `browser/busy` | a command is already in flight for that device | host |
+| `browser/unknown-target` | not a paired device id, or the credential is revoked | host |
+| `browser/bad-request` | malformed frame (§10.2) | either side |
+| `browser/frame-too-large` | over §10.3 | either side |
+| `browser/denied` | the client's own consent setting is off for this host | client |
+| `browser/not-found` | unknown tab/page id | client |
+
+A client may return any `browser/…` code it needs; the host shows a generic error for a code it does
+not know, as §5a says for unknown codes.
+
+### 10.6 Target resolution and the `remoteSessionScope` service
+
+A tool asks for a target: `auto` | `host` | `<deviceId>`. `auto` is the last device that **prompted**
+this session ("driven") when it is connected, capable and granted — otherwise `host`, i.e. the local
+owner's own browser. The gateway records the last prompt device per session from two places: the
+remote-bridge `session/prompt` call it forwards, and a companion `message` op. A prompt the gateway did
+not proxy is the local owner's (no device). A frame without a `sessionId` records nothing.
+
+The gateway publishes that as two host services (spec 014 C6):
+
+```js
+ctx.provide('remoteSessionScope', {
+  describe(session) { return { driven: 'remote', deviceId: 'dev-1', scopes: ['browser:control', …] } },
+})
+ctx.provide('remoteBrowser', {
+  targets(sessionId),                       // [{ id: 'host' | deviceId, name, connected, capable, granted }]
+  send(target, sessionId, op, args, signal) // → { ok: true, value } | { ok: false, error: { code, message } }
+})
+```
+
+`driven: 'local'` means the local owner's session (no scope needed); anything undeterminable is
+reported as remote, per C6.
+
+**Two keys, never one:** the host needs the `browser:control` grant on the device AND the client needs
+its own "allow the paired host to drive a browser on this machine" setting (off by default, per
+host). Every result that carries page content is wrapped as untrusted page content on the host, and
+the client keeps a visible "agent is driving" indicator plus a kill switch.
+
+## Revision 11 (session rename/archive, additive)
+
+Two client ops join §4: `session-rename` and `session-archive`, answered with `session-renamed` and
+`session-archived`. Both use the existing never-default scope `sessions:author` (no new scope) and are
+session-scoped: the gateway decides them on `{kind:'session', id}`, so a device can rename or archive only a
+session it can see. `title` is trimmed and must be non-empty and at most 200 code points, else
+`bad-request`. `hello.capabilities` lists `session-rename` and `session-archive` only for a device holding
+`sessions:author`; the app shows its row menu only when they are listed. Archiving a session removes it from
+the device's list; the conversation stays on the Host.
+
+## Revision 12 (specs 018 and 020 scopes, additive)
+
+Three scopes join the scope table, each never-default and present in the `full` preset:
+
+| Scope | Owner | Grants |
+|---|---|---|
+| `stats:read` | spec 018 | session stats and context usage frames (`session-stats` and its metric types) |
+| `schedule:read` | spec 018 | the three read-only scheduled-task frames; every schedule mutation stays refused |
+| `web:unlock` | spec 020, narrowed by spec 021 (revision 14) | the passkey frames that unlock a web (PWA) client (§14) |
+
+Agent-team and sub-agent read frames ride the existing `sessions:read` scope (no new scope). Question
+answer and cancel frames ride `approval:respond`. A locked web client receives `auth/locked` (§6) and the
+close code `4412` (§3); it keeps its credential, unlike `4401`.
+
+## Revision 13 (spec 019 permission control, additive)
+
+Scope `permission:lower` (spec 019) joins the scope table: never-default, mobile-grantable, present only in
+the `full` preset. It gates two frames that are NOT §4 ops (like the revision 8 upload family):
+`permission-options {sessionId}` (the current preset and the strictly stricter presets with their
+`{sandbox, approval}` pairs) and `permission-lower {sessionId, preset}` (receipt `accepted` plus
+`reason` one of `not-stricter`, `custom-current`, `raced`, `unavailable`). Both are session-scoped. The
+gateway only ever lowers: sandbox `read-only` < `workspace-write` < `danger-full-access`, approval
+`ask` < `never`; the target must be no looser on both axes and stricter on one. Viewing the current preset
+needs only `sessions:read` (`permissions.currentValue` in the session row). `hello.capabilities` lists
+`permission-lower` only for a device holding `permission:lower`. Design: specs/019-parity-wave3-high-risk-design/permission-lower.md.
+
+`permission-options` and `permission-lower` are the two frames gated by `permission:lower`.
+
+## Revision 14 (spec 021 web passkey unlock, additive)
+
+The spec 020 DeepSeek-account unlock is **replaced**: the PWA proves possession of a WebAuthn
+passkey bound to its paired device. Additive — `OPS` (§4) does not change, no type gains a new
+scope, and the wire protocol stays v1. A device without `web:unlock` (every native iOS/Android
+device) is unaffected: it never receives `hello.webLock` and never sees a lock.
+
+### 14.1 Frames
+
+All four are **not** §4 operations. They are gated by the existing `web:unlock` scope (§3 FR2),
+require an accepted `client-hello`, and each is answered with exactly one frame echoing its
+`requestId` (§1/§3.7). Every binary field is **unpadded base64url**.
+
+```json
+{ "type": "passkey-register-options", "requestId": "r-1" }
+{ "kind": "passkey-register-options", "requestId": "r-1", "challenge": "<32 random bytes>",
+  "rp": { "id": "<hostname>", "name": "<gateway name>" },
+  "user": { "id": "<base64url>", "name": "<device name>", "displayName": "<device name>" },
+  "pubKeyCredParams": [{ "type": "public-key", "alg": -7 }, { "type": "public-key", "alg": -257 }],
+  "excludeCredentials": [{ "type": "public-key", "id": "<stored credential id>" }], "timeout": 60000 }
+```
+
+`rp.id` is the hostname of the socket's `Origin` (the page can only assert with that id), and that
+origin MUST be one of the gateway's `allowedOrigins`. `excludeCredentials` lists the device's stored
+credential (empty when it has none), so a browser whose passkey already exists refuses a silent
+duplicate.
+
+```json
+{ "type": "passkey-register", "requestId": "r-1",
+  "attestation": { "id": "<base64url>", "rawId": "<base64url>",
+                   "clientDataJSON": "<base64url>", "attestationObject": "<base64url>" } }
+{ "kind": "passkey-register", "requestId": "r-1", "ok": true }
+```
+
+Accepted: attestation format `none` only (no attestation trust is needed — the device is already
+paired with a per-device credential); credential public key ES256 (P-256, COSE algorithm identifier
+-7) or RS256 (COSE algorithm identifier -257); any other key is refused. The gateway stores
+`{credentialId, publicKey (COSE), signCount, createdAt}` for that device, in its owner-only state.
+
+```json
+{ "type": "passkey-assert-options", "requestId": "r-2" }
+{ "kind": "passkey-assert-options", "requestId": "r-2", "challenge": "<32 random bytes>",
+  "rpId": "<hostname>", "allowCredentials": [{ "type": "public-key", "id": "<stored credential id>" }],
+  "timeout": 60000 }
+{ "type": "passkey-assert", "requestId": "r-2",
+  "assertion": { "id": "<base64url>", "rawId": "<base64url>", "clientDataJSON": "<base64url>",
+                 "authenticatorData": "<base64url>", "signature": "<base64url>", "userHandle": null } }
+{ "kind": "passkey-assert", "requestId": "r-2", "unlocked": true }
+```
+
+A challenge is **32 random bytes, single use, bound to the socket that asked for it**, with a
+**60 s** lifetime (the answer's `timeout` is that bound). `passkey-assert` verifies, in this order:
+`type` = `webauthn.get`; `clientDataJSON.challenge` equals the socket's live challenge;
+`origin` equals **exactly** the socket's `Origin` AND that origin is in `allowedOrigins`;
+`rpIdHash` = SHA-256(`rp.id`); flags UP and UV; the signature over `authenticatorData ||
+SHA-256(clientDataJSON)` with the stored key; and `signCount` monotonic when both the stored and the
+presented counters are non-zero. Success unlocks **that socket** only.
+
+### 14.2 Lock
+
+Each new WS connection from a web device starts **locked**. While locked the gateway answers only
+`client-hello`, `ping`, `device-forget` and the four passkey frames; **everything else** — §4 ops,
+the remote bridge, uploads, the browser family — is refused `auth/locked` with `reason` `locked`,
+`unregistered` or `rate-limited`, before any Host call, and nothing about sessions (titles, counts,
+ids) reaches the device. A locked device receives only `hello`, `paired`, `client-hello`, `pong`,
+`error`, `device-info` and `device-forgotten` server frames. The lock is server-side, not a UI
+convention.
+
+Re-lock: a successful assertion covers that socket until it sends nothing for **15 minutes**
+(measured from its last frame), until the owner revokes the device, until its passkey is replaced,
+or until the PWA locks it: `{ "type": "passkey-lock", "requestId": "r-3" }` →
+`{ "kind": "passkey-lock", "requestId": "r-3", "locked": true }` (scope `web:unlock`; accepted in
+any lock state, so a tab that reloaded into a locked socket can still say so). Socket close and a
+tab reload always require a new assertion.
+
+### 14.3 Re-registration needs the owner
+
+A device with no passkey registers with the desktop's approval (pairing, revision 5). Adding or
+**replacing** a passkey on a device that already has one is refused
+`passkey/already-registered`; the gateway raises a pending request the owner approves on the Host
+(the same pending list and routes as pairing under `POST /mgw/pending/:id/approve|reject`), and
+sends `{ "kind": "passkey-approval", "approvalId": "<id>", "action": "approve" | "reject",
+"verificationCode": "<8 chars>" }` to the asking device. On `approve` the device re-sends
+`passkey-register` with a fresh `passkey-register-options` challenge within 5 minutes; the new
+passkey replaces the old one only after a fresh `passkey-assert` on that device (the other sockets
+of that device are closed with `4412`, so every tab shows its lock screen again). A `reject`
+answers nothing on the register path, but the asking socket is locked again.
+
+### 14.4 Error codes
+
+`passkey/not-registered` (assert with no passkey), `passkey/already-registered` (needs approval),
+`passkey/challenge-expired`, `passkey/verification-failed` (every other verification failure; never
+a reason), `passkey/rate-limited`. A failure never reveals which check failed. No credential id,
+public key, challenge, clientDataJSON or signature is ever logged, and the error carries no field
+beyond `code`, `requestType`, `requestId` and a fixed `message`. A malformed frame is `bad-request`
+(§3.7): `requestId` 1–64 chars, every `attestation`/`assertion` field a base64url string.
+
+### 14.5 Rate limits
+
+Failures only: **5 failed operations per device in 10 minutes** and **30 globally per hour** lock
+the affected devices out (`passkey/rate-limited`, and `auth/locked` with `reason: "rate-limited"`
+for the request path) until the window passes. Failures are logged as codes only.
+
+### 14.6 Revocation
+
+Revoking the device on the Host deletes its passkey record and closes its sockets with `4401` (the
+credential is gone, as §3 says). Re-pairing the same installation with a new grant clears the old
+records with them.

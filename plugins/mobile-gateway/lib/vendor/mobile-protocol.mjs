@@ -9,7 +9,7 @@
  * Source:     packages/mobile-protocol/src/index.mjs
  * Regenerate: node scripts/sync-mobile-protocol.mjs   (npm run sync:protocol)
  * Verify:     node scripts/sync-mobile-protocol.mjs --check   (npm run check:protocol)
- * Source sha256: ede9ace8ab5101fc9794ba94275b8d3aa1bd3ab5702e2ea03f942ae8c126f766
+ * Source sha256: 5b5a33ff482a61f7b2fd7aa9c6c3edbeaea8253b302764d1fe68eb4837a8b404
  *
  * Everything below this header is the source file unchanged (byte for byte, LF):
  * the contract logic is never forked, only copied.
@@ -28,7 +28,18 @@
  * full-control scopes and `SCOPE_PRESETS`) and
  * `specs/011-mobile-session-authoring/spec.md` (revision 7 — scope
  * `sessions:author` and the four session-authoring ops it gates; additive, the
- * wire protocol stays v1).
+ * wire protocol stays v1) and `specs/013-remote-attachments/spec.md` (revision 8 —
+ * scope `attachments:write` and the four `remote-upload-*` frames it gates;
+ * additive, the wire protocol stays v1) and `specs/014-sidebar-browser/spec.md`
+ * * `specs/014-sidebar-browser/spec.md`
+ * (C6 — scope `browser:control` for the side-panel browser; additive, the wire
+ * protocol stays v1) and `specs/016-start-page-per-machine/spec.md` Phase 3
+ * (revision 10 — the first host-initiated request/response on the link:
+ * `browser-command`/`browser-result`/`browser-cancel`, the `browser-agent:1`
+ * capability and their limits; additive, the wire protocol stays v1) and
+ * `specs/019-parity-wave3-high-risk-design/permission-lower.md` (scope
+ * `permission:lower`, the `permission-options`/`permission-lower` frames and the
+ * `permission-lower` capability; additive, the wire protocol stays v1).
  * `test/contract.test.mjs` parses that document and fails when a constant here
  * drifts from it. Breaking change ⇒ v2, never an edit in place.
  *
@@ -99,8 +110,9 @@ export function deviceSubprotocol(installUuid) {
 
 /**
  * The `companion-v1` operation allowlist: the contract §4 `type` column in table order,
- * followed by the four spec 011 session-authoring ops (revision 7, additive). The op
- * identity is the client frame's `type`; anything else is answered with `op/forbidden`.
+ * including the spec 011 session-authoring ops (revision 7) and the revision 11
+ * session rename/archive ops. The op identity is the client frame's `type`; anything
+ * else is answered with `op/forbidden`.
  */
 export const OPS = Object.freeze([
   'client-hello',
@@ -124,6 +136,10 @@ export const OPS = Object.freeze([
   'session-create',
   'models',
   'select-model',
+  // Revision 11: rename and archive ONE session the device already sees. Same
+  // never-default `sessions:author` scope; no new scope.
+  'session-rename',
+  'session-archive',
 ])
 
 /** Server → client response `kind` per operation (contract §4 "Response `kind`" column). */
@@ -149,6 +165,9 @@ export const OP_RESPONSES = Object.freeze({
   'session-create': 'session-created',
   models: 'models',
   'select-model': 'select-model',
+  // Revision 11: answered by the same upstream kinds the loopback admin client uses.
+  'session-rename': 'session-renamed',
+  'session-archive': 'session-archived',
 })
 
 /** Server → client push frames that carry no `requestId` (contract §1, §5). */
@@ -173,6 +192,13 @@ export const SCOPES = Object.freeze([
   'files:read',
   'files:write',
   'settings:write',
+  // Spec 018 (revision 10): read-only session metrics. Mobile-holdable, and never a
+  // default: a device must be paired with it explicitly.
+  'stats:read',
+  // Spec 020 (revision 10), narrowed by spec 021 (revision 14): the PWA's passkey unlock
+  // (the `passkey-*` frames). Mobile-holdable (the web PWA is a mobile-kind device) and
+  // never a default. A device holding it starts LOCKED on every new connection.
+  'web:unlock',
   // Spec 008: the remote-bridge channel (desktop → DSH wire calls on this Host).
   // Never a default and never granted to a `mobile` device: the owner has to pick
   // it explicitly when pairing a `desktop`.
@@ -185,12 +211,36 @@ export const SCOPES = Object.freeze([
   'credentials:write',
   'plugins:manage',
   'schedule:write',
+  // Spec 018 item 3 (revision 12): reading the schedule list and each task's next run. A NEW
+  // scope, unlike item 2: measured 2026-11-11, NO schedule data travels in `projection-baseline`
+  // or in any broadcast frame (the baseline carries goal/todos/turnOutline/agentTeam/…
+  // and nothing about schedules), so this really is visibility a device did not have.
+  'schedule:read',
   'terminal',
   // Spec 011 (revision 7): list this Host's workspaces, list the model catalog,
   // create a session and pick its provider/model. Deliberately NOT desktop-only —
   // the owner decided a `mobile` offer may tick it, the first scope to cross that
   // line. It stays explicit-only: never a default, never implicit.
   'sessions:author',
+  // Spec 013 (revision 8): send attachment bytes into a session on this Host
+  // (`remote-upload-*` frames). It belongs to the DESKTOP default set, like every
+  // other desktop grant the owner may untick — and it is never part of a
+  // kind-independent default, so no existing or newly paired `mobile` device
+  // receives it without the owner choosing it on the Devices page.
+  'attachments:write',
+  // Spec 014 C6 (owner decision 2026-11-11): drive the Host's built-in side-panel
+  // Browser from a device (`plugins/sidebar-browser`). Grantable like any other
+  // scope — no hard block — and it belongs to the DESKTOP default set, while the
+  // kind-independent defaults never acquire it. Enforcement lands with
+  // plugins/sidebar-browser (`remoteSessionScope` service); the gateway's remote
+  // bridge does not forward a `browser/*` endpoint, so nothing is gated here yet.
+  'browser:control',
+  // Spec 019 Wave 3: read this Host's permission presets and switch ONE session to a
+  // STRICTLY STRICTER preset (`permission-options` / `permission-lower`). It never
+  // widens: the gateway refuses an equal or looser target, and it writes through the
+  // in-process `permissionPresets` service, never a command string. Explicit-only and
+  // never a default; `full` includes it.
+  'permission:lower',
 ])
 
 /**
@@ -210,43 +260,58 @@ export const DESKTOP_ONLY_SCOPES = Object.freeze([
 
 /**
  * Scopes a desktop offer gets unless the owner picks some (spec 005, FR3): see
- * sessions, prompt, answer approvals — nothing that writes files or settings.
- * `harness:remote` and the full-control scopes are deliberately absent (spec 008):
- * they must be chosen. `sessions:author` (spec 011) is absent for the same reason:
- * creating sessions and choosing models is an explicit grant.
+ * sessions, prompt, answer approvals — plus, since spec 013, attach files and
+ * images to a session (`attachments:write`) and, since spec 014 C6, drive the
+ * Host's side-panel browser (`browser:control`). `harness:remote` and the
+ * full-control scopes are deliberately absent (spec 008): they must be chosen.
+ * `sessions:author` (spec 011) is absent for the same reason: creating sessions
+ * and choosing models is an explicit grant.
  */
-export const DESKTOP_DEFAULT_SCOPES = Object.freeze(['sessions:read', 'prompt:send', 'approval:respond'])
+export const DESKTOP_DEFAULT_SCOPES = Object.freeze([
+  'sessions:read', 'prompt:send', 'approval:respond', 'attachments:write', 'browser:control',
+])
 
 /**
- * Scopes no default grant may ever contain, whatever a device kind's default
- * otherwise is (spec 011 FR-006).
+ * Scopes no *kind-independent* default may contain (spec 011 FR-006, extended by
+ * spec 013).
+ *
+ * The two defaults that must not hand out a capability the owner did not ask for
+ * are the ones that do not know the device kind: the gateway's mobile-offer
+ * default ("every scope except the bridge") and the device registry's mobile
+ * default, which is also the grant a record written before spec 005 migrates to.
+ * Both sites read this one list: `plugins/mobile-gateway/lib/index.mjs` (the
+ * pairing-request offer default) and `plugins/mobile-gateway/lib/devices.js`
+ * (`defaultScopes`).
  *
  * `sessions:author` is grantable to a `mobile` device on purpose, so it is NOT in
- * DESKTOP_ONLY_SCOPES — and that is exactly why the two default computations would
- * otherwise hand it out: the gateway's offer default is "every scope except the
- * bridge" and the registry's mobile default is "every non-desktop scope". Creating
- * sessions and choosing models starts agent work on the owner's machine, so it must
- * be a deliberate tick, never a default. Both sites read this one list:
- * `plugins/mobile-gateway/lib/index.mjs` (the pairing-request offer default) and
- * `plugins/mobile-gateway/lib/devices.js` (`defaultScopes`).
+ * DESKTOP_ONLY_SCOPES — and that is exactly why those two computations would
+ * otherwise hand it out: creating sessions and choosing models starts agent work
+ * on the owner's machine, so it must be a deliberate tick, never a default.
+ * `attachments:write` (spec 013) IS in DESKTOP_DEFAULT_SCOPES, which is the
+ * desktop default in its own right; it is listed here so the kind-independent
+ * defaults never acquire it either, which is what keeps a migration quiet.
+ * `browser:control` (spec 014 C6) is listed for exactly the same reason.
  *
  * This narrows *defaults* only. An explicit scope list — an owner's tick, an OTP
  * offer that names it, `SCOPE_PRESETS.full` — is taken literally and still grants it.
  */
-export const NEVER_DEFAULT_SCOPES = Object.freeze(['sessions:author'])
+export const NEVER_DEFAULT_SCOPES = Object.freeze(['sessions:author', 'attachments:write', 'browser:control', 'stats:read', 'schedule:read', 'web:unlock', 'permission:lower'])
 
 /**
  * Pairing presets for the Devices UI (spec 008). `standard` is the default at
  * Approve; `full` ticks every contract scope ("full control"), including the
- * spec 011 author scope. A preset is only a list the owner may edit: the grant
- * is still the explicit scope list.
+ * spec 011 author scope and the spec 013 attachment scope. A preset is only a
+ * list the owner may edit: the grant is still the explicit scope list.
  */
 export const SCOPE_PRESETS = Object.freeze({
   standard: Object.freeze(['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote']),
   full: Object.freeze([
     'sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'files:write', 'settings:write',
     'harness:remote', 'commands:execute', 'workspace:manage', 'credentials:write', 'plugins:manage',
-    'schedule:write', 'terminal', 'sessions:author',
+    'schedule:read', 'schedule:write', 'terminal', 'sessions:author', 'attachments:write', 'browser:control', 'stats:read', 'web:unlock',
+    // Spec 019 Wave 3: lower-only permission control ("full control" includes it; the
+    // Devices page lists it as its own tick).
+    'permission:lower',
   ]),
 })
 
@@ -282,7 +347,307 @@ export const SCOPE_BY_TYPE = Object.freeze({
   'session-create': 'sessions:author',
   models: 'sessions:author',
   'select-model': 'sessions:author',
+  // Revision 11: renaming and archiving one session the device may see. Same
+  // never-default scope, and the session itself is the resource DSH decides on.
+  'session-rename': 'sessions:author',
+  'session-archive': 'sessions:author',
+  // Spec 013 (revision 8): the four attachment-transfer frames, all behind
+  // `attachments:write`. The gateway additionally requires a `desktop` device and
+  // a session that device may see; the scope alone is never enough.
+  'remote-upload-open': 'attachments:write',
+  'remote-upload-chunk': 'attachments:write',
+  'remote-upload-finish': 'attachments:write',
+  'remote-upload-cancel': 'attachments:write',
+  // Spec 018 (revision 10): the two read-only session metric frames, both behind
+  // `stats:read`. The scope gate checks EXACTLY `stats:read` and nothing else: it does
+  // not require `sessions:read`, and it does not decide which sessions are visible.
+  // Visibility is the HOST's: the gateway reads each session's own snapshot through the
+  // requesting device's non-owner peer, so DSH's per-item `allows({kind:'session', id})`
+  // answers, and a session that device may not address is refused there
+  // (`remote-access/denied`). The frames never write.
+  'session-stats': 'stats:read',
+  'context-usage': 'stats:read',
+  // Spec 021 (revision 14): the four passkey frames are the only types that map to
+  // `web:unlock` (the spec 020 `account-attestation` is withdrawn). All four are answered
+  // in band; the assert family is the unlock itself.
+  'passkey-register-options': 'web:unlock',
+  'passkey-register': 'web:unlock',
+  'passkey-assert-options': 'web:unlock',
+  'passkey-assert': 'web:unlock',
+  // Spec 018 item 4 (revision 13): answering a question is the SAME interaction as an approval
+  // card — same session, same `rpcId` life cycle, same card, same answer path — so it rides the
+  // existing `approval:respond` scope instead of a new one. No new scope, no migration.
+  'question-answer': 'approval:respond',
+  'question-cancel': 'approval:respond',
+  // Spec 018 item 2 (revision 11): the agent-team and subagent-catalog reads are READ-ON-DEMAND
+  // of data `sessions:read` ALREADY grants: the same projections travel in
+  // `projection-baseline` and the `agent-team-updated` / `subagents-updated` frames to every
+  // device that holds `sessions:read` (measured 2026-11-11: 31/52 sessions carried `agentTeam`).
+  // They are mapped to that scope instead of a new one precisely so the device surface is not
+  // widened by pairing, and so the two frames cannot drift from the baseline shape.
+  'agent-team': 'sessions:read',
+  // Spec 018 item 3: the read-only schedule frames. `schedule-catalog` lists WHAT CAN BE
+  // scheduled (no user data), `schedule-list` and `schedule-view` return the owner's tasks and
+  // their next run, so all three sit behind the explicit-only read scope.
+  'schedule-catalog': 'schedule:read',
+  'schedule-list': 'schedule:read',
+  'schedule-view': 'schedule:read',
+  'subagents': 'sessions:read',
+  // Spec 019 Wave 3: the two permission frames are the only types that map to
+  // `permission:lower`. The scope gate reads this map, so a lost entry is a refusal,
+  // never an implicit grant.
+  'permission-options': 'permission:lower',
+  'permission-lower': 'permission:lower',
 })
+
+// ---------------------------------------------------------------------------
+// Spec 013 — attachment upload over the pinned link (revision 8, additive)
+// ---------------------------------------------------------------------------
+
+/**
+ * Client → server attachment frames (spec 013, revision 8). They are NOT
+ * contract §4 operations (`OPS` is unchanged): only a `desktop` device holding
+ * `attachments:write` can send them, and every frame is answered with
+ * {@link REMOTE_UPLOAD_RESULT_KIND} echoing its `requestId`.
+ *
+ *   remote-upload-open   { type, requestId, sessionId, kind: 'file'|'image',
+ *                          name?, mediaType?, size, sha256 }
+ *                        → { ok: true, value: { uploadId, sessionId, kind, name?, mediaType?,
+ *                                              size, chunkBytes, maxBytes, idleTimeoutMs } }
+ *   remote-upload-chunk  { type, requestId, uploadId, offset, data }
+ *                        → { ok: true, value: { uploadId, sessionId, nextOffset } }
+ *   remote-upload-finish { type, requestId, uploadId }
+ *                        → { ok: true, value: { receiptId, file | image } }   (the Host's own receipt)
+ *   remote-upload-cancel { type, requestId, uploadId }
+ *                        → { ok: true, value: { uploadId, sessionId, cancelled: true } }
+ *
+ * `data` is CANONICAL base64 (the standard alphabet, padded, exactly as
+ * `Buffer#toString('base64')` produces it) and `offset` counts decoded bytes: it
+ * must equal the bytes already accepted. `sha256` is 64 lowercase hex digits and
+ * is verified against the whole file at `finish`.
+ */
+export const REMOTE_UPLOAD_CLIENT_TYPES = Object.freeze([
+  'remote-upload-open',
+  'remote-upload-chunk',
+  'remote-upload-finish',
+  'remote-upload-cancel',
+])
+
+/** Server → client answer to every `remote-upload-*` frame (revision 8). */
+export const REMOTE_UPLOAD_RESULT_KIND = 'remote-upload-result'
+
+/**
+ * Largest chunk (decoded bytes) one `remote-upload-chunk` frame may carry. The
+ * gateway lowers it further when its own WS payload budget is smaller, and tells
+ * the client the effective value in the `open` answer (`chunkBytes`).
+ */
+export const REMOTE_UPLOAD_MAX_CHUNK_BYTES = 256 * 1024
+
+/** Scope every `remote-upload-*` frame requires, and nothing else requires it (spec 013, R1). */
+export const ATTACHMENTS_WRITE_SCOPE = SCOPE_BY_TYPE['remote-upload-open']
+
+// ---------------------------------------------------------------------------
+// Spec 016 Phase 3 — the host drives a browser on the paired client (revision 10)
+//
+// The first HOST-initiated request/response on the link: the host sends a
+// `browser-command`, the client answers with exactly one `browser-result`, and
+// either side may send `browser-cancel` for a command it no longer wants. The
+// frames are additive: they are NOT contract §4 operations (`OPS` is unchanged)
+// and they carry no `SCOPE_BY_TYPE` entry — the scope is enforced per command by
+// the gateway service that owns the command id, never by a blanket type gate.
+// ---------------------------------------------------------------------------
+
+/**
+ * Capability the gateway advertises in `hello` when its browser bridge is
+ * available, and the one a client lists in its optional `client-hello`
+ * `capabilities` array when it can honour `browser-command`.
+ */
+export const BROWSER_AGENT_CAPABILITY = 'browser-agent:1'
+
+/** Scope a device needs before the host may send it a `browser-command` (spec 014 C6). */
+export const BROWSER_CONTROL_SCOPE = 'browser:control'
+
+/**
+ * Every `op` a `browser-command` may carry. The client implements exactly these;
+ * an op outside this list is refused `bad-request` before it reaches a device.
+ */
+export const BROWSER_OPS = Object.freeze([
+  // Page control (mutating).
+  'navigate', 'click', 'type', 'press', 'scroll', 'open', 'close',
+  // Reads. `snapshot` is the accessibility/DOM outline, `text` the visible text.
+  'snapshot', 'text', 'html', 'screenshot', 'tabs',
+])
+
+/** Server → client frames of this revision (they use `kind`, like every server frame). */
+export const BROWSER_HOST_KINDS = Object.freeze(['browser-command', 'browser-cancel'])
+
+/** Client → server frames of this revision (they use `type`, like every client frame). */
+export const BROWSER_CLIENT_TYPES = Object.freeze(['browser-result', 'browser-cancel'])
+
+/** Largest complete frame, serialized, either direction. */
+export const BROWSER_FRAME_MAX_BYTES = 1024 * 1024
+
+/** Deadline applied to a `browser-command` when it omits `deadlineMs`. */
+export const BROWSER_DEADLINE_DEFAULT_MS = 30_000
+
+/** Largest deadline a `browser-command` may ask for. */
+export const BROWSER_DEADLINE_MAX_MS = 120_000
+
+/** Largest decoded `result.screenshot` (JPEG bytes, before base64). */
+export const BROWSER_SCREENSHOT_MAX_BYTES = 768 * 1024
+
+/** Largest `result.text` / `result.html` the host keeps; longer text is cut and flagged. */
+export const BROWSER_TEXT_MAX_BYTES = 256 * 1024
+
+/** A `commandId`, and the `requestId` shape it reuses: 1..64 of `[A-Za-z0-9._-]`. */
+export const BROWSER_COMMAND_ID = /^[A-Za-z0-9._-]{1,64}$/
+
+/**
+ * Codes both sides use in `error.code` of a `browser-result`. A client may also
+ * return its own `browser/…` code (e.g. `browser/denied` when its consent is
+ * off, `browser/not-found` for an unknown tab); the host shows a generic error
+ * for any code it does not know, exactly as §5a says for unknown codes.
+ */
+export const BROWSER_ERROR_CODES = Object.freeze([
+  'browser/not-supported',
+  'browser/forbidden-scope',
+  'browser/offline',
+  'browser/timeout',
+  'browser/cancelled',
+  'browser/busy',
+  'browser/bad-request',
+  'browser/frame-too-large',
+  'browser/unknown-target',
+])
+
+const BROWSER_ERROR_SHAPE = /^[a-z][a-z0-9]*(?:[/-][a-z0-9]+)*$/
+
+const isRecord = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
+
+/** UTF-8 byte count of a frame's JSON form (`Infinity` when it cannot be serialized). */
+export function browserFrameBytes(frame) {
+  try {
+    const text = JSON.stringify(frame)
+    return text === undefined ? 0 : new TextEncoder().encode(text).length
+  } catch {
+    return Number.POSITIVE_INFINITY
+  }
+}
+
+const badRequest = (message) => ({ ok: false, code: 'bad-request', message })
+
+/** Shared shape checks: the id, the session, and the frame's own size bound. */
+function commonCommandChecks(commandId) {
+  if (typeof commandId !== 'string' || !BROWSER_COMMAND_ID.test(commandId)) {
+    return badRequest('commandId must be 1..64 characters of [A-Za-z0-9._-]')
+  }
+  return undefined
+}
+
+/**
+ * Validate one host → client `browser-command`.
+ *
+ * Returns `{ ok: true, value }` with `args` defaulted to `{}` and `deadlineMs`
+ * clamped to `1..BROWSER_DEADLINE_MAX_MS` (default `BROWSER_DEADLINE_DEFAULT_MS`),
+ * or `{ ok: false, code: 'bad-request', message }`. Never throws.
+ *
+ * @param {unknown} frame
+ */
+export function validateBrowserCommand(frame) {
+  if (!isRecord(frame)) return badRequest('a browser-command must be an object')
+  if (frame.kind !== 'browser-command') return badRequest('kind must be "browser-command"')
+  const idProblem = commonCommandChecks(frame.commandId)
+  if (idProblem) return idProblem
+  const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId.trim() : ''
+  if (sessionId === '' || sessionId.length > 128) return badRequest('sessionId must be a non-empty string of at most 128 characters')
+  if (typeof frame.op !== 'string' || !BROWSER_OPS.includes(frame.op)) return badRequest('op is not a browser operation')
+  const args = frame.args === undefined ? {} : frame.args
+  if (!isRecord(args)) return badRequest('args must be an object')
+  let deadlineMs = BROWSER_DEADLINE_DEFAULT_MS
+  if (frame.deadlineMs !== undefined) {
+    if (!Number.isSafeInteger(frame.deadlineMs) || frame.deadlineMs < 1) return badRequest('deadlineMs must be a positive integer')
+    deadlineMs = Math.min(frame.deadlineMs, BROWSER_DEADLINE_MAX_MS)
+  }
+  if (browserFrameBytes(frame) > BROWSER_FRAME_MAX_BYTES) {
+    return { ok: false, code: 'browser/frame-too-large', message: `a frame may not exceed ${BROWSER_FRAME_MAX_BYTES} bytes` }
+  }
+  return { ok: true, value: { commandId: frame.commandId, sessionId, op: frame.op, args, deadlineMs } }
+}
+
+/**
+ * Validate one client → host `browser-result`: `{ type, commandId, ok, result|error }`.
+ * Structural checks and the frame bound only; oversized `text`/`html` is the
+ * gateway's business (it truncates it, see {@link truncateBrowserText}).
+ *
+ * @param {unknown} frame
+ */
+export function validateBrowserResult(frame) {
+  if (!isRecord(frame)) return badRequest('a browser-result must be an object')
+  if (frame.type !== 'browser-result') return badRequest('type must be "browser-result"')
+  const idProblem = commonCommandChecks(frame.commandId)
+  if (idProblem) return idProblem
+  if (frame.ok === true) {
+    if (frame.result === undefined) return badRequest('a successful browser-result must carry result')
+  } else if (frame.ok === false) {
+    if (!isRecord(frame.error)) return badRequest('a failed browser-result must carry error { code, message }')
+    if (typeof frame.error.code !== 'string' || !BROWSER_ERROR_SHAPE.test(frame.error.code)) {
+      return badRequest('error.code must look like "browser/name"')
+    }
+  } else {
+    return badRequest('ok must be true or false')
+  }
+  if (browserFrameBytes(frame) > BROWSER_FRAME_MAX_BYTES) {
+    return { ok: false, code: 'browser/frame-too-large', message: `a frame may not exceed ${BROWSER_FRAME_MAX_BYTES} bytes` }
+  }
+  return {
+    ok: true,
+    value: frame.ok === true
+      ? { commandId: frame.commandId, ok: true, result: frame.result }
+      : { commandId: frame.commandId, ok: false, error: { code: frame.error.code, message: String(frame.error.message ?? '') } },
+  }
+}
+
+/**
+ * Validate one `browser-cancel`, in either direction: the host sends
+ * `{ kind: 'browser-cancel', commandId }`, a client `{ type: 'browser-cancel',
+ * commandId }`. Either envelope is accepted and normalised to `{ commandId }`.
+ *
+ * @param {unknown} frame
+ */
+export function validateBrowserCancel(frame) {
+  if (!isRecord(frame)) return badRequest('a browser-cancel must be an object')
+  if (frame.kind !== 'browser-cancel' && frame.type !== 'browser-cancel') {
+    return badRequest('browser-cancel needs kind (host) or type (client) "browser-cancel"')
+  }
+  const idProblem = commonCommandChecks(frame.commandId)
+  if (idProblem) return idProblem
+  return { ok: true, value: { commandId: frame.commandId } }
+}
+
+/**
+ * Cut a text result to `maxBytes` of UTF-8 without splitting a code point.
+ *
+ * @param {unknown} text
+ * @param {number} [maxBytes]
+ * @returns {{ text: string, truncated: boolean, bytes: number }}
+ */
+export function truncateBrowserText(text, maxBytes = BROWSER_TEXT_MAX_BYTES) {
+  const value = typeof text === 'string' ? text : String(text ?? '')
+  const encoder = new TextEncoder()
+  const limit = Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : BROWSER_TEXT_MAX_BYTES
+  const whole = encoder.encode(value)
+  if (whole.length <= limit) return { text: value, truncated: false, bytes: whole.length }
+  // A byte prefix can end mid-code-point. `fatal` turns that into a throw, so
+  // stepping back at most three bytes finds the last complete character; the
+  // decode itself is linear, unlike trimming the string one char at a time.
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  for (let end = limit; end > limit - 4 && end > 0; end -= 1) {
+    try {
+      return { text: decoder.decode(whole.subarray(0, end)), truncated: true, bytes: end }
+    } catch { /* partial sequence: drop one more byte */ }
+  }
+  return { text: '', truncated: true, bytes: 0 }
+}
 
 // ---------------------------------------------------------------------------
 // Spec 011 — session authoring (revision 7, additive)
@@ -298,13 +663,187 @@ export const SCOPE_BY_TYPE = Object.freeze({
  *   models         { type, requestId, sessionId? }                       → models         { current, groups, ... }
  *   select-model   { type, requestId, sessionId, provider, model, reasoningEffort? }
  *                                                                        → select-model
+ *
+ * Revision 11 (additive, same scope): two more entries, both decided on the session
+ * the device already sees.
+ *   session-rename  { type, requestId, sessionId, title }  → session-renamed  { sessionId, title, seq }
+ *   session-archive { type, requestId, sessionId }         → session-archived { sessionId, archivedSessionIds }
  */
 export const AUTHORING_CLIENT_TYPES = Object.freeze([
   'workspaces',
   'session-create',
   'models',
   'select-model',
+  'session-rename',
+  'session-archive',
 ])
+
+/**
+ * Spec 018 (revision 10): the read-only session-metric frames, served only to a
+ * device that holds {@link STATS_READ_SCOPE}. They are NOT contract §4 operations
+ * (`OPS` is unchanged) and they never mutate anything: each one reads projections
+ * the Host already keeps for the session (`sessionStats`, `tokenUsage`,
+ * `contextPressure`) through that session's own snapshot, so the per-item rule is
+ * the ordinary "the device may see this session".
+ */
+export const STATS_READ_CLIENT_TYPES = Object.freeze([
+  'session-stats',
+  'context-usage',
+])
+
+/** The scope that lifts the spec 018 metric frames. */
+export const STATS_READ_SCOPE = SCOPE_BY_TYPE['session-stats']
+
+/**
+ * Spec 018 item 2 (revision 11): the read-only agent-team and subagent-catalog frames. They are
+ * NOT contract §4 operations (`OPS` is unchanged) and never mutate anything. They are also NOT
+ * a new capability: each one returns one projection the Host already keeps for the session, the
+ * same value the recipient already receives in `projection-baseline`, so they need no scope of
+ * their own — {@link TEAM_READ_SCOPE} is `sessions:read`, and the per-item rule stays the Host's
+ * own "may this device see this session".
+ */
+export const TEAM_READ_CLIENT_TYPES = Object.freeze([
+  'agent-team',
+  'subagents',
+])
+
+/** The scope that lifts the spec 018 team frames: the ordinary session read scope. */
+export const TEAM_READ_SCOPE = SCOPE_BY_TYPE['agent-team']
+
+/**
+ * Spec 018 item 3 (revision 12): the READ-ONLY schedule frames — the `schedule:write` family
+ * minus every mutation. These are the only schedule types a device may issue without the write
+ * scope; `schedule-history` and `schedule-run` are NOT here (history is per-task activity and
+ * `run` executes, so both stay admin-only for now).
+ */
+export const SCHEDULE_READ_CLIENT_TYPES = Object.freeze([
+  'schedule-catalog',
+  'schedule-list',
+  'schedule-view',
+])
+
+/** The scope that lifts the spec 018 schedule read frames: explicit-only, never a default. */
+export const SCHEDULE_READ_SCOPE = SCOPE_BY_TYPE['schedule-list']
+
+/**
+ * Spec 018 item 4 (revision 13): answering or declining a question the Host asked in a session.
+ * These are the companion's ONLY two question frames; they are not contract §4 operations
+ * (`OPS` is unchanged), and they are lifted by {@link QUESTION_RESPONSE_SCOPE} — the approval
+ * scope, not a new one. Answering is at-most-once (`accepted:false, reason:'not-pending'`).
+ */
+export const QUESTION_RESPONSE_TYPES = Object.freeze([
+  'question-answer',
+  'question-cancel',
+])
+
+/** The scope that lifts the question frames: the ordinary approval scope. */
+export const QUESTION_RESPONSE_SCOPE = SCOPE_BY_TYPE['question-answer']
+
+/** Contracts §5: a `custom` free-text answer may not exceed this many characters. */
+export const QUESTION_CUSTOM_MAX_LENGTH = 2000
+
+
+/**
+ * Spec 021 (revision 14): the web (PWA) unlock is a WebAuthn PASSKEY bound to the paired
+ * device. The spec 020 DeepSeek-account attestation (`account-attestation`) is withdrawn
+ * entirely: the gateway no longer reads `account/*` for any unlock decision.
+ *
+ * Four client frames, NOT contract §4 operations (`OPS` is unchanged), all behind the one
+ * existing scope {@link WEB_UNLOCK_SCOPE}. Every binary field is unpadded base64url.
+ *
+ *   passkey-register-options { type, requestId }
+ *     -> { kind: 'passkey-register-options', requestId,
+ *          challenge, rp: { id, name }, user: { id, name, displayName },
+ *          pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+ *          excludeCredentials: [{ type: 'public-key', id }], timeout }
+ *   passkey-register { type, requestId,
+ *                      attestation: { id, rawId, clientDataJSON, attestationObject } }
+ *     -> { kind: 'passkey-register', requestId, ok: true }
+ *       | error `passkey/already-registered` (needs Host approval, re-sent after approval)
+ *       | error `passkey/challenge-expired` | `passkey/verification-failed` | `passkey/rate-limited`
+ *   passkey-assert-options { type, requestId }
+ *     -> { kind: 'passkey-assert-options', requestId, challenge, rpId, allowCredentials, timeout }
+ *   passkey-assert { type, requestId,
+ *                    assertion: { id, rawId, clientDataJSON, authenticatorData, signature, userHandle } }
+ *     -> { kind: 'passkey-assert', requestId, unlocked: true }
+ *       | error `passkey/not-registered` | `passkey/challenge-expired` | `passkey/verification-failed`
+ *       | `passkey/rate-limited`
+ *
+ * A device holding {@link WEB_UNLOCK_SCOPE} starts LOCKED on every new connection: it is
+ * answered {@link WEB_LOCK_ERROR} for every frame outside {@link WEB_UNLOCK_EXEMPT_TYPES}
+ * (hello and ping are channel-neutral and always run), until a successful
+ * `passkey-assert` on that socket. `hello` tells it why in `webLock`.
+ */
+export const PASSKEY_REGISTER_OPTIONS_TYPE = 'passkey-register-options'
+export const PASSKEY_REGISTER_TYPE = 'passkey-register'
+export const PASSKEY_ASSERT_OPTIONS_TYPE = 'passkey-assert-options'
+export const PASSKEY_ASSERT_TYPE = 'passkey-assert'
+
+/** The four spec 021 client frames, in the order the PWA uses them. */
+export const PASSKEY_CLIENT_TYPES = Object.freeze([
+  PASSKEY_REGISTER_OPTIONS_TYPE,
+  PASSKEY_REGISTER_TYPE,
+  PASSKEY_ASSERT_OPTIONS_TYPE,
+  PASSKEY_ASSERT_TYPE,
+])
+
+/** The scope that gates the passkey frames and arms the server-side lock (spec 020's name). */
+export const WEB_UNLOCK_SCOPE = 'web:unlock'
+
+/**
+ * Ops a locked web device may still send. `client-hello` and `ping` are channel-neutral at
+ * the gateway (they always run), and `device-forget` is scope-exempt, so only the passkey
+ * frames need to be listed here.
+ */
+export const WEB_UNLOCK_EXEMPT_TYPES = Object.freeze([...PASSKEY_CLIENT_TYPES])
+
+/** The in-band refusal of a locked device (contract §6). WS close `4412` stays reserved for re-auth. */
+export const WEB_LOCK_ERROR = 'auth/locked'
+
+/**
+ * `hello.webLock` for a web device: `unregistered` (no passkey on this device — register),
+ * `locked` (a passkey exists, this socket has not asserted yet), `unlocked` (this socket
+ * asserted). Absent from `hello` for every device without {@link WEB_UNLOCK_SCOPE}.
+ */
+export const WEB_LOCK_STATES = Object.freeze(['unregistered', 'locked', 'unlocked'])
+
+/**
+ * Challenge lifetime: one challenge, one use, bound to the socket that asked for it. The
+ * client's `timeout` is clamped to this value.
+ */
+export const PASSKEY_CHALLENGE_TTL_MS = 60_000
+
+/**
+ * Rate limits over FAILED passkey operations (assertions and registrations, never refusals
+ * that cost nothing): `perDevice` failures in a 10-minute window lock that device out, and
+ * `global` failures in a one-hour window lock every web device out.
+ */
+export const PASSKEY_RATE_LIMITS = Object.freeze({ perDevice: 5, perDeviceWindowMs: 10 * 60_000, global: 30, globalWindowMs: 60 * 60_000 })
+
+/**
+ * Inactivity bound of an unlock: a socket that sends nothing for this long is locked again
+ * on its next frame. A new connection always starts locked, so a tab reload re-asserts.
+ */
+export const WEB_UNLOCK_IDLE_MS = 15 * 60_000
+
+/**
+ * Error codes of the passkey frames (contract §6). `passkey/already-registered` means the
+ * device already has a passkey: replacing it needs the owner's approval on the Host, and the
+ * client re-sends `passkey-register` once `passkey-approval` reports the approval.
+ */
+export const PASSKEY_ERROR_CODES = Object.freeze([
+  'passkey/not-registered',
+  'passkey/already-registered',
+  'passkey/challenge-expired',
+  'passkey/verification-failed',
+  'passkey/rate-limited',
+])
+
+/** Server frame announcing that the owner approved replacing this device's passkey. */
+export const PASSKEY_APPROVAL_KIND = 'passkey-approval'
+
+/** Approvals a desktop client may decide for a web device's passkey. */
+export const PASSKEY_APPROVAL_ACTIONS = Object.freeze(['approve', 'reject'])
 
 /** Scope every authoring type requires, and nothing else requires it (spec 011, FR-002). */
 export const AUTHORING_SCOPE = SCOPE_BY_TYPE['session-create']
@@ -351,6 +890,86 @@ export const REMOTE_STREAM_DEFAULT_CREDIT = 64
 export const REMOTE_BINARY_CHUNK_BYTES = 256 * 1024
 
 // ---------------------------------------------------------------------------
+// Spec 019 Wave 3 — permission control, view + lower-only (additive)
+//
+// Two client frames, NOT contract §4 operations (`OPS` is unchanged), both lifted
+// by the one new never-default scope `permission:lower`:
+//
+//   permission-options { type, requestId, sessionId }
+//     → { kind: 'permission-options', requestId, sessionId, currentValue,
+//         options: [{ preset, sandbox, approval }] }
+//   permission-lower   { type, requestId, sessionId, preset }
+//     → { kind: 'permission-lower', requestId, sessionId, preset, currentValue,
+//         accepted: true }
+//       | { kind: 'permission-lower', requestId, sessionId, currentValue,
+//           accepted: false, reason }
+//
+// The gateway computes both lists itself, from the in-process `permissionPresets`
+// service: only presets that are STRICTLY stricter than the current one on at least
+// one axis and looser on neither are offered, and `permission-lower` refuses every
+// other target. When the service is missing or its shape differs, both frames are
+// refused `unavailable` (fail closed).
+// ---------------------------------------------------------------------------
+
+/** The two spec 019 client frames. */
+export const PERMISSION_LOWER_CLIENT_TYPES = Object.freeze(Object.keys(SCOPE_BY_TYPE).filter((type) => SCOPE_BY_TYPE[type] === 'permission:lower'))
+
+/**
+ * Alias so the contract test can treat the spec 019 frames like the other
+ * "listed but not §4" families instead of restating the names.
+ */
+export const PERMISSION_LOWER_TYPES = PERMISSION_LOWER_CLIENT_TYPES
+
+/** The scope that lifts them; never a default, present in `SCOPE_PRESETS.full`. */
+export const PERMISSION_LOWER_SCOPE = 'permission:lower'
+
+/** Capability the gateway advertises in `hello` for a device holding that scope. */
+export const PERMISSION_LOWER_CAPABILITY = 'permission-lower'
+
+/**
+ * The sandbox axis, strictest first: an index LOWERS as the mode widens. This is DSH's
+ * own escalation ladder (`read-only → workspace-write → danger-full-access`).
+ */
+export const SANDBOX_MODE_ORDER = Object.freeze(['read-only', 'workspace-write', 'danger-full-access'])
+
+/**
+ * The approval axis, strictest first. `ask` prompts the owner and `never` never does, so
+ * `ask` is the stricter of the two; DSH's `APPROVAL_POLICIES` admits exactly these.
+ */
+export const APPROVAL_POLICY_ORDER = Object.freeze(['ask', 'never'])
+
+/**
+ * Current values that are never comparable: `custom` matches no configured preset and
+ * `auto` is the experimental per-call reviewer (a `danger-full-access` sandbox). Either
+ * one makes `permission-lower` refuse `custom-current`.
+ */
+export const PERMISSION_INCOMPARABLE_CURRENTS = Object.freeze(['custom', 'auto'])
+
+/**
+ * `reason` of a `permission-lower` receipt with `accepted: false`. Unlike the §5
+ * approval receipt (a normal refusal with no error frame), a permission write refusal
+ * is an ERROR frame carrying one of these codes plus a fixed sentence per code.
+ *
+ *   not-stricter    the target is equal to or looser than the current preset
+ *   custom-current  the current preset is `custom`/`auto`/unknown, or the target is
+ *   raced           the re-read after the write no longer resolves to the target
+ *   unavailable     this Host has no usable `permissionPresets` service
+ */
+export const PERMISSION_LOWER_REASONS = Object.freeze(['not-stricter', 'custom-current', 'raced', 'unavailable'])
+
+/**
+ * The fixed sentence a DEVICE gets for each refusal code — never the Host's own text.
+ * `null` = `permission:lower` is not a scope this device holds (answered with
+ * `auth/forbidden-scope` by the ordinary scope gate).
+ */
+export const PERMISSION_LOWER_MESSAGES = Object.freeze({
+  'not-stricter': 'the requested preset is not stricter than the current one',
+  'custom-current': 'the current or requested preset cannot be compared to a preset',
+  raced: 'the preset changed before the switch could be confirmed',
+  unavailable: 'this computer cannot change the permission preset for a device',
+})
+
+// ---------------------------------------------------------------------------
 // §3.5 / §6 Capabilities, close codes, errors
 // ---------------------------------------------------------------------------
 
@@ -358,16 +977,51 @@ export const REMOTE_BINARY_CHUNK_BYTES = 256 * 1024
 export const CAPABILITIES = Object.freeze(['sessions-read', 'prompt', 'cancel', 'approval-v1'])
 
 /** Extra capabilities a host MAY advertise on top of `CAPABILITIES`. */
-export const OPTIONAL_CAPABILITIES = Object.freeze(['push-v1'])
+export const OPTIONAL_CAPABILITIES = Object.freeze([
+  'push-v1',
+  // Spec 016 Phase 3 (revision 10): the host will send `browser-command` frames.
+  // A client that can honour them lists the same name in `client-hello.capabilities`.
+  'browser-agent:1',
+  // Revision 11: the two ops that rename/archive ONE session the device already sees.
+  // Advertised PER DEVICE and only for a device holding `sessions:author`; the app
+  // shows its row menu only when they are listed (see SESSION_EDIT_CAPABILITY_SCOPE).
+  'session-rename',
+  'session-archive',
+  // Spec 019 Wave 3: the app may show its permission chip. Advertised PER DEVICE and
+  // only for a device holding `permission:lower` (see SESSION_EDIT_CAPABILITY_SCOPE).
+  'permission-lower',
+])
+
+/**
+ * Revision 11 (contract §3.5): `session-rename` / `session-archive` are advertised only
+ * for a device holding `sessions:author`. Spec 019 adds `permission-lower`, advertised
+ * only for a device holding `permission:lower`. Every other optional capability above
+ * is advertised on its own condition, so this map names exactly the scope-gated ones.
+ * The gateway reads it instead of restating the rule: a capability the list does not
+ * name and that is not `CAPABILITIES`/`push-v1` is not advertised at all (fail closed).
+ */
+export const SESSION_EDIT_CAPABILITY_SCOPE = Object.freeze({
+  'session-rename': AUTHORING_SCOPE,
+  'session-archive': AUTHORING_SCOPE,
+  // Spec 019 Wave 3: the app shows its permission chip only when this is listed.
+  'permission-lower': PERMISSION_LOWER_SCOPE,
+})
 
 /**
  * WebSocket close codes (contract §3). `4004` = gateway disabled, stop auto-reconnect;
- * `4003` = re-authenticate; `4401` = device revoked, wipe the stored credential.
+ * `4003` = re-authenticate; `4401` = device revoked, wipe the stored credential;
+ * `4412` = web unlock locked (spec 020): keep the credential, re-attest later.
  */
 export const CLOSE_CODES = Object.freeze({
   gatewayDisabled: 4004,
   reauth: 4003,
   revoked: 4401,
+  // Spec 021 (revision 14): a web device whose passkey was replaced elsewhere, or whose
+  // replacement was approved, is closed with this code so it re-asserts. Deliberately
+  // NOT 4401: nothing was revoked, the credential must be KEPT, and the lock is in band
+  // (`auth/locked`) for an ordinary locked socket. Distinct from the pairing codes
+  // 4403 / 4408 / 4410, which only occur before a credential exists.
+  locked: 4412,
 })
 
 /**
@@ -385,6 +1039,16 @@ export const ERROR_CODES = Object.freeze({
   'protocol/unsupported': null,
   'bad-request': null,
   'session-not-found': null,
+  // Spec 021 (revision 14): a web:unlock device whose socket has not passed a passkey
+  // assertion is refused every op except the passkey frames. `reason` is `locked`,
+  // `unregistered` or `rate-limited`.
+  'auth/locked': null,
+  // Spec 021: every passkey frame's refusal is in band and carries no detail beyond the code.
+  'passkey/not-registered': null,
+  'passkey/already-registered': null,
+  'passkey/challenge-expired': null,
+  'passkey/verification-failed': null,
+  'passkey/rate-limited': null,
 })
 
 /**
@@ -699,6 +1363,7 @@ export const PING_INTERVAL_MS = 25_000
 /** @typedef {typeof DEVICE_KINDS[number]} DeviceKind */
 /** @typedef {typeof SCOPES[number]} Scope */
 /** @typedef {typeof AUTHORING_CLIENT_TYPES[number]} AuthoringType */
+/** @typedef {typeof REMOTE_UPLOAD_CLIENT_TYPES[number]} RemoteUploadType */
 /** @typedef {typeof CAPABILITIES[number] | typeof OPTIONAL_CAPABILITIES[number]} Capability */
 /** @typedef {typeof APPROVAL_OUTCOMES_CLIENT[number]} ClientApprovalOutcome */
 /** @typedef {typeof APPROVAL_OUTCOMES_FINAL[number]} FinalApprovalOutcome */

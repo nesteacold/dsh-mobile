@@ -30,6 +30,8 @@ import {
   Reconnector,
   SessionsStore,
   approvalSourceFromFrame,
+  coerceHistoryEvent,
+  coerceHistoryEvents,
   defaultClientMsgId,
   isReconnectable,
   pairedHostFromPayload,
@@ -65,6 +67,30 @@ import {
   type PinnedTransport,
 } from '../src/platform';
 import { createPinnedTransport, type CreatePinnedTransportOptions } from '../src/platform/pinned-transport';
+import { readAgentTeam, readSubagents, type TeamRead, type AgentTeamProjection, type SubagentCatalogEntry } from './core/team';
+import {
+  lowerPermission,
+  readPermissionOptions,
+  type PermissionLowerOutcome,
+  type PermissionOptionsResult,
+} from './core/permission-lower';
+import { PERMISSION_LOWER_CAPABILITY } from '@dsh-ext/mobile-protocol';
+import { hasScheduleReadScope, readScheduleCatalog, readScheduleList, readScheduleView, type ScheduleCatalog, type ScheduleList, type ScheduleViewResult } from './core/schedules';
+import { hasStatsReadScope, readSessionStats, type SessionStatsRead } from './core/stats';
+import { archiveFrame, renameFrame } from './ui/conversation/session-actions';
+import {
+  EMPTY_SESSION_PANEL,
+  panelFromUpdate,
+  parseProjectionBaseline,
+  type SessionPanel,
+} from './core/projections';
+import type { Op } from '@dsh-ext/mobile-protocol';
+import { PASSKEY_REGISTER_TYPE, WEB_LOCK_STATES, type WebLockState } from '@dsh-ext/mobile-protocol';
+// Spec 021: the pairing's `web:unlock` grant (a no-op pair on native, the real store on web).
+import { readWebUnlockGrant, saveWebUnlockGrant } from '../src/platform/web-grant';
+// Spec 021: the browser's passkey steps (no-op pair on native, where nothing is ever locked).
+import { assertPasskey, lockPasskeySocket, registerPasskey, watchPasskeyApproval } from '../src/platform/passkey';
+import { lockReasonFor, type LockReason } from './core/web-lock';
 import { debugLogSinksFromEnv } from '../src/platform/debug-log-file';
 import { appVersion, platformName } from './runtime';
 import type { Locale } from '../i18n';
@@ -111,7 +137,24 @@ export interface ApprovalCardView {
 export const AUTHORING_FORBIDDEN_CODE = 'auth/forbidden-scope';
 
 /** Result of an authoring call that must report a reason instead of throwing at the screen. */
-export type AuthoringResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly code: string };
+export type AuthoringResult<T> =
+  | { readonly ok: true; readonly value: T }
+  /** `code` is always present; `message` is the Host's own wording when the gateway supplied one. */
+  | { readonly ok: false; readonly code: string; readonly message?: string };
+
+/**
+ * The Host refused the workspace before calling itself: the id is not (or no longer) a workspace of
+ * this Host. Measured 2026-11-11: a name, an old id, an empty id and a missing field all produce
+ * `remote/argument-denied` with zero Host calls.
+ */
+export const WORKSPACE_DENIED_CODE = 'remote/argument-denied';
+
+/**
+ * The one field this app reads off `hello` that the shared `HelloFrame` type does not declare yet
+ * (`packages/mobile-protocol` is not ours to change; the gateway does send it —
+ * `plugins/mobile-gateway/lib/index.mjs:4793`). Declared here so the access is a single cast.
+ */
+type HelloWithHistory = { historyFormatVersion?: unknown };
 
 /**
  * Is a reconnect actually in progress?
@@ -269,12 +312,46 @@ export function receiptConfirmsSelection(
   return answer.kind === 'select-model';
 }
 
+/**
+ * Result of a session rename/archive.
+ *
+ * `ok: false` with a code is the "could not even try" case (no live socket, or a client-side
+ * precondition). A refusal by the Host is NOT represented here: it rejects with `CoreError`, so a
+ * caller cannot accidentally treat a refusal as a quiet no-op.
+ */
+export type SessionActionOutcome =
+  | { ok: true; sessionId: string; title?: string }
+  | { ok: false; code: string };
+
+/**
+ * Spec 021 (contract §14.2) — the web device's passkey lock, as the app sees it.
+ *
+ * `state` mirrors `hello.webLock`. `reason` is what the GATE shows: the Host's state, or a local
+ * refusal (`LOCK_COPY` in `src/core/web-lock.ts` has a sentence for each). `approval` carries the
+ * owner's answer to a replacement request (§14.3); its `verificationCode` is the one the owner
+ * approves on the Host, so the two can be compared.
+ */
+export interface WebLockSnapshot {
+  state: WebLockState;
+  reason: LockReason;
+  approval: { action: 'approve' | 'reject'; verificationCode?: string } | null;
+  /** The lock message shown BECAUSE the action failed (cleared by the next attempt). */
+  error: LockReason | null;
+}
+
 export interface AppStateSnapshot {
   /** Unlocked through biometrics (A020). */
-  unlocked: boolean;
-  hosts: PairedHost[];
+  unlocked: boolean;  hosts: PairedHost[];
   activeHost: PairedHost | null;
   connection: ClientState;
+  /**
+   * Capabilities the Host advertised in its `hello` (contract §3.5), or `[]` before any handshake.
+   *
+   * Surfaced so screens can follow the spec-011 rule "no button without something behind it": an op
+   * the Host does not advertise must be ABSENT, not drawn disabled. The list is the Host's own
+   * statement — it is never merged with client guesses.
+   */
+  capabilities: string[];
   banner: BannerKind;
   /** True while no session list is known yet (first load). */
   loading: boolean;
@@ -317,6 +394,11 @@ export interface AppStateSnapshot {
    * as "denied".
    */
   grantedScopes: readonly string[];
+  /**
+   * Spec 021 — the web passkey lock. `null` means "this device is not locked": native, or a Host
+   * that does not speak revision 14 (it never sends `webLock`).
+   */
+  webLock: WebLockSnapshot | null;
   /** Spec 011 — this host's workspaces, for the workspace picker. */
   workspaces: Array<{ id: string; name?: string; path?: string }>;
   /** Load state of {@link workspaces}: `idle` when nothing was asked yet. */
@@ -335,6 +417,13 @@ export interface AppStateSnapshot {
   modelsState: 'idle' | 'loading' | 'ready' | 'error';
   /** The refusal/failure code when {@link modelsState} is `error`. */
   modelsError: string | null;
+  /**
+   * Spec 018 item 5 — the open session's task list and goal as the Host last projected them,
+   * read-only (the phone never writes either). Empty until a `projection-baseline` or an update
+   * for this session arrives; a control set that does not include this session legitimately
+   * leaves it empty (PROTOCOL.md:761).
+   */
+  openSessionPanel: SessionPanel;
   lastError: { code: string; message: string } | null;
   locale: Locale;
 }
@@ -415,6 +504,14 @@ export interface ControllerOptions {
    * tests shorten it.
    */
   pairApprovalTimeoutMs?: number;
+  /**
+   * Spec 021 — the three browser passkey steps (register / assert / lock). Defaults to the platform
+   * module (`src/platform/passkey`), which is a no-op on native and the real WebAuthn calls on web.
+   * Injected by tests because Node has no WebAuthn: the browser half is covered against a fake
+   * `navigator.credentials` in `test/web-unlock*.test.ts`, and the controller's WIRING is what the
+   * controller tests assert.
+   */
+  passkey?: { register: typeof registerPasskey; assert: typeof assertPasskey; lock: typeof lockPasskeySocket };
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +613,44 @@ export function createInstallScopedClientMsgId(readInstallId: () => string | nul
 }
 
 const APP_STATE_TRACKED: AppStateStatus[] = ['background', 'inactive'];
+
+/**
+ * How many sessions' projections are kept (spec 018 item 5). One panel is a handful of rows, so this
+ * is generous for a phone yet bounded: the least recently named session leaves first.
+ */
+const SESSION_PANEL_CACHE_MAX = 64;
+
+/** Distinguishes one live socket's projection frames from the next socket's (see `panelFrameKey`). */
+let panelConnectionSequence = 0;
+
+/**
+ * Drop the least recently named panels beyond `SESSION_PANEL_CACHE_MAX`. Map insertion order is age
+ * order (a refolded session is deleted and re-set, so it moves to the end), and `keep` — the open
+ * session, whose panel the screen is drawing — is never the one evicted.
+ */
+function evictPanels(panels: Map<string, SessionPanel>, keep: string): void {
+  for (const sessionId of panels.keys()) {
+    if (panels.size <= SESSION_PANEL_CACHE_MAX) return;
+    if (sessionId === keep) continue;
+    panels.delete(sessionId);
+  }
+}
+
+/**
+ * Is `next` a newer value than `held`? A value with no usable cut point does not displace one that
+ * has one. (`panelFromUpdate` applies a cut-point-less update because the Host always sends one; a
+ * fold that only ADDS data leans the other way — silence is not evidence of being newer.)
+ */
+function isNewer(next: number | null, held: number | null): boolean {
+  if (held === null) return true;
+  return next !== null && next >= held;
+}
+
+/** The cut point to keep for a key: the later of the two, `null` being "never seen". */
+function newer(next: number | null, held: number | null): number | null {
+  if (held === null) return next;
+  return next !== null && next >= held ? next : held;
+}
 
 export class AppController {
   /**
@@ -628,7 +763,43 @@ export class AppController {
   private host: PairedHost | null = null;
   private hosts: PairedHost[] = [];
   private unlocked = false;
+  /**
+   * Spec 021 (contract §14.2) — the web passkey lock of the CURRENT connection.
+   *
+   * `webLocked` is false for every native device (nothing ever reports `webLock`), so the app behaves
+   * exactly as before there. `webUnlockGranted` remembers the pairing's `web:unlock` grant
+   * (see `src/platform/web-grant.ts`), which is what lets the gate offer "create a passkey" before a
+   * first `hello` ever arrives.
+   */
+  private webLocked = false;
+  private webLockGranted = false;
+  /** The Host's state (`hello.webLock`); `locked` until the Host says otherwise. */
+  private webLockState: WebLockState = 'locked';
+  private webLockReason: LockReason = 'locked';
+  private webLockApproval: { action: 'approve' | 'reject'; verificationCode?: string } | null = null;
+  private webLockError: LockReason | null = null;
+  /** Releases the `passkey-approval` listener of the current socket (one listener per client). */
+  private unsubscribePasskeyApproval: (() => void) | null = null;
+  /** One passkey step at a time: a second tap must not start a second authenticator prompt. */
+  private passkeyInFlight = false;
+  /** Spec 021: the browser steps (the platform default, or a test's fake). */
+  private readonly passkeySteps: { register: typeof registerPasskey; assert: typeof assertPasskey; lock: typeof lockPasskeySocket };
   private openSessionId: string | null = null;
+  /**
+   * Spec 018 item 5 — task list / goal per session, as the Host projected them.
+   *
+   * Every session the Host has named is kept, not just the open one: the baseline arrives once, right
+   * after `hello` (`plugins/mobile-gateway/lib/index.mjs:6073`) and before any session can be opened,
+   * so a store limited to the open session could never see it. Each panel carries its own per-key
+   * `asOfSeq`, which is what makes a late frame for a closed session still comparable. Bounded,
+   * because a Host may name every session it has.
+   */
+  private readonly panels = new Map<string, SessionPanel>();
+  /** The connection the store was built from; another one starts it over. */
+  private panelsConnection: string | null = null;
+  /** The open session whose panel `panelsPanel` copies (never a local edit of the Host's data). */
+  private panelsSessionId: string | null = null;
+  private panelsPanel: SessionPanel = EMPTY_SESSION_PANEL;
   private openApprovals: ApprovalCardView[] = [];
   private banner: BannerKind = 'none';
   private loading = true;
@@ -655,6 +826,7 @@ export class AppController {
     this.pairAckTimeoutMs = options.pairAckTimeoutMs ?? 20_000;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs;
     this.pairApprovalTimeoutMs = options.pairApprovalTimeoutMs ?? DEFAULT_PAIR_APPROVAL_TIMEOUT_MS;
+    this.passkeySteps = options.passkey ?? { register: registerPasskey, assert: assertPasskey, lock: lockPasskeySocket };
   }
 
   // -------------------------------------------------------------------------
@@ -696,6 +868,9 @@ export class AppController {
     // Not awaited: a send before it lands keeps the core generator (no new await on the send
     // path). It makes the id available to an installation paired by an earlier app version or run.
     this.primeInstallId();
+    // Spec 021: whether this install's pairing carried `web:unlock` — read before anything else so
+    // the gate knows, without a credential read, that a lock screen (not a biometric) is the way in.
+    void this.loadWebUnlockGrant();
     const hosts = await readHosts();
     if (!this.isLifecycleCurrent(hook)) return;
     this.hosts = hosts;
@@ -786,8 +961,275 @@ export class AppController {
     this.teardownConnection('locked');
     this.pairing = null;
     this.banner = 'none';
+    // The lock is per connection (contract §14.2): a later `unlock()` opens a NEW socket that starts
+    // locked again. Remembering it as locked (rather than cleared) means the gate never briefly reads
+    // "unlocked" between this lock and the next connection's `hello`.
+    this.clearWebLock();
+    this.webLocked = this.webLockGranted;
     this.bump();
   }
+
+  // -------------------------------------------------------------------------
+  // Spec 021 — web passkey unlock (contract revision 14)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Create this device's passkey (right after pairing, or from the lock screen). The browser makes
+   * the credential with the Host's fresh challenge and the Host verifies it; the app only relays.
+   *
+   * A device that already has a passkey is refused `passkey/already-registered`: the owner has to
+   * approve the replacement on the Host (§14.3), and `passkeyApproval()` reports that approval.
+   * Never throws; the outcome is in the snapshot (`webLock.error`).
+   */
+  async registerWebPasskey(): Promise<void> {
+    await this.runPasskeyStep(async (client) => {
+      await this.passkeySteps.register(client);
+      // The Host stored the key and unlocked nothing (a registration opens no socket, §14.1), so
+      // the socket is still locked and the next action is an assertion, never a second registration.
+      this.setLockedAfterRegister();
+    });
+  }
+
+  /**
+   * The FIRST-RUN action: create this device's passkey and then assert it on the same socket.
+   *
+   * A fresh web install has no second screen to wait for, and a registration unlocks nothing, so
+   * `register` alone left it on a lock screen whose only button re-registered (`already-registered`)
+   * and never asked for the assertion — the deadlock. Pairing, registering and asserting are now
+   * one user action, and `unlocked` still flips only when the HOST confirms the assertion (§14.1).
+   */
+  async registerAndUnlockWebPasskey(): Promise<void> {
+    await this.runPasskeyStep(async (client) => {
+      await this.passkeySteps.register(client);
+      this.setLockedAfterRegister();
+      await this.assertOnSocket(client);
+    });
+  }
+
+  /** One locked-step run: the socket, the local failure, and the re-render, in one place. */
+  private async runPasskeyStep(step: (client: CompanionClient) => Promise<void>): Promise<void> {
+    if (this.passkeyInFlight) return;
+    this.passkeyInFlight = true;
+    this.webLockError = null;
+    this.bump();
+    let client: CompanionClient | null = null;
+    try {
+      client = await this.passkeySocket();
+      if (client === null) return;
+      await step(client);
+    } catch (error) {
+      this.recordPasskeyFailure(error);
+    } finally {
+      this.passkeyInFlight = false;
+      if (client === null || client === this.client) this.bump();
+    }
+  }
+
+  /** After a registration: the socket is still locked, and the next action is the assertion. */
+  private setLockedAfterRegister(): void {
+    this.webLockState = 'locked';
+    this.webLockReason = 'locked';
+  }
+
+  /**
+   * Assert the passkey on the current socket — the unlock itself. The Host verifies the challenge,
+   * the origin, the signature and the sign counter, and unlocks that socket only; this app never
+   * decides it succeeded (§14.1). Never throws; the outcome is in the snapshot.
+   */
+  async unlockWithPasskey(): Promise<void> {
+    await this.runPasskeyStep((client) => this.assertOnSocket(client));
+  }
+
+  /**
+   * Assert the passkey on `client` and take the Host's answer as final (§14.1).
+   *
+   * The socket is unlocked only because the HOST said so; this app never decides it. `unlock()` is
+   * deliberately NOT used here: it reconnects with the stored credential, and the §14.2 lock belongs
+   * to the socket that asserted, so a fresh socket would start locked again and ask for a second
+   * prompt. This verified socket is resynced in place instead. Throws for the caller to classify.
+   */
+  private async assertOnSocket(client: CompanionClient): Promise<void> {
+    // A020/M5: locking (the app left the foreground) is a credential boundary, and the browser's
+    // passkey sheet outlives it. The `lock()` generation bump is the authority here: an assertion
+    // that answers after it must neither open the gate nor connect anything.
+    const generation = this.generation;
+    await this.passkeySteps.assert(client);
+    if (!this.isCurrent(generation) || client !== this.client) return; // locked, or replaced mid-prompt
+    this.webLocked = false;
+    this.webLockReason = 'locked';
+    this.webLockApproval = null;
+    // The gate opens here and nowhere else on web: a confirmed assertion is the only evidence that
+    // this socket may read the credential's data.
+    this.unlocked = true;
+    this.banner = 'none';
+    this.bump();
+    try {
+      await this.resync(client);
+    } catch (error) {
+      this.recordError(error);
+    }
+  }
+
+  /** One failed passkey step, kept in the snapshot (never thrown at a screen). */
+  private recordPasskeyFailure(error: unknown): void {
+    const reason = lockReasonFor(error);
+    this.webLockError = reason;
+    // A refusal of the frames themselves also says what the device's state is, so the gate offers
+    // the action that can actually work. `not-registered` really is "unregistered" (there is no
+    // passkey to assert); the other two are refusals of the attempt, not of the device's state.
+    if (reason === 'not-registered') {
+      this.webLockState = 'unregistered';
+      this.webLockReason = reason;
+    }
+  }
+
+  /**
+   * "Lock now" (contract §14.2): send `passkey-lock` so the HOST locks this socket, then close it.
+   *
+   * The local close is not a cosmetic step: the server-side lock protects what the gate displays,
+   * while the close guarantees the credential and the session list are gone from this browser too,
+   * and a reload cannot inherit an unlocked socket.
+   */
+  async lockWebDevice(): Promise<void> {
+    const client = this.client;
+    this.unlocked = false;
+    this.beginGeneration();
+    if (client !== null && client.state === 'ready') {
+      try {
+        await this.passkeySteps.lock(client);
+      } catch {
+        // The socket is closed right below either way; the next connection starts locked.
+      }
+    }
+    if (this.client !== client) return; // a newer connection already owns the UI
+    this.teardownConnection('web-lock');
+    // The gate is locked from here on; the closed socket's own `webLock` is gone with it, and the
+    // grant stays because a reload has to show the same lock screen again.
+    this.clearWebLock();
+    this.webLocked = this.webLockGranted;
+    this.webLockState = 'locked';
+    this.webLockReason = 'locked';
+    this.pairing = null;
+    this.banner = 'none';
+    this.bump();
+  }
+
+  private clearWebLock(): void {
+    this.webLocked = false;
+    this.webLockState = 'locked';
+    this.webLockReason = 'locked';
+    this.webLockApproval = null;
+    this.webLockError = null;
+  }
+
+  /** The socket a passkey step may talk through: the current one and ready. */
+  private passkeyClient(): CompanionClient | null {
+    const client = this.client;
+    if (client === null || client.state !== 'ready') return null;
+    // The FRAMES are already refused by the Host on a device without `web:unlock`; refusing them
+    // here too means a locked socket never sends a frame its own lock would refuse.
+    return this.webLocked || this.webLockGranted ? client : null;
+  }
+
+  /**
+   * The socket a passkey step runs on, opening one when a reloaded page has none.
+   *
+   * A web passkey is asserted on a LIVE socket (§14.2), and the Host locks every new connection, so
+   * the page has to reach an accepted `client-hello` before it can ask for the assertion. That
+   * socket is opened here, locked: nothing is read through it until the Host confirms the assertion.
+   */
+  private async passkeySocket(): Promise<CompanionClient | null> {
+    const existing = this.passkeyClient();
+    if (existing !== null) return existing;
+    const opened = await this.startWebLockSession();
+    if (opened !== null) {
+      // Bounded and cancellable like every other handshake wait: a lock, a forget or a newer
+      // connection supersedes it, and a socket that never answers fails the step instead of hanging.
+      await this.waitForAcceptedHello(opened.client, opened.generation, true);
+    }
+    return this.passkeyClient();
+  }
+
+  /**
+   * Spec 021 — open the socket a web passkey is asserted on, WITHOUT unlocking anything.
+   *
+   * The credential is read for the transport only; the controller asks this socket for nothing
+   * while `webLocked` (`onReady` skips the resync, and the Host refuses the frames anyway), and
+   * `unlocked` stays false until the Host confirms an assertion. A no-op on native (no grant is
+   * ever recorded) and while a socket already exists.
+   */
+  async startWebLockSession(): Promise<{ client: CompanionClient; generation: number } | null> {
+    if (this.unlocked || this.client !== null) return null;
+    const host = this.host;
+    if (host === null || !this.webLockGranted) return null;
+    this.webLocked = true;
+    this.webLockState = 'locked';
+    this.webLockReason = 'locked';
+    this.bump();
+    return this.connectHost(host, { lockPending: true });
+  }
+
+  /**
+   * The live socket the GATE may assert a passkey on (null: none). Public because the gate is above
+   * the controller: the assert has to run on THIS socket, before `unlock()` may read the credential.
+   */
+  get passkeyConnection(): CompanionClient | null {
+    return this.passkeyClient();
+  }
+
+  /**
+   * Read the lock state `hello` reported for this (current) client, and keep it while the socket
+   * lives. Called from `onReady`, before any resync request: a locked socket may only use the
+   * channel-neutral frames and the passkey ones (§14.2), so nothing else may be asked of it.
+   */
+  private applyWebLock(client: CompanionClient): void {
+    const state = client.webLock;
+    if (state === null) {
+      // No `webLock`: this device is not locked (native, or a Host without revision 14).
+      this.clearWebLock();
+      return;
+    }
+    this.webLockGranted = true;
+    this.webLockError = null;
+    this.webLockApproval = null;
+    this.webLockState = state;
+    this.webLockReason = state;
+    this.webLocked = state !== 'unlocked';
+  }
+
+  /** One `passkey-approval` listener for the current socket (§14.3). */
+  private listenForPasskeyApproval(client: CompanionClient): void {
+    this.unsubscribePasskeyApproval?.();
+    this.unsubscribePasskeyApproval = null;
+    if (!this.webLockGranted) return;
+    this.unsubscribePasskeyApproval = watchPasskeyApproval(client, (approval) => {
+      if (client !== this.client) return;
+      this.webLockApproval = {
+        action: approval.action,
+        ...(approval.verificationCode === undefined ? {} : { verificationCode: approval.verificationCode }),
+      };
+      this.bump();
+    });
+  }
+
+  /**
+   * Read the stored `web:unlock` grant once at start (never the credential): the gate needs it
+   * before any socket exists, so a web install whose first attempt never reached `hello` still
+   * knows to offer "create a passkey".
+   */
+  private async loadWebUnlockGrant(): Promise<void> {
+    try {
+      this.webLockGranted = await readWebUnlockGrant();
+      // With no socket yet there is no `hello.webLock`: a granted install waits for its passkey.
+      if (this.webLockGranted && this.webLocked === false && this.host !== null) {
+        this.webLocked = true;
+      }
+      this.bump();
+    } catch {
+      // An unreadable store proves nothing; the live `hello.webLock` decides once it arrives.
+    }
+  }
+
 
   subscribe(listener: (snapshot: AppStateSnapshot) => void): () => void {
     this.listeners.add(listener);
@@ -866,6 +1308,16 @@ export class AppController {
         if (seenPaired) return;
         seenPaired = true;
         const device = { id: frame.device.id, name: frame.device.name };
+        // Spec 021: the `paired` frame is where a web pairing learns it must create a passkey. This
+        // is recorded SYNCHRONOUSLY, because the decision below (keep the pairing socket for the
+        // passkey frames, or open a bearer connection) runs in this same turn and would otherwise
+        // read the previous state. A `web:unlock` device starts LOCKED on every connection (§14.2).
+        if ((frame.device.scopes ?? []).includes('web:unlock')) {
+          this.webLockGranted = true;
+          this.webLocked = true;
+          this.webLockState = 'locked';
+          this.webLockReason = 'locked';
+        }
         // M5: a lock, a forget, a revoke or a newer pairing cancelled this attempt before the
         // one-time token could be written. Persisting it now would resurrect an unowned
         // credential, so this attempt must not touch the secure store at all.
@@ -891,6 +1343,10 @@ export class AppController {
             // N6: the credential now lives in the secure store only — drop the JS copy.
             pairingClient.forgetPairedToken();
             this.debug.info('paired: token stored', { gatewayId: payload.gatewayId, deviceId: device.id });
+            // Spec 021: remember the grant across reloads (no-op on native), so a page that reopens
+            // without ever reaching `hello` still knows a passkey is the way in. Best effort: it
+            // never throws and never delays this pairing.
+            void saveWebUnlockGrant(frame.device.scopes ?? []);
             resolve(device);
           },
           (error: unknown) => {
@@ -1021,6 +1477,28 @@ export class AppController {
       this.host = host;
       this.debug.info('paired host saved', { gatewayId: host.gatewayId });
       this.bump();
+
+      if (!this.unlocked && this.webLocked) {
+        // Spec 021: a web device that has already seen a `web:unlock` lock keeps THIS pairing socket
+        // for its passkey frames — a new connection would start locked again and lose the owner's
+        // approval (which §14.3 grants to the asking socket only). The pairing succeeded on the
+        // accepted `client-hello` exactly as for a locked pairing.
+        await this.waitForAcceptedHello(pairingClient, generation, false);
+        if (!this.isCurrent(generation)) throw new CoreError({ code: 'client/bad-state', message: 'Pairing was superseded' });
+        // The socket is PROMOTED to the live one: it stops being the one-time pairing socket, or
+        // every passkey step would be refused (`passkeyClient` rejects that socket) and the fresh
+        // install would sit on a lock screen it can never answer.
+        this.pairingSocket = null;
+        this.client = pairingClient;
+        // Both were decided before the grant was known (at construction and in the handshake), so
+        // they are attached here: the owner's `passkey-approval` reaches the socket that asked, and
+        // this socket's `hello.webLock` is what the lock screen shows.
+        this.listenForPasskeyApproval(pairingClient);
+        this.applyWebLock(pairingClient);
+        this.bump();
+        this.debug.info('pair succeeded (web lock: passkey socket promoted)', { gatewayId: host.gatewayId });
+        return { ok: true, host };
+      }
 
       if (!this.unlocked) {
         // A020/M5: the gate is closed, so the stored credential must not be read and no bearer
@@ -1225,6 +1703,11 @@ export class AppController {
 
   openSession(sessionId: string): void {
     this.openSessionId = sessionId;
+    // A panel belongs to the session it was projected for: a different one never inherits the
+    // previous session's checklist, and the cached projections are the Host's own for this id
+    // (the baseline arrived before the session could be opened).
+    this.panelsSessionId = sessionId;
+    this.panelsPanel = this.panels.get(sessionId) ?? EMPTY_SESSION_PANEL;
     this.syncOpenApprovals();
     this.history.clear();
     this.bump();
@@ -1234,6 +1717,8 @@ export class AppController {
   closeSession(): void {
     const open = this.openSessionId;
     this.openSessionId = null;
+    this.panelsSessionId = null;
+    this.panelsPanel = EMPTY_SESSION_PANEL;
     this.openApprovals = [];
     this.bump();
     if (open !== null && this.client?.state === 'ready') {
@@ -1271,6 +1756,89 @@ export class AppController {
   /** Older-history load state; drives the affordance's busy/locked state and its honest failure line. */
   private historyLoad = { loading: false, error: null as string | null };
 
+  /**
+   * A `beforeSeq` request MUST carry the `historyFormatVersion` the Host announced, or the gateway
+   * refuses it with `history-format-mismatch` + `resetRequired: true` (`PROTOCOL.md:748`,
+   * `plugins/mobile-gateway/lib/index.mjs:1398-1403`). The version is remembered from the first
+   * `history` reply (and also accepted from a `hello`), never guessed.
+   */
+  private historyCursorParams(sessionId: string, beforeSeq: number): Record<string, unknown> {
+    const formatVersion = this.history.page.formatVersion;
+    // `sessionId` is REQUIRED by the gateway (`parseSessionTarget`, index.mjs:1695-1697); without it
+    // every older-page request was refused, which the screen then reported as "could not load earlier
+    // messages" — the defect the AOW Remaster capture exposed.
+    return formatVersion === null
+      ? { sessionId, beforeSeq }
+      : { sessionId, beforeSeq, historyFormatVersion: formatVersion };
+  }
+
+  /**
+   * Remember the format version from any `history` reply, so cursors can be built later.
+   *
+   * The field is on the reply (`PROTOCOL.md:768`, `historyFormatVersion: 4`) and is also announced in
+   * `hello` (`plugins/mobile-gateway/lib/index.mjs:4793`). `HelloFrame` in `packages/mobile-protocol`
+   * does not declare it yet and that package is not ours to change, so it is read through this narrow
+   * local view rather than by widening the shared contract.
+   */
+  private historyFormatVersionOf(reply: Record<string, unknown>): number | null {
+    if (typeof reply.historyFormatVersion === 'number' && Number.isFinite(reply.historyFormatVersion)) {
+      return reply.historyFormatVersion;
+    }
+    const hello = this.client?.hello as HelloWithHistory | null | undefined;
+    const fromHello = hello?.historyFormatVersion;
+    return typeof fromHello === 'number' && Number.isFinite(fromHello) ? fromHello : null;
+  }
+
+  /**
+   * Load a first page, then keep pulling older pages while the Host says there is more AND the
+   * transcript still has no real prompt.
+   *
+   * WHY: the Host pages by bytes, so the opening page of a finished turn can contain only the tail —
+   * MEASURED (packaging) on session-391f5de4: the first page was 7 events (`request/context` …
+   * `turn/end`), while `user/message` (seq 9) and `turn/start` (seq 5) sat on an older page. Reading
+   * only the first page therefore showed an answer with no question, which on device looked like the
+   * history renderer was broken.
+   *
+   * Bounded by `maxPages` so a Host that always reports `hasMore` cannot spin forever.
+   */
+  private async loadHistoryWithPrompts(sessionId: string, maxPages = 5): Promise<void> {
+    const client = this.client;
+    if (client === null || client.state !== 'ready') return;
+    const first = await client.request('history', { sessionId });
+    if (this.openSessionId !== sessionId) return;
+    const formatVersion = this.historyFormatVersionOf(first);
+    this.history.setPage(this.historyRows(first), {
+      hasMore: first.hasMore === true,
+      ...(typeof first.nextBeforeSeq === 'number' ? { nextBeforeSeq: first.nextBeforeSeq } : {}),
+      formatVersion,
+    });
+    let pages = 0;
+    while (pages < maxPages && this.openSessionId === sessionId) {
+      const page = this.history.page;
+      if (!page.hasMore || this.history.hasUserTurn()) break;
+      const beforeSeq = page.nextBeforeSeq;
+      if (beforeSeq === null) break;
+      pages += 1;
+      const older = await client.request('history', this.historyCursorParams(sessionId, beforeSeq));
+      if (this.openSessionId !== sessionId) return;
+      const rows = this.historyRows(older);
+      const arrived = rows.length;
+      this.history.prependPage(rows, {
+        hasMore: older.hasMore === true && arrived > 0,
+        ...(typeof older.nextBeforeSeq === 'number' ? { nextBeforeSeq: older.nextBeforeSeq } : {}),
+      });
+    }
+    this.historyLoad = { loading: false, error: null };
+    this.bump();
+  }
+
+  /** Drop the loaded transcript and re-read it from the Host (a `resetRequired` recovery). */
+  private async resetHistoryBaseline(sessionId: string): Promise<void> {
+    this.history.clear();
+    this.bump();
+    await this.loadHistoryWithPrompts(sessionId);
+  }
+
   async loadOlderHistory(): Promise<void> {
     const sessionId = this.openSessionId;
     if (sessionId === null || this.client?.state !== 'ready') return;
@@ -1292,19 +1860,36 @@ export class AppController {
     this.historyLoad = { loading: true, error: null };
     this.bump();
     try {
-      const answer = await this.client.request('history', { sessionId, beforeSeq });
-      const items = answer.items ?? answer.messages;
+      const answer = await this.client.request('history', this.historyCursorParams(sessionId, beforeSeq));
+      const items = this.historyRows(answer);
       const arrived = Array.isArray(items) ? items.length : 0;
       // An empty page means there is nothing older after all: never keep advertising more.
-      this.history.prependPage(items, { hasMore: answer.hasMore === true && arrived > 0 });
+      this.history.prependPage(items, {
+        hasMore: answer.hasMore === true && arrived > 0,
+        ...(typeof answer.nextBeforeSeq === 'number' ? { nextBeforeSeq: answer.nextBeforeSeq } : {}),
+      });
       this.historyLoad = { loading: false, error: null };
       this.bump();
     } catch (error) {
+      // A cursor the Host will not accept is not a dead end: `resetRequired` means "reload the
+      // baseline", and swallowing it left the screen claiming there was no older history at all.
+      if (this.isHistoryResetRequired(error)) {
+        this.historyLoad = { loading: false, error: null };
+        await this.resetHistoryBaseline(sessionId);
+        return;
+      }
       // Never silent: the screen shows one muted line with the code's reason.
       this.historyLoad = { loading: false, error: authoringErrorCode(error) };
       this.recordError(error);
       this.bump();
     }
+  }
+
+  /** `history-format-mismatch` + `resetRequired: true`: the cursor generation is gone. */
+  private isHistoryResetRequired(error: unknown): boolean {
+    if (!(error instanceof CoreError)) return false;
+    if (error.code !== 'history-format-mismatch') return false;
+    return error.details?.resetRequired === true;
   }
 
   /** Send a prompt with a stable clientMsgId; retried by the outbox after a reconnect. */
@@ -1537,6 +2122,12 @@ export class AppController {
    * late events from this socket can never touch the controller again (one live connection).
    */
   private teardownConnection(reason = 'teardown'): void {
+    // Projections belong to the connection that projected them: the next one sends its own baseline
+    // (right after `hello`), so nothing from the old socket is folded into a new session list.
+    this.forgetPanels();
+    // Spec 021: the `passkey-approval` listener belongs to the socket being closed.
+    this.unsubscribePasskeyApproval?.();
+    this.unsubscribePasskeyApproval = null;
     this.connectionCleanup?.();
     this.connectionCleanup = null;
     const reconnector = this.reconnector;
@@ -1546,6 +2137,57 @@ export class AppController {
     this.client = null;
     this.pairingSocket = null;
     if (client !== null) client.close(1000, reason);
+  }
+
+  /**
+   * Drop every cached projection and the open session's copy of it. Called by `teardownConnection`
+   * (so disconnect, lock, re-pair, revocation and host switch all clear it) and by `forget`.
+   */
+  private forgetPanels(): void {
+    this.panels.clear();
+    this.panelsConnection = null;
+    this.panelsSessionId = null;
+    this.panelsPanel = EMPTY_SESSION_PANEL;
+  }
+
+  /**
+   * Which socket a projection frame belongs to: the live client's own token (a fixed marker when
+   * there is none), so a frame already queued on the socket a host switch closed is told apart from
+   * the new socket's frames instead of being folded into the new computer's projections.
+   */
+  private panelConnection(): string {
+    const client = this.client;
+    if (client === null) return 'no-client';
+    const known = this.panelConnectionTokens.get(client);
+    if (known !== undefined) return known;
+    panelConnectionSequence += 1;
+    const token = String(panelConnectionSequence);
+    this.panelConnectionTokens.set(client, token);
+    return token;
+  }
+
+  /** One token per client instance (`CompanionClient` carries no identity of its own). */
+  private readonly panelConnectionTokens = new WeakMap<CompanionClient, string>();
+
+  /**
+   * Fold one decoded panel into the store per key: a value whose cut point is at or behind the one
+   * already held is not newer, and is dropped rather than overwriting a later `asOfSeq`.
+   */
+  private mergePanel(sessionId: string, panel: SessionPanel): void {
+    const held = this.panels.get(sessionId);
+    if (held === undefined) {
+      this.panels.set(sessionId, panel);
+      return;
+    }
+    const merged: SessionPanel = {
+      todos: isNewer(panel.todosAsOfSeq, held.todosAsOfSeq) ? panel.todos : held.todos,
+      todosAsOfSeq: newer(panel.todosAsOfSeq, held.todosAsOfSeq),
+      goal: isNewer(panel.goalAsOfSeq, held.goalAsOfSeq) ? panel.goal : held.goal,
+      goalAsOfSeq: newer(panel.goalAsOfSeq, held.goalAsOfSeq),
+    };
+    // Re-set so the entry counts as freshly named (see `evictPanels`).
+    this.panels.delete(sessionId);
+    this.panels.set(sessionId, merged);
   }
 
   /**
@@ -1654,6 +2296,10 @@ export class AppController {
     // previous one may be carried over.
     this.clearAuthoring();
     this.client = client;
+    // Spec 021: point the `passkey-approval` listener at THIS connection (no-op on native), so an
+    // owner approval on the Host reaches the socket that asked for it.
+    this.listenForPasskeyApproval(client);
+    /** Handler guard: events from a socket that was replaced/closed are ignored (M5). */
     /** Handler guard: events from a socket that was replaced/closed are ignored (M5). */
     const current = () => this.client === client;
     /** Last state this socket reported, so the trace shows transitions instead of repeats. */
@@ -1739,6 +2385,9 @@ export class AppController {
       }
       this.onEvent(frame);
     });
+    client.on('projection', (frame) => {
+      if (current()) this.onProjection(frame);
+    });
     return client;
   }
 
@@ -1753,8 +2402,15 @@ export class AppController {
    * Returns the live client and the generation that owns it (null when nothing was opened), so
    * `pair()` can await *that* connection's accepted `client-hello` (M9/A048).
    */
-  private async connectHost(host: PairedHost): Promise<{ client: CompanionClient; generation: number } | null> {
-    if (!this.unlocked) return null;
+  private async connectHost(
+    host: PairedHost,
+    options: { lockPending?: boolean } = {},
+  ): Promise<{ client: CompanionClient; generation: number } | null> {
+    // `lockPending` is the ONE exception to "no socket before the platform unlock": a web device
+    // whose credential is only usable once its passkey has been asserted needs a live socket to
+    // assert on, and it reads nothing through it (see `startWebLockSession`).
+    const lockPending = options.lockPending === true;
+    if (!this.unlocked && !lockPending) return null;
     const generation = this.beginGeneration();
     this.teardownConnection('reconnect');
     // M5 ownership: remember which credential revision the read starts from. If a newer `paired`
@@ -1762,7 +2418,7 @@ export class AppController {
     // recording the older revision makes a revocation of this socket leave that fresh token alone.
     const revisionBeforeRead = this.credentialRevision(host.gatewayId);
     const token = await readToken(host.gatewayId);
-    if (!this.isCurrent(generation) || !this.unlocked) {
+    if (!this.isCurrent(generation) || (!this.unlocked && !lockPending)) {
       this.debug.info('token read superseded before connecting', { gatewayId: host.gatewayId });
       return null;
     }
@@ -1780,7 +2436,7 @@ export class AppController {
     const client = this.newClient();
     this.socketCredentials.set(client, { gatewayId: host.gatewayId, revision: revisionBeforeRead });
     const connect = () => {
-      if (!this.unlocked || credential === null || this.client !== client) return;
+      if ((!this.unlocked && !lockPending) || credential === null || this.client !== client) return;
       if (client.connected || client.state === 'ready' || client.state === 'connecting'
         || client.state === 'waiting-hello' || client.state === 'waiting-client-hello') {
         // The previous attempt is still alive (e.g. a failed resync on a live socket): closing
@@ -1933,10 +2589,14 @@ export class AppController {
     if (client !== this.client) return;
     if (client === this.pairingSocket) return; // one-time pairing socket: never resynced
     this.debug.info('client ready', { gatewayId: this.host?.gatewayId ?? null });
+    // Spec 021 (contract §14.2): a locked web socket may only use hello/ping and the passkey frames,
+    // so its state is read BEFORE anything else and the resync below is skipped while it is locked.
+    this.applyWebLock(client);
     this.banner = 'none';
     this.pinnedTransportUnavailable = false;
     this.updateRequired = null;
     this.bump();
+    if (this.webLocked) return;
     const reconnector = this.reconnector;
     if (reconnector !== null) {
       // M6: going live runs the resync and resets the backoff; a resync failure is a drop.
@@ -1960,10 +2620,9 @@ export class AppController {
     const sessionId = this.openSessionId;
     if (sessionId !== null) {
       await client.request('subscribe', { sessionId });
-      const history = await client.request('history', { sessionId });
+      // Pages until the transcript actually contains the prompt (see loadHistoryWithPrompts).
+      await this.loadHistoryWithPrompts(sessionId);
       if (client !== this.client || this.openSessionId !== sessionId) return;
-      this.historyLoad = { loading: false, error: null };
-      this.history.setPage(history.items ?? history.messages, { hasMore: history.hasMore === true });
     }
     await this.drainOutbox();
     this.bump();
@@ -1999,12 +2658,14 @@ export class AppController {
     if (client === null || client.state !== 'ready') return;
     try {
       await client.request('subscribe', { sessionId });
-      const history = await client.request('history', { sessionId });
-      if (this.openSessionId !== sessionId) return; // the user moved on meanwhile
-      this.historyLoad = { loading: false, error: null };
-      this.history.setPage(history.items ?? history.messages, { hasMore: history.hasMore === true });
+      await this.loadHistoryWithPrompts(sessionId);
       this.bump();
     } catch (error) {
+      if (this.isHistoryResetRequired(error)) {
+        this.historyLoad = { loading: false, error: null };
+        await this.resetHistoryBaseline(sessionId).catch(() => {});
+        return;
+      }
       this.recordError(error);
     }
   }
@@ -2069,11 +2730,102 @@ export class AppController {
   private onEvent(frame: Record<string, unknown>): void {
     const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId : null;
     const payload = frame.event as Record<string, unknown> | undefined;
-    const message = payload?.message ?? payload;
-    if (sessionId !== null && this.openSessionId === sessionId && message !== undefined) {
-      const appended = this.history.append(message);
+    if (payload === undefined) return;
+    // Spec 011 parity: `session-status` / `session-created` carry the workspace binding (and may run
+    // ahead of the next `sessions` list), so the group a row belongs to updates without a refetch.
+    // Merged, never upserted: these events have no title, and an upsert would blank it.
+    const eventType = typeof payload.type === 'string' ? payload.type : '';
+    if (eventType === 'session-status' || eventType === 'session-created') {
+      const boundSessionId = sessionId
+        ?? (typeof payload.sessionId === 'string' ? payload.sessionId : null);
+      if (boundSessionId !== null) {
+        this.sessions.applyWorkspace(boundSessionId, {
+          ...(typeof payload.workspaceId === 'string' ? { workspaceId: payload.workspaceId } : {}),
+          ...(typeof payload.workspaceLabel === 'string' ? { workspaceLabel: payload.workspaceLabel } : {}),
+        });
+      }
+    }
+    // The live frame keeps `seq`/`time` on the FRAME (`buildWireEvent` builds `base` separately,
+    // plugins/mobile-gateway/lib/index.mjs:416-421) while the event body carries the display fields,
+    // so the two are merged before mapping: without it every live row would lose its ordering key.
+    const merged = {
+      ...payload,
+      ...(typeof frame.seq === 'number' ? { seq: frame.seq } : {}),
+      ...(typeof frame.time === 'number' ? { time: frame.time } : {}),
+    };
+    // Raw session events wrap their message (`data.message`), older frames put it at the top level.
+    // Try the event itself first, then its `message`, so neither shape is dropped.
+    const row = coerceHistoryEvent(merged)
+      ?? (typeof payload.message === 'object' && payload.message !== null
+        ? coerceHistoryEvent({ ...(payload.message as Record<string, unknown>), ...(merged.seq === undefined ? {} : { seq: merged.seq }), ...(merged.time === undefined ? {} : { time: merged.time }) })
+        : null);
+    if (sessionId !== null && this.openSessionId === sessionId && row !== null) {
+      const appended = this.history.append(row);
       if (appended !== null) this.bump();
     }
+  }
+
+  /**
+   * Spec 018 item 5 — fold one projection push into the per-session store.
+   *
+   * The gateway sends `projection-baseline` for the whole control set, ONCE, right after `hello`
+   * (`plugins/mobile-gateway/lib/index.mjs:6073`), and `tasks-updated` / `goal-updated` per session
+   * (PROTOCOL.md:1197-1201). The baseline therefore always arrives before any session is opened, so
+   * it is folded for EVERY session it names, and an update is folded whenever it is newer — the open
+   * session only decides what is drawn, never what is kept. An older `asOfSeq` never overwrites a
+   * newer one (per key, per session — `src/core/projections.ts` does the compare).
+   */
+  private onProjection(frame: Record<string, unknown>): void {
+    const connection = this.panelConnection();
+    // A connection's frames share one store; only a frame from a DIFFERENT connection starts a new
+    // one, so the baseline of one connection is never thrown away by an update it sent afterwards.
+    if (this.panelsConnection !== connection) {
+      this.forgetPanels();
+      this.panelsConnection = connection;
+    }
+    if (frame.kind === 'projection-baseline') {
+      const baselines = parseProjectionBaseline(frame.projections);
+      if (baselines === null) return;
+      // HISTORY, not the newest frame: the gateway sends `projection-baseline` once at connect
+      // (`lib/index.mjs:6073`, before any update) and again only on a `session/control` migration
+      // (:7039-7044), where its `values` are a re-read that may sit BEHIND frames already folded. So
+      // it is applied per key like history — it seeds every session when nothing is held yet, and
+      // never pulls a session back to an older cut point. A malformed session is simply absent.
+      for (const [sessionId, panel] of baselines) this.mergePanel(sessionId, panel);
+    } else {
+      const target = typeof frame.sessionId === 'string' && frame.sessionId !== '' ? frame.sessionId : null;
+      if (target === null) return;
+      const previous = this.panels.get(target);
+      const next = panelFromUpdate(frame, target, previous);
+      if (next === null) return;
+      this.panels.delete(target);
+      this.panels.set(target, next);
+    }
+    const open = this.openSessionId;
+    evictPanels(this.panels, open ?? '');
+    if (open === null) return;
+    // The screen draws the open session only: refresh its copy, and re-render only when a frame
+    // could have changed it — a push for another session changes nothing on screen.
+    this.panelsSessionId = open;
+    this.panelsPanel = this.panels.get(open) ?? EMPTY_SESSION_PANEL;
+    if (frame.kind === 'projection-baseline' || (typeof frame.sessionId === 'string' && frame.sessionId === open)) {
+      this.bump();
+    }
+  }
+
+  /**
+   * Normalise a `history` reply to rows the store understands.
+   *
+   * The gateway answers with raw DSH events (`PROTOCOL.md:744,768` — an `events[]` array), while the
+   * contract and every app fixture use `{role, text}` rows (`mobile-protocol-v1.md:213`). Both are
+   * accepted here so a page is never silently empty, and `coerceHistoryEvents` drops protocol
+   * chatter (`turn/start`, `llm/*`, titles, …) instead of inventing rows for it. Rows that already
+   * carry a role pass through untouched, additive fields included.
+   */
+  private historyRows(reply: { items?: unknown; messages?: unknown; events?: unknown }): unknown[] {
+    if (Array.isArray(reply.items)) return reply.items;
+    if (Array.isArray(reply.messages)) return reply.messages;
+    return coerceHistoryEvents(reply.events);
   }
 
   /**
@@ -2348,11 +3100,243 @@ export class AppController {
     this.bump();
   }
 
+  /**
+   * Read the agent team of one session (spec 018 item 2). Sends the contract's `agent-team` frame
+   * through the CURRENT client — the UI never touches the client object itself.
+   *
+   * Returns `{ state: 'unavailable' }` when there is no usable connection (no client, or not
+   * `ready`): the caller cannot get a projection either way, and this is not an error the user
+   * should see as a failure. It deliberately does NOT throw for that case so a screen can render
+   * its normal "nothing to show yet" state without try/catch around every read.
+   *
+   * A real protocol/host problem still REJECTS with the `CoreError` from `src/core/team.ts`
+   * (`client/bad-message`, the Host's own code such as `session/not-found`, …), because that is a
+   * defect worth surfacing, not a quiet "empty".
+   */
+  async readTeam(sessionId: string): Promise<TeamRead<AgentTeamProjection>> {
+    if (this.client === null || this.client.state !== 'ready') return { state: 'unavailable' };
+    return readAgentTeam(this.client, sessionId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Spec 019 — permission control, view + lower-only (header chip + sheet)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Spec 019 — read the presets and the strictly-stricter options for one session
+   * (`permission-options`).
+   *
+   * Same rule as {@link readTeam}: no live socket, or a Host that does not advertise
+   * `permission-lower`, answers `{ state: 'unavailable' }` instead of throwing — there is nothing
+   * to show either way, and that is not a failure. A real refusal (a scope refusal, a malformed
+   * reply, a reply for another session) REJECTS with `CoreError` carrying the Host's code.
+   */
+  async readPermissionOptions(sessionId: string): Promise<PermissionOptionsResult> {
+    const client = this.client;
+    if (client === null || client.state !== 'ready') return { state: 'unavailable' };
+    const capabilities = client.hello?.capabilities;
+    if (!Array.isArray(capabilities) || !capabilities.includes(PERMISSION_LOWER_CAPABILITY)) {
+      return { state: 'unavailable' };
+    }
+    const result = await readPermissionOptions(client, sessionId);
+    return result;
+  }
+
+  /**
+   * Spec 019 — switch one session to ONE of the offered presets (`permission-lower`).
+   *
+   * No live socket does NOT throw (the caller checks the same capability before it opens the
+   * sheet), so a socket that died between the sheet's read and its confirm rejects here with
+   * `client/bad-state` from the core — it is not swallowed into a fake receipt. A RECEIPT is
+   * then applied: an accepted switch moves the row's preset; a refusal keeps the row's preset
+   * when the receipt names none, and its fixed sentence is the caller's to render.
+   */
+  async lowerPermission(sessionId: string, preset: string): Promise<PermissionLowerOutcome> {
+    const client = this.client;
+    if (client === null || client.state !== 'ready') {
+      throw new CoreError({ code: 'client/bad-state', message: 'Not connected; the permission switch was not sent' });
+    }
+    const outcome = await lowerPermission(client, sessionId, preset);
+    return outcome;
+  }
+
+  /**
+   * Read the subagent catalog of one session. Same contract and the same "no connection ⇒
+   * `unavailable`, protocol problem ⇒ rejects" rule as {@link readTeam}.
+   */
+  async readSubagents(sessionId: string): Promise<TeamRead<SubagentCatalogEntry[]>> {
+    if (this.client === null || this.client.state !== 'ready') return { state: 'unavailable' };
+    return readSubagents(this.client, sessionId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Spec 018 — read-only session metrics (`stats:read`) and schedules (`schedule:read`)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Spec 018: does this device hold one of the two read scopes (`stats:read` / `schedule:read`)?
+   *
+   * Both scopes are EXPLICIT-ONLY (contract `NEVER_DEFAULT_SCOPES`) and the gateway advertises no
+   * `hello` capability for either (contract §3.5 names none), so the device's own granted scopes are
+   * the only statement the app can rely on — the same signal the enclosing accessors enforce. A
+   * scope list that is absent or malformed grants nothing, so an older pairing reads as "not
+   * granted": fail closed, the UI hides the section instead of promising a read that would be
+   * refused. Exposed so screens ask the SAME question the accessors answer.
+   */
+  hasReadScope(scope: 'stats:read' | 'schedule:read'): boolean {
+    const scopes = this.client?.device?.scopes;
+    return scope === 'stats:read' ? hasStatsReadScope(scopes) : hasScheduleReadScope(scopes);
+  }
+
+  /**
+   * Read one session's metrics (`session-stats`, scope `stats:read`).
+   *
+   * Same rule as {@link readTeam}: no live socket, or a device NOT paired with `stats:read` answers
+   * `{ state: 'unavailable' }` instead of throwing — the frame would be refused before it reached the
+   * Host, and a screen must render that as "not available", not as a fault. A real refusal (the Host's
+   * `session-not-found` / `remote-access/denied`, a malformed reply, another session's reply) REJECTS
+   * with the `CoreError` from `src/core/stats.ts`.
+   */
+  async readSessionStats(sessionId: string): Promise<SessionStatsRead | { state: 'unavailable' }> {
+    const client = this.client;
+    if (client === null || client.state !== 'ready') return { state: 'unavailable' };
+    if (!hasStatsReadScope(client.device?.scopes)) return { state: 'unavailable' };
+    return readSessionStats(client, sessionId);
+  }
+
+  /**
+   * Read the Host's schedule rule catalog (`schedule-catalog`, scope `schedule:read`).
+   *
+   * Same rule as {@link readSessionStats}: no live socket, or no `schedule:read` grant ⇒
+   * `{ state: 'unavailable' }` (the gateway refuses it by scope before the Host is called); a real
+   * refusal rejects with the Host's code.
+   */
+  async readScheduleCatalog(): Promise<ScheduleCatalog | { state: 'unavailable' }> {
+    const client = this.client;
+    if (client === null || client.state !== 'ready') return { state: 'unavailable' };
+    if (!hasScheduleReadScope(client.device?.scopes)) return { state: 'unavailable' };
+    return readScheduleCatalog(client);
+  }
+
+  /** Read one page of the Host-wide schedule list. Same availability rule as {@link readScheduleCatalog}. */
+  async readSchedules(options: { active?: boolean; limit?: number; offset?: number } = {}): Promise<ScheduleList | { state: 'unavailable' }> {
+    const client = this.client;
+    if (client === null || client.state !== 'ready') return { state: 'unavailable' };
+    if (!hasScheduleReadScope(client.device?.scopes)) return { state: 'unavailable' };
+    return readScheduleList(client, options);
+  }
+
+  /**
+   * Read one scheduled task. Same availability rule. `{ state: 'not-found' }` is the Host's
+   * structured `schedule_not_found` answer (the task is gone), NOT an unavailable read.
+   */
+  async readSchedule(taskId: string): Promise<ScheduleViewResult | { state: 'unavailable' }> {
+    const client = this.client;
+    if (client === null || client.state !== 'ready') return { state: 'unavailable' };
+    if (!hasScheduleReadScope(client.device?.scopes)) return { state: 'unavailable' };
+    return readScheduleView(client, taskId);
+  }
+
+  /**
+   * Rename one session (`session-rename { sessionId, title }`).
+   *
+   * Same rule as {@link readTeam}: no live socket is NOT a protocol error, so it answers
+   * `{ ok: false, code: 'client/bad-state' }` instead of throwing. A real refusal (the Host's
+   * `{ kind: 'error' }` frame, a malformed reply, another session's reply) REJECTS with `CoreError`
+   * carrying the Host's code — it is never swallowed, because a rename that silently did nothing is
+   * worse than a visible failure. Success is ONLY a `session-renamed` receipt for this session, and
+   * the title reported is the one the gateway stored (it normalises the request value).
+   */
+  async renameSession(sessionId: string, title: string): Promise<SessionActionOutcome> {
+    if (this.client === null || this.client.state !== 'ready') {
+      return { ok: false, code: 'client/bad-state' };
+    }
+    const frame = renameFrame(sessionId, title);
+    // `session-rename` is not in the contract's `Op` union yet (spec 011 P2 item 4: the contract
+    // revision is packaging's, and the gateway's handlers exist but are unmapped, so the Host answers
+    // a refusal which we surface). The cast disappears when the contract lists the op.
+    const reply = (await this.client.request('session-rename' as Op, frame)) as Record<string, unknown>;
+    if (reply?.kind === 'error') {
+      throw new CoreError({
+        code: typeof reply.code === 'string' && reply.code !== '' ? reply.code : 'internal',
+        message: 'the Host refused the rename',
+      });
+    }
+    // Only the one receipt kind is a rename, and only when it names THIS session: a reply for another
+    // session would repaint this row with a name it never stored. The title reported is the gateway's
+    // normalised one, never the local draft (the wire value and the stored value must not drift).
+    if (reply?.kind !== 'session-renamed') {
+      throw new CoreError({ code: 'client/bad-message', message: 'Expected a session-renamed reply', details: { kind: reply?.kind } });
+    }
+    if (reply.sessionId !== frame.sessionId) {
+      throw new CoreError({ code: 'client/bad-message', message: 'session-rename reply was for a different session' });
+    }
+    const stored = typeof reply.title === 'string' ? reply.title : '';
+    if (stored === '') throw new CoreError({ code: 'client/bad-message', message: 'session-rename reply carried no title' });
+    return { ok: true, sessionId: frame.sessionId, title: stored };
+  }
+
+  /**
+   * Archive one session (`session-archive { sessionId }`). Same contract as {@link renameSession}:
+   * no socket ⇒ `{ ok: false, code: 'client/bad-state' }`; a real refusal rejects with the Host's code;
+   * success is ONLY a `session-archived` receipt for this session.
+   */
+  async archiveSession(sessionId: string): Promise<SessionActionOutcome> {
+    if (this.client === null || this.client.state !== 'ready') {
+      return { ok: false, code: 'client/bad-state' };
+    }
+    const frame = archiveFrame(sessionId);
+    // See the cast in `renameSession`: the op reaches the wire before the contract lists it.
+    const reply = (await this.client.request('session-archive' as Op, frame)) as Record<string, unknown>;
+    if (reply?.kind === 'error') {
+      throw new CoreError({
+        code: typeof reply.code === 'string' && reply.code !== '' ? reply.code : 'internal',
+        message: 'the Host refused the archive',
+      });
+    }
+    // Same rule as the rename: the receipt must be `session-archived` AND name this session, or it
+    // is a malformed reply — never a quiet success.
+    if (reply?.kind !== 'session-archived') {
+      throw new CoreError({ code: 'client/bad-message', message: 'Expected a session-archived reply', details: { kind: reply?.kind } });
+    }
+    if (reply.sessionId !== frame.sessionId) {
+      throw new CoreError({ code: 'client/bad-message', message: 'session-archive reply was for a different session' });
+    }
+    return { ok: true, sessionId: frame.sessionId };
+  }
+
   /** Create a session in one workspace. Returns the new id so the caller can open it. */
   async createSession(input: { workspaceId: string }): Promise<AuthoringResult<string>> {
     if (this.client?.state !== 'ready') return { ok: false, code: 'client/bad-state' };
+    /**
+     * NEVER send a workspace NAME, nor an id remembered from an earlier load.
+     *
+     * The Host's workspace list changes (a workspace was added on 2026-11-11), and the gateway refuses
+     * anything that is not a current id with `remote/argument-denied` — before the Host is called at
+     * all, so no session is created. The id is therefore re-checked against the most recent
+     * `workspaces` reply, refreshed once if it is not there, and never cached across a reload.
+     */
+    const isCurrentWorkspace = (id: string): boolean =>
+      id !== '' && this.authoring.workspaces.some((workspace) => workspace.id === id);
+    if (!isCurrentWorkspace(input.workspaceId)) {
+      await this.listWorkspaces();
+      if (!isCurrentWorkspace(input.workspaceId)) {
+        return { ok: false, code: WORKSPACE_DENIED_CODE };
+      }
+    }
     try {
       const answer = await this.client.request('session-create', { workspaceId: input.workspaceId });
+      // Success is a `session-created` frame carrying the HOST's session id. The gateway answers
+      // refusals with a typed frame instead of throwing, so it is classified first — otherwise a
+      // refusal would look like "an id was missing" and the real reason would be lost.
+      if (answer.kind === 'error') {
+        const code = typeof answer.code === 'string' && answer.code !== '' ? answer.code : 'client/bad-message';
+        const message = typeof answer.message === 'string' ? answer.message : '';
+        // A denied workspace means the list the picker showed is stale: refresh it so the next attempt
+        // offers real ids instead of the dead one.
+        if (code === WORKSPACE_DENIED_CODE) await this.listWorkspaces().catch(() => {});
+        return { ok: false, code, ...(message === '' ? {} : { message }) };
+      }
       const sessionId = typeof answer.sessionId === 'string' ? answer.sessionId : '';
       if (sessionId === '') return { ok: false, code: 'client/bad-message' };
       // The new session exists on the host now; reflect it without waiting for the next list poll.
@@ -2469,6 +3453,7 @@ export class AppController {
       hosts: this.hosts,
       activeHost: this.host,
       connection: this.client?.state ?? 'idle',
+      capabilities: this.client?.hello?.capabilities ?? [],
       banner: this.banner,
       loading: this.loading,
       sessions: this.sessions.snapshot().items,
@@ -2512,6 +3497,14 @@ export class AppController {
       // empty/idle otherwise is what makes a disconnect (or a teardown that has not cleared yet)
       // read as "nothing fetched", never as the previous computer's workspaces.
       grantedScopes: this.client?.device?.scopes ?? [],
+      webLock: this.webLockGranted && this.host !== null
+        ? {
+            state: this.webLocked ? this.webLockState : 'unlocked',
+            reason: this.webLockReason,
+            approval: this.webLockApproval,
+            error: this.webLockError,
+          }
+        : null,
       workspaces: this.client?.state === 'ready' ? this.authoring.workspaces : [],
       workspacesState: this.client?.state === 'ready' ? this.authoring.workspacesState : 'idle',
       workspacesError: this.client?.state === 'ready' ? this.authoring.workspacesError : null,
@@ -2519,6 +3512,10 @@ export class AppController {
       currentModel: this.client?.state === 'ready' ? this.authoring.currentModel : null,
       modelsState: this.client?.state === 'ready' ? this.authoring.modelsState : 'idle',
       modelsError: this.client?.state === 'ready' ? this.authoring.modelsError : null,
+      openSessionPanel:
+        this.openSessionId !== null && this.panelsSessionId === this.openSessionId
+          ? this.panelsPanel
+          : EMPTY_SESSION_PANEL,
       lastError: this.lastError,
       locale: this.localeFor(),
     };

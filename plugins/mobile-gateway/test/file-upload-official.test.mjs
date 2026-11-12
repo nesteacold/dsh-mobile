@@ -41,7 +41,9 @@ agents.set('s1', makeAgent('s1'))
 agents.set('s2', makeAgent('s2'))
 const host = createDshHostAdapter({ invoke: async () => ({}), stream: async () => (async function* () {})() }, peer, connection)
 host.sessions.list = async () => ({ items: [{ sessionId: 's1' }, { sessionId: 's2' }] })
-const manager = createFileUploadManager(host, { fileUploadChunkBytes: 4 })
+// Spec 013: the image path reads the Host's own admission limits, as the gateway
+// passes `ctx.attachments.imageLimits` at runtime.
+const manager = createFileUploadManager(host, { fileUploadChunkBytes: 4, imageLimits: () => attachments.imageLimits })
 const client = {}
 const send = (type, args) => manager.handle(client, { type, requestId: crypto.randomUUID(), ...args })
 try {
@@ -76,6 +78,54 @@ try {
   await assert.rejects(() => SessionCommandController.prototype.prompt.call(promptContext,
     { ...prompt, sessionId: 's2', requestId: 'foreign-send' }, { kind: 'user', rpcId: 'foreign-send' }),
   { code: 'session/attachment-invalid' })
+
+  // -------------------------------------------------------------------------
+  // Spec 013 (contract revision 8): the IMAGE destination through the same real
+  // route. `mediaType` selects the Host's `uploadImageStream`, the Host validates
+  // and NORMALIZES the image, and the receipt carries `image` (never `file`).
+  // -------------------------------------------------------------------------
+  const { handleRemoteUpload } = await import('../lib/file-upload.mjs')
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+    'base64')
+  const pngSha = crypto.createHash('sha256').update(png).digest('hex')
+  const remote = (type, args) => handleRemoteUpload(manager, client, { type, requestId: `rem-${type}`, ...args })
+  const openedImage = await remote('remote-upload-open', {
+    sessionId: 's2', kind: 'image', mediaType: 'image/png', name: 'px.png', size: png.length, sha256: pngSha })
+  assert.equal(openedImage.ok, true, JSON.stringify(openedImage))
+  assert.equal(openedImage.value.kind, 'image')
+  assert.equal(openedImage.value.mediaType, 'image/png')
+  for (let offset = 0; offset < png.length; offset += 4) {
+    const accepted = await remote('remote-upload-chunk', { uploadId: openedImage.value.uploadId, offset,
+      data: png.subarray(offset, offset + 4).toString('base64') })
+    assert.equal(accepted.ok, true, JSON.stringify(accepted))
+    assert.equal(accepted.value.nextOffset, Math.min(offset + 4, png.length))
+  }
+  const finishedImage = await remote('remote-upload-finish', { uploadId: openedImage.value.uploadId })
+  assert.equal(finishedImage.ok, true, JSON.stringify(finishedImage))
+  // Exactly the Host's own value: a receipt plus a normalized image reference.
+  assert.equal(typeof finishedImage.value.receiptId, 'string')
+  assert.equal(Object.hasOwn(finishedImage.value, 'file'), false)
+  const image = finishedImage.value.image
+  assert.equal(image.mediaType, 'image/png')
+  assert.ok(image.attachmentId.startsWith('sha256:'))
+  for (const key of ['bytes', 'width', 'height']) {
+    assert.ok(Number.isSafeInteger(image[key]) && image[key] > 0, `${key} must be positive: ${JSON.stringify(image)}`)
+  }
+  // Staged for the SAME session's agent, exactly like the file receipt above
+  // (the Host stages `{type, attachment, encodedBytes}`; the receipt's `image`
+  // is the attachment reference the client then carries in a prompt).
+  const staged = uploads.resolve(agents.get('s2'), finishedImage.value.receiptId)
+  assert.equal(staged.type, 'image')
+  assert.deepEqual(staged.attachment, image)
+  assert.equal(uploads.resolve(agents.get('s1'), finishedImage.value.receiptId), undefined)
+  // A mediaType the deployment does not accept is refused before a byte moves —
+  // mirroring the Host's own 4 accepted types (svg is not one of them).
+  const refusedImage = await remote('remote-upload-open', {
+    sessionId: 's2', kind: 'image', mediaType: 'image/svg+xml', size: png.length, sha256: pngSha })
+  assert.equal(refusedImage.ok, false)
+  assert.equal(refusedImage.error.code, 'session/attachment-invalid')
+  console.log(`OFFICIAL REMOTE ATTACHMENT TESTS PASSED (image ${image.mediaType} ${image.width}x${image.height}, ${image.bytes} bytes; real route and store)`)
   console.log(`OFFICIAL FILE UPLOAD CONTRACT TESTS PASSED (DSH ${DSH_VERSION}; isolated temporary store and Agent fixtures)`)
 } finally {
   await manager.dispose()

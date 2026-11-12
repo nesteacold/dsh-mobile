@@ -11,6 +11,10 @@ const ROUTES = [
   ['POST', '/devices/remotes', { address: '127.0.0.1:1', pairingString: 'x'.repeat(40) }],
   ['DELETE', '/devices/remotes/00000000-0000-4000-8000-000000000001'],
   ['GET', '/devices/remotes/00000000-0000-4000-8000-000000000001/sessions'],
+  // The address edit (the other host's Tailscale IP moved) carries a url, so it is
+  // guarded like every other write: a non-loopback or cross-origin caller never
+  // reaches it, and no dial happens without the same-origin check.
+  ['PATCH', '/devices/remotes/00000000-0000-4000-8000-000000000001', { url: 'wss://10.0.0.5:3081/ws/mobile' }],
   ['GET', '/devices/remotes/00000000-0000-4000-8000-000000000001/history?sessionId=s1'],
   // Spec 008 P2c: the path form of the same route reads the local copy offline.
   ['GET', '/devices/remotes/00000000-0000-4000-8000-000000000001/sessions/s1/history'],

@@ -101,8 +101,17 @@ window.__ModuleLoader__.load({
         'scope.credentials:write': 'Set or remove provider credentials',
         'scope.plugins:manage': 'Install and manage plugins',
         'scope.schedule:write': 'Create and run schedules',
+        'scope.schedule:read': 'See scheduled tasks and when each one runs next',
         'scope.terminal': 'Open a terminal',
         'scope.sessions:author': 'Create sessions and choose a model',
+        'scope.attachments:write': 'Send files and images',
+        // Spec 014 C6: the Host's side-panel browser, driven from a paired device.
+        'scope.browser:control': "Drive the Host's browser panel",
+        'scope.stats:read': 'Read session statistics and context usage',
+        // Spec 020: the Host-attested unlock the web PWA asks for.
+        'scope.web:unlock': 'Unlock the web client (PWA)',
+        // Spec 019 Wave 3: lower-only, and this Host decides whether it is stricter.
+        'scope.permission:lower': 'Make a session stricter (never looser)',
         // One short risk line per dangerous scope, shown under its checkbox.
         'risk.files:write': 'Can change files in your workspaces.',
         'risk.settings:write': 'Can change Host settings, models and agent presets.',
@@ -113,6 +122,14 @@ window.__ModuleLoader__.load({
         'risk.schedule:write': 'Can create jobs that run later without you.',
         'risk.terminal': 'Full shell on this Host: it can do anything you can.',
         'risk.sessions:author': 'Can start new sessions on this Host and pick which model runs them.',
+        'risk.attachments:write': 'Can send files and images into a session on this Host.',
+        'risk.browser:control': "Can open pages and act in the Host's browser as you.",
+        'risk.web:unlock': 'Can attest the unlock of the web client for this account.',
+        'risk.permission:lower': 'Can only make a session stricter; it can never loosen permissions.',
+        // Spec 013: `uploads` on GET /devices/remotes. A remote row must name a
+        // broken attachment bridge instead of letting every upload 404.
+        'uploadsOff': 'Remote attachments are off: this Host does not take file uploads for a remote session.',
+        'uploadsBroken': 'Remote attachments will fail: the upload route this plugin wraps is not in place',
         presetStandard: 'Standard',
         presetFull: 'Full control',
         presetFullHint: 'Every permission, including shell, plugins and credentials. Only for devices you fully trust.',
@@ -193,29 +210,20 @@ window.__ModuleLoader__.load({
         waitingCode: 'Code',
         waitingHelp: 'Approve this request on the other device after checking that it shows the same code.',
         cancelWait: 'Cancel',
+        editAddress: 'Edit address',
+        saveAddress: 'Save',
+        addressPinNote: 'Same certificate pin; only the address changes.',
+        addressSaving: 'Saving…',
         pairRejected: 'The host rejected this device.',
         pairApproved: 'Paired.',
         // --- spec 008 P2b: remote sessions inside the native UI ---
-        groupLocal: 'Local workspaces',
-        groupSearch: 'Search workspaces and sessions',
-        groupNoMatches: 'Nothing matches.',
-        groupNoWorkspaces: 'This host lists no workspace.',
-        // A group can be empty for three different reasons; say which one it is.
-        groupHostOffline: 'This host is not connected; its workspaces appear here once it reconnects.',
-        groupHostRefused: 'The host refused the last request, so it lists no workspace',
-        newSession: 'New session',
-        newSessionIn: 'New session in this host',
-        newSessionNeedsWorkspace: 'No workspace on this host to start a session in.',
-        lastActivity: 'Last activity',
-        pinSession: 'Pin session',
-        unpinSession: 'Unpin session',
-        archiveSession: 'Archive session',
-        unarchiveSession: 'Unarchive session',
-        archived: 'Archived',
-        pinned: 'Pinned',
-        unread: 'Unread',
+        // The native browser owns the workspace and session rows (workspaces,
+        // nesting, search, pin/archive), so this plugin only names the host.
         hostChip: 'Host',
         hostAlreadyShown: 'Host',
+        // The session row's second copy row: the shipped one copies the tagged id
+        // this plugin mints, this one the id the Host itself uses.
+        copyOriginalId: 'Copy original ID',
         popoverTitle: 'Remote host',
         popoverPaired: 'Paired',
         popoverKind: 'Type',
@@ -241,11 +249,10 @@ window.__ModuleLoader__.load({
         terminalOpen: 'Open a terminal on this host',
         terminalHint: 'The terminal needs the "Open a terminal" permission on this device.',
         terminalUnavailable: 'The terminal is not available in this shell.',
-        sidebarOff: 'Remote hosts cannot be shown here.',
-        sidebarGrouping: 'Sidebar grouping',
-        sidebarOn: 'grouped by host',
+        sidebarGrouping: 'Sidebar host names',
+        sidebarOn: 'names shown on session rows',
         sidebarOffState: 'off',
-        // Why the grouped sidebar is not installed. The plugin produces this small,
+        // Why the host-name seats are not installed. The plugin produces this small,
         // fixed set of short reasons; each is printed as a sentence, not as the raw
         // English the diagnosis writes.
         sidebarReasonNotInstalled: 'Not installed yet.',
@@ -263,6 +270,28 @@ window.__ModuleLoader__.load({
         missingRemoteScope: 'Remote sessions and workspaces cannot appear until this device is paired again on that host with the "Use this host remotely" (harness:remote) permission.',
         pinMismatchNote: 'This host presented a different certificate. Nothing was sent. Pair it again if you trust the change.',
         hostRefused: 'The host refused the last request',
+        // --- spec 016 Phase 3: a browser this machine lets a paired host drive ---
+        // Two keys, never one: the host also needs the `browser:control` grant; this
+        // switch is the owner's own consent on THIS machine and is off by default.
+        browserAgentConsent: 'Allow this host to drive a browser on this machine',
+        browserAgentConsentHelp: 'Off by default. When it is on, this host\'s agent may open pages in its own headless Chrome or Edge, with a profile of its own. Stop in the Browser (agent) tab closes it at once.',
+        browserAgentOffByDefault: 'Off',
+        browserAgentTab: 'Browser (agent)',
+        browserAgentOpen: 'Open Browser (agent)',
+        browserAgentDescription: 'A screencast of the browser this host is driving here',
+        browserAgentBanner: 'The agent is driving',
+        browserAgentStop: 'Stop',
+        browserAgentStopped: 'Stopped. The browser on this machine is closed.',
+        browserAgentEmpty: 'Waiting for the first frame…',
+        browserAgentNoConsent: 'This host is not allowed to drive a browser on this machine.',
+        browserAgentFailed: 'The screencast is not available',
+        // --- spec 016 Phase 1: one Start-page doorway per paired machine ---
+        // The label is `<this string> · <host>`; the host name is the only part the
+        // shell cannot translate, so it is the one part that stays verbatim.
+        hostDoor: 'Remote machine',
+        hostDoorDescription: 'Sessions and approvals on this machine',
+        devicesDoorDescription: 'Pairing, consent and browser control for this machine',
+        hostDoorGone: 'This machine is no longer paired. Add it again on the Devices page.',
       },
       vi: {
         title: 'Thiết bị',
@@ -346,8 +375,14 @@ window.__ModuleLoader__.load({
         'scope.credentials:write': 'Đặt hoặc xóa thông tin xác thực nhà cung cấp',
         'scope.plugins:manage': 'Cài đặt và quản lý plugin',
         'scope.schedule:write': 'Tạo và chạy lịch',
+        'scope.schedule:read': 'Xem các tác vụ theo lịch và lần chạy kế tiếp của mỗi tác vụ',
         'scope.terminal': 'Mở terminal',
         'scope.sessions:author': 'Tạo phiên và chọn model',
+        'scope.attachments:write': 'Gửi tệp và hình ảnh đính kèm',
+        'scope.browser:control': 'Điều khiển bảng trình duyệt trên Host',
+        'scope.stats:read': 'Xem thống kê phiên và mức dùng ngữ cảnh',
+        'scope.web:unlock': 'Mở khóa ứng dụng web (PWA)',
+        'scope.permission:lower': 'Đặt phiên về mức chặt hơn (không bao giờ nới lỏng)',
         'risk.files:write': 'Có thể sửa tệp trong workspace của bạn.',
         'risk.settings:write': 'Có thể đổi cài đặt Host, model và preset agent.',
         'risk.commands:execute': 'Có thể chạy lệnh của Host với quyền của bạn.',
@@ -357,6 +392,12 @@ window.__ModuleLoader__.load({
         'risk.schedule:write': 'Có thể tạo tác vụ chạy sau mà không cần bạn.',
         'risk.terminal': 'Toàn quyền shell trên Host này: làm được mọi việc bạn làm được.',
         'risk.sessions:author': 'Có thể mở phiên mới trên Host này và chọn model chạy phiên đó.',
+        'risk.attachments:write': 'Có thể gửi tệp và hình ảnh đính kèm vào phiên trên Host này.',
+        'risk.browser:control': 'Có thể mở trang và thao tác trong trình duyệt trên Host thay bạn.',
+        'risk.web:unlock': 'Có thể chứng thực việc mở khóa ứng dụng web cho tài khoản này.',
+        'risk.permission:lower': 'Chỉ có thể đặt phiên chặt hơn; không bao giờ nới lỏng quyền.',
+        'uploadsOff': 'Đính kèm từ xa đang tắt: Host này không nhận tệp tải lên cho phiên từ xa.',
+        'uploadsBroken': 'Đính kèm từ xa sẽ lỗi: tuyến tải lên mà plugin này bọc không còn ở đó',
         presetStandard: 'Tiêu chuẩn',
         presetFull: 'Toàn quyền',
         presetFullHint: 'Mọi quyền, gồm shell, plugin và thông tin xác thực. Chỉ dùng cho thiết bị bạn hoàn toàn tin cậy.',
@@ -434,28 +475,19 @@ window.__ModuleLoader__.load({
         waitingCode: 'Mã',
         waitingHelp: 'Hãy phê duyệt yêu cầu này trên thiết bị kia sau khi kiểm tra nó hiển thị cùng một mã.',
         cancelWait: 'Hủy',
+        editAddress: 'Sửa địa chỉ',
+        saveAddress: 'Lưu',
+        addressPinNote: 'Giữ nguyên vân tay chứng chỉ; chỉ đổi địa chỉ.',
+        addressSaving: 'Đang lưu…',
         pairRejected: 'Host đã từ chối thiết bị này.',
         pairApproved: 'Đã ghép đôi.',
         // --- spec 008 P2b: phiên từ xa trong giao diện gốc ---
-        groupLocal: 'Workspace trên máy này',
-        groupSearch: 'Tìm workspace và phiên',
-        groupNoMatches: 'Không có kết quả.',
-        groupNoWorkspaces: 'Host này không có workspace nào.',
-        groupHostOffline: 'Host này chưa kết nối. Workspace sẽ hiện ra khi kết nối lại.',
-        groupHostRefused: 'Host đã từ chối yêu cầu vừa rồi nên chưa hiện được workspace nào',
-        newSession: 'Phiên mới',
-        newSessionIn: 'Phiên mới trên host này',
-        newSessionNeedsWorkspace: 'Host này chưa có workspace để mở phiên.',
-        lastActivity: 'Hoạt động cuối',
-        pinSession: 'Ghim phiên',
-        unpinSession: 'Bỏ ghim phiên',
-        archiveSession: 'Lưu trữ phiên',
-        unarchiveSession: 'Bỏ lưu trữ phiên',
-        archived: 'Đã lưu trữ',
-        pinned: 'Đã ghim',
-        unread: 'Chưa đọc',
+        // Trình duyệt gốc giữ các dòng workspace và phiên, nên plugin chỉ đặt tên host.
         hostChip: 'Host',
         hostAlreadyShown: 'Host',
+        // Dòng sao chép thứ hai trên dòng phiên: bản gốc sao chép id đã gắn thẻ của
+        // plugin này, dòng này sao chép id mà chính Host dùng.
+        copyOriginalId: 'Sao chép ID gốc',
         popoverTitle: 'Host từ xa',
         popoverPaired: 'Ghép đôi lúc',
         popoverKind: 'Loại',
@@ -481,11 +513,10 @@ window.__ModuleLoader__.load({
         terminalOpen: 'Mở terminal trên host này',
         terminalHint: 'Terminal cần quyền "Mở terminal" trên thiết bị này.',
         terminalUnavailable: 'Terminal không khả dụng trong giao diện này.',
-        sidebarOff: 'Không thể hiển thị host từ xa ở đây.',
-        sidebarGrouping: 'Nhóm thanh bên',
-        sidebarOn: 'nhóm theo host',
+        sidebarGrouping: 'Tên host trên thanh bên',
+        sidebarOn: 'đang hiện tên trên các dòng phiên',
         sidebarOffState: 'tắt',
-        // Vì sao thanh bên nhóm chưa được cài — cùng bộ lý do cố định như bản en.
+        // Vì sao các chỗ đặt tên host chưa được cài — cùng bộ lý do cố định như bản en.
         sidebarReasonNotInstalled: 'Chưa cài đặt.',
         sidebarReasonNoServices: 'Giao diện này không cung cấp dịch vụ phía máy khách.',
         sidebarReasonNoHost: 'Chưa có host từ xa nào kết nối.',
@@ -501,6 +532,24 @@ window.__ModuleLoader__.load({
         missingRemoteScope: 'Phiên và workspace từ xa sẽ không hiện ra cho tới khi thiết bị này được ghép đôi lại trên host đó kèm quyền "Dùng host này từ xa" (harness:remote).',
         pinMismatchNote: 'Host này đưa ra chứng chỉ khác với lần ghép đôi. Chưa có gì được gửi đi. Nếu bạn tin thay đổi này thì ghép đôi lại.',
         hostRefused: 'Host đã từ chối yêu cầu vừa rồi',
+        // --- spec 016 Phase 3: trình duyệt trên máy này cho host đã ghép đôi điều khiển ---
+        browserAgentConsent: 'Cho phép host này điều khiển trình duyệt trên máy này',
+        browserAgentConsentHelp: 'Mặc định tắt. Khi bật, agent của host này được mở trang trong Chrome hoặc Edge headless riêng của nó, với profile riêng. Nút Dừng trong tab Trình duyệt (agent) sẽ đóng nó ngay.',
+        browserAgentOffByDefault: 'Tắt',
+        browserAgentTab: 'Trình duyệt (agent)',
+        browserAgentOpen: 'Mở Trình duyệt (agent)',
+        browserAgentDescription: 'Bản chiếu màn hình trình duyệt mà host này đang điều khiển trên máy bạn',
+        browserAgentBanner: 'Agent đang điều khiển',
+        browserAgentStop: 'Dừng',
+        browserAgentStopped: 'Đã dừng. Trình duyệt trên máy này đã đóng.',
+        browserAgentEmpty: 'Đang chờ khung hình đầu tiên…',
+        browserAgentNoConsent: 'Host này không được phép điều khiển trình duyệt trên máy này.',
+        browserAgentFailed: 'Không lấy được bản chiếu màn hình',
+        // --- spec 016 Phase 1: mỗi máy đã ghép đôi một cửa vào ở trang Bắt đầu ---
+        hostDoor: 'Máy từ xa',
+        hostDoorDescription: 'Phiên và phê duyệt trên máy này',
+        devicesDoorDescription: 'Ghép đôi, cấp quyền và điều khiển trình duyệt cho máy này',
+        hostDoorGone: 'Máy này không còn ghép đôi. Hãy thêm lại trong trang Thiết bị.',
       },
     }
     let hostLanguage = ''
@@ -531,9 +580,24 @@ window.__ModuleLoader__.load({
 
     // ------------------------------------------------------------- helpers
     // Same-origin only; honours the <base> prefix the way the gateway does.
-    async function request(path, options) {
+    // `image` asks for the raw body (a screencast frame) instead of JSON: the page
+    // still has exactly one network call site, so no second fetch can bypass these
+    // rules.
+    async function request(path, options, { image = false } = {}) {
       const target = new URL(path.replace(/^\//, ''), document.baseURI).href
       const response = await fetch(target, { credentials: 'same-origin', ...options })
+      if (image) {
+        if (!response.ok) {
+          // The route's own reason travels in the JSON body (e.g. "no Chrome or Edge
+          // is installed"); a failed frame must say that, not a generic sentence.
+          const body = await response.json().catch(() => ({}))
+          const failure = new Error(body.message || body.error || `HTTP ${response.status}`)
+          failure.code = body.error
+          failure.status = response.status
+          throw failure
+        }
+        return { status: response.status, blob: await response.blob() }
+      }
       const body = await response.json().catch(() => ({}))
       if (!response.ok) {
         // Keep the route's machine-readable reason beside its sentence: a page that
@@ -576,6 +640,9 @@ window.__ModuleLoader__.load({
     const SVG_NS = ['http:', '//www.w3.org/2000/svg'].join('')
     const css = `
 .dshdev{font-family:var(--dsw-font-family,system-ui,sans-serif);font-size:13px;color:${colors.text};max-width:880px;line-height:1.5}
+/* The sidebar panel's host: the main column ships no padding and does not scroll,
+   so this seat owns the page's insets and its own scroll region. */
+.dshdev-panel{flex:1;min-height:0;overflow:auto;box-sizing:border-box;padding:28px 32px 40px}
 .dshdev h2{margin:0;font-size:20px;font-weight:650;letter-spacing:-.01em}
 .dshdev h3{margin:0 0 8px;font-size:13.5px;font-weight:600}
 .dshdev-head{margin-bottom:18px}
@@ -623,17 +690,12 @@ window.__ModuleLoader__.load({
 .dshdev-seg button{background:transparent;border:0;color:inherit;font:inherit;padding:5px 14px;cursor:pointer}
 .dshdev-seg button[aria-pressed=true]{background:${colors.accent};color:${colors.accentText}}
 .dshdev-seg button:disabled{opacity:.5;cursor:default}
-/* spec 008 P2b: the host-grouped sidebar, the composer chip/popover and the notices. */
-.dshdev-side{display:flex;flex-direction:column;gap:2px;font-size:13px;color:${colors.text}}
-.dshdev-side-search{box-sizing:border-box;width:100%;background:transparent;border:1px solid ${colors.border};border-radius:8px;color:inherit;font:inherit;padding:4px 8px;margin-bottom:6px}
-.dshdev-side-group{margin-bottom:8px;min-width:0}
-.dshdev-side-head{display:flex;align-items:center;gap:6px;padding:2px 2px;color:${colors.muted};font-size:11px;text-transform:uppercase;letter-spacing:.04em}
-.dshdev-side-head strong{color:${colors.text};font-size:11px;text-transform:none;letter-spacing:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dshdev-side-ws{padding:2px 2px 2px 8px;color:${colors.muted};font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dshdev-side-session{display:flex;align-items:center;gap:6px;padding:2px 4px 2px 16px;border-radius:6px;min-width:0}
-.dshdev-side-session:hover{background:${colors.hover}}
-.dshdev-side-title{flex:1;min-width:0;background:transparent;border:0;color:inherit;font:inherit;text-align:left;cursor:pointer;padding:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dshdev-side-meta{color:${colors.muted};font-size:11px;flex:none}
+/* spec 008 P2b: the host seat on a native session row, the composer chip/popover
+   and the session notices. The seat is a sibling of the row's own timestamp, so
+   it stays small and quiet and never pushes the title. */
+.dshdev-hostbadge{display:inline-flex;align-items:center;gap:5px;flex:none;max-width:120px;
+  color:${colors.muted};font-size:11px;line-height:1}
+.dshdev-hostbadge-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dshdev-dot{width:7px;height:7px;border-radius:50%;flex:none;background:${colors.muted};display:inline-block}
 .dshdev-dot.ok{background:${colors.success}}
 /* The dot is the only thing that carries the link state, so each state owns a
@@ -641,10 +703,6 @@ window.__ModuleLoader__.load({
 .dshdev-dot.warn{background:${colors.warn};animation:dshdev-dot-pulse 1.7s ease-in-out infinite}
 .dshdev-dot.off{background:${colors.danger}}
 @keyframes dshdev-dot-pulse{0%,100%{opacity:.45}50%{opacity:1}}
-.dshdev-side-action{background:transparent;border:0;color:${colors.muted};cursor:pointer;font:inherit;font-size:11px;padding:0 3px;flex:none}
-.dshdev-side-action:hover{color:${colors.text}}
-.dshdev-side-new{background:transparent;border:0;color:${colors.muted};cursor:pointer;font:inherit;font-size:13px;line-height:1;padding:0 4px;flex:none}
-.dshdev-side-new:hover{color:${colors.text}}
 .dshdev-chip-host{display:inline-flex;align-items:center;gap:6px;background:transparent;border:1px solid ${colors.border};border-radius:999px;color:inherit;cursor:pointer;font:inherit;font-size:12px;padding:2px 10px;max-width:220px}
 .dshdev-chip-host:hover{background:${colors.hover}}
 .dshdev-chip-host span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -657,6 +715,10 @@ window.__ModuleLoader__.load({
 .dshdev-banner{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;border:1px solid ${colors.border};border-left:3px solid ${colors.danger};border-radius:8px;padding:8px 10px;background:${colors.card}}
 .dshdev-banner.info{border-left-color:${colors.accent}}
 .dshdev-banner strong{display:block;font-weight:600}
+/* Spec 016 Phase 3: the agent browser tab is a plain screencast under a notice bar. */
+.dshdev-agentbrowser{display:flex;flex-direction:column;gap:8px;height:100%;min-height:0}
+.dshdev-agentframe{display:block;width:100%;height:auto;border:1px solid ${colors.border};border-radius:8px;background:${colors.panel}}
+.dshdev-agentplaceholder{padding:18px;border:1px dashed ${colors.border};border-radius:8px;text-align:center}
 /* An exceptional condition is a quiet line under the facts, not a panel: no border,
    no fill, no heading — the words are the whole weight. */
 .dshdev-note{margin:8px 0 0;color:${colors.muted};font-size:12px;line-height:1.45}
@@ -909,9 +971,24 @@ window.__ModuleLoader__.load({
     const ALL_SCOPES = [
       'sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote',
       'files:write', 'settings:write', 'commands:execute', 'workspace:manage',
-      'credentials:write', 'plugins:manage', 'schedule:write', 'terminal',
+      'credentials:write', 'plugins:manage', 'schedule:write', 'schedule:read', 'terminal',
       // spec 011: a paired device may also start its own session and pick the model.
       'sessions:author',
+      // spec 013: attach files and images to a session on the other Host. It rides
+      // in the desktop default offer, but never arrives by itself on an existing
+      // grant: only an explicit tick or preset puts it on a device.
+      'attachments:write',
+      // spec 014 C6: drive the Host's side-panel browser. Also a desktop default,
+      // and also never handed out by a kind-independent default.
+      'browser:control',
+      // Read-only usage metrics (session stats, context usage). Also never a default.
+      'stats:read',
+      // spec 020: the web unlock attestation for the PWA. Mobile-holdable, and never
+      // a default: it is a deliberate tick on the Devices page.
+      'web:unlock',
+      // spec 019 Wave 3: read this Host's permission presets and switch ONE session to a
+      // strictly stricter one. It can never widen, and it is never a default either.
+      'permission:lower',
     ]
     const SCOPE_PRESETS = {
       standard: ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote'],
@@ -919,7 +996,8 @@ window.__ModuleLoader__.load({
     }
     // Scopes that get a risk hint under their checkbox.
     const RISKY_SCOPES = new Set(['files:write', 'settings:write', 'commands:execute', 'workspace:manage',
-      'credentials:write', 'plugins:manage', 'schedule:write', 'terminal', 'sessions:author'])
+      'credentials:write', 'plugins:manage', 'schedule:write', 'terminal', 'sessions:author', 'attachments:write',
+      'browser:control', 'web:unlock', 'permission:lower'])
     const keepKnown = (scopes) => ALL_SCOPES.filter((scope) => scopes.includes(scope))
 
     // The checkbox list + the two preset buttons, shared by Approve and Edit permissions.
@@ -1579,7 +1657,9 @@ window.__ModuleLoader__.load({
 
       return h('div', null,
         h('div', { className: 'dshdev-row', style: { marginBottom: 10 } },
-          h('button', { type: 'button', className: 'dshdev-btn', onClick: onBack }, tr('back')),
+          // Only a card opened from a list has somewhere to go back to; the same card
+          // opened as a tab (spec 016 Phase 1) has not, so it draws no inert button.
+          typeof onBack === 'function' ? h('button', { type: 'button', className: 'dshdev-btn', onClick: onBack }, tr('back')) : null,
           h('h3', { className: 'dshdev-grow', style: { margin: 0 } }, remote.name),
           statusBadge(remote.status),
           h('button', { type: 'button', className: 'dshdev-btn', onClick: load }, tr('refresh'))),
@@ -1633,13 +1713,140 @@ window.__ModuleLoader__.load({
       return scopes !== null && !scopes.includes('harness:remote')
     }
 
+    // Spec 013: whether attachment bytes can reach a remote Host. `wrapped` is
+    // measured by the Host on every read, so a route that was replaced after load
+    // shows up here instead of as a native 404 on the first tagged upload (A1.1).
+    // A Host that reports no `uploads` at all is an older one: claim nothing.
+    const uploadsNote = (uploads) => {
+      if (!uploads || typeof uploads !== 'object') return null
+      if (uploads.wrapped === true) return null
+      const reason = typeof uploads.reason === 'string' && uploads.reason !== '' ? uploads.reason : 'unknown'
+      if (reason === 'disabled') {
+        return h('div', { key: 'uploads', className: 'dshdev-muted', 'data-testid': 'remote-uploads', 'data-reason': reason, role: 'status' },
+          tr('uploadsOff'))
+      }
+      return h('div', { key: 'uploads', className: 'dshdev-err', 'data-testid': 'remote-uploads', 'data-reason': reason, role: 'alert' },
+        `${tr('uploadsBroken')} (${reason})`)
+    }
+
+    // Spec 016 Phase 3: a tab type per paired host. The kind carries the host id, so
+    // the tab type's title ("Browser (agent) · <host>") is per machine and the body
+    // can be keyed to one host without reading anything from the remote.
+    const agentKindOf = (hostId) => `dsh-ext.devices.browser-agent.${hostId}`
+
+    // ------------------------------------------- spec 016 Phase 1: per-machine doors
+    // The Start page is a flat, `order`-sorted list of capsules contributed by tab
+    // types (`sidebarRightTabs` -> `guide`), and picking a capsule opens ITS OWNER's
+    // kind: an entry carries no params and cannot name another page. One doorway is
+    // therefore one tab type, so every entry below is registered as its own type with
+    // a single-entry `guide` — that is the only shape the shell can honour.
+    const HOST_DOOR_BASE = 1000
+    const HOST_DOOR_STRIDE = 100
+    // The doorways one paired machine contributes. `host` is the machine's own card
+    // (its sessions, history and approvals); `devices` is the Devices page, where its
+    // grant, its consent and this machine's browser are managed.
+    const HOST_DOORWAYS = ['host', 'devices']
+    const hostDoorId = (hostId, entry) => `dsh-ext.devices.${hostId}.${entry}`
+
+    /**
+     * Spec 016 Phase 1: the entries one set of paired machines contributes to the
+     * Start page. Only a CONNECTED machine gets them — the spec says "per connected
+     * remote host" — so an offline one is omitted rather than shown dead: a capsule
+     * that opens a card for a machine which cannot answer is a doorway onto nothing.
+     *
+     * Orders: every shipped capsule sits at 10–60 (workspace files 10, code review 15,
+     * terminal 20, browser 30, session inspector 60), so a block starts at 1000 — the
+     * first round number above all of them, which keeps every local doorway first — and
+     * each machine gets 100 slots (stride 100) so its entries stay contiguous and a
+     * later phase can add doorways to a machine without renumbering the others. The
+     * block index comes from the host ids sorted, so the same paired set always yields
+     * the same numbers regardless of the order the Host listed them in.
+     * @param {Array<{id: string, name: string, status?: string}>} remotes paired machines
+     * @returns {Array<{key: string, hostId: string, id: string, order: number, title: () => string, description: () => string, icon: Function}>}
+     */
+    function hostDoorEntries(remotes) {
+      const connected = (Array.isArray(remotes) ? remotes : [])
+        .filter((remote) => remote && typeof remote.id === 'string' && remote.status === 'online')
+        .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
+      return connected.flatMap((remote, index) => HOST_DOORWAYS.map((key, offset) => ({
+        key,
+        hostId: remote.id,
+        id: hostDoorId(remote.id, key),
+        order: HOST_DOOR_BASE + index * HOST_DOOR_STRIDE + offset,
+        // `<item> · <host>` is how every other per-host label in this plugin reads
+        // (`Browser (agent) · <host>`, `REA_Project · Sigma-DSH`).
+        title: () => `${key === 'devices' ? tr('title') : tr('hostDoor')} · ${remote.name}`,
+        description: () => tr(key === 'devices' ? 'devicesDoorDescription' : 'hostDoorDescription'),
+        icon: key === 'devices' ? DevicesPanelIcon : HostDoorIcon,
+      })))
+    }
+
+    // The machine card's glyph: one more mark in the same 24-unit monochrome style as
+    // `deviceGlyph`, so a guide capsule drawn by the shell carries this package's ink.
+    function HostDoorIcon(props) {
+      const size = props && typeof props.size === 'number' ? props.size : 16
+      return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8,
+        strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true, focusable: false },
+      h('rect', { x: 2.5, y: 4.5, width: 11, height: 8, rx: 1.5 }),
+      h('path', { d: 'M5.5 16.5h4M7.5 12.5v4' }),
+      h('path', { d: 'M17.5 6.5v10M14.5 13.5l3 3 3-3' }))
+    }
+
+    // Changes only the address of an already paired host (PATCH keeps the pinned
+    // certificate, so no credential is re-issued). The server's own refusal
+    // sentence is shown inline and the editor stays open so the owner can fix it.
+    function AddressEditor({ remote, onDone }) {
+      useLang()
+      const [editing, setEditing] = React.useState(false)
+      const [value, setValue] = React.useState(remote.address || '')
+      const [busy, setBusy] = React.useState(false)
+      const [error, setError] = React.useState('')
+      const mounted = React.useRef(true)
+      React.useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
+      if (!editing) {
+        return h('button', {
+          type: 'button', className: 'dshdev-link', 'data-testid': 'address-edit',
+          onClick: () => { setValue(remote.address || ''); setError(''); setEditing(true) },
+        }, tr('editAddress'))
+      }
+      const save = async () => {
+        if (busy) return
+        setBusy(true); setError('')
+        try {
+          await request(`/devices/remotes/${encodeURIComponent(remote.id)}`, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: value }),
+          })
+          if (mounted.current) setEditing(false)
+          if (onDone) await onDone()
+        } catch (cause) {
+          if (mounted.current) setError(cause.message)
+        } finally { if (mounted.current) setBusy(false) }
+      }
+      return h('div', { 'data-testid': 'address-editor', style: { marginTop: 6 } },
+        h('input', {
+          type: 'text', className: 'dshdev-input', 'data-testid': 'address-input', 'aria-label': tr('addressLabel'),
+          value, disabled: busy, spellCheck: false,
+          onChange: (event) => setValue(event.target.value),
+        }),
+        h('div', { className: 'dshdev-muted', 'data-testid': 'address-pin-note' }, tr('addressPinNote')),
+        error ? h('div', { className: 'dshdev-err', role: 'alert', 'data-testid': 'address-error' }, error) : null,
+        h('div', { className: 'dshdev-row' },
+          h('button', { type: 'button', className: 'dshdev-btn', 'data-testid': 'address-save', disabled: busy, onClick: save },
+            busy ? tr('addressSaving') : tr('saveAddress')),
+          h('button', { type: 'button', className: 'dshdev-btn', 'data-testid': 'address-cancel', disabled: busy,
+            onClick: () => { setEditing(false); setError('') } }, tr('cancel'))))
+    }
+
     function ConnectTab() {
       useLang()
       const [remotes, setRemotes] = React.useState([])
       const [status, setStatus] = React.useState(null)
+      // Spec 013: the Host's own attachment bridge rides the same read.
+      const [uploads, setUploads] = React.useState(null)
       const [openId, setOpenId] = React.useState('')
       const [error, setError] = React.useState('')
       const [connecting, setConnecting] = React.useState('')
+      const [consenting, setConsenting] = React.useState('')
       const [connectError, setConnectError] = React.useState(null)
       const mounted = React.useRef(true)
       // Two reads the tab needs anyway: the paired hosts, and this machine's own
@@ -1654,6 +1861,7 @@ window.__ModuleLoader__.load({
           ])
           if (!mounted.current) return
           setRemotes(data.remotes || [])
+          setUploads(data.uploads ?? null)
           setStatus(mgw)
         } catch (cause) { if (mounted.current) setError(cause.message) }
       }, [])
@@ -1687,6 +1895,16 @@ window.__ModuleLoader__.load({
       const remove = async (remote) => {
         try { await request(`/devices/remotes/${encodeURIComponent(remote.id)}`, { method: 'DELETE' }); await refresh() } catch (cause) { setError(cause.message) }
       }
+      // Spec 016 Phase 3: the owner's per-host consent. The route redials the link so
+      // the host's capability list matches the new setting at once.
+      const setConsent = async (remote, allow) => {
+        if (consenting) return
+        setConsenting(remote.id); setError('')
+        try {
+          await post(`/devices/remotes/${encodeURIComponent(remote.id)}/browser`, { allow })
+          await refresh()
+        } catch (cause) { if (mounted.current) setError(cause.message) } finally { if (mounted.current) setConsenting('') }
+      }
       // One card per paired host: an icon tile, the name with the link state, the
       // address in a mono line, then the row's own notes and three icon actions.
       // Every note keeps its data-testid and its exact sentence.
@@ -1717,6 +1935,9 @@ window.__ModuleLoader__.load({
           connectError && connectError.id === remote.id
             ? h('div', { key: 'dial', className: 'dshdev-err', role: 'alert', 'data-testid': 'remote-reconnect-error' }, connectError.message)
             : null,
+          // Spec 013: the attachment bridge is this Host's, not the remote's, so the
+          // note lands on every row and explains why a send would 404.
+          uploadsNote(uploads),
         ].filter(Boolean)
         return h('div', { key: remote.id, className: 'dshdev-item', 'data-testid': 'remote-item' },
           h('div', { className: `dshdev-tile${remote.status === 'online' ? ' ok' : remote.status === 'revoked' || remote.status === 'error' ? ' bad' : ''}` },
@@ -1730,6 +1951,26 @@ window.__ModuleLoader__.load({
                 ? h('span', { className: 'dshdev-badge warn', 'data-testid': 'remote-approvals' }, `${tr('approvals')}: ${remote.approvals.length}`)
                 : null),
             h('div', { className: 'dshdev-item-addr' }, remote.address),
+            // Revoked hosts cannot be re-dialled, so an address edit would be moot.
+            remote.status === 'revoked' ? null : h(AddressEditor, { key: 'address', remote, onDone: refresh }),
+            // Spec 016 Phase 3: the two keys are separate — the host also needs its
+            // own `browser:control` grant for this device. This switch is the owner's
+            // consent on THIS machine and starts off.
+            h('div', { className: 'dshdev-row', style: { marginTop: 6 } },
+              h('span', { className: 'dshdev-muted', 'data-testid': 'browser-consent-label', title: tr('browserAgentConsentHelp') },
+                tr('browserAgentConsent')),
+              h('button', {
+                type: 'button', role: 'switch', className: 'dshdev-switch',
+                'aria-checked': remote.browserConsent === true, 'aria-label': tr('browserAgentConsent'),
+                'data-testid': 'browser-consent', disabled: consenting === remote.id,
+                onClick: () => setConsent(remote, remote.browserConsent !== true),
+              }),
+              remote.browserConsent === true
+                ? h('button', { type: 'button', className: 'dshdev-btn', 'data-testid': 'browser-open',
+                  disabled: !nav.openBrowserAgent,
+                  onClick: () => { if (nav.openBrowserAgent) nav.openBrowserAgent(agentKindOf(remote.id)) } },
+                tr('browserAgentOpen'))
+                : null),
             notes),
           h('div', { className: 'dshdev-item-actions' }, [
             // A revoked remote gets no Reconnect at all: pairing again is the only fix, and
@@ -1773,6 +2014,26 @@ window.__ModuleLoader__.load({
       const match = typeof value === 'string' ? HOST_TAG.exec(value) : null
       return match ? { hostId: match[1], rawId: match[2] } : null
     }
+    /**
+     * One "Copy original ID" row for a remote session, nothing for a Local one.
+     *
+     * The shipped row (`session.id`, order 450) copies `target.sessionId` as it is,
+     * which for a remote session is the tagged `h:<hostId>:<rawId>` this plugin mints
+     * so the UI can route it back. The Host itself only ever knows `<rawId>`
+     * (lib/host-router.mjs: `namespaceId` adds the tag on the way in, `stripHostIds`
+     * takes it off again on the way out), and that is the value a person pasting the
+     * id elsewhere needs. An untagged id is a Local session, so it contributes no row
+     * and never a second copy of the shipped one.
+     */
+    function sessionIdMenuItems(target) {
+      const tag = hostTagOf(target && target.sessionId)
+      if (!tag) return []
+      return [{
+        id: 'copy-original',
+        label: tr('copyOriginalId'),
+        run: () => copyText(tag.rawId),
+      }]
+    }
     const stamp = (value) => {
       const date = new Date(value)
       return Number.isNaN(date.getTime()) ? '—' : date.toISOString().slice(0, 16).replace('T', ' ')
@@ -1788,45 +2049,6 @@ window.__ModuleLoader__.load({
     }
     const ANY = (state) => state
     const titleOf = (row, fallback) => (row && (row.displayTitle || row.title)) || fallback || ''
-    /**
-     * DSH's own sidebar nests a subagent session under its parent (`flattenLineage`):
-     * a row with `origin:'subagent'` whose `parentSessionId` is in the same list is
-     * rendered under that parent with a depth; an orphan (parent absent) or a row
-     * whose lineage loops stays a ROOT row — never dropped. Same rule inside a remote
-     * host group, where the list is the workspace's rows and a remote parent arrives
-     * tagged (`h:<hostId>:<id>`) by the router.
-     */
-    const nestByParent = (rows) => {
-      const byId = new Map(rows.map((row) => [row.id, row]))
-      const parentOf = (row) => {
-        const summary = row.summary || {}
-        if (summary.origin !== 'subagent' || typeof summary.parentSessionId !== 'string') return undefined
-        return byId.get(summary.parentSessionId)
-      }
-      // 0 for a root or a cycle member; otherwise how many parents this list holds.
-      const depthOf = (row) => {
-        const seen = new Set([row.id])
-        let depth = 0
-        for (let current = parentOf(row); current; current = parentOf(current)) {
-          if (seen.has(current.id)) return 0
-          seen.add(current.id)
-          depth += 1
-        }
-        return depth
-      }
-      const depths = new Map(rows.map((row) => [row.id, depthOf(row)]))
-      const ordered = []
-      const emitted = new Set()
-      const emit = (row) => {
-        if (emitted.has(row.id)) return
-        emitted.add(row.id)
-        ordered.push({ ...row, depth: depths.get(row.id) })
-        for (const child of rows) if (depths.get(child.id) > 0 && parentOf(child) === row) emit(child)
-      }
-      for (const row of rows) if (depths.get(row.id) === 0) emit(row)
-      for (const row of rows) emit(row)
-      return ordered
-    }
 
     const EMPTY_HOSTS = { hosts: [], remotes: [], routing: null, error: '', loaded: false }
     function createHostsStore() {
@@ -1858,6 +2080,9 @@ window.__ModuleLoader__.load({
                 // Why an automatic reconnect stopped for good (a changed
                 // certificate); `retry` is null in that case, never both.
                 linkError: remote.linkError ?? null,
+                // Spec 016 Phase 3: the body shows this host's own consent, so the
+                // tab never claims the agent is driving when it was never allowed.
+                browserConsent: remote.browserConsent === true,
               })),
               // index.mjs answers with exactly the CONNECTED hosts, so a host here is
               // online by construction; a tagged session whose host is absent is the
@@ -1900,175 +2125,37 @@ window.__ModuleLoader__.load({
     })()
     const useRemoteUI = () => React.useSyncExternalStore(remoteUI.subscribe, remoteUI.getSnapshot, remoteUI.getSnapshot)
 
-    // What a click may call. Empty until the shell hands the services over
+    // What a click may call. Empty until the shell hands the service over
     // (installRemoteSurfaces); every affordance disables itself instead of
-    // pretending, and the two pin methods are used only when the service has them
-    // (the client service catalog documents open/start/archive/unarchive, not pin).
-    const nav = {
-      openSession: null, startSession: null, archiveSession: null, unarchiveSession: null,
-      pinSession: null, unpinSession: null, openTerminal: null,
-    }
+    // pretending. Session rows and workspaces are the native browser's own, so the
+    // right column's terminal tab is the only action left to this plugin.
+    const nav = { openTerminal: null, openBrowserAgent: null }
 
-    // The host-grouped browser: "Local workspaces" first, then one group per
-    // connected host, each with that host's workspaces and their nested sessions.
-    // It REPLACES the single `sidebar.workspaces` slot (rc.1 has no group header
-    // slot), which is why installRemoteSurfaces also removes it again on any error.
-    function GroupedWorkspaces(props) {
+    // Host identity on a remote session row. The native browser renders
+    // `sidebar.session.row.trailing` beside the row's own timestamp and
+    // `sidebar.session.row.hover` inside the hover card (client-ui-workspace
+    // declares both seats, `kind:'list'`, `scope:'root'`), so a tagged session
+    // says which Host it lives on without a second sidebar: the merged
+    // `session/list` and `workspace/follow` answers already put the remote
+    // workspace and its sessions in the stock browser.
+    function SessionHostBadge(props) {
       useLang()
       const hosts = useHosts(hostsStore)
-      // The standard hooks arrive as props from the shell's root bindings; without
-      // them there is no merged list to group. Reporting beats an empty sidebar.
-      const ready = ['useWorkspaces', 'useSessions', 'useSessionStatus'].every((name) => typeof props[name] === 'function')
-      if (!ready) return h('div', { className: 'dshdev-side dshdev-muted', 'data-testid': 'grouped-sidebar-off' }, tr('sidebarOff'))
-      if (props.wide === false) return h(RailHosts, { hosts: hosts.hosts })
-      return h(GroupedTree, { ...props, hosts })
-    }
-
-    // Rail (collapsed) mode: only who is connected, never the full list.
-    function RailHosts({ hosts }) {
-      useLang()
-      return h('div', { className: 'dshdev-side', 'data-testid': 'grouped-sidebar-rail' }, hosts.map((host) =>
-        h('div', { key: host.hostId, className: 'dshdev-side-head', title: host.hostName },
-          h('span', { className: `dshdev-dot ${host.online ? 'ok' : 'off'}` }),
-          h('strong', null, host.hostName.slice(0, 2)))))
-    }
-
-    function GroupedTree(props) {
-      useLang()
-      // Unconditional hook calls: the ready check happened in GroupedWorkspaces.
-      const workspaces = props.useWorkspaces(ANY) || {}
-      const sessions = props.useSessions(ANY) || {}
-      const statuses = props.useSessionStatus(ANY)
-      const [query, setQuery] = React.useState('')
-      const byId = sessions.byId || {}
-      const items = Array.isArray(workspaces.items) ? workspaces.items : []
-      const pinned = new Set(workspaces.pinnedSessionIds || [])
-      const archived = new Set(workspaces.archivedSessionIds || [])
-      const statusOf = (sessionId) => {
-        // The shell hands a Map over; a realm boundary (or a test) can make
-        // `instanceof` lie, so the shape is what is trusted.
-        if (statuses && typeof statuses.get === 'function') return statuses.get(sessionId) || {}
-        if (statuses && typeof statuses === 'object') return statuses[sessionId] || {}
-        return {}
-      }
-      const call = (name, ...args) => {
-        const fn = typeof props[name] === 'function' ? props[name] : nav[name]
-        if (typeof fn !== 'function') return
-        try {
-          const result = fn(...args)
-          if (result && typeof result.catch === 'function') result.catch(() => { /* the shell reports its own refusal */ })
-        } catch (cause) {
-          // A broken replacement must fall back to the stock browser, not blank.
-          if (typeof props.onError === 'function') props.onError(cause && cause.message ? cause.message : 'the grouped sidebar failed')
-        }
-      }
-      const groups = [
-        { key: 'local', hostId: null, name: tr('groupLocal'), online: true, error: null },
-        ...props.hosts.hosts.map((host) => ({ key: `h:${host.hostId}`, hostId: host.hostId, name: host.hostName, online: host.online !== false, error: host.error ?? null })),
-        // A paired host with no live link is absent from routing, and merged
-        // `workspace/follow` delivers nothing for it — so its group was the one that
-        // claimed "lists no workspace" while the host simply was not connected (spec
-        // 008 P2b, measured on the owner's screen: the host's own `/mgw/status` said
-        // `devices: 0`). Keep the group and let it say it is offline. A revoked
-        // pairing never reconnects, so it stays a Devices-page matter.
-        ...(props.hosts.remotes || [])
-          .filter((remote) => remote.status !== 'revoked' && !props.hosts.hosts.some((host) => host.hostId === remote.id))
-          .map((remote) => ({ key: `h:${remote.id}`, hostId: remote.id, name: remote.name || remote.id, online: remote.status === 'online', error: null })),
-      ]
-      const workspacesOf = (key) => items.filter((item) => {
-        const tag = hostTagOf(item.workspaceId)
-        return (tag ? `h:${tag.hostId}` : 'local') === key
-      })
-      // `workspace.sessionIds` is renamed with the payload, so a remote workspace
-      // already lists its sessions by tagged id and a summary lookup is enough.
-      const sessionsOf = (workspace) => (Array.isArray(workspace.sessionIds) ? workspace.sessionIds : [])
-        .map((id) => ({ id, summary: byId[id] || null }))
-        .filter((row) => row.summary)
-      const needle = query.trim().toLowerCase()
-      const hit = (text) => String(text || '').toLowerCase().includes(needle)
-      const entriesOf = (group) => workspacesOf(group.key).map((workspace) => ({ workspace, rows: sessionsOf(workspace) }))
-      // Search filters ACROSS groups: a host name match keeps the whole group, a
-      // session match keeps just those rows, and a group with no match disappears.
-      const filtered = (group) => {
-        const entries = entriesOf(group)
-        if (!needle) return entries
-        if (hit(group.name)) return entries
-        return entries
-          .map((entry) => ({ ...entry, rows: entry.rows.filter((row) => hit(titleOf(row.summary, row.id))) }))
-          .filter((entry) => entry.rows.length > 0)
-      }
-      const newSession = (group, workspaceId) => {
-        const target = workspaceId || (entriesOf(group)[0] || {}).workspace?.workspaceId
-        // A remote group has no workspace to create into until one is listed.
-        if (!target && group.hostId) return
-        call('startSession', target)
-      }
-      // An empty group used to say "lists no workspace" whatever the cause. Three
-      // different truths hide behind that: the host is connected and really has none,
-      // the host has no live link (so the merged lists deliver nothing), or the host
-      // refused the call. Name the one that applies, in the quiet style of the
-      // per-row refusal line.
-      const emptyNote = (group) => {
-        if (!group.online) {
-          return h('div', { className: 'dshdev-side-ws', 'data-testid': 'group-host-offline', role: 'status' }, tr('groupHostOffline'))
-        }
-        if (group.error) {
-          return h('div', { className: 'dshdev-side-ws', 'data-testid': 'group-host-refused', role: 'status' },
-            `${tr('groupHostRefused')} — ${group.error.code}${group.error.scope ? ` (${group.error.scope})` : ''}`)
-        }
-        return h('div', { className: 'dshdev-side-ws' }, tr('groupNoWorkspaces'))
-      }
-      const sessionRow = (id, summary, depth = 0) => {
-        const status = statusOf(id)
-        const isPinned = pinned.has(id)
-        const isArchived = archived.has(id)
-        // No per-row child seats here (sidebar.session.row.leading/.trailing/.hover,
-        // sidebar.workspaces.session.row.action). A row cannot render them: the shell
-        // hands `renderSlot` only to an entry that declares those children itself, and
-        // SlotCore.register refuses a child key another live entry declares — the stock
-        // browser declares all four and stays live under this shadow at priority 0.
-        // Measured cost of trying anyway: the registration throws and the grouped
-        // sidebar falls back entirely. Leave them out rather than re-add a broken call.
-        return h('div', { key: id, className: 'dshdev-side-session', 'data-testid': 'session-row', 'data-depth': depth,
-          style: depth > 0 ? { paddingLeft: 12 * depth } : undefined },
-          h('button', { type: 'button', className: 'dshdev-side-title', title: titleOf(summary, id), 'data-testid': 'session-open',
-            onClick: () => call('openSession', id) }, titleOf(summary, id)),
-          status.completionUnread === true || summary.unread === true
-            ? h('span', { className: 'dshdev-dot ok', title: tr('unread'), 'data-testid': 'unread-dot' }) : null,
-          isPinned ? h('span', { className: 'dshdev-side-meta', title: tr('pinned'), 'data-testid': 'pinned-mark' }, '★') : null,
-          isArchived ? h('span', { className: 'dshdev-side-meta', 'data-testid': 'archived-mark' }, tr('archived')) : null,
-          h('span', { className: 'dshdev-side-meta', title: tr('lastActivity'), 'data-testid': 'last-activity' }, stamp(summary.updatedAt)),
-          h('button', { type: 'button', className: 'dshdev-side-action', 'data-testid': 'pin-toggle',
-            title: isPinned ? tr('unpinSession') : tr('pinSession'), 'aria-pressed': isPinned,
-            onClick: () => call(isPinned ? 'unpinSession' : 'pinSession', id) }, isPinned ? '★' : '☆'),
-          h('button', { type: 'button', className: 'dshdev-side-action', 'data-testid': 'archive-toggle',
-            title: isArchived ? tr('unarchiveSession') : tr('archiveSession'),
-            onClick: () => call(isArchived ? 'unarchiveSession' : 'archiveSession', id) }, isArchived ? '↺' : '⌫'))
-      }
-      return h('div', { className: 'dshdev-side', 'data-testid': 'grouped-sidebar' },
-        h('input', { className: 'dshdev-side-search', type: 'search', value: query, placeholder: tr('groupSearch'),
-          'aria-label': tr('groupSearch'), 'data-testid': 'group-search', onChange: (event) => setQuery(event.target.value) }),
-        groups.map((group) => {
-          const entries = filtered(group)
-          if (needle && entries.length === 0) return null
-          return h('div', { key: group.key, className: 'dshdev-side-group', 'data-testid': 'host-group', 'data-host': group.hostId || 'local' },
-            h('div', { className: 'dshdev-side-head' },
-              group.hostId ? h('span', { className: `dshdev-dot ${group.online ? 'ok' : 'off'}`, 'data-testid': 'host-dot' }) : null,
-              h('strong', { className: 'dshdev-grow' }, group.name),
-              h('button', { type: 'button', className: 'dshdev-side-new', 'data-testid': 'group-new-session',
-                title: group.hostId ? tr('newSessionIn') : tr('newSession'), 'aria-label': `${tr('newSession')}: ${group.name}`,
-                onClick: () => newSession(group) }, '+')),
-            entries.length === 0 ? emptyNote(group) : null,
-            entries.map(({ workspace, rows }) => h('div', { key: workspace.workspaceId, 'data-testid': 'workspace-row' },
-              h('div', { className: 'dshdev-side-ws' },
-                h('span', null, titleOf(workspace, workspace.workspaceId)),
-                h('button', { type: 'button', className: 'dshdev-side-new', 'data-testid': 'workspace-new-session',
-                  title: tr('newSession'), 'aria-label': `${tr('newSession')} ${titleOf(workspace, '')}`,
-                  onClick: () => newSession(group, workspace.workspaceId) }, '+')),
-              nestByParent(rows).map(({ id, summary, depth }) => sessionRow(id, summary, depth)))))
-        }),
-        needle && groups.every((group) => filtered(group).length === 0)
-          ? h('div', { className: 'dshdev-side-ws', 'data-testid': 'group-no-matches' }, tr('groupNoMatches')) : null)
+      const tag = hostTagOf(props.sessionId)
+      // An untagged id is a local session: the native row says all there is to say.
+      if (!tag) return null
+      const host = hosts.hosts.find((entry) => entry.hostId === tag.hostId)
+      const remote = hosts.remotes.find((entry) => entry.id === tag.hostId)
+      // A tagged row whose host holds no link is still the owner's session (an
+      // offline copy), so it keeps the name and only the dot reads as dead.
+      const online = !!(host && host.online !== false)
+      const name = (host && host.hostName) || (remote && remote.name) || tag.hostId
+      return h('span', {
+        className: 'dshdev-hostbadge', 'data-testid': 'session-host-badge', 'data-host': tag.hostId,
+        title: `${tr('hostChip')}: ${name}`,
+      },
+      h('span', { className: `dshdev-dot ${online ? 'ok' : 'off'}`, 'data-testid': 'session-host-dot', 'aria-hidden': true }),
+      h('span', { className: 'dshdev-hostbadge-name' }, name))
     }
 
     // Composer chip: only a TAGGED session has a host to name. Clicking it toggles a
@@ -2213,9 +2300,96 @@ window.__ModuleLoader__.load({
         disabled: !openTerminal, onClick: () => { if (openTerminal) openTerminal(props.sessionId) } }, tr('terminalEntry'))
     }
 
+    // ------------------------------------------------- spec 016 Phase 3: agent tab
+    // Spec 016 Phase 1: the body of a machine's own doorway. It is the card the Devices
+    // page already shows for a paired host — its sessions, their history, its approvals
+    // and the prompt box — mounted in the tab the Start page opened. No `onBack`: there
+    // is no list behind it inside the tab, and RemoteDetail then draws no Back button.
+    function HostDoorTab({ hostId }) {
+      useLang()
+      const hosts = useHosts(hostsStore)
+      const remote = hosts.remotes.find((entry) => entry.id === hostId)
+      if (!remote) {
+        return h('div', { className: 'dshdev-panel', 'data-testid': 'host-door-gone' },
+          h('div', { className: 'dshdev-muted' }, tr('hostDoorGone')))
+      }
+      return h('div', { className: 'dshdev-panel', 'data-testid': 'host-door' }, h(RemoteDetail, { remote }))
+    }
+
+    // One tab type per paired host ("Browser (agent) · <host>"). The body is only a
+    // screencast: the browser itself runs in the plugin's Host half on THIS machine,
+    // and the tab never talks to the remote host at all.
+    function BrowserAgentTab({ hostId, hostName }) {
+      useLang()
+      const hosts = useHosts(hostsStore)
+      const remote = hosts.remotes.find((entry) => entry.id === hostId)
+      // Consent is read from the same one-window picture the cards use: off means
+      // nothing is polled, because the frame route would only answer 403.
+      const consented = !!(remote && remote.browserConsent === true)
+      const [src, setSrc] = React.useState('')
+      const [error, setError] = React.useState('')
+      const [note, setNote] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const objectUrl = React.useRef('')
+      React.useEffect(() => () => { if (objectUrl.current) URL.revokeObjectURL(objectUrl.current) }, [])
+      React.useEffect(() => {
+        if (!consented) { setSrc(''); return undefined }
+        let alive = true
+        let timer = null
+        const load = async () => {
+          try {
+            // The route answers 204 until the first frame exists, then a JPEG.
+            const answer = await request(`/devices/browser/${encodeURIComponent(hostId)}/frame?t=${Date.now()}`,
+              undefined, { image: true })
+            if (!alive) return
+            if (answer.status === 204) { setError(''); return }
+            const next = URL.createObjectURL(answer.blob)
+            if (objectUrl.current) URL.revokeObjectURL(objectUrl.current)
+            objectUrl.current = next
+            setSrc(next)
+            setError('')
+          } catch (cause) {
+            if (alive) setError(cause && cause.message ? cause.message : tr('browserAgentFailed'))
+          } finally {
+            if (alive) timer = window.setTimeout(load, 1000)
+          }
+        }
+        load()
+        return () => {
+          alive = false
+          if (timer) window.clearTimeout(timer)
+        }
+      }, [hostId, note, consented])
+      const stop = async () => {
+        if (busy) return
+        setBusy(true); setError('')
+        try {
+          await post(`/devices/browser/${encodeURIComponent(hostId)}/stop`)
+          if (objectUrl.current) URL.revokeObjectURL(objectUrl.current)
+          objectUrl.current = ''
+          setSrc(''); setNote(tr('browserAgentStopped'))
+        } catch (cause) { setError(cause.message) } finally { setBusy(false) }
+      }
+      if (!consented) {
+        return h('div', { className: 'dshdev-agentbrowser', 'data-testid': 'agent-browser' },
+          h('div', { className: 'dshdev-muted', 'data-testid': 'agent-browser-no-consent' }, tr('browserAgentNoConsent')))
+      }
+      return h('div', { className: 'dshdev-agentbrowser', 'data-testid': 'agent-browser' },
+        h('div', { className: 'dshdev-banner', 'data-testid': 'agent-browser-banner', role: 'status' },
+          h('div', { className: 'dshdev-grow' },
+            h('strong', null, tr('browserAgentBanner')),
+            hostName ? h('div', { className: 'dshdev-muted' }, hostName) : null),
+          h('button', { type: 'button', className: 'dshdev-btn danger', 'data-testid': 'agent-browser-stop',
+            disabled: busy, onClick: stop }, busy ? tr('working') : tr('browserAgentStop'))),
+        note ? h('div', { className: 'dshdev-muted', 'data-testid': 'agent-browser-note' }, note) : null,
+        error ? h('div', { className: 'dshdev-err', role: 'alert', 'data-testid': 'agent-browser-error' }, error) : null,
+        src
+          ? h('img', { src, alt: tr('browserAgentTab'), className: 'dshdev-agentframe', 'data-testid': 'agent-browser-frame' })
+          : h('div', { className: 'dshdev-agentplaceholder dshdev-muted', 'data-testid': 'agent-browser-empty' }, tr('browserAgentEmpty')))
+    }
+
     // The Devices page's own line about the replacement, so a failed install is
-    // visible in the UI instead of only in the console.
-    //
+    // visible in the UI instead of only in the console.    //
     // The plugin writes these few reasons itself, so they are printed as sentences
     // rather than as the raw English diagnosis. `routing.reason` is the carrier's own
     // short code (A1.1 self-test); a code without a translation is left alone instead
@@ -2256,104 +2430,212 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Spec 008 P2b. Everything here is additive except the grouped sidebar, which
-     * shadows the shipped browser: it is installed only while remote routing is
-     * live AND a host is connected, and removed again — stock browser back — when
-     * either stops being true or the replacement hits an error.
+     * Spec 008 P2b. Everything here is additive: the stock browsers keep their
+     * slots and the plugin only fills seats the shell leaves for other packages,
+     * so a refused seat removes nothing from the native UI.
      * @returns {() => void} disposer
      */
     function installRemoteSurfaces(ctx) {
       const dispose = []
-      // The grouped-sidebar registration is stateful and the service callbacks below
-      // can fire before this function's body finishes, so the helpers are hoisted
-      // function declarations over a variable declared first.
-      let sidebarEntry = null
-      function sidebarActive(snapshot) {
-        return !!(snapshot.routing && snapshot.routing.remote === true)
-          && snapshot.hosts.length > 0 && !!nav.openSession && !!nav.startSession
-      }
-      function removeSidebar() {
-        if (!sidebarEntry) return
-        const entry = sidebarEntry
-        sidebarEntry = null
-        try { entry?.() } catch { /* already disposed with the declaration */ }
-      }
+      // Why a seat failed to register, when one did. A refused seat is reported on
+      // the Devices page, never papered over and never worked around.
+      let seatError = null
       const register = (slot, meta, component, props) => {
         try {
           dispose.push(ctx.slots.inject(slot, () => ctx.slots.register({ ...meta, name: slot, ...(props ? { inject: props } : {}) }, component)))
         } catch (cause) {
-          remoteUI.set({ grouped: false, reason: `${slot}: ${cause && cause.message ? cause.message : 'not available'}` })
+          seatError = `${slot}: ${cause && cause.message ? cause.message : 'not available'}`
+          remoteUI.set({ grouped: false, reason: seatError })
         }
       }
+      // The native session catalog, once the shell hands it over.
+      let sessions = null
+      // A host change can land before the service does; the pull is not lost, it
+      // waits for the handle.
+      let sessionsPending = false
+      /** Ask the native catalog to pull `session/list` again (ClientSessions.refresh). */
+      const refreshSessions = () => {
+        if (!sessions) { sessionsPending = true; return }
+        sessionsPending = false
+        try {
+          const pending = sessions.refresh()
+          if (pending && typeof pending.catch === 'function') pending.catch(() => { /* the native sidebar reports its own refusal */ })
+        } catch { /* a refused refresh must not take the surfaces down */ }
+      }
+      // `session/list` is answered by merging every connected Host (`host-router`),
+      // but the client catalog only pulls it on connect — `ClientSessions.refresh`
+      // → `manager.refreshList`, driven by `handleConnected`. A Host that connects
+      // after startup would therefore never show its sessions until a reload, so the
+      // connected-host set is compared here and the catalog is pulled again whenever
+      // it changes: connect, disconnect, and a reconnect (which leaves and re-enters
+      // the set).
+      let hostKey = ''
+      let hostKeyKnown = false
+      const refreshForHosts = (snapshot) => {
+        const next = snapshot.hosts.map((host) => host.hostId).sort().join(',')
+        if (hostKeyKnown && next === hostKey) return
+        const first = !hostKeyKnown
+        hostKey = next
+        hostKeyKnown = true
+        // Startup already pulled the list once; only a later change needs the second pull.
+        if (!first) refreshSessions()
+      }
+      // Spec 016 Phase 3: one registered tab type (and one keyed body) per paired
+      // host, kept in step with the host list. A shell that refuses the seat leaves
+      // the card's Open disabled instead of pretending a tab exists.
+      let tabTypesRegistry = null
+      const agentTabs = new Map()
+      function syncAgentTabs() {
+        const registry = tabTypesRegistry
+        if (!registry) return
+        const wanted = new Map(hostsStore.getSnapshot().remotes.map((remote) => [remote.id, remote]))
+        for (const [hostId, entry] of agentTabs) {
+          if (wanted.has(hostId)) continue
+          agentTabs.delete(hostId)
+          try { entry.dispose() } catch { /* already gone */ }
+        }
+        for (const remote of wanted.values()) {
+          if (agentTabs.has(remote.id)) continue
+          try {
+            const id = `dsh-ext.devices.browser-agent:${remote.id}`
+            const kind = agentKindOf(remote.id)
+            const title = () => `${tr('browserAgentTab')} · ${remote.name}`
+            const disposeType = registry.register({
+              id, kind, priority: 'extension', multiple: false, title,
+              // The Start page's doorway; picking it opens this host's agent tab.
+              guide: [{ id: 'open', order: 45, title, description: () => tr('browserAgentDescription') }],
+            })
+            const disposeBody = ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register(
+              { name: 'sidebar.right.pane.tab', key: id, priority: 100 },
+              (props) => h(BrowserAgentTab, { hostId: remote.id, hostName: remote.name, ...props })))
+            agentTabs.set(remote.id, { dispose: () => { try { disposeBody?.() } finally { disposeType?.() } } })
+          } catch { /* the tab type is optional; nothing else depends on it */ }
+        }
+      }
+      // Spec 016 Phase 1: the Start page's per-machine doorways. One tab type per
+      // doorway (a capsule opens its owner's kind and nothing else), kept in step with
+      // the same snapshot every other surface reads, so adding, removing or
+      // reconnecting a machine adds, removes or restores its entries on the next
+      // refresh — the 4 s `refresh()` the surfaces already share, never a new timer.
+      const hostDoors = new Map()
+      function syncHostDoors() {
+        const registry = tabTypesRegistry
+        if (!registry) return
+        const wanted = new Map(hostDoorEntries(hostsStore.getSnapshot().remotes).map((entry) => [entry.id, entry]))
+        for (const [id, dispose] of hostDoors) {
+          if (wanted.has(id)) continue
+          hostDoors.delete(id)
+          try { dispose() } catch { /* already gone */ }
+        }
+        for (const entry of wanted.values()) {
+          if (hostDoors.has(entry.id)) continue
+          try {
+            const body = entry.key === 'devices' ? DevicesPanel : HostDoorTab
+            // The type's id IS its kind: the id is namespaced by machine and doorway,
+            // and the keyed body is dispatched with the id (rc.1's `sidebar.right.pane.tab`).
+            const disposeType = registry.register({
+              id: entry.id, kind: entry.id, priority: 'extension', multiple: false, title: entry.title,
+              guide: [{ id: 'open', order: entry.order, title: entry.title, description: entry.description, icon: entry.icon }],
+            })
+            const disposeBody = ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register(
+              { name: 'sidebar.right.pane.tab', key: entry.id, priority: 100 },
+              (props) => h(body, { hostId: entry.hostId, ...props })))
+            hostDoors.set(entry.id, () => { try { disposeBody?.() } finally { disposeType?.() } })
+          } catch { /* a refused seat leaves the Start page without that doorway */ }
+        }
+      }
+      // What the Devices page says: are the seats in, and does the merged picture
+      // exist at all (routing live). Kept in the page's own words, not a raw error.
+      function reportSeats() {
+        const snapshot = hostsStore.getSnapshot()
+        // A1.1: the wrapper's own reason (e.g. `dsh-version-mismatch`) is shown, so a
+        // refused wrap is never a silently missing feature.
+        const routingOff = !(snapshot.routing && snapshot.routing.remote === true)
+        remoteUI.set({
+          grouped: !seatError && !routingOff,
+          hosts: snapshot.hosts.length,
+          reason: seatError
+            ? seatError
+            : routingOff
+              ? `multi-host routing is off${snapshot.routing && snapshot.routing.reason ? `: ${snapshot.routing.reason}` : ''}`
+              : null,
+        })
+      }
       if (typeof ctx.inject === 'function') {
-        dispose.push(ctx.inject(['uiWorkspace', 'workspaces'], (scope) => {
-          const call = (object, name) => (object && typeof object[name] === 'function' ? object[name].bind(object) : null)
-          nav.openSession = call(scope.uiWorkspace, 'openSession')
-          nav.startSession = call(scope.uiWorkspace, 'startSession')
-          nav.pinSession = call(scope.uiWorkspace, 'pinSession')
-          nav.unpinSession = call(scope.uiWorkspace, 'unpinSession')
-          nav.archiveSession = call(scope.workspaces, 'archiveSession')
-          nav.unarchiveSession = call(scope.workspaces, 'unarchiveSession')
-          syncSidebar()
+        dispose.push(ctx.inject(['sessions'], (scope) => {
+          sessions = scope.sessions
+          if (sessionsPending) refreshSessions()
         }))
         // Undocumented but present in the shell: the right column's tab registry.
         dispose.push(ctx.inject(['sidebarRight'], (scope) => {
           nav.openTerminal = (sessionId) => scope.sidebarRight.openTab('terminal', { params: { sessionId } })
+          // Spec 016 Phase 3: the card's doorway into the agent tab. The kind is the
+          // per-host type registered below, so opening it is `openTab(kind)`.
+          nav.openBrowserAgent = (kind) => scope.sidebarRight.openTab(kind)
         }))
+        // The tab-type registry the native Browser itself uses. Injected separately:
+        // a shell without it simply has no agent tab and no per-machine doorway, and
+        // nothing else changes.
+        dispose.push(ctx.inject(['sidebarRightTabs'], (scope) => {
+          tabTypesRegistry = scope.sidebarRightTabs
+          syncAgentTabs()
+          syncHostDoors()
+        }))
+        // A second row on a session's context menu. The shipped "Copy Session ID" row
+        // cannot be changed from here: the registry refuses a repeated target/id and
+        // the menu is an additive flatMap with no filter, so the Host's own id gets its
+        // own row instead of a replacement. Order 451 puts it directly BELOW that row
+        // (450) without its `separatorBefore`, so the two copy rows read as one pair.
+        ctx.inject(['contextMenus'], (scope) => {
+          const menus = scope && scope.contextMenus
+          // A shell without the menu service is a shell with no second row, not an error.
+          if (!menus) return undefined
+          return menus.register({
+            id: 'session.devices-copy-raw',
+            target: 'session',
+            order: 451,
+            resolve: sessionIdMenuItems,
+          })
+        })
       }
       register('conversation.input.left', { id: 'dsh-ext.devices.host', order: 100, label: tr('hostChip') }, HostChip)
       register('conversation.input.dock', { id: 'dsh-ext.devices.banners', order: 100, label: tr('banners') }, SessionBanners)
       register('conversation.input.right', { id: 'dsh-ext.devices.terminal', order: 100, label: tr('terminalEntry') }, RemoteTerminalEntry,
         () => ({ openTerminal: nav.openTerminal }))
+      // The native `WorkspaceBrowser` declares these two seats (`kind:'list'`,
+      // `scope:'root'`, the row's own `sessionId` as the owner prop), which is the
+      // documented way another package decorates a session row: the same shape as
+      // the shipped decoration template registering into `conversation.composer.dock`.
+      // The row keeps rendering them; nothing here replaces the browser.
+      register('sidebar.session.row.trailing', { id: 'dsh-ext.devices.host', order: 100, label: tr('hostChip') }, SessionHostBadge)
+      register('sidebar.session.row.hover', { id: 'dsh-ext.devices.host', order: 100, label: tr('hostChip') }, SessionHostBadge)
 
-      function syncSidebar() {
-        const snapshot = hostsStore.getSnapshot()
-        if (sidebarActive(snapshot)) {
-          if (sidebarEntry) return
-          try {
-            sidebarEntry = ctx.slots.inject('sidebar.workspaces', () => ctx.slots.register({
-              name: 'sidebar.workspaces',
-              // `sidebar.workspaces` is a single slot and the shipped browser already
-              // occupies it at priority 0 (default). Measured on a live Host: a second
-              // registration at 0 is refused outright ("already has a registration at
-              // priority 0 (registered by tk) — register at a different priority to
-              // shadow it (lowest renders)"), which made this feature never render.
-              // -1 shadows the stock browser; the slot's own rule says lowest renders.
-              priority: -1,
-              inject: () => ({
-                openSession: nav.openSession, startSession: nav.startSession,
-                pinSession: nav.pinSession, unpinSession: nav.unpinSession,
-                archiveSession: nav.archiveSession, unarchiveSession: nav.unarchiveSession,
-                onError: (message) => { removeSidebar(); remoteUI.set({ grouped: false, reason: message }) },
-              }),
-            }, GroupedWorkspaces))
-            remoteUI.set({ grouped: true, reason: null, hosts: snapshot.hosts.length })
-          } catch (cause) {
-            sidebarEntry = null
-            remoteUI.set({ grouped: false, reason: cause && cause.message ? cause.message : 'not available' })
-          }
-          return
-        }
-        // Not active: the stock browser keeps the slot, and the Devices page says
-        // why, so a silently missing replacement is impossible to misread.
-        if (sidebarEntry) removeSidebar()
-        remoteUI.set({ grouped: false, hosts: snapshot.hosts.length,
-          // A1.1: the wrapper's own reason (e.g. `dsh-version-mismatch`) is shown, so
-          // a refused wrap is never a silently missing feature.
-          reason: !(snapshot.routing && snapshot.routing.remote === true)
-            ? `multi-host routing is off${snapshot.routing && snapshot.routing.reason ? `: ${snapshot.routing.reason}` : ''}`
-            : snapshot.hosts.length === 0 ? 'no remote host is connected'
-              : 'the shell provides no workspace actions' })
+      const sync = () => {
+        refreshForHosts(hostsStore.getSnapshot())
+        syncAgentTabs()
+        syncHostDoors()
+        reportSeats()
       }
-      dispose.push(hostsStore.subscribe(syncSidebar))
-      const refresh = () => { hostsStore.refresh().then(syncSidebar, () => {}) }
+      dispose.push(hostsStore.subscribe(sync))
+      const refresh = () => { hostsStore.refresh().then(sync, () => {}) }
       refresh()
       dispose.push(...startPoll(refresh))
+      dispose.push(() => {
+        for (const entry of agentTabs.values()) {
+          try { entry.dispose() } catch { /* teardown must not throw */ }
+        }
+        agentTabs.clear()
+        for (const entry of hostDoors.values()) {
+          try { entry() } catch { /* teardown must not throw */ }
+        }
+        hostDoors.clear()
+        tabTypesRegistry = null
+      })
       return () => {
         for (const entry of dispose.splice(0)) {
           try { entry?.() } catch { /* teardown must not throw */ }
         }
-        removeSidebar()
+        sessions = null
         for (const key of Object.keys(nav)) nav[key] = null
       }
     }
@@ -2380,12 +2662,45 @@ window.__ModuleLoader__.load({
         tab === 'allow' ? h(AllowTab) : h(ConnectTab))
     }
 
-    function DevicesIcon() {
-      return h('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8,
+    // The left sidebar row and the main panel it opens. One id, one page: the
+    // Settings section (below) is the other door, and `layout.selectPanel(id)`
+    // resolves an id against the `main` slot's keys, so the two halves must share
+    // this value or the row opens nothing.
+    const PANEL_ID = 'dsh-ext.devices'
+    // Panel rows sort ascending. The shipped ones are Plugins 0, Automation tasks
+    // 10 (client-ui-schedule) and Repo Wiki 20 (plugins/dsh-wiki), so 21 puts
+    // Devices directly below Repo Wiki; the "More" launcher is not a row and
+    // always renders after the list.
+    const PANEL_ORDER = 21
+
+    // One glyph, two seats. Settings asks for 18 and the sidebar row asks for its
+    // own size (16 wide / 18 on the collapsed rail, like the shipped rows), so the
+    // monochrome mark is drawn once and sized by the caller.
+    function deviceGlyph(size) {
+      return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8,
         strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true, focusable: false },
       h('rect', { x: 3, y: 4, width: 13, height: 9, rx: 1.5 }),
       h('path', { d: 'M7 17h5M9.5 13v4' }),
       h('rect', { x: 17, y: 8, width: 4, height: 11, rx: 1 }))
+    }
+
+    function DevicesIcon() {
+      return deviceGlyph(18)
+    }
+
+    // The sidebar row's glyph: the shell renders it inside the row's own glyph
+    // span and passes `{ size, active }`, so the size it asks for is honoured.
+    function DevicesPanelIcon(props) {
+      return deviceGlyph(props && typeof props.size === 'number' ? props.size : 16)
+    }
+
+    // Two doors, one page: the host adds only what the main column does not supply
+    // (padding, and the scroll container the Settings body would otherwise provide)
+    // and reuses DevicesPage as it is. Every piece of that page's state is local to
+    // the component and its data comes from the module-level stores, so the Settings
+    // section and this panel can be open at the same time without sharing anything.
+    function DevicesPanel() {
+      return h('div', { className: 'dshdev-panel', 'data-testid': 'devices-panel' }, h(DevicesPage))
     }
 
     const inject = ['slots', 'locale']
@@ -2404,11 +2719,24 @@ window.__ModuleLoader__.load({
       }, 'devices: styles')
       // One settings page per list entry (spec 008 Q1): the page and its icon share an id.
       ctx.slots.inject('settings.section', () => ctx.slots.register(
-        { name: 'settings.section', id: 'dsh-ext.devices', order: 80, label: tr('title') },
+        { name: 'settings.section', id: PANEL_ID, order: 80, label: tr('title') },
         () => h(DevicesPage)))
       ctx.slots.inject('settings.section.icon', () => ctx.slots.register(
-        { name: 'settings.section.icon', id: 'dsh-ext.devices', order: 80, label: tr('title') },
+        { name: 'settings.section.icon', id: PANEL_ID, order: 80, label: tr('title') },
         () => h(DevicesIcon)))
+      // The same page as a left-sidebar row, right below Repo Wiki. `label` is a
+      // function because the shell re-resolves it on every locale change (that is
+      // how the shipped rows switch language live), and the `main` half is keyed by
+      // the same id because the row selects its panel as `layout.selectPanel(id)`,
+      // which the shell resolves against the `main` slot's keys.
+      // Both seats are additions, not requirements: a shell that does not declare
+      // them (an older rc.1, or a seat the shell refuses) must still get the
+      // Settings page, so a refusal cannot be allowed to end apply() here.
+      const seat = (slot, register) => { try { ctx.slots.inject(slot, register) } catch { /* the seat is optional */ } }
+      seat('sidebar.panellist', () => ctx.slots.register(
+        { name: 'sidebar.panellist', id: PANEL_ID, order: PANEL_ORDER, label: () => tr('title') },
+        DevicesPanelIcon))
+      seat('main', () => ctx.slots.register({ name: 'main', key: PANEL_ID }, () => h(DevicesPanel)))
       // Spec 008 P2b. Gated on the client context's own capability (`ctx.inject` is
       // how a browser plugin waits for optional services): without it there is no
       // way to reach the workspace/session actions, so nothing is installed and the
@@ -2422,13 +2750,23 @@ window.__ModuleLoader__.load({
 
     exports.apply = apply
     exports.inject = inject
-    exports.testing = { DevicesPage, AllowTab, ConnectTab, RemoteDetail, AddDeviceForm, AddDeviceDialog, OtpDialog, PendingRequests, ScopePicker, AdvancedLimits, ALL_SCOPES, SCOPE_PRESETS, request, tr, DICT, setHostLanguage,
+    exports.testing = { DevicesPage, AllowTab, ConnectTab, AddressEditor, RemoteDetail, AddDeviceForm, AddDeviceDialog, OtpDialog, PendingRequests, ScopePicker, AdvancedLimits, ALL_SCOPES, SCOPE_PRESETS, RISKY_SCOPES, request, tr, DICT, setHostLanguage,
       // The flow strip's honesty rule, exported so the test can prove all three
       // states without depending on CSS.
       FlowStrip, flowState, connectedCount, localName,
       // spec 008 P2b
-      GroupedWorkspaces, GroupedTree, HostChip, SessionBanners, OfflineBanner, ModelStatusBanner, RemoteTerminalEntry,
-      RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText }
+      HostChip, SessionBanners, OfflineBanner, ModelStatusBanner, RemoteTerminalEntry,
+      SessionHostBadge,
+      RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText,
+      // spec 016 Phase 3
+      BrowserAgentTab, agentKindOf,
+      // spec 016 Phase 1: the per-machine Start-page doorways, their numbers and the
+      // card each one opens, so a test can prove the entries without a browser.
+      HostDoorTab, HostDoorIcon, hostDoorEntries, hostDoorId, HOST_DOORWAYS,
+      HOST_DOOR_BASE, HOST_DOOR_STRIDE,
+      // The sidebar row's two halves, so a test can prove the row sits below Repo
+      // Wiki and that its panel hosts the same DevicesPage instead of a copy.
+      PANEL_ID, PANEL_ORDER, DevicesPanel, DevicesPanelIcon }
     return module.exports
   },
 })

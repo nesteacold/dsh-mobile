@@ -1,4 +1,4 @@
-import { isTailscaleIp, tailscaleInterfaceStatus } from './tailscale-addresses.mjs'
+import { isOwnTailscaleHost, isTailscaleIp, tailscaleInterfaceStatus, tailscaleMagicDnsName, verifiedAdvertiseHost } from './tailscale-addresses.mjs'
 import { isAllowedMobileSource, isPrivateNetworkHostname } from './network-addresses.mjs'
 import { createNetworkDiagnostics } from './network-diagnostics.mjs'
 import { log } from './logging.mjs'
@@ -166,15 +166,33 @@ import { createDeviceAccess } from './device-peers.mjs'
 import { hostEndpointAllowedForDevice } from './companion-access.mjs'
 import { loadOrCreateTlsIdentity, tlsServerOptions } from './tls.mjs'
 import {
-  CLOSE_REVOKED, COMPANION_CAPABILITIES, COMPANION_DEVICE_GUARD, COMPANION_PROTOCOL_VERSION,
-  MIN_CLIENT_VERSION, OP_FORBIDDEN, PROTOCOL_UNSUPPORTED, SESSIONS_AUTHOR_TYPES,
-  createPositiveDeviceGuard, isCompanionType, scopeDenial,
+  CLOSE_LOCKED, CLOSE_REVOKED, COMPANION_CAPABILITIES, COMPANION_DEVICE_GUARD, COMPANION_PROTOCOL_VERSION,
+  MIN_CLIENT_VERSION, OP_FORBIDDEN, PERMISSION_LOWER_TYPES, PERMISSION_LOWER_SCOPE, PROTOCOL_UNSUPPORTED, QUESTION_RESPONSE_TYPES, SCHEDULE_READ_TYPES, SESSIONS_AUTHOR_TYPES, STATS_READ_TYPES, TEAM_READ_TYPES,
+  holdsWebUnlockScope, PASSKEY_LOCK_TYPE,
+  createPositiveDeviceGuard, isCompanionType, isPasskeyType, isPermissionLowerType, isRemoteUploadType, scopeDenial,
 } from './allowlist.mjs'
 import { approvalArgsHash } from './approval-hash.mjs'
+// Spec 021 (revision 14): the web passkey unlock replaces the spec 020 account attestation.
+import {
+  createPasskeyLock, createPasskeyService, loadPasskeyStore, PASSKEY_CODES, PASSKEY_FIXED_MESSAGES,
+  PASSKEY_STORE_FILE, PasskeyRefusal,
+} from './passkey.mjs'
 import { checkArguments, checkArgumentsWithHost, createRemoteBridge, REMOTE_SCOPE } from './remote-bridge.mjs'
+// Spec 016 Phase 3 / spec 014 C6: the host→client browser channel and the driver record
+// the sidebar browser reads. Both are host services registered below.
+import {
+  createRemoteBrowser, createSessionDriver, provideHostService,
+  REMOTE_BROWSER_SERVICE, REMOTE_SESSION_SCOPE_SERVICE,
+} from './remote-browser.mjs'
+// Spec 019 Wave 3: read + lower-only permission control, through the in-process
+// `permissionPresets` cordis service (never a command string).
+import { createPermissionLower } from './permission-lower.mjs'
 import { createPairingRequests, otpProof, verificationCode } from './pairing-requests.mjs'
 import { createSpeechInputManager, SPEECH_REQUEST_TYPES } from './speech-input.mjs'
-import { createFileUploadManager, FILE_UPLOAD_REQUEST_TYPES, FILE_UPLOAD_DEFAULTS } from './file-upload.mjs'
+import {
+  createFileUploadManager, FILE_UPLOAD_REQUEST_TYPES, FILE_UPLOAD_DEFAULTS, handleRemoteUpload,
+  REMOTE_UPLOAD_RESULT_KIND,
+} from './file-upload.mjs'
 import { handlePluginQuery, PLUGIN_REQUEST_TYPES } from './plugin-management.mjs'
 import { createSessionFollower } from './session-follower.mjs'
 import { parseSessionTarget, TEAM_PROJECTION_KINDS } from './session-target.mjs'
@@ -185,7 +203,12 @@ import { serializeMessageText, userMessageTextParts } from './message-text.mjs'
 import { handleScheduleQuery, SCHEDULE_REQUEST_TYPES } from './schedule-management.mjs'
 // Generated copy of the contract (see scripts/sync-mobile-protocol.mjs): the
 // bare package specifier would not resolve in an installed tarball.
-import { DEVICE_KINDS, SCOPES, REMOTE_CLIENT_TYPES, DESKTOP_DEFAULT_SCOPES, NEVER_DEFAULT_SCOPES } from './vendor/mobile-protocol.mjs'
+import { DEVICE_KINDS, SCOPES, REMOTE_CLIENT_TYPES, DESKTOP_DEFAULT_SCOPES, NEVER_DEFAULT_SCOPES,
+  ATTACHMENTS_WRITE_SCOPE, BROWSER_AGENT_CAPABILITY, BROWSER_CLIENT_TYPES, QUESTION_CUSTOM_MAX_LENGTH,
+  QUESTION_RESPONSE_SCOPE, SESSION_EDIT_CAPABILITY_SCOPE,
+  // Spec 021 (revision 14): the web passkey unlock frames, codes and `hello.webLock`.
+  PASSKEY_APPROVAL_KIND, PASSKEY_ASSERT_OPTIONS_TYPE, PASSKEY_ASSERT_TYPE, PASSKEY_CLIENT_TYPES,
+  PASSKEY_REGISTER_OPTIONS_TYPE, PASSKEY_REGISTER_TYPE, WEB_LOCK_ERROR } from './vendor/mobile-protocol.mjs'
 import QRCode from 'qrcode'
 
 const { createRegistry, clampPairingTtlMs, MAX_PAIRING_TTL_MS } = devicesModule
@@ -209,6 +232,8 @@ const DEFAULT_FILE_DOWNLOAD_CHUNK_BYTES = 512 * 1024
 const DEFAULT_FILE_DOWNLOAD_IDLE_MS = 2 * 60 * 1000
 const DEFAULT_FILE_DOWNLOAD_MAX_TRANSFERS = 4
 const INTERACTION_PROTOCOL_REVISION = 'question-approval-v2'
+/** Spec 018 item 4: the contract's cap on a free-text question answer. */
+const contractCustomMax = QUESTION_CUSTOM_MAX_LENGTH
 // T024/T026 (contract §5): the approval frame carries `argsHash` + `argsPreview`.
 // `tool/call` and `approval/request` arrive over different Host streams in no
 // guaranteed order, so a request waits at most this long for the matching
@@ -802,6 +827,44 @@ async function proxyQuery(api, type, method, payload, signal) {
 async function querySessionProjection(api, requestType, sessionId) {
   const history = await proxyQuery(api, 'history', api.sessions.history.bind(api.sessions), { sessionId, maxMessages: 1 })
   return history.kind === 'error' ? { ...history, requestType, sessionId } : history
+}
+
+/**
+ * The fixed message a DEVICE gets for a failed `session-rename` / `session-archive` /
+ * `schedule-catalog` / `schedule-list` / `schedule-view`. `proxyQuery` otherwise copies
+ * `error.message` from the Host, whose text is not part of this contract and can name
+ * Host internals (a filesystem path, a title the device may not read, a record id). The
+ * device keeps the structured `code` and learns a stable sentence instead; the admin
+ * (owner) loopback keeps the Host's own text, the same split the `workspaces` projection
+ * already draws. One KEY PER CODE, never one generic sentence, so the refusal still
+ * distinguishes its causes: no Claude-style "invalid code" collapse.
+ */
+const DEVICE_SESSION_EDIT_MESSAGES = Object.freeze({
+  'session-rename': Object.freeze({
+    'bad-request': 'the title must be a non-empty string of at most 200 characters',
+    'session/title-invalid': 'the Host rejected the new session title',
+  }),
+  'session-archive': Object.freeze({
+    'bad-request': 'the request must name the session to archive',
+    'session/not-found': 'the Host does not serve this session to this device',
+  }),
+  'schedule-catalog': Object.freeze({
+    'bad-request': 'schedule-catalog takes no arguments',
+  }),
+  'schedule-list': Object.freeze({
+    'bad-request': 'schedule-list takes a limit of 1..500, a nonnegative offset and active only on a host-wide list',
+  }),
+  'schedule-view': Object.freeze({
+    'bad-request': 'schedule-view requires the id of one scheduled task',
+  }),
+})
+
+/** `code`'s fixed device sentence for `requestType`, or a code-named sentence for an unmapped code. */
+function deviceRefusalMessage(requestType, code) {
+  const byType = Object.hasOwn(DEVICE_SESSION_EDIT_MESSAGES, requestType) ? DEVICE_SESSION_EDIT_MESSAGES[requestType] : null
+  if (byType !== null && Object.hasOwn(byType, code)) return byType[code]
+  // Unmapped codes still drop the Host's free text; the code itself is structured data.
+  return `${requestType} failed (${code})`
 }
 
 function fileTransferError(code, message, requestType, sessionId) {
@@ -1585,6 +1648,20 @@ async function selectCommandOption(api, host, command, sessionId, optionId) {
   return { kind: 'error', code: 'bad-request', message: `command is not selectable: ${command}`, requestType: 'command-select', sessionId }
 }
 
+/**
+ * Whether this dispatch came from the loopback admin surface rather than a paired device.
+ * `handleQuery` learns the socket from its two call sites: the admin management branch
+ * passes only `{ workspaceGroupFieldsFor, ... }`, the device branches pass the sending
+ * `ws` as `client`. That field is the ONE discriminator, because `adminCaller` also
+ * covers a test-only `legacyAdmin` device socket, which still speaks the device wire.
+ */
+function deviceless(pluginContext) {
+  return pluginContext?.client === undefined
+}
+
+// A preset ID is a plain identifier; anything path-like or structured never leaves the Host.
+const PRESET_ID = /^[A-Za-z0-9._:-]{1,64}$/
+
 function parseAgentPreset(msg, requestType, required = false) {
   if (msg.agentPreset === undefined && !required) return {}
   if (typeof msg.agentPreset !== 'string' || !msg.agentPreset.trim()) {
@@ -1655,14 +1732,33 @@ async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
   if (msg.type === 'sessions') {
     const frame = await proxyQuery(api, 'sessions', api.sessions.list.bind(api.sessions), {})
     if (frame.kind !== 'sessions' || !Array.isArray(frame.items)) return frame
+    // Spec 011 addendum: the companion groups conversations by workspace. DSH's
+    // session record carries no workspaceId, so the gateway attaches the id the Host
+    // itself relates the session to (`workspace.sessionIds`) plus that workspace's
+    // label, from the same rule the `workspaces` op uses; a direct-subagent session
+    // inherits its parent's workspace. Additive and optional: `workspaceId` and
+    // `workspaceLabel` are omitted together when the Host relates the session to no
+    // workspace. Only an id and a basename label travel — never a path — and a row
+    // reaches a client only if that client may see it.
+    const groupFieldsFor = typeof pluginContext?.workspaceGroupFieldsFor === 'function'
+      ? pluginContext.workspaceGroupFieldsFor : undefined
     // Lists need only titles; full projections can make these frames many MiB.
     // Copy at the mobile boundary so Host data and history projections stay intact.
     return { ...frame, items: frame.items.map(item => {
-      if (!item?.projections) return item
-      const { asOfSeq, values } = item.projections
-      return { ...item, projections: {
+      const group = groupFieldsFor === undefined || !item
+        ? undefined
+        : groupFieldsFor(item.sessionId, item.parentSessionId)
+      const withWorkspace = group === undefined ? item : { ...item, ...group }
+      if (!withWorkspace?.projections) return withWorkspace
+      const { asOfSeq, values } = withWorkspace.projections
+      // Spec 018: the session screen shows which agent preset the session runs (view only).
+      // Only the plain preset ID travels: a Host value outside the ID charset stays on the Host.
+      const agentPreset = values?.agentPreset
+      const shownPreset = typeof agentPreset === 'string' && PRESET_ID.test(agentPreset) ? agentPreset : undefined
+      return { ...withWorkspace, projections: {
         ...(asOfSeq === undefined ? {} : { asOfSeq }),
-        values: values && Object.hasOwn(values, 'title') ? { title: values.title } : {},
+        values: { ...(values && Object.hasOwn(values, 'title') ? { title: values.title } : {}),
+          ...(shownPreset === undefined ? {} : { agentPreset: shownPreset }) },
       } }
     }) }
   }
@@ -1816,17 +1912,53 @@ async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
       api.workspace.archiveSession.bind(api.workspace),
       { sessionId: sessionId.value },
     )
-    if (frame.kind === 'error') return { ...frame, sessionId: sessionId.value }
-    return { ...frame, kind: 'session-archived', sessionId: sessionId.value }
+    if (frame.kind === 'error') {
+      // Reviewer item 5(b): Host text never reaches a device — it names Host internals
+      // and is not contract. The admin path keeps the Host's own message.
+      const reply = deviceless(pluginContext) ? frame : { ...frame, message: deviceRefusalMessage('session-archive', frame.code) }
+      return { ...reply, sessionId: sessionId.value }
+    }
+    // Reviewer item 5(a): the Host replies with its COMPLETE archive set (PROTOCOL.md §5),
+    // so an unfiltered pass-through shows a device the ids of every session the owner
+    // archived — sessions that device may not see. Reduce it by the SAME per-recipient
+    // rule the `session-archives` broadcast uses (`aggregateFrameFor`), not a second
+    // filter that could drift from it. An admin socket gets the whole set back unchanged;
+    // a device whose credential is no longer live would be sent no broadcast at all, so
+    // it gets the `sessionId` receipt with no set, never the Host's.
+    // Fail closed: a DEVICE socket without the reducer cannot apply the rule, so it
+    // gets no set at all rather than the Host's complete one. Only the admin path,
+    // which is the owner and needs no reduction, keeps the set unchanged.
+    const { archivedSessionIds: hostArchives, ...receipt } = frame
+    let archivedSessionIds
+    if (deviceless(pluginContext)) {
+      archivedSessionIds = frame.archivedSessionIds
+    } else {
+      const reduceArchives = typeof pluginContext?.aggregateFrameFor === 'function' ? pluginContext.aggregateFrameFor : undefined
+      if (reduceArchives !== undefined && Array.isArray(frame.archivedSessionIds)) {
+        const visible = reduceArchives(pluginContext.client, { kind: 'session-archives', archivedSessionIds: frame.archivedSessionIds })
+        archivedSessionIds = visible === null ? undefined : visible.archivedSessionIds
+      }
+    }
+    return { ...receipt, kind: 'session-archived', sessionId: sessionId.value, ...(Array.isArray(archivedSessionIds) ? { archivedSessionIds } : {}) }
   }
   if (msg.type === 'session-rename') {
     const sessionId = requireSessionId(msg)
     if (sessionId.error) return sessionId.error
-    if (typeof msg.title !== 'string' || !msg.title.trim()) {
+    // Revision 11 (contract §4): the title is trimmed and must be non-empty and at
+    // most 200 CODE POINTS. Counted in code points, not UTF-16 units, so one emoji
+    // is one character — 200 emoji pass where a UTF-16 count would refuse them while
+    // looking short. The trimmed value is what is stored and echoed.
+    const title = typeof msg.title === 'string' ? msg.title.trim() : ''
+    const refusal = !title
+      ? 'session-rename requires a non-empty title'
+      : Array.from(title).length > 200
+        ? 'session-rename title must be at most 200 characters'
+        : null
+    if (refusal !== null) {
       return {
         kind: 'error',
         code: 'bad-request',
-        message: 'session-rename requires a non-empty title',
+        message: refusal,
         requestType: 'session-rename',
         sessionId: sessionId.value,
       }
@@ -1835,10 +1967,16 @@ async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
       api,
       'session-rename',
       api.sessions.rename.bind(api.sessions),
-      { sessionId: sessionId.value, title: msg.title },
+      { sessionId: sessionId.value, title },
     )
-    if (frame.kind === 'error') return { ...frame, sessionId: sessionId.value }
-    return { ...frame, kind: 'session-renamed', sessionId: sessionId.value }
+    if (frame.kind === 'error') {
+      // Reviewer item 5(b): fixed device text, the Host's own text on the admin path.
+      const reply = deviceless(pluginContext) ? frame : { ...frame, message: deviceRefusalMessage('session-rename', frame.code) }
+      return { ...reply, sessionId: sessionId.value }
+    }
+    // Contract §4: the receipt carries the trimmed title that was stored, never the
+    // untrimmed request value.
+    return { ...frame, kind: 'session-renamed', sessionId: sessionId.value, title }
   }
   if (msg.type === 'workspace-create') {
     const wsPath = typeof msg.path === 'string' && msg.path.trim() !== '' ? msg.path.trim() : null
@@ -2093,7 +2231,18 @@ async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
     const method = msg.type === 'goal-pause' ? 'pause' : msg.type === 'goal-resume' ? 'resume' : 'clear'
     return mutateGoal(api, msg.type, method, { sessionId: sessionId.value, ref: ref.value })
   }
-  if (SCHEDULE_REQUEST_TYPES.has(msg.type)) return handleScheduleQuery(api, msg)
+  if (SCHEDULE_REQUEST_TYPES.has(msg.type)) {
+    const frame = await handleScheduleQuery(api, msg)
+    // Reviewer item 5(b): a device sees the STRUCTURED schedule refusal and a fixed
+    // sentence, never the Host's `error.message` (the three reads are device-reachable
+    // through `schedule:read`; every other schedule type stays admin-only and keeps the
+    // Host text). Everything else in the frame — the task record, `code`, identity — is
+    // forwarded verbatim.
+    if (frame?.kind === 'error' && !deviceless(pluginContext) && SCHEDULE_READ_TYPES.includes(msg.type)) {
+      frame.message = deviceRefusalMessage(msg.type, frame.code)
+    }
+    return frame
+  }
   if (msg.type === 'agent-presets') {
     return proxyQuery(api, 'agent-presets', api.agentPresets.list.bind(api.agentPresets), {})
   }
@@ -2155,7 +2304,7 @@ async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
 // here: `session/selectModel` is mapped as a `session` resource in
 // `companion-access.mjs` exactly like `session/prompt`, so DSH applies the
 // identical rule to both and no second session policy exists.
-async function admitAuthoring(api, host, agentDefaultModel, msg, device, refreshWorkspaces) {
+async function admitAuthoring(api, host, agentDefaultModel, msg, device, refreshWorkspaces, workspaceGroupFieldsFor, aggregateFrameFor, client) {
   if (msg.type === 'session-create') {
     const refusal = await createdSessionRefusal(api, msg, device)
     if (refusal) return refusal
@@ -2165,7 +2314,13 @@ async function admitAuthoring(api, host, agentDefaultModel, msg, device, refresh
   if (msg.type === 'workspaces' && typeof refreshWorkspaces === 'function') {
     await refreshWorkspaces().catch(() => {})
   }
-  const frame = await handleQuery(api, host, agentDefaultModel, msg, {})
+  const frame = await handleQuery(api, host, agentDefaultModel, msg, {
+    ...(typeof workspaceGroupFieldsFor === 'function' ? { workspaceGroupFieldsFor } : {}),
+    // The per-recipient archive reduction closes over `apply`'s visible-session
+    // snapshot, so it reaches `handleQuery` that way too (same as the group fields).
+    ...(typeof aggregateFrameFor === 'function' ? { aggregateFrameFor } : {}),
+    ...(client === undefined ? {} : { client }),
+  })
   // Minor 1 (reviewer, spec 011): a phone learns which workspace ids it may target,
   // not where the owner's projects live on disk.
   return msg.type === 'workspaces' ? projectWorkspacesForDevice(frame, device) : frame
@@ -2180,6 +2335,24 @@ function pathBasename(value) {
   if (typeof value !== 'string' || value === '') return ''
   const segments = value.split(/[\\/]+/).filter((segment) => segment !== '')
   return segments.length === 0 ? '' : segments[segments.length - 1]
+}
+
+/**
+ * One workspace's display label — THE single source for both the `workspaces` op and
+ * the additive `workspaceLabel` on session rows/events (spec 011 addendum).
+ *
+ * Order: an explicit `name`, then `title`, then the last segment of `path`. Real Hosts
+ * store an EMPTY name and only a path (measured 2026-11-10: nine workspaces, all
+ * `name: ""`), so the basename is the label. It is a LABEL, not a location: the path
+ * never leaves the Host. Empty when nothing could be shown, so callers can omit the
+ * field instead of rendering a raw uuid.
+ */
+function workspaceLabelOf(item) {
+  if (!item || typeof item !== 'object') return ''
+  const named = typeof item.name === 'string' && item.name !== ''
+    ? item.name
+    : typeof item.title === 'string' && item.title !== '' ? item.title : ''
+  return named !== '' ? named : pathBasename(item.path)
 }
 
 /**
@@ -2199,6 +2372,8 @@ function pathBasename(value) {
 function projectWorkspacesForDevice(frame, device) {
   if (!frame || frame.kind !== 'workspaces' || !Array.isArray(frame.items)) return frame
   const scopes = Array.isArray(device?.scopes) ? device.scopes : []
+  // `workspace:manage` keeps the full shape, archive set included: that class may
+  // already browse the Host's directories, and this is the same carve-out as below.
   if (scopes.includes('workspace:manage')) return frame
   const items = []
   for (const item of frame.items) {
@@ -2208,14 +2383,8 @@ function projectWorkspacesForDevice(frame, device) {
       : typeof item.id === 'string' && item.id !== '' ? item.id : ''
     // No id: the app drops the row and cannot create a session from it.
     if (id === '') continue
-    const named = typeof item.name === 'string' && item.name !== ''
-      ? item.name
-      : typeof item.title === 'string' && item.title !== '' ? item.title : ''
-    // Real Hosts store an EMPTY name and only a path (measured 2026-11-10: nine
-    // workspaces, all `name: ""`), so the last path segment is the label. It is a
-    // label, not a location: the path itself never leaves the Host, and a row with
-    // nothing a picker could show is skipped instead of rendering a raw uuid.
-    const name = named !== '' ? named : pathBasename(item.path)
+    // Same label rule as the session rows' `workspaceLabel` (one source of truth).
+    const name = workspaceLabelOf(item)
     if (name === '') continue
     items.push({ workspaceId: id, name })
   }
@@ -2453,31 +2622,62 @@ function resolveListenHost(target, interfaces) {
   return linkLocal[0] ?? null
 }
 
-function lanWebSocketUrls(options, wsPath, boundPort) {
+/**
+ * The WSS URLs a phone may dial for the TLS listener.
+ * @param {object} options plugin options
+ * @param {string} wsPath WebSocket path
+ * @param {number} boundPort the port the listener really bound
+ * @param {string|null} [advertiseHost] `lanAdvertiseHost` AFTER `verifiedAdvertiseHost`;
+ *   a configured hostname that did not verify is never advertised (null)
+ * @param {string|null} [dnsName] verified MagicDNS name: it replaces a Tailscale
+ *   address in the URL (the stable handle), while the socket stays bound to the IP
+ * @returns {string[]}
+ */
+function lanWebSocketUrls(options, wsPath, boundPort, advertiseHost = null, dnsName = null) {
   if (!options.lanEnabled) return []
-  const advertised = typeof options.lanAdvertiseHost === 'string' ? options.lanAdvertiseHost.trim() : ''
-  const hosts = advertised
-    ? [advertised]
+  const configured = typeof options.lanAdvertiseHost === 'string' ? options.lanAdvertiseHost.trim() : ''
+  const hosts = configured
+    ? [advertiseHost]
     : options.lanHost && options.lanHost !== '0.0.0.0' && options.lanHost !== '::'
       ? [options.lanHost]
       : privateLanAddresses()
-  return hosts
-    .filter((host) => isPrivateNetworkHostname(host))
+  return [...new Set(hosts
+    .filter((host) => typeof host === 'string' && host !== '' && (host === advertiseHost || isPrivateNetworkHostname(host)))
+    .map((host) => (dnsName && isTailscaleIp(host) ? dnsName : host))
     // T018 (FR-003): the plugin-owned listener is TLS only; there is no `ws://`
     // remote endpoint to advertise inside or outside the LAN.
-    .map((host) => `wss://${host.includes(':') ? `[${host}]` : host}:${boundPort}${wsPath}`)
+    .map((host) => `wss://${host.includes(':') ? `[${host}]` : host}:${boundPort}${wsPath}`))]
+}
+
+/**
+ * MagicDNS name to advertise for a listener bound to a tailnet address, or
+ * `null`. Only a `tailscale`-target bind gets a name, and only an address this
+ * machine really owns: the name belongs to THIS node, so a stale or injected
+ * interface table must not borrow it. Any failure is `null` and the IP stands.
+ * @param {string} host the address the listener is bound to
+ * @param {boolean} listening whether the listener is up
+ * @returns {Promise<string|null>}
+ */
+async function advertisedTailscaleName(host, listening) {
+  if (!listening) return null
+  const bound = String(host || '').replace(/^\[|\]$/g, '')
+  if (!isTailscaleIp(bound)) return null
+  const owned = tailscaleInterfaceStatus({ listening: false, host: '', port: 0, wsPath: '' }, os.networkInterfaces())
+  if (!owned.addresses.includes(bound)) return null
+  return tailscaleMagicDnsName()
 }
 
 /** Hostnames/IPs the TLS certificate must cover: what either listener advertises. */
-function tlsAdvertisedHosts(options, wsPath) {
+function tlsAdvertisedHosts(options, wsPath, advertiseHost = null) {
   const hosts = new Set(['localhost', '127.0.0.1'])
   if (options.lanEnabled === true) {
-    for (const url of lanWebSocketUrls(options, wsPath, options.lanPort || 30081)) {
+    for (const url of lanWebSocketUrls(options, wsPath, options.lanPort || 30081, advertiseHost)) {
       try { hosts.add(new URL(url).hostname.replace(/^\[|\]$/g, '')) } catch { /* ignore */ }
     }
   }
-  const advertised = typeof options.lanAdvertiseHost === 'string' ? options.lanAdvertiseHost.trim() : ''
-  if (advertised && isPrivateNetworkHostname(advertised)) hosts.add(advertised.replace(/^\[|\]$/g, ''))
+  // Only a verified advertise host (a private IP, or a name that resolved to
+  // private addresses) may enter the certificate.
+  if (advertiseHost) hosts.add(advertiseHost.replace(/^\[|\]$/g, ''))
   for (const endpoint of Array.isArray(options.endpoints) ? options.endpoints : []) {
     try {
       const host = new URL(endpoint).hostname.replace(/^\[|\]$/g, '')
@@ -2573,13 +2773,15 @@ function isSameOrigin(req) {
 const TRUSTED_LOCAL_AUTHORITY = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i
 
 /**
- * DNS-rebinding guard for the write that moves a remote surface (Blocker 1,
- * review 2026-11-10). `isSameOrigin` above compares two caller-supplied headers,
- * so a page served from `attacker.example` that resolves to 127.0.0.1 reaches
- * this listener with `Host`/`Origin` that agree with each other and passes it —
- * and a missing Origin is allowed outright. Requiring a Host header that names
- * THIS machine's loopback authority, plus an Origin that matches it exactly over
- * http(s), leaves no name under an attacker's control able to reach this route.
+ * DNS-rebinding guard for the loopback management routes that change or reveal
+ * state a rebound page must not reach (Blocker 1, review 2026-11-10; extended to
+ * the pending routes by the spec 021 review). `isSameOrigin` above compares two
+ * caller-supplied headers, so a page served from `attacker.example` that resolves
+ * to 127.0.0.1 reaches this listener with `Host`/`Origin` that agree with each
+ * other and passes it — and a missing Origin is allowed outright. Requiring a Host
+ * header that names THIS machine's loopback authority, plus an Origin that matches
+ * it exactly over http(s), leaves no name under an attacker's control able to
+ * reach these routes.
  *
  * The canonical accepted authorities are exactly `127.0.0.1`, `localhost` and
  * `[::1]`, each with an optional port (see TRUSTED_LOCAL_AUTHORITY above).
@@ -2591,7 +2793,7 @@ const TRUSTED_LOCAL_AUTHORITY = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})
 function assertTrustedLocalAuthority(req) {
   const host = typeof req.headers.host === 'string' ? req.headers.host.trim() : ''
   if (!TRUSTED_LOCAL_AUTHORITY.test(host)) {
-    const error = new Error('listen address changes require a Host header naming this machine (127.0.0.1, localhost or [::1])')
+    const error = new Error('this route requires a Host header naming this machine (127.0.0.1, localhost or [::1])')
     error.status = 403
     error.code = 'forbidden'
     throw error
@@ -2603,7 +2805,7 @@ function assertTrustedLocalAuthority(req) {
   // `URL.host` keeps the port: the same loopback name on another port is still
   // a different (cross-origin) caller.
   if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:') || url.host !== host) {
-    const error = new Error('listen address changes require an Origin that matches the Host header over http(s)')
+    const error = new Error('this route requires an Origin that matches the Host header over http(s)')
     error.status = 403
     error.code = 'forbidden'
     throw error
@@ -2892,6 +3094,16 @@ const plugin = {
     // workspace ids it is told about. This is that list: the owner `api` sees every
     // workspace, and the device path re-reads it before answering.
     let visibleWorkspaceIds = []
+    // sessionId -> workspaceId, derived from the Host's own attach relation
+    // (`workspace.sessionIds`, the same list `workspace/follow` filters). DSH's session
+    // record carries NO workspaceId (measured 2026-11-11: `session/list` rows have
+    // `cwd` but no workspace), so this map is the only server-side source for the
+    // additive `workspaceId` field the companion groups conversations by.
+    let sessionWorkspaceIds = new Map()
+    // workspaceId -> display label, from the SAME rule the `workspaces` op uses
+    // (`workspaceLabelOf`). Only a label travels (never the path), and only for a
+    // workspace the session map already names.
+    let workspaceLabels = new Map()
     let workspaceIdsRefreshedAt = 0
     let workspaceIdsRefresh = null
     const WORKSPACE_IDS_TTL_MS = 2_000
@@ -2912,6 +3124,25 @@ const plugin = {
               ? item.workspaceId
               : typeof item?.id === 'string' ? item.id : ''))
             .filter((id) => id !== '')
+          // The same answer carries each workspace's member session ids, because this
+          // adapter is the OWNER's (the device one is filtered): that is the Host's
+          // attach relation, and it is what maps a session to its workspace.
+          const bySession = new Map()
+          const labels = new Map()
+          for (const item of items) {
+            const workspaceId = typeof item?.workspaceId === 'string' && item.workspaceId !== ''
+              ? item.workspaceId
+              : typeof item?.id === 'string' ? item.id : ''
+            if (workspaceId === '') continue
+            // Same label as the `workspaces` op would serve for this id.
+            const label = workspaceLabelOf(item)
+            if (label !== '') labels.set(workspaceId, label)
+            for (const sessionId of Array.isArray(item?.sessionIds) ? item.sessionIds : []) {
+              if (typeof sessionId === 'string' && sessionId !== '') bySession.set(sessionId, workspaceId)
+            }
+          }
+          sessionWorkspaceIds = bySession
+          workspaceLabels = labels
           workspaceIdsRefreshedAt = Date.now()
         } catch (error) {
           log(`workspace id refresh failed (keeping the previous ${visibleWorkspaceIds.length}): ${error?.message ?? error}`)
@@ -2921,6 +3152,45 @@ const plugin = {
         return visibleWorkspaceIds
       })()
       return workspaceIdsRefresh
+    }
+    /**
+     * Spec 011 addendum (2026-11-11): the workspace a session belongs to, for the
+     * additive `workspaceId` field the companion groups conversations by.
+     *
+     * Only the ID ever leaves the gateway (never the workspace path: labels stay the
+     * basename served by the `workspaces` op). A direct-subagent session inherits the
+     * workspace of the parent it was started from, which the caller supplies from the
+     * row it is projecting. Returns undefined when the Host does not relate the
+     * session to a workspace, so the field stays optional.
+     */
+    const workspaceIdFor = (sessionId, parentSessionId) => {
+      const id = typeof sessionId === 'string' ? sessionId : ''
+      if (id !== '' && sessionWorkspaceIds.has(id)) return sessionWorkspaceIds.get(id)
+      const parent = typeof parentSessionId === 'string' ? parentSessionId : ''
+      if (parent !== '' && sessionWorkspaceIds.has(parent)) return sessionWorkspaceIds.get(parent)
+      return undefined
+    }
+    /**
+     * Spec 011 addendum (owner decision 2026-11-11, option B for EVERY device): the
+     * grouping fields a session row/event carries — `{workspaceId, workspaceLabel?}`.
+     *
+     * One `workspaceId` and, when the label is known, its display name. The label is
+     * the SAME string the `workspaces` op serves (`workspaceLabelOf`), and it is
+     * permitted for every device that can see the session because the row already
+     * carries the session's absolute `cwd` — a workspace basename reveals strictly
+     * less. The pair travels together: no id means no label, never a lone label, and
+     * the path itself never leaves the Host.
+     *
+     * Returns undefined when the Host relates the session to no workspace, so the
+     * caller omits both fields instead of sending an empty pair.
+     */
+    const workspaceGroupFieldsFor = (sessionId, parentSessionId) => {
+      const workspaceId = workspaceIdFor(sessionId, parentSessionId)
+      if (workspaceId === undefined) return undefined
+      const workspaceLabel = workspaceLabels.get(workspaceId)
+      return workspaceLabel === undefined
+        ? { workspaceId }
+        : { workspaceId, workspaceLabel }
     }
     const deviceAccess = createDeviceAccess({
       ctx,
@@ -3017,8 +3287,12 @@ const plugin = {
         && !isPrivateNetworkHostname(options.lanHost) && net.isIP(options.lanHost) === 0) {
       throw new Error('mobile-gateway: lanHost must be loopback, a private LAN/Tailscale address, or an IP literal')
     }
-    if (options.lanEnabled === true && options.lanAdvertiseHost && !isPrivateNetworkHostname(options.lanAdvertiseHost)) {
-      throw new Error('mobile-gateway: lanAdvertiseHost must be localhost, a private LAN or Tailscale address')
+    // A hostname is accepted only once it resolves to Tailscale/private addresses;
+    // a public, loopback-only or unresolvable name never reaches an advertised
+    // URL or the certificate. IP literals and private names need no lookup.
+    const advertiseHost = await verifiedAdvertiseHost(options.lanAdvertiseHost)
+    if (options.lanEnabled === true && options.lanAdvertiseHost && !advertiseHost) {
+      throw new Error('mobile-gateway: lanAdvertiseHost must be localhost, a private LAN or Tailscale address, or a name that resolves to one')
     }
     // T011: the owner switch, resolved from the RAW config, before defaults are
     // merged below. Precedence (lib/remote-control.mjs): an explicit
@@ -3077,10 +3351,50 @@ const plugin = {
     const allowedOrigins = [...new Set((Array.isArray(options.allowedOrigins) ? options.allowedOrigins : [])
       .map((origin) => typeof origin === 'string' ? origin.trim() : '')
       .filter(Boolean))]
+    // Spec 021 (revision 14): the web passkey unlock. Only the configured `allowedOrigins` can be
+    // a passkey site (the same list the WS upgrade fence uses): the rp id is that origin's
+    // hostname, so an origin the owner never listed can never be asserted against. One record per
+    // paired web device in an owner-only file next to the device store; a corrupt store only makes
+    // every device count as unregistered (registering again recovers), so it never stops the
+    // gateway.
+    const passkeyStoreFile = path.join(path.dirname(deviceFile), PASSKEY_STORE_FILE)
+    const passkeyStore = loadPasskeyStore(passkeyStoreFile)
+    if (passkeyStore.problem !== undefined) {
+      log(`passkey store unusable (${passkeyStore.problem}); every web device counts as unregistered until it registers again`)
+    }
+    const passkeyService = createPasskeyService({
+      records: passkeyStore.records,
+      file: passkeyStoreFile,
+      allowedOrigins,
+
+      gatewayName: gatewayIdentity.gatewayName,
+      listDevices: () => registry.list(),
+      // A replacement invalidates the device's other sockets: they show the lock screen again and
+      // re-assert on the new passkey (contract §14.6).
+      onPasskeyChanged: (deviceId) => {
+        for (const client of [...clients]) {
+          if (client.deviceId !== deviceId || !holdsWebUnlockScope(registry.get(deviceId)?.scopes)) continue
+          if (client.passkeySlot) passkeyLock.lock(client.passkeySlot)
+          client.send(stringifyWireFrame({ kind: 'hello', ...gatewayIdentity, webLock: 'locked' }))
+        }
+      },
+      // The Devices page polls /mgw/pending; nothing is pushed on a decision.
+      onApprovalSettled: () => {},
+      log,
+    })
+    const passkeyLock = createPasskeyLock({
+      hasPasskey: (deviceId) => passkeyService.hasPasskey(deviceId),
+      // Test-only override (never set by the bundle, and derived from the options object the
+      // bundle does not populate): a short idle bound, so a test can watch a real socket idle
+      // out without waiting 15 minutes.
+      ...(Number.isSafeInteger(options.testWebUnlockIdleMs) && options.testWebUnlockIdleMs > 0
+        ? { idleMs: options.testWebUnlockIdleMs } : {}),
+    })
+
     // T016 (R1): the Host certificate. Created on first use in the plugin data
     // directory; replaced only by the owner's explicit regenerate action.
     const tlsDirectory = options.tlsCertificateDir || path.join(path.dirname(deviceFile), 'mobile-gateway-tls')
-    let tlsIdentity = await loadOrCreateTlsIdentity({ directory: tlsDirectory, advertised: tlsAdvertisedHosts(options, wsPath), log })
+    let tlsIdentity = await loadOrCreateTlsIdentity({ directory: tlsDirectory, advertised: tlsAdvertisedHosts(options, wsPath, advertiseHost), log })
     if (!tlsIdentity) throw new Error('mobile-gateway: the TLS identity could not be loaded')
     const wss = new WebSocketServer({
       noServer: true,
@@ -3286,7 +3600,16 @@ const plugin = {
       return preview
     }
     const fileTransfers = createFileTransferManager(api, options)
-    const fileUploads = createFileUploadManager(api, options)
+    // Spec 013: an image upload is checked against the Host's OWN admission limits
+    // (`LocalAttachmentStore.imageLimits`), the same object its upload route reads,
+    // so a mediaType the Host would refuse never moves a byte over the link. The
+    // getter runs per open: the attachment service may mount after this plugin.
+    const hostImageLimits = () => {
+      try { return ctx.get?.('attachments')?.imageLimits } catch { return undefined }
+    }
+    // `log` rides along for the failures a client is only told generically: the
+    // real one stays in the Host log instead of reaching the device.
+    const fileUploads = createFileUploadManager(api, { ...options, log: (line) => log(line), imageLimits: hostImageLimits })
     const speechInput = createSpeechInputManager(api, options)
     const fileTransferExpiryTimer = setInterval(() => {
       fileTransfers.expire().catch((error) => {
@@ -3374,7 +3697,7 @@ const plugin = {
         ...extra,
         ...configuredEndpoints,
         ...(publicUrl ? [publicUrl] : []),
-        ...(lanListening ? lanWebSocketUrls(options, wsPath, lanBoundPort) : []),
+        ...(lanListening ? lanWebSocketUrls(options, wsPath, lanBoundPort, advertiseHost) : []),
       ])])
     }
 
@@ -3626,19 +3949,40 @@ const plugin = {
     }
     /** Global (non-session) owner notifications: admin sockets only, never a device. */
     const clientMayReceiveGlobal = (client) => deviceLive(client) === undefined
-    // Questions: the protocol's SCOPE_BY_TYPE gives them NO scope and
-    // `question-answer` / `question-cancel` are ADMIN_ONLY, so a question is the
-    // owner's alone on this channel. NO device principal is sent a question push
-    // or a replay, whatever scopes its record holds — a scope cannot widen a type
-    // the contract reserves to the admin surface, and `question-answer` stays
-    // unreachable for a device. Spec 008 gives a paired device its own path to the
-    // same question (the remote bridge's `$events` stream plus
-    // `userQuestions/answer`), which is separate from this channel and unchanged
-    // here. A withheld card is audited with ids only — never the question text.
-    const mayReceiveQuestion = (client) => deviceLive(client) === undefined
+    // Questions: the protocol's SCOPE_BY_TYPE gives them no scope of their own;
+    // `question-answer` / `question-cancel` ride `QUESTION_RESPONSE_SCOPE` (`approval:respond`).
+    // OWNER DECISION 2026-11-11: a question card follows the SAME rule as an approval card —
+    // admin/loopback always, and EVERY paired device that holds `approval:respond` AND may see the
+    // session (desktop and mobile alike), gated by the scope and never by the device kind.
+    // The earlier rule was "admin only", on the argument that a push carries Host question text a
+    // paired device has no business receiving unsolicited. That argument does not hold for a device
+    // that may ALREADY see the session, and the reasoning is kept rather than erased:
+    //
+    //   1. A device holding `sessions:read` already receives that session's transcript and tool
+    //      calls (projection-baseline + history). The question asked INSIDE that session is the
+    //      same class of data — withholding it draws a line the rest of the surface does not draw.
+    //   2. An approval card already travels by exactly `clientMayReceive(client, sessionId,
+    //      'approval:respond')`. A question is the same interaction (same session, same `rpcId`
+    //      life cycle, same control card), so a different rule would make the two disagree.
+    //   3. Withholding the card makes the companion useless for this interaction: the app cannot
+    //      answer what it never sees. Spec 008's bridge (`$events` + `userQuestions/answer`) is the
+    //      OTHER path and needs `harness:remote`; it is not the companion app's path.
+    //
+    // The widening is bounded by exactly the approval rule (scope + visible session). A device
+    // WITHOUT the scope still receives nothing, and every withheld card is audited with ids only —
+    // never the question text.
+    const mayReceiveQuestion = (client, sessionId, scope = QUESTION_RESPONSE_SCOPE) =>
+      clientMayReceive(client, sessionId, scope)
     const clientMayReceiveQuestion = (client, sessionId) => {
-      if (mayReceiveQuestion(client)) return true
-      log(`question card withheld: device=${client.deviceId} session=${typeof sessionId === 'string' && sessionId ? sessionId : '-'} reason=admin-only`)
+      if (mayReceiveQuestion(client, sessionId)) return true
+      // The audit names the scope gate that actually refused, so a missing scope and an invisible
+      // session are distinguishable without ever logging the question.
+      const device = deviceLive(client)
+      const reason = device === null ? 'credential'
+        : device === undefined ? 'admin-only'
+          : !deviceHasScope(device, 'approval:respond') ? 'missing-scope'
+            : 'session-not-visible'
+      log(`question card withheld: device=${client.deviceId} session=${typeof sessionId === 'string' && sessionId ? sessionId : '-'} reason=${reason}`)
       return false
     }
 
@@ -3652,11 +3996,13 @@ const plugin = {
       }
     }
     /**
-     * Question cards/resolutions: admin sockets only — the per-recipient
-     * decision is `clientMayReceiveQuestion` (a device scope never widens it).
+     * Question cards/resolutions: admin sockets always; a device exactly when it holds
+     * `approval:respond` and may see the session — `clientMayReceiveQuestion`, the same
+     * decision the replay makes.
      */
-    const broadcastQuestionFrame = (frame) =>
-      broadcastInteractionFrame(frame, 'approval:respond', (client) => clientMayReceiveQuestion(client, frame.sessionId))
+    const broadcastQuestionFrame = (frame) => {
+      return broadcastInteractionFrame(frame, QUESTION_RESPONSE_SCOPE, (client) => clientMayReceiveQuestion(client, frame.sessionId))
+    }
 
     // Session-list metadata must reach every connected client even when it is
     // subscribed to one conversation. Subscriptions only scope the heavier
@@ -3697,6 +4043,17 @@ const plugin = {
     }
     const AGGREGATE_KINDS = new Set(['session-archives', 'session-queues', 'projection-baseline'])
     const broadcastSessionMetadataFrame = (frame) => {
+      // Spec 011 addendum: every session-update event carries the same additive
+      // `workspaceId` + `workspaceLabel` pair as the list item, so a client can group
+      // a session the moment it learns about it (including a session it did not list
+      // yet). Optional: both fields are omitted when the Host relates the session to
+      // no workspace. Per-client visibility is unchanged — the filter below already
+      // drops frames for sessions a client may not receive, so the pair can only
+      // reach a client that may see that session.
+      if (frame && typeof frame.sessionId === 'string' && frame.workspaceId === undefined) {
+        const group = workspaceGroupFieldsFor(frame.sessionId)
+        if (group !== undefined) frame = { ...frame, ...group }
+      }
       const aggregate = AGGREGATE_KINDS.has(frame.kind)
       const adminWire = stringifyWireFrame(frame)
       for (const client of clients) {
@@ -3730,6 +4087,9 @@ const plugin = {
       if (ws.mobileChannel === 'conversation' && trigger !== 'subscribe') {
         return { questionCount: 0, approvalCount: 0 }
       }
+      // `ws` may have closed between the connect and this replay: `recipient.send` below throws
+      // on a non-OPEN socket, which would turn the caller's connect path into an exception.
+      if (ws.readyState !== 1) return { questionCount: 0, approvalCount: 0 }
       const recipients = ws.mobileChannel === 'conversation'
         ? [...clients].filter((client) => client.readyState === 1 && client.mobileChannel !== 'conversation')
         : [ws]
@@ -3775,14 +4135,18 @@ const plugin = {
       && (!client.filterSessionId || client.filterSessionId === sessionId)
     ))
     // A question may only be handed back to the desktop when no socket that can
-    // actually RECEIVE it is connected. Since questions are admin-only, a
-    // connected device must not count: otherwise it would suppress the owner's
-    // own answer path while being sent nothing.
+    // actually RECEIVE it is connected. That is the SAME recipient rule as the
+    // card (`mayReceiveQuestion`, OWNER DECISION 2026-11-11, like approvals): an
+    // admin/legacy socket, or a device holding `approval:respond` that may see the
+    // session. A device holding the scope therefore suppresses the desktop fallback
+    // exactly as an approval card would — it really is sent the card. A connected
+    // device that would receive NOTHING (no scope, or the session invisible to it)
+    // must not count: otherwise it would suppress the owner's own answer path.
     const hasQuestionClient = (sessionId) => [...clients].some((client) => (
       client.readyState === 1
       && client.mobileChannel !== 'conversation'
       && (!client.filterSessionId || client.filterSessionId === sessionId)
-      && mayReceiveQuestion(client)
+      && mayReceiveQuestion(client, sessionId)
     ))
 
     const abortDownstreamInteraction = (pending, kind) => {
@@ -3814,8 +4178,19 @@ const plugin = {
       return true
     }
 
-    const normalizeQuestionAnswers = (pending, answers) => {
+    // `fromSocket` is the answering socket. The option rules below are the host's (`user-questions`
+    // typert remote) and stay exactly as they are — an authorized device gets no looser shape than
+    // the owner. An echo outside the offered labels (`custom`) is free text the HOST validates and
+    // applies; over the ADMIN channel that is the owner sitting at the Host, but a paired device is
+    // a principal the Host never checked on this path (the answer is a promise resolved in this
+    // process), so a DEVICE may pick from the offered options and nothing else: no free text, no
+    // empty selection. One answer, so both refusals use the existing `label` message and never an
+    // echo of anything the caller sent. The desktop app answers a question through the bridge's
+    // Host-validated `userQuestions/answer`, not this frame.
+    const normalizeQuestionAnswers = (pending, answers, fromSocket) => {
       if (answers.length !== pending.questions.length) return { error: 'answers must cover every question exactly once' }
+      const deviceAnswered = deviceLive(fromSocket) !== undefined
+      const offeredOnly = { error: 'selected values must match offered option labels' }
       const normalized = []
       for (let index = 0; index < pending.questions.length; index += 1) {
         const question = pending.questions[index]
@@ -3826,11 +4201,18 @@ const plugin = {
         if (answer.selected.some((label) => typeof label !== 'string')) return { error: 'selected values must be strings' }
         if (new Set(answer.selected).size !== answer.selected.length) return { error: 'selected values must not repeat' }
         const offered = new Set((question.options || []).map((option) => option.label))
-        if (answer.selected.some((label) => !offered.has(label))) return { error: 'selected values must match offered option labels' }
+        if (answer.selected.some((label) => !offered.has(label))) return offeredOnly
         if (question.multiSelect !== true && answer.selected.length > 1) return { error: 'single-select questions accept at most one selection' }
+        if (deviceAnswered && answer.selected.length === 0) return offeredOnly
         let custom
         if (answer.custom !== undefined) {
           if (typeof answer.custom !== 'string' || !answer.custom.trim()) return { error: 'custom answers must be non-empty strings' }
+          if (deviceAnswered) return offeredOnly
+          // Spec 018 item 4: a free-text answer is bounded. Measured on the TRIMMED value, because
+          // that is what the Host receives; the cap is a contract constant, not a local literal.
+          if (answer.custom.trim().length > contractCustomMax) {
+            return { error: `custom answers must not exceed ${contractCustomMax} characters` }
+          }
           custom = answer.custom.trim()
         }
         if (question.multiSelect !== true && custom !== undefined && answer.selected.length > 0) {
@@ -3875,7 +4257,7 @@ const plugin = {
           // A downstream answerer may report that no WebUI currently owns the
           // request. Keep the pending interaction active; the value is used only
           // once no socket that may actually receive it is connected (for a
-          // question that means admin only, see `hasQuestionClient`).
+          // question that means no socket `mayReceiveQuestion` allows, see `hasQuestionClient`).
           pending.downstream = { kind: 'unavailable', value: answer }
           if (!hasQuestionClient(pending.sessionId)) fallbackQuestion(pending)
         }
@@ -3949,7 +4331,7 @@ const plugin = {
       }
     }
 
-    const respondToQuestion = async (msg, cancel = false) => {
+    const respondToQuestion = async (msg, cancel = false, fromSocket = undefined) => {
       const rpcId = typeof msg.rpcId === 'string' && msg.rpcId.trim() ? msg.rpcId.trim() : null
       const sessionId = typeof msg.sessionId === 'string' && msg.sessionId.trim() ? msg.sessionId.trim() : null
       if (!rpcId || !sessionId) {
@@ -3960,13 +4342,32 @@ const plugin = {
       if (!pending) {
         return { kind: 'question-response', rpcId, sessionId, action: cancel ? 'cancel' : 'answer', accepted: false, reason: 'not-pending' }
       }
+      // Spec 018 item 4 — the boundary no Host enforces on this path: `pending.resolve()` is a
+      // promise INSIDE this process, so there is no per-item Host check behind it. A device
+      // must therefore see the session that asked and hold the interaction scope; knowing the
+      // the exact request shown. `rpcId` is not authority. Checked BEFORE anything consumes the
+      // card, so a refused caller cannot spend it. OWNER DECISION 2026-11-11: the rule is that
+      // "this socket is one the gateway would PUSH this card to" — the same `clientMayReceive` decision
+      // the broadcast and the replay make, so a socket can only answer a card it could have
+      // been shown (admin always; a device only with live `approval:respond` +
+      // `sessions:read` + the session in its visible set). The rule is per SOCKET: whether
+      // some OTHER socket is a recipient (`hasQuestionClient`) is not part of it — an admin
+      // socket subscribed to session B may answer a question from session A, as it may
+      // receive it.
+      if (!clientMayReceive(fromSocket, pending.sessionId, QUESTION_RESPONSE_SCOPE)) {
+        log(`question answer refused: device=${fromSocket?.deviceId ?? '-'} session=${pending.sessionId} reason=not-authorized-for-session`)
+        return {
+          kind: 'question-response', rpcId, sessionId,
+          action: cancel ? 'cancel' : 'answer', accepted: false, reason: 'not-authorized',
+        }
+      }
       if (pending.sessionId !== sessionId) {
         return { kind: 'error', code: 'bad-request', message: 'sessionId does not match the pending question', requestType: msg.type, sessionId }
       }
       if (!cancel && !Array.isArray(msg.answers)) {
         return { kind: 'error', code: 'bad-request', message: 'question-answer requires an answers array', requestType: msg.type, sessionId }
       }
-      const normalized = cancel ? null : normalizeQuestionAnswers(pending, msg.answers)
+      const normalized = cancel ? null : normalizeQuestionAnswers(pending, msg.answers, fromSocket)
       if (normalized?.error) {
         return { kind: 'error', code: 'bad-response', message: normalized.error, requestType: msg.type, sessionId }
       }
@@ -4029,6 +4430,37 @@ const plugin = {
       }
     }
 
+    // Spec 016 Phase 3 / spec 014 C6: which device last prompted a session. DSH 0.2.2-rc.1
+    // puts no client identity on the tool path, so only the half that PROXIED the prompt
+    // can say. Two sources feed it: a `session/prompt` the bridge forwards (below) and a
+    // companion `message` op; a `user/message` event with no device prompt outstanding is
+    // the local owner's. A session with no record answers "remote" (C6 fail closed).
+    const sessionDriver = createSessionDriver({ getDevice: (deviceId) => registry.get(deviceId) })
+    // Spec 019 Wave 3: read + lower-only permission control. Built once here; every call
+    // carries the connection's own device id and Peer, and the module keeps no state.
+    const permissionLower = createPermissionLower(ctx, {
+      dispatchRpc: (endpoint, payload, signal, peer) => resolveHostGateway(ctx)?.dispatchRpc?.(endpoint, payload, signal, peer),
+      log,
+    })
+    const remoteBrowser = createRemoteBrowser({
+      getDevice: (deviceId) => registry.get(deviceId),
+      listDevices: () => registry.list(),
+      listClients: () => clients,
+      sessionDriver,
+      log,
+    })
+    // Registered as host services, the way spec 014 C6 specifies: `plugins/sidebar-browser`
+    // reads `remoteSessionScope` with `ctx.get`, and the devices plugin reads `remoteBrowser`
+    // to place a `browser-command` on the machine that actually holds the browser.
+    for (const [name, service] of [
+      [REMOTE_SESSION_SCOPE_SERVICE, { describe: (session) => sessionDriver.describe(session) }],
+      [REMOTE_BROWSER_SERVICE, remoteBrowser],
+    ]) {
+      if (!provideHostService(ctx, name, service)) {
+        log(`host service not registered: ${name} (this Host offers no ctx.set/ctx.provide)`)
+      }
+    }
+
     // Spec 008: the remote-bridge channel. It reuses the Host's own typertGateway
     // (owner Peer per connection) and maps `$events/result` onto THIS file's
     // hash-bound approval decision — it never forwards that endpoint raw.
@@ -4053,6 +4485,10 @@ const plugin = {
       maxPayloadBytes: options.maxPayloadBytes,
       // All 0 (unlimited) unless the owner configured `remoteBridgeLimits`.
       limits: options.remoteBridgeLimits,
+      // Spec 016: a forwarded `session/prompt` is how a desktop device becomes the driver
+      // of that session. A frame without a session id records nothing (the bridge only
+      // calls this for a dispatched `session/prompt`).
+      onPrompt: (deviceId, sessionId) => sessionDriver.noteDevicePrompt(sessionId, deviceId),
       log,
     })
 
@@ -4083,6 +4519,9 @@ const plugin = {
           const p = url.pathname
           if (req.method === 'GET' && p === '/mgw/status') {
             const profile = ctx.get?.('profileContext')
+            // The stable handle for a tailnet-bound listener: the socket stays on
+            // the IP, only the advertised URL carries the name. null => IP as before.
+            const tailscaleDnsName = await advertisedTailscaleName(options.lanHost, lanListening)
             sendJson(res, 200, {
               version: PLUGIN_VERSION,
               // Owner decision 2026-11-10: while `@dsh-ext/devices` is loaded its
@@ -4124,7 +4563,7 @@ const plugin = {
               tailscaleUrl: gatewayState.tailscaleUrl,
               // The same table the listen targets bind against, so an address
               // reported here is exactly the one POST /mgw/listen can apply.
-              tailscale: tailscaleInterfaceStatus({ listening: lanListening, host: options.lanHost, port: lanBoundPort, wsPath }, interfaces()),
+              tailscale: tailscaleInterfaceStatus({ listening: lanListening, host: options.lanHost, port: lanBoundPort, wsPath, dnsName: tailscaleDnsName }, interfaces()),
               lan: {
                 enabled: options.lanEnabled === true,
                 listening: lanListening,
@@ -4133,7 +4572,7 @@ const plugin = {
                 // T013: advertise nothing that is not actually listening — with
                 // the switch off (or the listener closed) this is empty, so a
                 // client cannot be pointed at a dead non-loopback address.
-                urls: lanListening ? lanWebSocketUrls(options, wsPath, lanBoundPort) : [],
+                urls: lanListening ? lanWebSocketUrls(options, wsPath, lanBoundPort, advertiseHost, tailscaleDnsName) : [],
                 requireAuth: true,
                 // T016/T018: the listener is TLS and pinning is the only trust
                 // anchor, so the fingerprint is part of the status.
@@ -4278,7 +4717,7 @@ const plugin = {
             if (body.tailscaleUrl !== undefined && typeof body.tailscaleUrl !== 'string') throw badRequest('Tailscale address must be a string')
             const nextTailscaleUrl = body.tailscaleUrl === undefined ? gatewayState.tailscaleUrl :
               body.tailscaleUrl.trim() ? normalizePublicUrl(body.tailscaleUrl.trim(), req, wsPath) : ''
-            if (nextTailscaleUrl && (!nextTailscaleUrl.startsWith('wss://') || !isTailscaleIp(new URL(nextTailscaleUrl).hostname)))
+            if (nextTailscaleUrl && (!nextTailscaleUrl.startsWith('wss://') || !(await isOwnTailscaleHost(new URL(nextTailscaleUrl).hostname))))
               throw badRequest('Tailscale address must use wss:// with a Tailscale IPv4 or IPv6 address')
             gatewayState.setConnection(body.route, nextSettings, nextUrl, nextTailscaleUrl)
             transportSettings = nextSettings
@@ -4360,7 +4799,7 @@ const plugin = {
                 certSha256: tlsIdentity?.fingerprint256 ?? null,
                 error: null,
               },
-              tailscale: tailscaleInterfaceStatus({ listening: applied.listening, host: applied.applied, port: applied.port, wsPath }, table),
+              tailscale: tailscaleInterfaceStatus({ listening: applied.listening, host: applied.applied, port: applied.port, wsPath, dnsName: applied.dnsName }, table),
             })
           } else if (req.method === 'POST' && p === '/mgw/tls/regenerate') {
             // T016 (R1): the certificate is replaced only by this explicit owner
@@ -4384,7 +4823,7 @@ const plugin = {
               for (const client of [...clients]) client.close(CLOSE_REVOKED, 'gateway certificate regenerated')
               tlsIdentity = await loadOrCreateTlsIdentity({
                 directory: tlsDirectory,
-                advertised: tlsAdvertisedHosts(options, wsPath),
+                advertised: tlsAdvertisedHosts(options, wsPath, advertiseHost),
                 regenerate: true,
                 log,
               })
@@ -4442,16 +4881,20 @@ const plugin = {
                 otp: created.otp,
                 pairing: { id: created.offer.id, kind, scopes: [...created.offer.scopes], expiresAt: created.offer.expiresAt },
                 certSha256: tlsIdentity.fingerprint256,
-                addresses: lanListening ? lanWebSocketUrls(options, wsPath, lanBoundPort).map((url) => new URL(url).host) : [],
+                addresses: lanListening
+                  ? lanWebSocketUrls(options, wsPath, lanBoundPort, advertiseHost, await advertisedTailscaleName(options.lanHost, lanListening)).map((url) => new URL(url).host)
+                  : [],
                 ...gatewayIdentity,
               })
               return
             }
             const publicUrl = normalizePublicUrl(body.publicUrl || configuredPublicUrl(), req, wsPath)
-            if (pairingRoute === 'tailscale' && !isTailscaleIp(new URL(publicUrl).hostname))
-              throw badRequest('Tailscale pairing requires the host Tailscale IP address')
-            const endpoints = advertisedEndpoints(publicUrl, normalizeEndpoints(body.endpoints ?? [])).filter(endpoint =>
-              pairingRoute !== 'tailscale' || isTailscaleIp(new URL(endpoint).hostname))
+            if (pairingRoute === 'tailscale' && !(await isOwnTailscaleHost(new URL(publicUrl).hostname)))
+              throw badRequest('Tailscale pairing requires the host\'s Tailscale IP address or its verified MagicDNS name')
+            const candidateEndpoints = advertisedEndpoints(publicUrl, normalizeEndpoints(body.endpoints ?? []))
+            const endpointKept = await Promise.all(candidateEndpoints.map(endpoint =>
+              pairingRoute !== 'tailscale' || isOwnTailscaleHost(new URL(endpoint).hostname)))
+            const endpoints = candidateEndpoints.filter((_, index) => endpointKept[index])
             // T019: the offer remembers what the QR promises (data-model.md
             // PairingOffer); claimPairing() then refuses a redemption over a
             // different listener certificate.
@@ -4501,14 +4944,55 @@ const plugin = {
               sendJson(res, 403, { error: 'forbidden', message: 'pending requests are loopback and same-origin only' })
               return
             }
-            sendJson(res, 200, { pending: pairingRequests.list(), offers: pairingRequests.offerCount() })
+            // Review finding 5: `isSameOrigin` compares two CALLER-SUPPLIED headers, which a
+            // DNS-rebinding page satisfies (see assertTrustedLocalAuthority above), and the list
+            // carries the pairing names and the passkey verification codes — i.e. exactly what an
+            // owner uses to decide. So the Host must name THIS machine's loopback authority.
+            assertTrustedLocalAuthority(req)
+            // Spec 021 §14.3: a passkey replacement request is a pending approval of kind
+            // `passkey` — listed beside the pairing requests so the Devices page shows both.
+            sendJson(res, 200, { pending: [...pairingRequests.list(), ...passkeyService.pendingApprovals()], offers: pairingRequests.offerCount() })
           } else if (req.method === 'POST' && /^\/mgw\/pending\/[^/]+\/(?:approve|reject)$/.test(p)) {
             if (!isLoopback(req) || !isSameOrigin(req)) {
               sendJson(res, 403, { error: 'forbidden', message: 'pending requests are loopback and same-origin only' })
               return
             }
+            // Review finding 5: a decision is the strongest local action on this surface (it
+            // mints a device credential, or grants a passkey replacement). A rebound page passes
+            // `isSameOrigin`, so the Host/Origin pair must also name this machine's loopback.
+            assertTrustedLocalAuthority(req)
             const [, , , rawId, action] = p.split('/')
             const id = decodeURIComponent(rawId)
+            // Spec 021 §14.3: a passkey replacement is decided through the SAME route. It is
+            // granted to the socket that asked (never to the device), and the asking socket is
+            // told in band with `passkey-approval`; the owner sees an 8-character code.
+            const passkeyDecision = passkeyService.decideApproval(id, action === 'reject' ? 'reject' : 'approve')
+            if (passkeyDecision !== undefined) {
+              // Contract §14.3 names the frame's fields exactly: `approvalId`, `action`
+              // ('approve'|'reject') and the `verificationCode` the owner compared. The client
+              // keys on `approvalId`/`action`, so any other spelling leaves it waiting.
+              const approvalWire = stringifyWireFrame({
+                kind: PASSKEY_APPROVAL_KIND,
+                approvalId: passkeyDecision.approvalId,
+                action: passkeyDecision.action,
+                verificationCode: passkeyDecision.verificationCode,
+              })
+              for (const client of clients) {
+                if (client.passkeySlot?.stateKey !== passkeyDecision.stateKey) continue
+                // A `reject` answers nothing on the register path and the asking socket is LOCKED
+                // again: no grant was left, so its only way forward is a new ceremony.
+                if (passkeyDecision.action === 'reject' && client.passkeySlot) {
+                  passkeyLock.lock(client.passkeySlot)
+                  passkeyService.forgetSocket(client)
+                }
+                client.send(approvalWire)
+              }
+              log(`passkey replacement ${passkeyDecision.action === 'approve' ? 'approved' : 'rejected'} by the host user: ${id}`)
+              sendJson(res, 200, passkeyDecision.action === 'approve'
+                ? { approved: true, kind: 'passkey', verificationCode: passkeyDecision.verificationCode }
+                : { rejected: true, kind: 'passkey' })
+              return
+            }
             const waiting = pendingSockets.get(id)
             const request = pairingRequests.get(id)
             if (!request || !waiting) {
@@ -4576,7 +5060,9 @@ const plugin = {
             waiting.finished = true
             waiting.release()
             startBusinessConnection(() => activateBusinessConnection(new WebSocketMobileTransport(waiting.socket), device, 'legacy',
-              { ...waiting.transport, legacyAdmin: options.legacyAdmin === true }, claimed, claimed.generation),
+              // Spec 021: the passkey origin is the BROWSER's upgrade Origin, captured when the
+              // pending socket was accepted. `req` here is the Host management approval POST.
+              { ...waiting.transport, origin: waiting.origin, legacyAdmin: options.legacyAdmin === true }, claimed, claimed.generation),
             { deviceId: device.id, channel: 'legacy', paired: true })
             log(`pairing approved by the host user: ${id} -> ${device.id}, scopes=${device.scopes.join(', ')}`)
             sendJson(res, 200, { approved: true, device })
@@ -4586,6 +5072,9 @@ const plugin = {
             if (revoked) {
               rtc.closeDevice(id)
               void deviceAccess.revoke(id)
+              // Spec 021 §5: revoking the device deletes its passkey record and closes its sockets
+              // (4401 — the credential is gone, so the PWA must wipe its stored passkey too).
+              passkeyService.revoke(id)
               for (const client of clients) {
                 // Contract §3/§6: close code 4401 tells the phone its credential
                 // is gone and it must wipe it (4003 would mean "re-authenticate").
@@ -4628,7 +5117,25 @@ const plugin = {
     // `companionProtocol`/`minClientVersion` drive `client-hello`, and
     // `certSha256` is the pin the TLS listener presents. Spec 005 FR4: the
     // device also learns its own `kind` and `scopes`.
-    const helloFrame = (device, transport = {}) => ({
+    //
+    // Revision 11: `session-rename` / `session-archive` are advertised PER DEVICE,
+    // only to one holding `sessions:author`. The rule is not restated here: the
+    // contract's SESSION_EDIT_CAPABILITY_SCOPE names every capability that needs a
+    // scope, and the device record supplies the scopes. A device without the scope
+    // sees the unchanged set, so an app that gates its menu on these strings shows
+    // no row menu it could not use.
+    const deviceCapabilities = (device) => {
+      const scopes = Array.isArray(device?.scopes) ? device.scopes : []
+      const granted = []
+      for (const [capability, scope] of Object.entries(SESSION_EDIT_CAPABILITY_SCOPE)) {
+        if (typeof scope === 'string' && scopes.includes(scope)) granted.push(capability)
+      }
+      return [...COMPANION_CAPABILITIES, BROWSER_AGENT_CAPABILITY, ...granted]
+    }
+    // Spec 021 (revision 14): a `web:unlock` device learns its lock state in `hello` — absent for
+    // every device that does not hold the scope, so an ordinary phone's hello is unchanged. The
+    // state is per SOCKET (a tab reload starts locked again), so the caller passes it.
+    const helloFrame = (device, transport = {}, webLock) => ({
       kind: 'hello',
       ...gatewayIdentity,
       protocol: 3,
@@ -4636,11 +5143,15 @@ const plugin = {
       minClientVersion: MIN_CLIENT_VERSION,
       dshVersion: api.dshVersion,
       historyFormatVersion: SESSION_FORMAT_VERSION,
-      capabilities: [...COMPANION_CAPABILITIES],
+      // Spec 016 Phase 3 (revision 10): the browser capability is OPTIONAL — it says the
+      // host will send `browser-command` frames, and a client that cannot honour them
+      // simply ignores it. It is never part of the required `CAPABILITIES`.
+      capabilities: deviceCapabilities(device),
       certSha256: tlsIdentity?.fingerprint256 ?? null,
       port: transport.port || webServer.port,
       clients: clients.size,
       authenticated: !!device,
+      ...(webLock === undefined ? {} : { webLock }),
       ...(device ? { device: { id: device.id, name: device.name, kind: device.kind, scopes: device.scopes } } : {}),
     })
     // Contract §4: `message` is idempotent per device by `clientMsgId`; a retry
@@ -4697,6 +5208,11 @@ const plugin = {
         companionProtocol: COMPANION_PROTOCOL_VERSION,
         ...(typeof msg.appVersion === 'string' ? { appVersion: msg.appVersion.slice(0, 64) } : {}),
         ...(msg.platform === 'ios' || msg.platform === 'android' ? { platform: msg.platform } : {}),
+        // Spec 016 Phase 3: what this client can do. Only `browser-agent:1` is read today;
+        // unknown names are kept out so a typo can never widen what the host sends.
+        ...(Array.isArray(msg.capabilities)
+          ? { capabilities: msg.capabilities.filter((name) => name === BROWSER_AGENT_CAPABILITY) }
+          : {}),
       }
       ws.clientHello = client
       ws.send(stringifyWireFrame({ kind: 'client-hello', ...requestId, ...client }))
@@ -4713,9 +5229,11 @@ const plugin = {
       // it can no longer be attributed by the client and must not travel back.
       const echo = requestIdEcho(msg)
       if (id === undefined) {
-        // Contract §4 ops always carry one. The revision-4 stream frames
-        // `remote-stream-open/-cancel/-credit` have no requestId by design.
-        if (!isCompanionType(msg.type)) return undefined
+        // Contract §4 ops always carry one, and so does every spec 013
+        // `remote-upload-*` frame (revision 8: one request, one answer). The
+        // revision-4 stream frames `remote-stream-open/-cancel/-credit` have no
+        // requestId by design.
+        if (!isCompanionType(msg.type) && !isRemoteUploadType(msg.type)) return undefined
         return { kind: 'error', code: 'bad-request', requestType: msg.type,
           message: 'requestId is required (1..64 characters from [A-Za-z0-9._-])' }
       }
@@ -4816,6 +5334,72 @@ const plugin = {
         })
       }
       const ws = new MobileConnection(adapter, { deviceId: device?.id, channel })
+      // Spec 021 §14.1: a passkey is bound to the EXACT origin the page runs on, so the socket
+      // carries the `Origin` it upgraded with and the door asks for that origin's rp id. A
+      // native companion sends no Origin, so it can never run a ceremony at all.
+      ws.origin = typeof transport.origin === 'string' ? transport.origin : undefined
+      // Spec 021 (revision 14): a `web:unlock` socket has its OWN lock record. It starts locked on
+      // every connection (a tab reload or reconnect always needs a new assertion), and only a
+      // `passkey-assert` ON THIS socket unlocks it. Ordinary devices get no slot and no gate.
+      const webDevice = !!device && holdsWebUnlockScope(device.scopes)
+      if (webDevice) ws.passkeySlot = passkeyLock.newSocket()
+      // Spec 021: the socket's lock state, recomputed from the lock layer (which also applies the
+      // 15-minute idle re-lock). `unregistered` means the device has no passkey yet — register first.
+      const webLockState = () => (webDevice ? passkeyLock.state(ws.passkeySlot, device.id) : undefined)
+      ws.passkeyLockState = webLockState
+      // Spec 021 §14.5: the failure budget is part of the lock, and it applies to the OUTBOUND
+      // gate as well — a device that failed its way over the limit stops receiving data, exactly
+      // as a locked one does. `rate-limited` is reported in preference to the underlying state so
+      // the refusal says why it cannot be solved by a fresh assertion.
+      const webLockReason = () => {
+        if (!webDevice) return undefined
+        if (passkeyService.rateLimited(device.id)) return 'rate-limited'
+        return webLockState()
+      }
+      // Spec 021 (reviewer-style: the lock must stop data already flowing, not just refuse the next
+      // request). Every broadcast loop (session events, approvals, questions, projections, push)
+      // sends through `ws.send`, so this one gate keeps a locked socket from receiving any session
+      // data — including frames produced by a request that was already in flight.
+      // Frames a locked socket still receives: the handshake, errors (`auth/locked` included), the
+      // four passkey frames plus the `passkey-lock` acknowledgement, the owner's approval notice,
+      // the keep-alive and the lifecycle receipts of its own credential. Everything else is dropped.
+      const LOCKED_PASSTHROUGH_KINDS = new Set([
+        'hello', 'paired', 'client-hello', 'pong', 'error', 'device-info',
+        'device-forgotten', 'session-stream-reset',
+        ...PASSKEY_CLIENT_TYPES,
+        PASSKEY_LOCK_TYPE,
+        PASSKEY_APPROVAL_KIND,
+      ])
+      // An `error` frame is allowed through a lock (the device must learn WHY it is refused), but
+      // its free text is not trusted: several error paths quote a Host/upstream message. A locked
+      // device gets the structured fields only, with a fixed message.
+      const LOCKED_ERROR_MESSAGE = 'this device is locked; unlock with a passkey first'
+      const lockedErrorWire = (frame) => stringifyWireFrame({
+        kind: 'error',
+        ...(typeof frame.code === 'string' ? { code: frame.code } : {}),
+        ...(typeof frame.requestType === 'string' ? { requestType: frame.requestType } : {}),
+        ...(typeof frame.requestId === 'string' ? { requestId: frame.requestId } : {}),
+        ...(typeof frame.reason === 'string' ? { reason: frame.reason } : {}),
+        ...(typeof frame.scope === 'string' ? { scope: frame.scope } : {}),
+        message: LOCKED_ERROR_MESSAGE,
+      })
+      // `session-stream-reset` is allowed through (a locked device may still have a stream it must
+      // stop waiting on), but it carries `message: error.message`, so its text is replaced too.
+      // `device-info` carries only the device's OWN record.
+      const lockedStreamResetWire = (frame) => stringifyWireFrame({
+        ...frame,
+        ...(typeof frame.code === 'string' ? { code: frame.code } : {}),
+        message: LOCKED_ERROR_MESSAGE,
+      })
+      ws.sendGate = (wire) => {
+        if (!webDevice || webLockReason() === 'unlocked') return wire
+        let frame
+        try { frame = JSON.parse(wire) } catch { return null }
+        if (!LOCKED_PASSTHROUGH_KINDS.has(frame.kind)) return null
+        if (frame.kind === 'error') return lockedErrorWire(frame)
+        if (frame.kind === 'session-stream-reset') return lockedStreamResetWire(frame)
+        return wire
+      }
       ws.hostApi = connApi
       // Test-only `legacyAdmin` device sockets speak the upstream admin surface
       // (they can answer questions), so the per-recipient authorization treats
@@ -4837,10 +5421,136 @@ const plugin = {
       const sendFrame = frame => {
         if (ws.readyState === 1) ws.send(stringifyWireFrame(frame))
       }
+      // Spec 021 (revision 2 of the web target): WebAuthn needs the page's exact origin, so a TLS
+      // listener with an empty `allowedOrigins` can never have a passkey site. Until the browser
+      // holds a passkey it sends no Origin at all. That combination gets a one-line, login-less
+      // `webauthn.request` here (the page names its own origin; the owner then lists it), and
+      // nothing else — it is not a device, holds no session data and is closed after the frame.
+      if (!device && tlsListener && allowedOrigins.length === 0) {
+        sendFrame({ kind: 'webauthn.request', gatewayId: gatewayIdentity.gatewayId, gatewayName: gatewayIdentity.gatewayName })
+        log('webauthn.request sent: allowedOrigins is empty, so no web passkey site exists yet')
+        setTimeout(() => { try { ws.close(4003, 'webauthn.request') } catch { /* already gone */ } }, 50)
+        return ws
+      }
       // Spec 008: per-connection remote-bridge state (one owner Peer, the open
       // streams). Created lazily; closed with the socket so no Host iterator
       // outlives it, and closed by revoke/re-pair because those close the socket.
       let remoteChannel = null
+      // Spec 021: the same lock gate for the frame families dispatched BEFORE the generic scope
+      // gate (remote bridge, upload, browser). Returns true when the frame was refused. A device
+      // may hold `web:unlock` together with `harness:remote`, `attachments:write` or
+      // `browser:control`, so each of those branches calls this; the passkey frames are never in
+      // them. Fails closed: a `web:unlock` socket with no lock record is refused, never served.
+      const refuseIfWebLocked = (socket, msg) => {
+        if (!socket.passkeySlot) return false
+        // `webLockReason()` already folds in §14.5's failure budget, so an unlocked socket over
+        // its limit is refused here too, with `reason: "rate-limited"`.
+        const locked = webLockReason()
+        if (locked === 'unlocked') return false
+        socket.send(stringifyWireFrame({ kind: 'error', code: WEB_LOCK_ERROR, requestType: msg.type,
+          ...requestIdEcho(msg), reason: locked,
+          message: 'this device is locked; unlock with a passkey first' }))
+        log(`op locked: type=${msg.type} device=${socket.deviceId} reason=${locked}`)
+        return true
+      }
+      // Spec 021 (revision 14): the four passkey frames. They are the ONLY frames a locked socket
+      // may send, so they run before the lock gate; their own refusals carry a `passkey/…` code and
+      // a fixed sentence, never a field, a challenge or a signature (contract §6, §14.4).
+      const sendPasskeyRefusal = (socket, msg, code, extra = {}) => {
+        socket.send(stringifyWireFrame({ kind: 'error', code, requestType: msg.type,
+          ...requestIdEcho(msg), ...extra, message: PASSKEY_FIXED_MESSAGES[code] ?? 'the passkey request was refused' }))
+        log(`passkey refused: type=${msg.type} device=${socket.deviceId} code=${code}`)
+      }
+      const handlePasskeyFrame = (socket, msg) => {
+        // Read the record HERE rather than taking it from the caller's scope: this handler is
+        // reached from the per-frame dispatcher below, and the credential it must prove is the
+        // one this socket authenticated with, never one read a frame earlier.
+        const live = socket.deviceId ? registry.get(socket.deviceId) : undefined
+        const refusal = (code) => { sendPasskeyRefusal(socket, msg, code); return true }
+        if (!live || registry.generation(socket.deviceId) !== socket.deviceGeneration) {
+          sendFrame({ kind: 'error', code: 'auth/revoked', requestType: msg.type, ...requestIdEcho(msg),
+            message: 'this device credential is no longer valid' })
+          log(`stale device connection closed: device=${socket.deviceId} type=${msg.type}`)
+          socket.close(CLOSE_REVOKED, 'credential is no longer valid')
+          return true
+        }
+        if (!socket.passkeySlot) return refusal(PASSKEY_CODES.notRegistered)
+        // Contract §14.2: the PWA's "Lock now". It comes BEFORE the site check on purpose — no
+        // proof is needed to GIVE UP a secret, so it is accepted in any lock state, including on a
+        // socket whose Origin the gateway would not accept for a ceremony (a tab that reloaded
+        // into a locked socket must still be able to say so). The answer is exactly the frame the
+        // app waits for: `{kind:'passkey-lock', locked:true}`.
+        if (msg.type === PASSKEY_LOCK_TYPE) {
+          passkeyLock.lock(socket.passkeySlot)
+          passkeyService.forgetSocket(socket)
+          sendFrame({ kind: PASSKEY_LOCK_TYPE, ...requestIdEcho(msg), locked: true })
+          log(`passkey locked: device=${socket.deviceId}`)
+          return true
+        }
+        // The site (exact Origin ∈ allowedOrigins) is decided by the service; a refusal here means
+        // no challenge is ever issued for this socket's origin.
+        let site
+        try {
+          site = passkeyService.siteFor(socket)
+        } catch (error) {
+          if (error instanceof PasskeyRefusal) return refusal(error.code)
+          throw error
+        }
+        const handle = (run, onSuccess) => {
+          try {
+            const value = run()
+            onSuccess(value)
+          } catch (error) {
+            if (!(error instanceof PasskeyRefusal)) throw error
+            sendPasskeyRefusal(socket, msg, error.code)
+          }
+          return true
+        }
+        if (msg.type === PASSKEY_REGISTER_OPTIONS_TYPE) {
+          return handle(
+            () => passkeyService.registrationOptions(socket, live, site),
+            (options) => sendFrame({ ...options, ...requestIdEcho(msg) }),
+          )
+        }
+        if (msg.type === PASSKEY_REGISTER_TYPE) {
+          return handle(
+            () => passkeyService.register(socket, live, site, msg.attestation),
+            // A registration is NOT an unlock (contract §14.2): only a successful
+            // `passkey-assert` on this socket opens it. Storing the credential just turns
+            // the socket's state from `unregistered` into `locked`, so the very next
+            // non-passkey frame is still refused `auth/locked` — a registration proves the
+            // page may create a credential, not that the user just authenticated.
+            (value) => sendFrame({ kind: PASSKEY_REGISTER_TYPE, ...requestIdEcho(msg), ok: value.ok === true }),
+          )
+        }
+        if (msg.type === PASSKEY_ASSERT_OPTIONS_TYPE) {
+          return handle(
+            () => passkeyService.assertionOptions(socket, live, site),
+            (options) => sendFrame({ ...options, ...requestIdEcho(msg) }),
+          )
+        }
+        if (msg.type === PASSKEY_LOCK_TYPE) {
+          // Contract §14.2: the PWA's "Lock now". A proof is not needed to GIVE UP a secret, so
+          // this is accepted in any lock state (a tab that reloaded into a locked socket can
+          // still say so), and it answers `{kind:'passkey-lock', locked:true}` — never
+          // `passkey-assert` fields, which the app does not read for this frame.
+          passkeyLock.lock(socket.passkeySlot)
+          passkeyService.forgetSocket(socket)
+          sendFrame({ kind: PASSKEY_LOCK_TYPE, ...requestIdEcho(msg), locked: true })
+          log(`passkey locked: device=${socket.deviceId}`)
+          return true
+        }
+        if (msg.type === PASSKEY_ASSERT_TYPE) {
+          return handle(
+            () => passkeyService.assert(socket, live, site, msg.assertion),
+            () => {
+              passkeyLock.unlock(socket.passkeySlot)
+              sendFrame({ kind: PASSKEY_ASSERT_TYPE, ...requestIdEcho(msg), unlocked: true })
+            },
+          )
+        }
+        return false
+      }
       const handleRemoteFrame = (socket, msg) => {
         // Same gates as every other frame, in the same order: the generation of
         // the credential first (a revoked or re-paired socket is closed 4401),
@@ -4854,6 +5564,7 @@ const plugin = {
           socket.close(CLOSE_REVOKED, 'credential is no longer valid')
           return
         }
+        if (refuseIfWebLocked(socket, msg)) return
         // Same pre-dispatch fences as the companion channel (requestId + the
         // client-hello gate); a bridge frame is no less an operation. Ordering
         // matches the companion path: identity first, then framing, then scopes,
@@ -4882,6 +5593,109 @@ const plugin = {
         else if (msg.type === 'remote-stream-open') trackInFlight(socket, msg, remoteChannel.openStream(msg))
         else if (msg.type === 'remote-stream-credit') remoteChannel.credit(msg)
         else if (msg.type === 'remote-stream-cancel') remoteChannel.cancel(msg)
+      }
+      // Spec 019 Wave 3: permission control (`permission-options` / `permission-lower`).
+      // Same gates as every other frame — the credential generation first, then the web
+      // lock, then framing, then the device's scopes — and only then the service. A
+      // session is resolved through THIS device's Peer, so DSH's own per-session policy
+      // answers before anything is compared, let alone written.
+      const handlePermissionFrame = (socket, msg) => {
+        const live = registry.get(socket.deviceId)
+        if (!live || registry.generation(socket.deviceId) !== socket.deviceGeneration) {
+          sendFrame({ kind: 'error', code: 'auth/revoked', requestType: msg.type, ...requestIdEcho(msg),
+            message: 'this device credential is no longer valid' })
+          log(`stale device connection closed: device=${socket.deviceId} type=${msg.type}`)
+          socket.close(CLOSE_REVOKED, 'credential is no longer valid')
+          return
+        }
+        if (refuseIfWebLocked(socket, msg)) return
+        const fence = frameFence(socket, msg)
+        if (fence) {
+          socket.send(stringifyWireFrame(fence))
+          log(`permission frame refused before dispatch: type=${msg.type} device=${socket.deviceId} code=${fence.code}`)
+          return
+        }
+        const refusal = scopeDenial(live, msg.type)
+        if (refusal) {
+          socket.send(stringifyWireFrame({ ...refusal, ...requestIdEcho(msg) }))
+          log(`scope refused: type=${msg.type} device=${socket.deviceId} scope=${PERMISSION_LOWER_SCOPE}`)
+          return
+        }
+        const peer = devicePeer?.peer
+        if (!peer) {
+          sendFrame({ ...permissionLower.unavailable(msg), ...requestIdEcho(msg) })
+          return
+        }
+        // One operation per call: the module keeps no state between calls, and the
+        // resolution above runs on the session's own device Peer.
+        const operation = msg.type === 'permission-options' ? permissionLower.options : permissionLower.lower
+        trackInFlight(socket, msg, operation(msg, peer, socket.deviceId)).then((frame) => {
+          sendFrame(frame ? { ...frame, ...requestIdEcho(msg) } : { kind: 'error', code: 'bad-request',
+            requestType: msg.type, ...requestIdEcho(msg), message: `${msg.type} could not be served` })
+        })
+      }
+      // Spec 013: attachment bytes from the client (contract revision 8). Same
+      // gates as the remote bridge — credential generation, framing, scope (which
+      // is what decides between a phone and a desktop, spec 012) — plus the checks
+      // the contract makes mandatory before any byte is stored: a session this
+      // device may see, and a cap on concurrent transfers per device. The transfer
+      // rules themselves (offset, canonical base64, sha256, size, image media type)
+      // live in the manager the admin upload frames already use, so both paths
+      // cannot drift apart.
+      const deviceUploadsInFlight = (deviceId) => {
+        let total = 0
+        for (const client of clients) if (client.deviceId === deviceId) total += fileUploads.activeTransfers(client)
+        return total
+      }
+      const handleRemoteUploadFrame = (socket, msg) => {
+        const live = registry.get(socket.deviceId)
+        if (!live || registry.generation(socket.deviceId) !== socket.deviceGeneration) {
+          sendFrame({ kind: 'error', code: 'auth/revoked', requestType: msg.type, ...requestIdEcho(msg),
+            message: 'this device credential is no longer valid' })
+          log(`stale device connection closed: device=${socket.deviceId} type=${msg.type}`)
+          socket.close(CLOSE_REVOKED, 'credential is no longer valid')
+          return
+        }
+        if (refuseIfWebLocked(socket, msg)) return
+        const fence = frameFence(socket, msg)
+        if (fence) {
+          socket.send(stringifyWireFrame(fence))
+          log(`upload frame refused before dispatch: type=${msg.type} device=${socket.deviceId}`)
+          return
+        }
+        const refusal = scopeDenial(live, msg.type)
+        // Spec 012: the scopes decide, not the device kind — a phone holding
+        // `attachments:write` may upload exactly as a desktop may.
+        if (refusal) {
+          const echo = requestIdEcho(msg)
+          socket.send(stringifyWireFrame({ ...refusal, ...echo }))
+          log(`scope refused: type=${msg.type} device=${socket.deviceId} scope=${ATTACHMENTS_WRITE_SCOPE}`)
+          return
+        }
+        const refuse = (code, message) => sendFrame({ kind: REMOTE_UPLOAD_RESULT_KIND, ...requestIdEcho(msg),
+          ok: false, error: { code, message } })
+        // Starting a transfer is a claim on a real session: it must be one this
+        // device may already address (the same visible set every read uses), so an
+        // upload cannot stage bytes for a session the device cannot see.
+        const openingSession = msg.type === 'remote-upload-open' && typeof msg.sessionId === 'string'
+          ? msg.sessionId.trim() : ''
+        if (openingSession !== '' && !deviceMaySeeSession(live, openingSession)) {
+          refuse('session-not-found', 'no session with this ID is visible to this device')
+          log(`upload refused: device=${socket.deviceId} (session not visible)`)
+          return
+        }
+        // Per DEVICE, not per socket: opening more connections must not multiply
+        // the budget. The manager keeps the same bound globally as a backstop.
+        if (msg.type === 'remote-upload-open' && deviceUploadsInFlight(socket.deviceId) >= options.fileUploadMaxTransfers) {
+          refuse('file-upload-limit', 'too many active uploads for this device')
+          log(`upload refused: device=${socket.deviceId} (transfer limit)`)
+          return
+        }
+        const settle = (frame) => { if (frame) sendFrame(frame) }
+        trackInFlight(socket, msg, handleRemoteUpload(fileUploads, socket, msg)).then(settle, (error) => {
+          log(`upload failed: type=${msg.type} device=${socket.deviceId} error=${error && error.message ? error.message : String(error)}`)
+          refuse('gateway/internal', 'the upload failed')
+        })
       }
 
       // T022a: the follower opens `session/follow` through this connection's
@@ -4912,6 +5726,11 @@ const plugin = {
           return
         }
         if (!msg || typeof msg.type !== 'string') return
+        // Spec 021 §14.2 (review finding 6): an accepted incoming frame restarts the socket's
+        // idle clock — measured from its LAST FRAME, so active traffic keeps an unlock alive.
+        // The lock layer applies the idle bound BEFORE refreshing, so a frame that arrives after
+        // the bound cannot extend an expired unlock; it only re-locks and is then refused below.
+        if (ws.passkeySlot) passkeyLock.touch(ws.passkeySlot)
         // T013: the switch can be turned off while a socket is still draining
         // its close handshake. Nothing but the switch-state answer is served.
         if (!remoteControlEnabled()) {
@@ -4954,13 +5773,86 @@ const plugin = {
           handleRemoteFrame(ws, msg)
           return
         }
+        // Spec 013: the four attachment frames are outside the §4 vocabulary as
+        // well, but they ARE scoped (`attachments:write`), so they are diverted
+        // here — BEFORE the op/forbidden refusal below — and then go through the
+        // same generation, framing and scope gates (`handleRemoteUploadFrame`).
+        // A mobile device can never reach the manager: the frames require a
+        // `desktop` record.
+        if (isRemoteUploadType(msg.type)) {
+          if (!deviceTokenCaller) {
+            ws.send(stringifyWireFrame({ kind: 'error', code: 'auth/required', requestType: msg.type,
+              ...requestIdEcho(msg),
+              message: 'a paired device credential is required' }))
+            return
+          }
+          handleRemoteUploadFrame(ws, msg)
+          return
+        }
+        // Spec 016 Phase 3 (revision 10): a `browser-result`/`browser-cancel` answers a
+        // command the HOST sent, so it is not a §4 op and carries no scope of its own —
+        // the command it settles was already authorized when it was sent. It still takes
+        // the same generation and framing fences as every other frame, and the service
+        // refuses an id it did not issue to this device.
+        if (BROWSER_CLIENT_TYPES.includes(msg.type)) {
+          if (!deviceTokenCaller) {
+            ws.send(stringifyWireFrame({ kind: 'error', code: 'auth/required', requestType: msg.type,
+              ...requestIdEcho(msg),
+              message: 'a paired device credential is required' }))
+            return
+          }
+          const browserDevice = registry.get(ws.deviceId)
+          if (!browserDevice || registry.generation(ws.deviceId) !== ws.deviceGeneration) {
+            sendFrame({ kind: 'error', code: 'auth/revoked', requestType: msg.type, ...requestIdEcho(msg),
+              message: 'this device credential is no longer valid' })
+            log(`stale device connection closed: device=${ws.deviceId} type=${msg.type}`)
+            ws.close(CLOSE_REVOKED, 'credential is no longer valid')
+            return
+          }
+          if (refuseIfWebLocked(ws, msg)) return
+          const browserFence = frameFence(ws, msg)
+          if (browserFence) {
+            ws.send(stringifyWireFrame(browserFence))
+            log(`browser frame refused before dispatch: type=${msg.type} device=${ws.deviceId}`)
+            return
+          }
+          remoteBrowser.handleClientFrame(ws, msg)
+          return
+        }
         // Spec 011: the four authoring types are not companion-v1 ops either, but
         // they ARE scoped (`sessions:author`), so they must reach the scope gate
         // below instead of being refused as unknown: a device without the scope is
         // answered `auth/forbidden-scope`, never `op/forbidden`, and never reaches
         // a handler. Every other non-companion type keeps the refusal here.
         const authoringType = SESSIONS_AUTHOR_TYPES.includes(msg.type)
-        if (!isCompanionType(msg.type) && !authoringType && !adminCaller) {
+        // Spec 018: the read-only metric types are not companion-v1 ops either, but
+        // they ARE scoped (`stats:read`), so they must reach the scope gate below: a
+        // device without the scope is answered `auth/forbidden-scope`, never
+        // `op/forbidden`, and never reaches a handler.
+        const statsReadType = STATS_READ_TYPES.includes(msg.type)
+        // Spec 018 item 2 (plan A): the read-on-demand team/subagent frames are scoped by the
+        // ordinary session read scope, so they reach the scope gate below rather than being
+        // refused as unknown — and a device without `sessions:read` never reaches a handler.
+        const teamReadType = TEAM_READ_TYPES.includes(msg.type)
+        // Spec 018 item 3 (revision 12): the READ-ONLY schedule frames are lifted by the
+        // explicit-only `schedule:read` scope, so they come through the same gate. Every mutating
+        // schedule type (create/edit/update/delete/run/delete-inactive/history) stays admin-only.
+        const scheduleReadType = SCHEDULE_READ_TYPES.includes(msg.type)
+        // Spec 018 item 4 (revision 13): the two question frames are lifted by the EXISTING
+        // `approval:respond` scope and dispatched by the interaction branch below (the same place
+        // `approval-response` is handled) — NOT by the query branch. They must pass the guards
+        // here so a device reaches that branch; the per-session boundary is inside
+        // `respondToQuestion`.
+        const questionResponseType = QUESTION_RESPONSE_TYPES.includes(msg.type)
+        // Spec 021: the passkey frames are scoped too (web:unlock) — they reach the scope
+        // gate instead of being refused as unknown. `passkey-lock` is in the family.
+        const passkeyType = isPasskeyType(msg.type)
+        // Spec 019 Wave 3: the two permission frames (`permission-options`,
+        // `permission-lower`) are not §4 ops either, and they are scoped
+        // (`permission:lower`): they reach the scope gate like the rest.
+        const permissionLowerType = isPermissionLowerType(msg.type)
+        if (!isCompanionType(msg.type) && !authoringType && !statsReadType && !teamReadType && !scheduleReadType
+          && !questionResponseType && !passkeyType && !permissionLowerType && !adminCaller) {
           ws.send(stringifyWireFrame({ kind: 'error', code: OP_FORBIDDEN, requestType: msg.type,
             ...requestIdEcho(msg),
             message: `${msg.type} is not part of the companion-v1 operations` }))
@@ -5016,11 +5908,36 @@ const plugin = {
           log(`scope refused: type=${msg.type} device=${ws.deviceId} scope=${scopeRefusal.scope ?? '-'}`)
           return
         }
-        const conversationRequest = ['message', 'history', 'subscribe', 'unsubscribe'].includes(msg.type)
-        // The handshake and the keep-alive are channel-neutral: without this, a
-        // conversation channel could never negotiate at all, which the
-        // pre-negotiation fence would turn into a permanent refusal.
+        // Spec 021 (revision 14, contract §14.2/§3.5): a `web:unlock` socket is LOCKED until a
+        // passkey assertion succeeds on THIS socket. Every frame outside the passkey family is
+        // refused here, before any handler, so a locked socket reaches no Host call and sees no
+        // session title, count or id. The check is synchronous and fails closed (a socket without
+        // a lock record is treated as locked); the idle re-lock is applied by the lock layer.
+        //
+        // `client-hello` and `ping` stay channel-neutral (contract §3.6/§5a): the handshake is the
+        // exchange that makes a device ready and the keep-alive carries no data, so refusing them
+        // would leave a locked socket unable to negotiate at all — and both are already in the
+        // locked socket's own send passthrough list. `device-forget` is allowed as well (§14.2):
+        // it revokes the CALLING device, and no lock may strand a credential that cannot remove
+        // itself (§5 FR2's reason for making it scope-exempt in the first place).
         const channelNeutral = msg.type === 'ping' || msg.type === 'client-hello'
+        const lockedAllowed = channelNeutral || msg.type === 'device-forget' || passkeyType
+        // §14.5: the failure budget is part of the lock. An UNLOCKED socket that is over its
+        // budget is still refused here — `reason: "rate-limited"`, the contract's wording for the
+        // request path — so a device cannot keep using an unlock it earned before failing its way
+        // into the limit. A passkey frame is never gated here: its own handler answers
+        // `passkey/rate-limited` instead.
+        if (!adminCaller && ws.passkeySlot && !lockedAllowed) {
+          const locked = webLockReason()
+          if (locked !== 'unlocked') {
+            ws.send(stringifyWireFrame({ kind: 'error', code: WEB_LOCK_ERROR, requestType: msg.type,
+              ...requestIdEcho(msg), reason: locked,
+              message: 'this device is locked; unlock with a passkey first' }))
+            log(`op locked: type=${msg.type} device=${ws.deviceId} reason=${locked}`)
+            return
+          }
+        }
+        const conversationRequest = ['message', 'history', 'subscribe', 'unsubscribe'].includes(msg.type)
         if ((ws.mobileChannel === 'control' && conversationRequest) ||
             (ws.mobileChannel === 'conversation' && !conversationRequest && !channelNeutral)) {
           ws.send(stringifyWireFrame({ kind: 'error', code: 'wrong-channel', requestType: msg.type,
@@ -5028,7 +5945,17 @@ const plugin = {
           return
         }
 
-        if (msg.type === 'client-hello') {
+        if (permissionLowerType && !adminCaller) {
+          // Spec 019 Wave 3: read + lower-only. The handler re-runs the same generation,
+          // framing and scope gates on its own (it is reached through this branch only,
+          // but every gate it would need is stated where it uses it), then resolves the
+          // session on THIS device's Peer and talks to the in-process service.
+          handlePermissionFrame(ws, msg)
+        } else if (passkeyType) {
+          // Spec 021 (revision 14): the four passkey frames (and the in-band `lock: true`
+          // form of `passkey-assert`). The lock gate above lets them through on purpose.
+          handlePasskeyFrame(ws, msg)
+        } else if (msg.type === 'client-hello') {
           handleClientHello(ws, msg)
         } else if (msg.type === 'device-info') {
           const requestId = typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}
@@ -5051,6 +5978,8 @@ const plugin = {
             rtc?.closeDevice(deviceId)
             void deviceAccess.revoke(deviceId)
             deviceClientMessages.delete(deviceId)
+            // Spec 021 §5: a device that forgets itself drops its passkey record with its credential.
+            passkeyService.revoke(deviceId)
             for (const client of clients) if (client.deviceId === deviceId) client.close(CLOSE_REVOKED, 'device forgot itself')
             log(`device removed itself: ${deviceId}`)
           }
@@ -5067,11 +5996,14 @@ const plugin = {
           const requestId = typeof msg.requestId === 'string' && msg.requestId.length > 0 && msg.requestId.length <= 128
             ? { requestId: msg.requestId } : {}
           ws.send(stringifyWireFrame({ kind: 'pong', at: Date.now(), ...requestId }))
-        } else if (!adminCaller && !isCompanionType(msg.type) && !authoringType) {
+        } else if (!adminCaller && !isCompanionType(msg.type) && !authoringType && !statsReadType && !teamReadType
+          && !scheduleReadType && !questionResponseType && !passkeyType && !permissionLowerType) {
           // Unreachable: a companion type always has an entry above and the
           // allowlist refuses every non-companion type without an admin
           // channel — the scoped authoring types included, which are diverted
-          // to their own branch below. Kept as a closed backstop (fail closed).
+          // to their own branch below, and the spec 018 metric types, which
+          // are diverted to the read/control branch. Kept as a closed backstop
+          // (fail closed).
           sendFrame({ kind: 'error', code: OP_FORBIDDEN, requestType: msg.type,
             ...(typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}),
             message: `${msg.type} is not part of the companion-v1 operations` })
@@ -5135,8 +6067,12 @@ const plugin = {
           sendFrame({ kind: 'unsubscribed',
             ...(typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}) })
         } else if (msg.type === 'question-answer' || msg.type === 'question-cancel') {
-          trackInFlight(ws, msg, respondToQuestion(msg, msg.type === 'question-cancel')).then((frame) => {
-            if (frame) sendFrame(frame)
+          // Every answer carries this request's id back (contract §1), the same way the
+          // `approval-response` branch below does: the refusal shapes (`bad-response`,
+          // `bad-request`) name no rpcId of their own, so without the echo a client could not
+          // tell which answer its receipt settles.
+          trackInFlight(ws, msg, respondToQuestion(msg, msg.type === 'question-cancel', ws)).then((frame) => {
+            if (frame) sendFrame({ ...frame, ...(typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}) })
           })
         } else if (msg.type === 'approval-response') {
           // `respondToApproval` answers an already-decided request with a
@@ -5180,16 +6116,22 @@ const plugin = {
               ws.send(stringifyWireFrame({ ...duplicate, ...(requestId ? { requestId } : {}) }))
               return
             }
+            // Spec 016: this device is now the driver of that session (spec 014 C6 reads
+            // it). Recorded before dispatch so the `user/message` event it causes is
+            // attributed to the device, never to the local owner.
+            sessionDriver.noteDevicePrompt(sessionId, ws.deviceId)
             trackInFlight(ws, msg, admitMessage(connApi, msg)).then((frame) => {
               if (frame) ws.send(stringifyWireFrame(rememberSentFrame(ws.deviceId, clientMsgId, frame)))
             })
-            return          }
+            return
+          }
           // Admin channel (loopback): upstream semantics, including creating a
           // session when `sessionId` is omitted. Owner Peer by design (T022a).
           admitMessage(api, msg).then((frame) => {
             if (frame) sendFrame(frame)
           })
-        } else if (msg.type === 'sessions' || msg.type === 'search' || msg.type === 'history' || msg.type === 'session-cancel') {
+        } else if (msg.type === 'sessions' || msg.type === 'search' || msg.type === 'history' || msg.type === 'session-cancel'
+          || statsReadType || teamReadType || scheduleReadType) {
           // The remaining contract §4 read/control operations, mapped onto the
           // upstream handlers. `sessions` returns the upstream list projection
           // (title in `projections.values.title`), `history` the upstream page,
@@ -5198,7 +6140,7 @@ const plugin = {
           const requestId = typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}
           // T022a: a device token reads and cancels through its own non-owner Peer.
           const queryApi = adminCaller ? api : connApi
-          trackInFlight(ws, msg, handleQuery(queryApi, queryApi, agentDefaultModel, msg, {})).then((frame) => {
+          trackInFlight(ws, msg, handleQuery(queryApi, queryApi, agentDefaultModel, msg, { workspaceGroupFieldsFor, aggregateFrameFor, deviceId: ws.deviceId, client: ws })).then((frame) => {
             sendFrame(frame
               ? { ...frame, ...requestId }
               : { kind: 'error', code: 'bad-request', requestType: msg.type, ...requestId, message: `${msg.type} could not be served` })
@@ -5211,11 +6153,19 @@ const plugin = {
           // enforces (FR-005). Contract §1: the receipt echoes this request's id.
           const authorIdentity = requestIdEcho(msg)
           trackInFlight(ws, msg, admitAuthoring(connApi, connApi, agentDefaultModel, msg, scopedDevice,
-            () => refreshWorkspaceIds(host))).then((frame) => {
+            () => refreshWorkspaceIds(host), workspaceGroupFieldsFor, aggregateFrameFor, ws)).then((frame) => {
             // Spec 011: the creating device can address the new session on its NEXT
             // request (an app opens it immediately and asks for its models), so the
             // id joins the visible-session snapshot before the answer goes out.
-            if (frame?.kind === 'session-created') noteSessionCreated(frame.sessionId)
+            if (frame?.kind === 'session-created') {
+              noteSessionCreated(frame.sessionId)
+              // The session was just attached to the workspace it was created in, so
+              // it is groupable at once — no wait for the next snapshot refresh.
+              const created = typeof msg.workspaceId === 'string' ? msg.workspaceId.trim() : ''
+              if (created !== '' && typeof frame.sessionId === 'string') sessionWorkspaceIds.set(frame.sessionId, created)
+              const createdGroup = workspaceGroupFieldsFor(frame.sessionId)
+              if (createdGroup !== undefined) frame = { ...frame, ...createdGroup }
+            }
             sendFrame(frame
               ? { ...frame, ...authorIdentity }
               : { kind: 'error', code: 'bad-request', requestType: msg.type, ...authorIdentity, message: `${msg.type} could not be served` })
@@ -5236,6 +6186,7 @@ const plugin = {
           // Admin channel only (owner on the DSH loopback listener): the upstream
           // management surface. A device token never reaches this branch (T022).
           handleQuery(api, host, agentDefaultModel, msg, {
+            workspaceGroupFieldsFor,
             onInstallStart: (requestId) => pluginInstallOwners.set(requestId, ws),
             onInstallEnd: (requestId) => pluginInstallOwners.delete(requestId),
           }).then((frame) => {
@@ -5250,6 +6201,12 @@ const plugin = {
 
       ws.on('close', () => {
         remoteChannel?.close()
+        // Spec 021 §4: closing the socket re-locks it — its live challenge goes with it, and the
+        // next connection (or tab reload) always needs a fresh assertion.
+        if (ws.passkeySlot) {
+          passkeyService.forgetSocket(ws)
+          passkeyLock.lock(ws.passkeySlot)
+        }
         speechInput.closeClient(ws)
         ws.sessionFollower.stop()
         // T022a: the device's Peer lives exactly as long as this connection;
@@ -5258,6 +6215,13 @@ const plugin = {
         void devicePeer?.release()
         clients.delete(ws)
         if (ws.deviceId) registry.disconnected(ws.deviceId)
+        // Spec 016: a browser command may not outlive the machine's last connection.
+        // Every revoke/re-pair path closes the socket, so this is also where a revoked
+        // device's in-flight command dies.
+        if (ws.deviceId) {
+          const stillConnected = [...clients].some((client) => client.deviceId === ws.deviceId && client.readyState === 1)
+          if (!stillConnected) remoteBrowser.cancelDevice(ws.deviceId, 'browser/offline', 'this device is no longer connected')
+        }
         releaseUnclaimedInteractions()
         fileTransfers.closeClient(ws).catch((error) => {
           log(`file download cleanup failed: ${error && error.message ? error.message : String(error)}`)
@@ -5275,7 +6239,7 @@ const plugin = {
           ...gatewayIdentity,
         }))
       }
-      sendFrame(helloFrame(device, transport))
+      sendFrame(helloFrame(device, transport, webLockState()))
       // Reviewer 36d9 #4: per-recipient reduction (see `aggregateFrameFor`).
       if (ws.mobileChannel !== 'conversation' && archivedSessionIds !== null) {
         sendAggregateBaseline(ws, { kind: 'session-archives', archivedSessionIds })
@@ -5375,6 +6339,11 @@ const plugin = {
         pendingSockets.set(request.id, {
           socket: socketClient,
           transport,
+          // Spec 021: the Origin THIS upgrade carried. The approval that promotes the
+          // socket arrives on the Host management route, whose own `req.headers.origin`
+          // is the owner page, not the browser that is pairing — so the browser origin
+          // has to be captured here, while the upgrade request is still the one at hand.
+          origin: req.headers.origin,
           end: finish,
           // Approve re-checks this after its (possibly stalled) body read: the
           // state machine must be unfinished and the socket still OPEN.
@@ -5616,7 +6585,7 @@ const plugin = {
             }
             // T022: the RTC business channels get the same transport flags as a
             // plain WebSocket session (the test-only admin channel included).
-            const businessTransport = { ...transport, legacyAdmin: options.legacyAdmin === true }
+            const businessTransport = { ...transport, origin: req.headers.origin, legacyAdmin: options.legacyAdmin === true }
             rtc.attach({ socket: socketClient, device, hello: helloFrame(device, businessTransport),
               activate: (adapter, selectedChannel) => startBusinessConnection(
                 () => activateBusinessConnection(adapter, device, selectedChannel, businessTransport, null, credentialGeneration),
@@ -5627,7 +6596,7 @@ const plugin = {
             // by a header, because a legitimate interception proxy may present
             // its own certificate to the phone.
             startBusinessConnection(() => activateBusinessConnection(new WebSocketMobileTransport(socketClient), device, channel,
-              { ...transport, legacyAdmin: options.legacyAdmin === true }, paired, credentialGeneration),
+              { ...transport, origin: req.headers.origin, legacyAdmin: options.legacyAdmin === true }, paired, credentialGeneration),
               { deviceId: device.id, channel, paired: !!paired })
           }
         })
@@ -5764,7 +6733,7 @@ const plugin = {
         lanListenError = null
         const address = listener.address()
         if (address && typeof address === 'object') lanBoundPort = address.port
-        const urls = lanWebSocketUrls(options, wsPath, lanBoundPort)
+        const urls = lanWebSocketUrls(options, wsPath, lanBoundPort, advertiseHost)
         const shiftNote = configuredPort !== 0 && lanBoundPort !== configuredPort ? `; configured ${configuredPort} was busy` : ''
         // The certificate covers the hostnames a phone may dial; a rotation
         // widens the SAN list only for a later explicit regeneration.
@@ -5817,14 +6786,18 @@ const plugin = {
         } catch (error) {
           log(`listen address ${host} was not persisted: ${error.message}`)
         }
+        // Resolved inside the lane too: the name is advertised only for the
+        // address this generation really bound (a failure leaves the IP).
+        const dnsName = await advertisedTailscaleName(host, true)
         return {
           applied: host,
           port: lanBoundPort,
           persists,
           listening: true,
+          dnsName,
           // Captured here, inside the lane: the advertised URLs belong to the
           // listener this generation confirmed, not to a later one.
-          urls: lanWebSocketUrls(options, wsPath, lanBoundPort),
+          urls: lanWebSocketUrls(options, wsPath, lanBoundPort, advertiseHost, dnsName),
         }
       }
       const failure = outcome.error || lanListenError || 'the TLS listener did not come up'
@@ -5854,6 +6827,12 @@ const plugin = {
       if (event?.type === 'tool/call') {
         rememberToolCall(session?.id === undefined ? null : String(session.id),
           event.data?.callId, event.data?.name, event.data?.arguments)
+      }
+      // Spec 016 / spec 014 C6: the driver record follows EVERY prompt, whether or not a
+      // client is connected. A `user/message` with no device prompt outstanding is the
+      // local owner's, which is what makes `driven: 'local'` knowable at all.
+      if (event?.type === 'user/message' && session?.id !== undefined) {
+        sessionDriver.noteUserMessage(String(session.id))
       }
       api.observeSessionEvent(String(session.id), event)
       if (clients.size === 0) return
@@ -6299,6 +7278,9 @@ const plugin = {
       // looks alive and register a card, a broadcast or a waiter after teardown.
       // Cancelling the joins also drops their timers, so nothing keeps running.
       disposed = true
+      // Spec 016: no browser command may wait forever on a plugin that is going away.
+      remoteBrowser.close()
+      sessionDriver.clear()
       // Blocker 3: a rebind or rollback parked on a listener must not outlive
       // the plugin — it is superseded here and answers 409 instead of touching a
       // listener that teardown is about to close.
