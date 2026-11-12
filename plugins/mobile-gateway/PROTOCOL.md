@@ -1726,42 +1726,42 @@ id）与 `workspaceLabel`（该工作区的显示名，与 `workspaces` op 的 `
 - 不裁剪字段：与 baseline 逐字相同（若只裁剪 op，同一个数据会出现两种形状 ⇒ app 出错）。
   `writeScopes` 是**工作区相对路径**，不含绝对路径。
 
-**Web unlock — `account-attestation` / `web:unlock`（spec 020，revision 10；审查修订 1，追加）。**
-PWA（và mọi thiết bị `mobile`）chỉ dùng được khi **Host đang đăng nhập DeepSeek** **và** thiết bị đã **ghim đúng tài khoản đó**.
-Gateway đọc `account/getState` + `account/getProfile` bằng **peer owner** (thiết bị **không bao giờ** gọi `account/*`), rồi chỉ trả:
+**Web unlock — passkey / WebAuthn（spec 021，revision 14；取代 spec 020 的 DeepSeek 账号验证）。**
+PWA 的 WebSocket **每个连接都先处于锁定状态**，只有在本连接上完成一次 passkey 断言才解锁；"Host 已登录 DeepSeek"
+这一要求及其 `account-attestation` 帧、账号指纹与 pin 已**全部移除**，网关不再读取 `account/*`。原生 iOS/Android
+设备不持有 `web:unlock`，永远收不到 `hello.webLock`，行为不变。
 
-```json
-// request
-{ "type": "account-attestation", "requestId": "r-1" }
-// reply (unlocked)
-{ "kind": "account-attestation", "requestId": "r-1", "signedIn": true, "fingerprint": "kQ7…（43 ký tự base64url）" }
-// reply (locked)
-{ "kind": "error", "code": "auth/locked", "requestType": "account-attestation", "requestId": "r-1",
-  "reason": "host-signed-out" }
-```
+- **`hello.webLock`** 只对持有 `web:unlock` 的设备出现：`"unregistered"`（本设备还没有 passkey，先注册）、
+  `"locked"`（已有 passkey，但本连接尚未断言）或 `"unlocked"`。锁定期间 `hello` **不带** `clients` 计数。
+- **五个帧**（`web:unlock` 授权，均需先通过 `client-hello`，二进制字段一律无填充 base64url）：
+  `passkey-register-options` → `passkey-register`、`passkey-assert-options` → `passkey-assert`（成功后回
+  `{ "unlocked": true }`），以及 PWA 的 `passkey-lock` → `{ "locked": true }`（任意锁定状态都接受）。注册仅接受
+  `fmt: "none"` 与 ES256/RS256 公钥；断言校验 challenge、`origin`（必须**完全等于**本连接的 Origin 且在
+  `allowedOrigins` 内）、`rpIdHash`、UP+UV、签名与单调递增的 signCount。challenge 为 32 字节随机数、一次性、
+  60 s 内有效且**绑定申请它的那个 socket**。
+- **锁定期间只放行** `client-hello`、`ping`、`device-forget` 与上述 passkey 帧；其余一切 —— §4 的 op、remote
+  bridge、上传、browser 族 —— 在触达 Host **之前**一律 `auth/locked`（`reason`：`locked` / `unregistered` /
+  `rate-limited`），会话标题、数量与 id 都不会下发。锁在服务端判定，不是 UI 约定。
+- **重新锁定**：连接关闭、**15 分钟无任何帧**（从最后一帧算起）、PWA 主动 `passkey-lock`、所有者吊销设备、或
+  passkey 被替换。标签页刷新总是需要重新断言。
+- **限流**：仅统计失败操作，**每设备 10 分钟 5 次**、**全局每小时 30 次**，超限后窗口内回
+  `passkey/rate-limited`（请求路径为 `auth/locked` + `reason: "rate-limited"`）；失败只记代码。
+- **替换 passkey 需要所有者在 Host 上批准**（与配对同一条 `/mgw/pending` 通道）：已有 passkey 的设备再注册得到
+  `passkey/already-registered`，网关生成一条待批准请求并向该 socket 推送
+  `{ "kind": "passkey-approval", "approvalId", "action": "approve" | "reject", "verificationCode" }`；批准后
+  5 分钟内用新 challenge 重新注册，其他 socket 以 **`4412`** 关闭（凭据不撤销，保留后重新断言）。吊销设备则删除
+  其 passkey 记录并以 `4401` 关闭连接。
+- 错误码仅五个：`passkey/not-registered`、`passkey/already-registered`、`passkey/challenge-expired`、
+  `passkey/verification-failed`（其余一切校验失败，不透露具体检查项）、`passkey/rate-limited`。
+- `web:unlock` 是 scope **never-default**，mobile 可持有，在 `full` 预设里，不在 `standard`/移动端默认中，
+  **无迁移**。这五个帧**不在** `OPS`（contract §4 不变）。
 
-- `fingerprint` = `base64url(HMAC-SHA256(secret cố định của gateway, profile.id))` — **43 ký tự**, ổn định qua restart và ghép đôi lại.
-  **Không bao giờ** trả `id`/`name`/`contact`/token. Secret là file owner-only `mobile-gateway-web-unlock.key`
-  cạnh `mobile-gateway-devices.json`, tạo **độc quyền** (`wx`); file hỏng/sai quyền **không** làm gateway không khởi động —
-  chỉ **vô hiệu web unlock** (mọi thiết bị `web:unlock` bị khoá với `reason:"unlock-unavailable"`, thiết bị thường không bị ảnh hưởng), log 1 lần.
-- `signedIn:true` ⇔ `getState.status === "credential-stored"` **và** `getProfile.status === "ready"`. Mọi trường hợp khác (kể cả Host lỗi) ⇒ **khoá** (fail closed).
-- `reason` (enum, **chỉ 4 giá trị**): `host-signed-out` · `account-mismatch` · `attestation-required` · `unlock-unavailable`.
-- **Ghim một lần, theo từng thiết bị**: lần attest thành công đầu tiên ghim fingerprint vào record (`webAccountPin`, additive).
-  Pin **không bao giờ bị ghi đè**. `attestation-required` = thiết bị **chưa** attest (chưa có pin) ⇒ bị khoá cho tới khi gọi `account-attestation`.
-  Đường phục hồi duy nhất khi sai tài khoản: **thu hồi/xoá thiết bị rồi ghép đôi lại** (record mới, không pin).
-- **Khoá phía server, không dựa vào UI**, và **theo từng thiết bị**: `host-signed-out` là trạng thái chung;
-  `account-mismatch`/`attestation-required` chỉ áp cho **đúng thiết bị đó** (một trình duyệt cũ/độc hại không thể khoá các thiết bị khác).
-- **Khoá cắt cả dữ liệu đang chảy**: khi chuyển sang khoá, gateway **đóng socket** của mọi thiết bị web bị khoá bằng
-  close code **`4412`** (`CLOSE_CODES.locked`) — **KHÔNG phải 4401**: không có gì bị thu hồi, client **giữ** credential và chỉ cần re-attest.
-  Ngoài ra một cổng gửi chặn mọi khung không nằm trong nhóm an toàn (`hello`, `paired`, `client-hello`, `pong`, `error`,
-  `account-attestation`, `device-info`, `device-forgotten`, `session-stream-reset`) khi thiết bị đang bị khoá.
-  Thiết bị **chưa attest** không bị đóng socket (nếu đóng, nó không bao giờ kịp attest); nó bị chặn ở cổng yêu cầu.
-- **Cổng khoá áp cho MỌI loại khung** của thiết bị giữ `web:unlock` — kể cả `remote-call`/`remote-stream-*` (remote bridge),
-  `remote-upload-*`, `browser-result`/`browser-cancel` — vì một thiết bị **có thể** giữ đồng thời `web:unlock` với
-  `harness:remote` (desktop) hoặc `attachments:write`/`browser:control` (mobile). Miễn trừ: `client-hello`, `ping`,
-  `device-forget`, `account-attestation`.
-- **Sự kiện Host**: `deepseek-account/signed-out` và `deepseek-account/session-expired` khoá **tức thì** (không chờ poll).
-  Ngoài ra gateway poll `account/*` định kỳ (`webUnlockProbeMs`, mặc định 30 s) để phát hiện **đổi tài khoản** mà Host không phát event.
-- `web:unlock` là scope **never-default**, mobile-holdable, có trong preset `full`, không ở `standard`/mặc định mobile, **không migration**.
-  Type này **không** nằm trong `OPS` (contract §4 không đổi).
+帧的完整字段、校验顺序、close code 与错误表以
+[mobile-protocol-v1.md §Revision 14](../../specs/001-gateway-hardening/contracts/mobile-protocol-v1.md)
+为准（spec 021：[spec.md](../../specs/021-web-passkey-unlock/spec.md)）；此处只列行为要点，字段细节不重复。
+
+**已移除（spec 021 取代，勿再实现）：** `account-attestation` 帧、`account/getState` + `account/getProfile`
+读取、账号指纹 HMAC 密钥文件 `mobile-gateway-web-unlock.key`、设备记录上的 `webAccountPin`、
+`deepseek-account/*` 事件与定期账号探测，以及 `reason` 的旧枚举
+`host-signed-out`/`account-mismatch`/`attestation-required`/`unlock-unavailable`。
 

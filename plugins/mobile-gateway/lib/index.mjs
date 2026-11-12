@@ -5149,7 +5149,9 @@ const plugin = {
       capabilities: deviceCapabilities(device),
       certSha256: tlsIdentity?.fingerprint256 ?? null,
       port: transport.port || webServer.port,
-      clients: clients.size,
+      // Spec 021 §14.2: a locked web socket learns nothing about the Host, and that includes how
+      // many other clients are connected — the count is withheld until the socket is unlocked.
+      ...(webLock === undefined || webLock === 'unlocked' ? { clients: clients.size } : {}),
       authenticated: !!device,
       ...(webLock === undefined ? {} : { webLock }),
       ...(device ? { device: { id: device.id, name: device.name, kind: device.kind, scopes: device.scopes } } : {}),

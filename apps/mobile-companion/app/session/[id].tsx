@@ -104,6 +104,13 @@ export default function SessionScreen() {
   const theme = useTheme();
   const { colors, type, space, radius, hit } = theme;
   const headerHeight = insets.top + HEADER_BASE_HEIGHT;
+  /**
+   * The header's MEASURED height. `HEADER_BASE_HEIGHT` is only an estimate: the subline carries the
+   * status pill, the agent preset and the permission chip, so the real header grows with the content
+   * and with the safe-area inset. The "⋯" menu is anchored to this, not to a fixed offset, or it
+   * starts inside the header on a device with a tall notch and covers the status line.
+   */
+  const [headerMeasured, setHeaderMeasured] = useState(0);
 
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -421,6 +428,7 @@ export default function SessionScreen() {
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
       <View
+        onLayout={(event) => setHeaderMeasured(event.nativeEvent.layout.height)}
         style={[
           styles.header,
           {
@@ -935,7 +943,9 @@ export default function SessionScreen() {
                 backgroundColor: colors.surfaceRaised,
                 borderColor: colors.border,
                 borderRadius: radius.xl,
-                marginTop: 64,
+                // Below the header it drops from: the measured height once the header has laid out,
+                // the same `headerHeight` the transcript and the panel use before that first frame.
+                marginTop: (headerMeasured > 0 ? headerMeasured : headerHeight) + space.xs,
                 marginRight: space.lg,
                 ...elevation(colors, 'sheet'),
               },

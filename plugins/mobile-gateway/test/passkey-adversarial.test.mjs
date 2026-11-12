@@ -334,6 +334,9 @@ test('WL-1 a web device starts LOCKED: hello says so, and every non-passkey fram
   const web = await pairDevice(instance, 'wl-locked-01', { kind: 'mobile', scopes: WEB_SCOPES })
   // Before any passkey exists the state is `unregistered` — the client must register first.
   assert.equal(web.hello.webLock, 'unregistered', JSON.stringify(web.hello).slice(0, 240))
+  // §14.2 also covers the metadata in `hello`: a locked socket learns nothing about the Host,
+  // and "how many clients are connected" is Host state, so the count is withheld while locked.
+  assert.equal(Object.hasOwn(web.hello, 'clients'), false, 'a locked web socket gets no client count')
 
   const since = instance.hostCalls.length
   for (const frame of [
@@ -354,9 +357,11 @@ test('WL-1 a web device starts LOCKED: hello says so, and every non-passkey fram
   assert.equal((await ask(web.ws, { type: 'ping' })).kind, 'pong')
   await negotiate(web.ws)
 
-  // A phone without web:unlock is never affected: no lock, no gate.
+  // A phone without web:unlock is never affected: no lock, no gate — and its hello keeps the
+  // client count it has always carried.
   const phone = await pairDevice(instance, 'wl-locked-02', { kind: 'mobile', scopes: PHONE_SCOPES })
   assert.equal(Object.hasOwn(phone.hello, 'webLock'), false, 'hello.webLock is only for a web device')
+  assert.equal(typeof phone.hello.clients, 'number', 'a device with no lock keeps hello.clients')
   assert.equal((await ask(phone.ws, { type: 'sessions' })).kind, 'sessions')
   phone.ws.close()
   web.ws.close()
