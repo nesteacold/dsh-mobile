@@ -32,6 +32,40 @@ hardcodes 443, 8443 or any other number. The CSP admits any port on the tailnet 
 `URL.hostname`, which never contains a port — so `:8443`, `:18443` or anything else passes.
 `manifest.json` uses relative `start_url`/`scope` (`/`), correct on any port and host.
 
+### Same-origin gateway address (owner decision 2026-11-13)
+
+The supported web deployment is **one tailnet-only HTTPS origin serving both the PWA and the
+gateway**, with `tailscale serve` splitting the paths:
+
+| Path | Target |
+|---|---|
+| `/` | the built PWA (`node scripts/serve-web.mjs --port 18480`) |
+| `/ws/mobile` | the gateway TLS listener (`https+insecure://<this host's tailnet ip>:30081`) |
+
+That is why the PWA does **not** use the address inside the pairing QR. The QR names the gateway's
+own listener, which is self-signed on purpose (the native app pins its leaf); a browser refuses it
+before a single frame moves and cannot pin anything. Instead `src/core/gateway-address.ts` derives
+the page's OWN origin — `wss://<location.host>/ws/mobile` — whenever the page is served over HTTPS
+from a `*.ts.net` name, and `pair()` connects there (`ControllerOptions.webLocation` supplies the
+location; native answers `null`, so a phone keeps dialling the pinned listener untouched).
+
+The socket's CSP admission comes from `wss://*.ts.net:*`: `*.ts.net` matches the page's own tailnet
+hostname as a host-part suffix and `*` matches any port, and the derivation produces nothing but
+`<name>.ts.net:<port>`. `'self'` remains in `connect-src` as a second allowance, but the same-origin
+case does not depend on CSP3's `'self'` scheme-upgrade rule being implemented. No source expression
+hardcodes the machine name, and `wss://*` is deliberately not used.
+
+Two things the deployment must therefore get right, neither of which the app can enforce:
+
+- **`allowedOrigins` must contain the exact page origin**, e.g.
+  `https://<tailnet-host>:30443` — scheme, host and port as the browser writes them. The list is
+  both the WS upgrade fence and the WebAuthn site (spec 021), so a missing entry is a 403 at the
+  upgrade: the PWA cannot pair at all, and no passkey can exist.
+- **Route only `/ws/mobile` to the gateway.** The gateway refuses every `/mgw/*` request that
+  carries proxy headers, whatever the peer address is, so a mistaken `/mgw` route is inert rather
+  than an exposed management surface — but there is no reason to route it.
+
+
 Measured facts about this machine (2026-11-11):
 
 | Port | State |

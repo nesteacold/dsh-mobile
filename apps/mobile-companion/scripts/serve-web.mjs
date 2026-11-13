@@ -34,6 +34,12 @@ const CSP = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
+  // The SAME-ORIGIN gateway socket is admitted by `wss://*.ts.net:*`: the PWA and the gateway share
+  // one tailnet HTTPS origin (`tailscale serve` routes `/ws/mobile` to the listener), and the
+  // derived address is always `<name>.ts.net:<port>` — a host-part suffix match with any port.
+  // `'self'` stays as a second, belt-and-braces allowance. No host is hardcoded and `wss://*` is
+  // deliberately absent. Keep in step with scripts/build-web.mjs, which injects the same policy as
+  // a <meta>.
   "connect-src 'self' wss://*.ts.net:*",
   "manifest-src 'self'",
   "object-src 'none'",

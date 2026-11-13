@@ -52,8 +52,15 @@ export { redactArgsPreview, redactDiagnostic, redactFingerprint, redactString, r
 export type { RedactOptions } from './redact';
 export { PAIRED_HOST_SCHEMA_VERSION, pairedHostFromPayload, isReconnectable, describeHost } from './host';
 export type { PairedHost } from './host';
+// Contract revision 5 (§3.8): the OTP first-pairing flow — code normalization and the two derived
+// values the Host checks (`otpProof`, `verificationCode`). The SHA-256/HMAC primitives they need
+// live in `./hmac` (expo-crypto has no HMAC, and `src/core` may not import it anyway).
+export { OTP_DIGITS, OTP_SUBPROTOCOL, normalizeOtp, otpProof, verificationCode } from './pairing-otp';
+export type { OtpRejectReason } from './pairing-otp';
 export { parseSessionDeepLink, sessionDeepLink } from './deeplink';
 export type { SessionDeepLink } from './deeplink';
+export { GATEWAY_WS_PATH, sameOriginGatewayUrl, withSameOriginEndpoint } from './gateway-address';
+export type { WebLocation } from './gateway-address';
 export { DebugLog } from './debug-log';
 export type { LogLine, LogSink } from './debug-log';
 export { lowerPermission, readPermissionOptions, reasonMessage, toLowerOutcome, toOptionsView } from './permission-lower';

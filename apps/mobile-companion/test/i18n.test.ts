@@ -72,11 +72,37 @@ describe('pairing failure mapping', () => {
     assert.equal(pairErrorFromCode('client/remote-disabled'), 'remoteDisabled');
     assert.equal(pairErrorFromCode('pairing/expired'), 'expired');
     assert.equal(pairErrorFromCode('client/pin-mismatch'), 'pinMismatch');
+    // The Host's own identity could not be trusted: it stated none, or it claimed another known one.
+    // Both are refused locally, so each needs its own copy (a generic line would hide the cause).
+    assert.equal(pairErrorFromCode('client/pairing-no-host-id'), 'noHostId');
+    assert.equal(pairErrorFromCode('client/pairing-host-conflict'), 'hostConflict');
+    // A pairing refused because the stored host list had not loaded yet still has to say something:
+    // "bad-state" is the code the controller uses, and a generic line would hide the retry.
+    assert.equal(pairErrorFromCode('client/bad-state'), 'notReady');
     assert.equal(pairErrorFromCode('client/update-app-required'), 'appUpdate');
     assert.equal(pairErrorFromCode('client/update-host-required'), 'hostUpdate');
     assert.equal(pairErrorFromCode('client/pinned-transport-unavailable'), 'unavailable');
     assert.equal(pairErrorFromCode('client/disconnected'), 'unavailable');
     assert.equal(pairErrorFromCode('agent-busy'), 'generic');
+  });
+
+  it('gives the phone its own copy for a flow it cannot complete, in both locales', () => {
+    // The 8-digit code cannot be verified on a phone (no certificate rides with it, and the native
+    // transport will not open an unpinned socket), so the screen must point at the QR / long string
+    // instead of reporting a failure the user cannot act on.
+    for (const locale of LOCALES) {
+      const text = t(locale, 'pair.error.otpNative');
+      assert.ok(text.trim().length > 0, `${locale}: the native OTP refusal has copy`);
+      // It names the alternative the phone CAN use, which is the whole point of the message.
+      assert.match(text, /QR/);
+    }
+    const en = t('en', 'pair.error.otpNative');
+    const vi = t('vi', 'pair.error.otpNative');
+    assert.notEqual(en, vi, 'the message is really localized');
+    // Each identity refusal has its own line, distinct from the generic pairing failure.
+    for (const key of ['pair.error.noHostId', 'pair.error.hostConflict', 'pair.error.notReady'] as const) {
+      for (const locale of LOCALES) assert.ok(t(locale, key).trim().length > 0, `${locale}:${key}`);
+    }
   });
 });
 

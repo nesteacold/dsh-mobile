@@ -30,6 +30,7 @@ import { registerHooks } from 'node:module';
 import { afterEach, before, beforeEach, describe, it } from 'node:test';
 
 import { encodePairingPayload, type PairingPayload } from '../src/core';
+import type { PairedHost } from '../src/core/host';
 import { FakeGateway } from './support/fake-gateway';
 import { NodePinnedTransport } from './support/node-pinned-transport';
 import { deferred, waitFor } from './support/wait';
@@ -185,6 +186,20 @@ const TOKEN_PREFIX = 'dsh-companion.token.';
 const GATEWAY_A = '0f8fad5b-d9cb-469f-a165-70867728950e';
 const GATEWAY_B = '3c9e1a52-8b1f-4a3d-b6c0-2d5e7f8a9b1c';
 const NOW = Date.now();
+
+/** The trust material a stored record pins, for the host-conflict rule. */
+const PIN_A = 'a'.repeat(64);
+const KNOWN_HOSTS: PairedHost[] = [{
+  schemaVersion: 1,
+  gatewayId: GATEWAY_A,
+  name: 'pc-a',
+  publicUrl: 'wss://127.0.0.1:41000',
+  endpoints: ['wss://127.0.0.1:41000'],
+  certSha256: PIN_A,
+  deviceId: 'dev-1',
+  deviceName: 'Pixel test',
+  pairedAt: NOW,
+}];
 
 const nodeTransport = () => new NodePinnedTransport({ handshakeTimeoutMs: 4_000 });
 
@@ -1037,6 +1052,69 @@ describe('AppController credential cleanup races (M5)', () => {
   });
 
   // -------------------------------------------------------------------------
+  // The stored host list gates `pair()`: its identity check reads `this.hosts`, so pairing before
+  // the list is loaded would compare the `paired` frame against nothing at all.
+  // -------------------------------------------------------------------------
+
+  it('refuses a pairing before the stored host list is loaded, and writes nothing', async () => {
+    const code = pairCode('T');
+    const gateway = await FakeGateway.create({ pairingCodes: [code] });
+    const controller = new AppController({ locale: () => 'en', transport: nodeTransport, pairAckTimeoutMs: 400 });
+    try {
+      const entered = deferred<void>();
+      store.__delay(HOSTS_KEY, 80, () => entered.resolve());
+      const starting = controller.start();
+      await entered.promise; // the stored host read is in flight: the list is not installed yet
+
+      const refused = await controller.pair(pairingPayload(gateway, code, GATEWAY_A, 'pc-a'));
+      assert.equal(refused.ok, false);
+      if (!refused.ok) assert.equal(refused.code, 'client/bad-state');
+      // The screen learns about it the documented way: a typed banner, not a silent no-op.
+      assert.equal(controller.snapshot().pairing?.code, 'client/bad-state');
+      // Nothing happened at all: no socket, no credential, no record — and the one-time code was
+      // not spent, so the same tap works once startup has finished.
+      assert.equal(gateway.connectionAttempts, 0, 'no socket was opened');
+      assert.deepEqual(tokenEntries(), []);
+      assert.deepEqual(storedHosts(), []);
+
+      await starting;
+      store.__clearDelay();
+      const paired = await controller.pair(pairingPayload(gateway, code, GATEWAY_A, 'pc-a'));
+      assert.equal(paired.ok, true, JSON.stringify(paired));
+      assert.deepEqual(controller.snapshot().hosts.map((host) => host.gatewayId), [GATEWAY_A]);
+    } finally {
+      store.__clearDelay();
+      controller.stop();
+      await gateway.close();
+    }
+  });
+
+  it('refuses the reused gateway id when the attempt states no pin at all', () => {
+    // Reaching `paired` with an EMPTY pin cannot happen through either flow (a QR payload always
+    // carries one, and an OTP attempt adopts the challenge's before `paired`), so the rule is
+    // asserted directly: only the known record's exact trust material may replace it. An empty pin
+    // cannot show this is that computer, so it is a conflict like any other disagreement.
+    const controller = new AppController({ locale: () => 'en', transport: nodeTransport });
+    const conflictOf = (pin: string, publicUrl = 'wss://127.0.0.1:1'):
+      { code: string } | null => (controller as unknown as {
+        pairingHostConflict: (hosts: readonly PairedHost[], gatewayId: string, pin: string, url: string) => { code: string } | null;
+      }).pairingHostConflict(KNOWN_HOSTS, GATEWAY_A, pin, publicUrl);
+
+    assert.equal(conflictOf(PIN_A)?.code, 'client/pairing-host-conflict', 'an empty pin is a conflict');
+    assert.equal(conflictOf('b'.repeat(64))?.code, 'client/pairing-host-conflict', 'another leaf is a conflict');
+    assert.equal(conflictOf(PIN_A, 'wss://127.0.0.1:2')?.code, 'client/pairing-host-conflict', 'another address is a conflict');
+    // The legitimate case stays legitimate: the same computer, re-paired.
+    assert.equal(conflictOf(PIN_A, KNOWN_HOSTS[0]?.publicUrl), null);
+    // An unknown identity is never a conflict; it is simply a new computer.
+    assert.equal(
+      (controller as unknown as {
+        pairingHostConflict: (hosts: readonly PairedHost[], gatewayId: string, pin: string, url: string) => unknown;
+      }).pairingHostConflict(KNOWN_HOSTS, GATEWAY_B, '', 'wss://127.0.0.1:1'),
+      null,
+    );
+  });
+
+  // -------------------------------------------------------------------------
   // Start/stop lifecycle (reviewer finding): `start()` reads the stored host list across an await,
   // so a stop (unmount, or the retry `StartupSequence` runs) or a second start can land meanwhile.
   // The listeners belong to the lifecycle that registered them; the gate's own sequencing
@@ -1049,6 +1127,8 @@ describe('AppController credential cleanup races (M5)', () => {
     // A paired host is on disk, so a late start result would be visible if it were applied. Only
     // the record is seeded (a pairing without the unlock gate), never a live socket.
     const seeding = new AppController({ locale: () => 'en', transport: nodeTransport, pairAckTimeoutMs: 400 });
+    // Production order: `pair()` only runs once `start()` installed the stored host list.
+    await seeding.start();
     const paired = await seeding.pair(pairingPayload(gateway, code, GATEWAY_A, 'pc-a'));
     assert.equal(paired.ok, true, JSON.stringify(paired));
     seeding.stop();
@@ -1112,6 +1192,9 @@ describe('AppController credential cleanup races (M5)', () => {
     const gateway = await FakeGateway.create({ pairingCodes: [code] });
     const controller = new AppController({ locale: () => 'en', transport: nodeTransport, pairAckTimeoutMs: 400 });
     try {
+      // `start()` first: it primes the install id, so the one-shot failure below is the read the
+      // PAIRING performs rather than the startup one.
+      await controller.start();
       installId.clearInstallIdCache();
       store.__failGet('dsh-companion.install-id', 'keychain unavailable');
       const result = await controller.pair(pairingPayload(gateway, code));

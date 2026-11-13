@@ -15,7 +15,7 @@
 //
 // Nothing here listens beyond 127.0.0.1 and every port is ephemeral.
 
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { createServer, type Server as HttpsServer } from 'node:https';
 import type { IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -33,6 +33,25 @@ import {
 } from '@dsh-ext/mobile-protocol';
 
 import { generateTestCertificate, sha256OfCertificate, type TestCertificate } from './certs';
+
+/**
+ * The OTP flow's subprotocol (`PAIR_OTP_PROTOCOL` in `plugins/mobile-gateway/lib/index.mjs:268`).
+ * A literal on purpose: this fixture must refuse a socket the real Host would refuse, so it spells
+ * the same contract constant rather than importing the app's copy of it.
+ */
+const PAIR_OTP_PROTOCOL = 'dsh-pair-otp.v1';
+
+/**
+ * The Host's own identity, as the real gateway stamps it (`...gatewayIdentity` on `paired`, `hello`
+ * and the QR payload). An OTP pairing has no QR to read it from, so the frames are the only source.
+ *
+ * Every instance gets its OWN id unless `gatewayId` overrides it: two `FakeGateway`s are two
+ * different computers, and a real gateway never issues the same identity twice. A shared literal
+ * let a fixture pair two distinct hosts under one id, which the app correctly refuses as an
+ * identity conflict.
+ */
+const GATEWAY_ID = 'b3a4c2c9-5d2f-4a8e-9f2b-0c1d2e3f4a5b';
+const GATEWAY_NAME = 'my-pc';
 
 export interface FakeSession {
   id: string;
@@ -80,6 +99,16 @@ export interface FakeGatewayOptions {
   passkeyAnswers?: Partial<Record<'passkey-register-options' | 'passkey-register' | 'passkey-assert-options' | 'passkey-assert' | 'passkey-lock', { code: string } | 'ok'>>;
   /** Reject the HTTP upgrade with this status (401 / 403 scenarios). */
   upgradeStatus?: number;
+  /**
+   * This Host's own `gatewayId` (`hello` / `paired`). Defaults to a per-instance random UUID: two
+   * fixtures are two computers, and a real gateway never issues one identity twice.
+   */
+  gatewayId?: string;
+  /**
+   * Leave `gatewayId` out of `paired` entirely (a Host that states no identity). The app must
+   * refuse the pairing rather than key a credential to the empty id.
+   */
+  omitGatewayId?: boolean;
   /** Close every new socket with this code right after `hello` (4003 / 4004 / 4401). */
   closeAfterHello?: number;
   /** Advertise `push-v1` too. */
@@ -101,12 +130,18 @@ export interface FakeGatewayOptions {
   /** Answer `client-hello` twice (a duplicate ack must not resolve the pairing twice). */
   duplicateClientHelloAck?: boolean;
   /**
-   * Contract §3.8: `otpRequired` in the pairing challenge. `true` means the Host wants a
-   * one-time-code proof (`otpProof`); this fixture accepts any non-empty one, because the OTP
-   * flow is not implemented on the app side yet (slice B fails with
-   * `client/pairing-otp-unsupported`). Tests use it to prove a missing `otpProof` closes 4410.
+   * Contract §3.8/revision 5: `otpRequired` in the pairing challenge. `true` means the Host wants
+   * the one-time-code proof (`otpProof`).
+   *
+   * With `otp` set, this fixture VERIFIES the proof exactly as the Host does
+   * (`HMAC-SHA256(otp, certSha256||clientNonce||serverNonce)`, `compare` in `pairing-requests.mjs`),
+   * so a wrong code, a wrong pin or a replayed nonce fails here the way it fails on the real
+   * gateway. Without it, any non-empty `otpProof` is accepted (the shape-only behaviour the app's
+   * pre-OTP tests relied on).
    */
   otpRequired?: boolean;
+  /** The one-time code this fixture verifies `otpProof` against (see `otpRequired`). */
+  otp?: string;
   /**
    * Auto-approve a pairing as soon as its proof is accepted (default `true`). Every existing test
    * pairs through this fixture and none of them is about the approval wait, so they keep their
@@ -217,6 +252,8 @@ function headerValue(request: IncomingMessage, name: string): string | null {
 export class FakeGateway {
   readonly certificate: TestCertificate;
   private readonly options: FakeGatewayOptions;
+  /** This Host's own identity (`hello` / `paired`): one per instance unless overridden. */
+  private gatewayId = GATEWAY_ID;
   /** Test-only switch (see `refuseUpgrade`): refuses every new upgrade with this status. */
   private upgradeStatusOverride: number | null = null;
   private httpsServer: HttpsServer | null = null;
@@ -227,6 +264,8 @@ export class FakeGateway {
   private readonly tokens: Set<string>;
   /** Tokens minted for pairings, in order; a revocation does not remove them (see `mintedTokens`). */
   private readonly minted: string[] = [];
+  /** Tokens accepted on an authenticated upgrade, in order of first use (`tokensAccepted`). */
+  private readonly accepted = new Set<string>();
   /**
    * Device id each minted token belongs to. The real gateway resolves an authenticated
    * connection's device from the token (the handshake header is only the pairing hint), so a
@@ -263,6 +302,13 @@ export class FakeGateway {
   readonly pairingProofs: string[] = [];
   /** Frames refused before a pairing was admitted (the third refusal closes 4403). */
   pairingRefusals = 0;
+  /**
+   * OTP proofs (contract revision 5) that matched the configured code, and those that did not.
+   * Only counted when the fixture was given an `otp` to verify against; otherwise a proof is only
+   * shape-checked.
+   */
+  otpProofAccepts = 0;
+  otpProofFailures = 0;
   /** Pairings waiting for the test to approve / reject / expire (manual mode only). */
   readonly pendingPairings: Array<{ code: string; verificationCode: string; requestId: string; expiresAt: number; clientNonce: string }> = [];
   /** Frames rejected for not being a `{type, requestId}` request. */
@@ -275,6 +321,7 @@ export class FakeGateway {
   constructor(options: FakeGatewayOptions & { certificate: TestCertificate }) {
     this.options = options;
     this.certificate = options.certificate;
+    this.gatewayId = options.gatewayId ?? randomUUID();
     this.sessions = [...(options.sessions ?? DEFAULT_SESSIONS)];
     this.approvals = [...(options.approvals ?? [])];
     this.tokens = new Set(options.tokens ?? []);
@@ -301,6 +348,15 @@ export class FakeGateway {
 
   get certSha256(): string {
     return this.certificate.certSha256;
+  }
+
+  /**
+   * The identity the Host states of itself — the same values `hello` carries
+   * (`...gatewayIdentity` on the real gateway, which `paired` and the QR payload also use). A test
+   * asserting "the record took the Host's own id" reads it here instead of hard-coding the literal.
+   */
+  get status(): { gatewayId: string; gatewayName: string } {
+    return { gatewayId: this.gatewayId, gatewayName: GATEWAY_NAME };
   }
 
   get connectionCount(): number {
@@ -344,6 +400,15 @@ export class FakeGateway {
    */
   get mintedTokens(): string[] {
     return [...this.minted];
+  }
+
+  /**
+   * Every token this Host ACCEPTED on an authenticated upgrade, in order of first use. Lets a test
+   * prove which credential instance the phone is really presenting (a replaced token would show up
+   * here instead of the original).
+   */
+  get tokensAccepted(): string[] {
+    return [...this.accepted];
   }
 
   signingKeyFingerprint(): string {
@@ -550,12 +615,16 @@ export class FakeGateway {
     const match = typeof header === 'string' ? /^Bearer (.+)$/.exec(header) : null;
     if (match !== null) {
       const token = match[1] as string;
-      return this.tokens.has(token) ? { token, deviceId: headerValue(request, 'x-dsh-device-id') } : null;
+      if (!this.tokens.has(token)) return null;
+      this.accepted.add(token);
+      return { token, deviceId: headerValue(request, 'x-dsh-device-id') };
     }
     for (const protocol of protocols) {
       if (protocol.startsWith(SUBPROTOCOL_PREFIXES.auth)) {
         const token = protocol.slice(SUBPROTOCOL_PREFIXES.auth.length);
-        return this.tokens.has(token) ? { token, deviceId: this.deviceProtocolOf(protocols) } : null;
+        if (!this.tokens.has(token)) return null;
+        this.accepted.add(token);
+        return { token, deviceId: this.deviceProtocolOf(protocols) };
       }
     }
     return null;
@@ -566,7 +635,14 @@ export class FakeGateway {
     const code = protocols
       .filter((p) => p.startsWith(SUBPROTOCOL_PREFIXES.pair))
       .map((p) => p.slice(SUBPROTOCOL_PREFIXES.pair.length))[0];
-    if (code === undefined) return null;
+    if (code === undefined) {
+      // Contract revision 5: the OTP flow is selected by its OWN subprotocol, not by a pairing code
+      // — the 8-digit code never travels in the handshake. `code` is empty for such a socket: the
+      // proof (verified in `handlePreAdmissionFrame`) is the only credential it presents.
+      if (!protocols.includes(PAIR_OTP_PROTOCOL)) return null;
+      if (this.options.otpRequired !== true) return null;
+      return { code: '', deviceId: headerValue(request, 'x-dsh-device-id') ?? this.deviceProtocolOf(protocols), valid: true };
+    }
     // Unknown/expired/used codes are an upgrade failure (contract §3: 401), never a socket.
     if (!this.pairingCodes.has(code)) return { code, deviceId: null, valid: false };
     return { code, deviceId: headerValue(request, 'x-dsh-device-id') ?? this.deviceProtocolOf(protocols), valid: true };
@@ -612,7 +688,11 @@ export class FakeGateway {
     this.connectionAttempts += 1;
 
     if (pairing !== null) {
-      if (!this.pairingCodes.has(pairing.code)) {
+      // Contract revision 5: an OTP pairing presents NO pairing code at all — its subprotocol is
+      // `dsh-pair-otp.v1` and the proof is the credential — so the code-registry check below must
+      // not apply to it (an empty string is never a registered code).
+      const otpFlow = pairing.code === '';
+      if (!otpFlow && !this.pairingCodes.has(pairing.code)) {
         // Expired or already used code: contract §3 upgrade failure.
         socket.close(1008, 'pairing/expired');
         return;
@@ -628,13 +708,17 @@ export class FakeGateway {
         approved: false,
         proofNonce: null,
       };
+      // The nonce this challenge carries: an OTP proof is keyed to it, so it must be verified
+      // against THIS connection's challenge and not a fresh value.
+      const serverNonce = randomNonce();
       this.pairingChallenges += 1;
       socket.send(toFrame({
         kind: 'pairing-challenge',
-        serverNonce: randomNonce(),
+        serverNonce,
         certSha256: this.certificate.certSha256,
         otpRequired: this.options.otpRequired === true,
       }));
+      (connection as Connection & { challengeNonce?: string }).challengeNonce = serverNonce;
     } else {
       this.sendHello(connection);
       if (this.options.closeAfterHello !== undefined) socket.close(this.options.closeAfterHello, 'close-after-hello');
@@ -679,7 +763,7 @@ export class FakeGateway {
           ? {}
           : { kind: 'mobile' as const, scopes: this.options.deviceScopes }),
       },
-      gatewayId: 'b3a4c2c9-5d2f-4a8e-9f2b-0c1d2e3f4a5b',
+      gatewayId: this.gatewayId,
       dshVersion: '0.2.2-rc.1',
       certSha256: this.certificate.certSha256,
       // Spec 021 (contract §14.2): present ONLY for a `web:unlock` device, exactly like the gateway.
@@ -710,11 +794,27 @@ export class FakeGateway {
       }
       if (this.options.otpRequired === true) {
         // Contract §3.8: with `otpRequired` the proof MUST carry `otpProof`; a wrong or missing
-        // one expires the attempt with 4410. This fixture does not verify a real HMAC (the app
-        // has no OTP flow yet); it only requires the field.
+        // one expires the attempt with 4410. With an `otp` configured this fixture recomputes the
+        // Host's HMAC and refuses a mismatch, so a test can prove the app derives the SAME proof
+        // (and that a wrong code / wrong pin / replayed nonce is refused).
         if (typeof frame.otpProof !== 'string' || frame.otpProof === '') {
           socket.close(PAIRING_CLOSE_CODES.expired, 'pairing/expired');
           return;
+        }
+        if (this.options.otp !== undefined) {
+          const serverNonce = (connection as Connection & { challengeNonce?: string }).challengeNonce ?? '';
+          const expected = createHmac('sha256', this.options.otp)
+            .update(this.certificate.certSha256)
+            .update(nonce)
+            .update(serverNonce)
+            .digest('hex');
+          if (frame.otpProof !== expected) {
+            // The real Host burns one attempt per wrong proof and closes 4410 for this socket.
+            this.otpProofFailures += 1;
+            socket.close(PAIRING_CLOSE_CODES.expired, 'pairing/expired');
+            return;
+          }
+          this.otpProofAccepts += 1;
         }
       }
       this.admitPairing(connection, nonce);
@@ -783,7 +883,15 @@ export class FakeGateway {
       this.tokenDevices.set(token, connection.device.id);
       this.removePendingPairing(pairing.code);
       if (connection.socket.readyState !== WebSocket.OPEN) continue;
-      connection.socket.send(toFrame({ kind: 'paired', token, device: this.pairedDevice(connection) }));
+      connection.socket.send(toFrame({
+        kind: 'paired',
+        token,
+        device: this.pairedDevice(connection),
+        // The real gateway spreads `...gatewayIdentity` here, which is the ONLY place an OTP
+        // pairing can learn the Host's id (there is no QR payload to read it from).
+        ...(this.options.omitGatewayId === true ? {} : { gatewayId: this.gatewayId }),
+        gatewayName: GATEWAY_NAME,
+      }));
       this.sendHello(connection);
       if (this.options.closeAfterHello !== undefined) {
         connection.socket.close(this.options.closeAfterHello, 'close-after-hello');

@@ -30,15 +30,26 @@ export interface PairedHost {
   pairedAt: number;
 }
 
-/** Build the record from a decoded QR payload (before the `paired` answer fills `deviceId`). */
+/**
+ * Build the record from a decoded QR payload (before the `paired` answer fills `deviceId`).
+ *
+ * `gatewayId` may be empty: an OTP pairing has no QR, so the Host's id is not known until its
+ * `hello` arrives. `gatewayIdFromHello` below then supplies it, and `isReconnectable` refuses a
+ * record that still has none — a host record without an id cannot be looked up or revoked.
+ */
 export function pairedHostFromPayload(
   payload: Pick<PairingPayload, 'gatewayId' | 'gatewayName' | 'publicUrl' | 'endpoints' | 'certSha256'>,
   device: { id: string; name: string },
   pairedAt: number,
+  gatewayIdFromHello?: string,
 ): PairedHost {
+  // Contract §3.5: `hello.gatewayId` is the Host's own statement of its identity. It wins when the
+  // payload has none (OTP pairing); a payload pairing keeps the QR's id, which the Host already
+  // agreed to by accepting that code.
+  const gatewayId = payload.gatewayId !== '' ? payload.gatewayId : (gatewayIdFromHello ?? '');
   return {
     schemaVersion: PAIRED_HOST_SCHEMA_VERSION,
-    gatewayId: payload.gatewayId,
+    gatewayId,
     name: payload.gatewayName,
     publicUrl: payload.publicUrl,
     endpoints: [...payload.endpoints],
@@ -53,6 +64,7 @@ export function pairedHostFromPayload(
 export function isReconnectable(host: PairedHost | null): host is PairedHost {
   return host !== null
     && host.schemaVersion === PAIRED_HOST_SCHEMA_VERSION
+    && host.gatewayId !== ''
     && /^wss:\/\//.test(host.publicUrl)
     && /^[0-9a-f]{64}$/.test(host.certSha256)
     && host.deviceId.length > 0;

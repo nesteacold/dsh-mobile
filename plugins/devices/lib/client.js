@@ -57,6 +57,22 @@ window.__ModuleLoader__.load({
         edit: 'Edit permissions',
         editHelp: 'Permissions are fixed when a device pairs. Saving creates a new pairing code with the chosen permissions; the device must pair again, which closes its current connection.',
         editSave: 'Generate new pairing code',
+        // Spec 025 R5: the grant can change in place, so re-pairing is no longer the only
+        // way. `editHelp` above stays truthful about what the old button still does.
+        permissions: 'Permissions',
+        permsHelp: 'Applies to this device without re-pairing. Only the permissions this kind of device can hold are listed. Its current connections close and it reconnects with the new set.',
+        permsSave: 'Apply permissions',
+        permsApplied: 'Permissions applied. The device reconnects to pick them up.',
+        permsUnchanged: 'Nothing changed.',
+        permsConfirm: 'Apply these permissions to this device? Its current connections close and it reconnects with the new set.',
+        permsMissingUpload: 'Re-grant file upload permission',
+        // One sentence per refusal the route names; an unknown code is shown verbatim.
+        'permsErr.bad-request': 'The change could not be read. Reload the page and try again.',
+        'permsErr.unknown-scope': 'One of those is not a permission this Host knows.',
+        'permsErr.scope-not-updatable': 'The web unlock permission is granted by the passkey flow, not here.',
+        'permsErr.scope-not-for-kind': 'That permission does not apply to this kind of device.',
+        'permsErr.forbidden': 'Permissions can only be changed from this machine.',
+        'permsErr.not-found': 'That device is no longer paired. Reload the page.',
         cancel: 'Cancel',
         'scope.sessions:read': 'See sessions and history',
         'scope.prompt:send': 'Send prompts',
@@ -89,6 +105,10 @@ window.__ModuleLoader__.load({
         'status.online': 'Online',
         'status.connecting': 'Connecting',
         'status.offline': 'Offline',
+        // A PAIRED host whose link is down but whose sessions are still listed: the
+        // word has to differ from both "Online" and "Offline, nothing here".
+        'status.disconnected': 'Disconnected',
+        'status.disconnectedSessions': 'Sessions stay listed and readable; sending is refused until it reconnects.',
         'status.revoked': 'Access revoked',
         'status.error': 'Error',
         error: 'Error',
@@ -331,6 +351,19 @@ window.__ModuleLoader__.load({
         edit: 'Sửa quyền',
         editHelp: 'Quyền được cố định khi thiết bị ghép đôi. Lưu sẽ tạo mã ghép đôi mới với các quyền đã chọn; thiết bị phải ghép đôi lại và kết nối hiện tại sẽ bị đóng.',
         editSave: 'Tạo mã ghép đôi mới',
+        permissions: 'Quyền',
+        permsHelp: 'Áp dụng cho thiết bị này mà không cần ghép đôi lại. Chỉ liệt kê những quyền mà loại thiết bị này có thể có. Các kết nối hiện tại sẽ đóng và thiết bị kết nối lại với bộ quyền mới.',
+        permsSave: 'Áp dụng quyền',
+        permsApplied: 'Đã áp dụng quyền. Thiết bị sẽ kết nối lại để nhận bộ quyền mới.',
+        permsUnchanged: 'Không có gì thay đổi.',
+        permsConfirm: 'Áp dụng các quyền này cho thiết bị? Kết nối hiện tại sẽ đóng và thiết bị kết nối lại với bộ quyền mới.',
+        permsMissingUpload: 'Cấp lại quyền tải tệp lên',
+        'permsErr.bad-request': 'Không đọc được thay đổi. Hãy tải lại trang và thử lại.',
+        'permsErr.unknown-scope': 'Có một quyền mà Host này không biết.',
+        'permsErr.scope-not-updatable': 'Quyền mở khóa web do luồng passkey cấp, không cấp ở đây.',
+        'permsErr.scope-not-for-kind': 'Quyền đó không áp dụng cho loại thiết bị này.',
+        'permsErr.forbidden': 'Chỉ đổi được quyền từ máy này.',
+        'permsErr.not-found': 'Thiết bị đó không còn ghép đôi. Hãy tải lại trang.',
         cancel: 'Hủy',
         'scope.sessions:read': 'Xem phiên và lịch sử',
         'scope.prompt:send': 'Gửi prompt',
@@ -363,6 +396,8 @@ window.__ModuleLoader__.load({
         'status.online': 'Trực tuyến',
         'status.connecting': 'Đang kết nối',
         'status.offline': 'Ngoại tuyến',
+        'status.disconnected': 'Đã ngắt kết nối',
+        'status.disconnectedSessions': 'Phiên vẫn được liệt kê và đọc được; gửi prompt bị từ chối cho tới khi kết nối lại.',
         'status.revoked': 'Đã bị thu hồi quyền',
         'status.error': 'Lỗi',
         error: 'Lỗi',
@@ -999,6 +1034,13 @@ window.__ModuleLoader__.load({
       'credentials:write', 'plugins:manage', 'schedule:write', 'terminal', 'sessions:author', 'attachments:write',
       'browser:control', 'web:unlock', 'permission:lower'])
     const keepKnown = (scopes) => ALL_SCOPES.filter((scope) => scopes.includes(scope))
+    // Spec 025 R5: the Permissions editor lists only what the device's KIND can hold, so the
+    // gateway never has to refuse a tick the page itself offered. This mirrors the contract's
+    // DESKTOP_ONLY_SCOPES (client.test.mjs fails on drift), the same table the gateway's
+    // `scopesForKind` filters by.
+    const DESKTOP_ONLY_SCOPES = new Set(['harness:remote', 'commands:execute', 'workspace:manage',
+      'credentials:write', 'plugins:manage', 'schedule:write', 'terminal'])
+    const scopesForKind = (kind) => ALL_SCOPES.filter((scope) => kind === 'desktop' || !DESKTOP_ONLY_SCOPES.has(scope))
 
     // The checkbox list + the two preset buttons, shared by Approve and Edit permissions.
     // `allowed` (Approve only): the scopes the pairing request offered. The gateway
@@ -1058,6 +1100,77 @@ window.__ModuleLoader__.load({
           type: 'button', className: 'dshdev-scopes-toggle', 'aria-expanded': open,
           onClick: () => setOpen(!open),
         }, open ? tr('showLessScopes') : withCount('showAllScopes', list.length)) : null)
+    }
+
+    // Spec 025 R5: change one paired record's grant in place, through the owner-only route
+    // `POST /mgw/devices/:id/scopes`. The page sends the DIFF (`add`/`remove`), not the whole
+    // list: the route reads the record itself, so a page that went stale cannot resurrect a
+    // permission someone else removed. Only the scopes this device's kind can hold are listed,
+    // and `web:unlock` is not tickable here at all — the passkey flow owns it.
+    const UNSETTABLE_SCOPES = new Set(['web:unlock'])
+    function PermissionsEditor({ device, onClose, onApplied }) {
+      useLang()
+      const granted = Array.isArray(device.scopes) ? device.scopes : []
+      const allowed = scopesForKind(device.kind)
+      // `baseline` is the grant the ROUTE last reported, `ticked` what the owner wants: the diff is
+      // computed between them, so after a save the button goes quiet instead of re-sending the same
+      // change against the row this page was rendered with.
+      const [baseline, setBaseline] = React.useState(() => granted.filter((scope) => allowed.includes(scope)))
+      const [ticked, setTicked] = React.useState(() => granted.filter((scope) => allowed.includes(scope)))
+      const [busy, setBusy] = React.useState(false)
+      const [error, setError] = React.useState('')
+      const [notice, setNotice] = React.useState('')
+      // A refusal the route names ("unknown-scope", "scope-not-for-kind", …) is said in the Host
+      // language; anything else keeps its own sentence rather than disappearing into a lookup.
+      const setRefusal = (cause) => {
+        const key = cause && cause.code ? `permsErr.${cause.code}` : ''
+        setError(key && DICT[currentLang()][key] ? tr(key) : String((cause && cause.message) || ''))
+      }
+      const add = ticked.filter((scope) => !baseline.includes(scope))
+      const remove = baseline.filter((scope) => !ticked.includes(scope) && allowed.includes(scope))
+      const save = async () => {
+        if (busy || (add.length === 0 && remove.length === 0)) return
+        // Explicit confirm: the change closes the device's live connections (spec 025 R3), so it
+        // is never a thing that happens on a stray click.
+        if (!window.confirm(tr('permsConfirm'))) return
+        setBusy(true); setError(''); setNotice('')
+        try {
+          const answer = await post(`/mgw/devices/${encodeURIComponent(device.id)}/scopes`,
+            { ...(add.length ? { add } : {}), ...(remove.length ? { remove } : {}) })
+          setNotice(answer && answer.unchanged ? tr('permsUnchanged') : tr('permsApplied'))
+          // The route answers the record it really persisted: that becomes the new baseline, so a
+          // second click cannot re-send a change that already landed (and the row below agrees).
+          const now = Array.isArray(answer && answer.device && answer.device.scopes)
+            ? answer.device.scopes.filter((scope) => allowed.includes(scope)) : ticked
+          setBaseline(now)
+          setTicked(now)
+          await onApplied()
+        } catch (cause) { setRefusal(cause) } finally { setBusy(false) }
+      }
+      return h('div', { className: 'dshdev-card', 'data-testid': 'permissions-editor' },
+        h('h3', null, `${tr('permissions')} — ${device.displayName || device.name}`),
+        h('div', { className: 'dshdev-muted', style: { marginBottom: 8 } }, tr('permsHelp')),
+        h('div', { 'data-testid': 'permissions-scopes' }, allowed.map((scope) => h('label', {
+          key: scope, className: 'dshdev-row', style: { alignItems: 'flex-start' },
+        },
+          h('input', {
+            type: 'checkbox', checked: ticked.includes(scope),
+            disabled: busy || UNSETTABLE_SCOPES.has(scope),
+            onChange: (event) => setTicked(keepKnown(event.target.checked
+              ? [...ticked, scope] : ticked.filter((value) => value !== scope))),
+          }),
+          h('span', null, tr(`scope.${scope}`),
+            RISKY_SCOPES.has(scope) ? h('span', { className: 'dshdev-muted', style: { display: 'block' } }, tr(`risk.${scope}`)) : null,
+            UNSETTABLE_SCOPES.has(scope)
+              ? h('span', { className: 'dshdev-muted', style: { display: 'block' } }, tr('permsErr.scope-not-updatable')) : null)))),
+        error ? h('div', { className: 'dshdev-err', role: 'alert', 'data-testid': 'permissions-error' }, error) : null,
+        notice ? h('div', { className: 'dshdev-muted', 'data-testid': 'permissions-notice' }, notice) : null,
+        h('div', { className: 'dshdev-row', style: { marginTop: 10 } },
+          h('button', {
+            type: 'button', className: 'dshdev-btn primary', disabled: busy || (add.length === 0 && remove.length === 0),
+            onClick: save,
+          }, tr('permsSave')),
+          h('button', { type: 'button', className: 'dshdev-btn', onClick: onClose }, tr('cancel'))))
     }
 
     // Window 2: who is asking, what for, and the code to compare. Polled every 2 s.
@@ -1329,6 +1442,7 @@ window.__ModuleLoader__.load({
       const [pairing, setPairing] = React.useState(null)
       const [otpOffer, setOtpOffer] = React.useState(null)
       const [editing, setEditing] = React.useState(null) // { device, scopes }
+      const [permEditing, setPermEditing] = React.useState(null) // the device whose Permissions editor is open
       const mounted = React.useRef(true)
 
       const refresh = React.useCallback(async () => {
@@ -1468,9 +1582,16 @@ window.__ModuleLoader__.load({
                     h('span', { className: 'dshdev-badge' }, device.kind || 'mobile'),
                     device.online ? h('span', { className: 'dshdev-badge ok' }, tr('connectedHere')) : null)),
                 h('div', { className: 'dshdev-item-actions' },
-                  h('button', { type: 'button', className: 'dshdev-btn', disabled: !on, onClick: () => { setPairing(null); setEditing({ device, scopes: [...(device.scopes || [])] }) } }, tr('edit')),
+                  // Spec 025 R5: change the grant in place. Re-pairing stays available (Edit) but is
+                  // no longer the only way to widen or narrow one record.
+                  h('button', { type: 'button', className: 'dshdev-btn', disabled: !on, onClick: () => { setPairing(null); setEditing(null); setPermEditing(device) } }, tr('permissions')),
+                  h('button', { type: 'button', className: 'dshdev-btn', disabled: !on, onClick: () => { setPairing(null); setPermEditing(null); setEditing({ device, scopes: [...(device.scopes || [])] }) } }, tr('edit')),
                   h('button', { type: 'button', className: 'dshdev-btn danger', onClick: () => revoke(device) }, tr('remove')))),
               h('div', { className: 'dshdev-item-body' },
+                // A record paired before spec 013 cannot upload files, and nothing on the row said
+                // so: the hint names the fix and points at the editor next to it.
+                (device.scopes || []).includes('attachments:write') ? null
+                  : h('div', { className: 'dshdev-note warn', 'data-testid': 'missing-upload-hint' }, tr('permsMissingUpload')),
                 h(ScopeChips, { scopes: device.scopes }),
                 h('div', { className: 'dshdev-item-meta' },
                   h('span', { className: 'dshdev-muted' }, tr('lastUsed')),
@@ -1483,6 +1604,12 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', className: 'dshdev-btn primary', disabled: busy, onClick: () => generate(editing.scopes) }, tr('editSave')),
             h('button', { type: 'button', className: 'dshdev-btn', onClick: () => setEditing(null) }, tr('cancel')))) : null,
         pairing && editing ? h(PairingBox, { pairing }) : null,
+        // Spec 025 R5: the in-place editor. `refresh` re-reads /mgw/devices, so the row below shows
+        // the grant the route really persisted, not the one this page hoped for.
+        permEditing ? h(PermissionsEditor, {
+          key: permEditing.id, device: permEditing,
+          onClose: () => setPermEditing(null), onApplied: refresh,
+        }) : null,
         // The bind the listener really serves is a state card; the control that
         // changes it sits behind "Advanced" with the limits, so the page is quiet.
         h(ListeningOn, { lan: status && status.lan, tailscale: status && status.tailscale }),
@@ -2048,9 +2175,42 @@ window.__ModuleLoader__.load({
       return date.toLocaleString(currentLang() === 'vi' ? 'vi-VN' : 'en-US', WHEN_FORMAT)
     }
     const ANY = (state) => state
+    /**
+     * The link state of one tagged host, the single answer every surface reads.
+     *
+     * A host is `online` when the router lists it as connected. It is
+     * `disconnected` when it is still PAIRED and the router retains its last-known
+     * session rows — the sessions stay on screen, so the surface must say
+     * "disconnected, read-only" and not "there is nothing here". A host whose grant
+     * was revoked is `revoked` instead, never `disconnected`: its rows were dropped
+     * with the grant, so "read-only, it comes back" would be a lie. Anything
+     * else is a host this window has no record of (a stale tag), which stays plain
+     * offline.
+     * @param {{hosts: object[], disconnected: object[], remotes: object[]}} hosts the store snapshot
+     * @param {string} hostId the remote record id taken from a session tag
+     */
+    const hostLinkOf = (hosts, hostId) => {
+      const live = hosts.hosts.find((entry) => entry.hostId === hostId)
+      const gone = (hosts.disconnected || []).find((entry) => entry.hostId === hostId)
+      const remote = hosts.remotes.find((entry) => entry.id === hostId)
+      const online = !!(live && live.online !== false)
+      // A revoked grant is not a link that is briefly away: the sessions are gone
+      // with it, so it must never read as "disconnected, read-only". `revoked` is
+      // checked FIRST, before the router's retained `gone` entry can win.
+      const revoked = !!(remote && remote.status === 'revoked')
+      return {
+        online,
+        revoked,
+        disconnected: !online && !revoked && !!gone,
+        // How many rows of that host are still listed from its last answer.
+        retainedSessions: gone ? gone.retainedSessions : 0,
+        name: (live && live.hostName) || (gone && gone.hostName) || (remote && remote.name) || hostId,
+        remote: remote || null,
+      }
+    }
     const titleOf = (row, fallback) => (row && (row.displayTitle || row.title)) || fallback || ''
 
-    const EMPTY_HOSTS = { hosts: [], remotes: [], routing: null, error: '', loaded: false }
+    const EMPTY_HOSTS = { hosts: [], disconnected: [], remotes: [], routing: null, error: '', loaded: false }
     function createHostsStore() {
       let snapshot = EMPTY_HOSTS
       const listeners = new Set()
@@ -2094,6 +2254,22 @@ window.__ModuleLoader__.load({
                 // stays `null`.
                 error: host.error ?? null,
               })),
+              // A PAIRED host whose link is down. Its sessions stay in the merged list
+              // (the router retains them), so the row must read "Disconnected" rather
+              // than look like a host that was never there or one with nothing in it.
+              // A revoked grant is filtered out of this set BEFORE it is mapped: its
+              // rows were dropped with the grant, so it is not "disconnected".
+              disconnected: (Array.isArray(routing.disconnected) ? routing.disconnected : [])
+                .filter((host) => {
+                  const held = (data.remotes || []).find((entry) => entry.id === String(host?.hostId))
+                  return !(held && held.status === 'revoked')
+                })
+                .map((host) => ({
+                  hostId: String(host.hostId),
+                  hostName: String(host.hostName ?? host.hostId),
+                  online: false,
+                  retainedSessions: Number(host.retainedSessions) || 0,
+                })),
               routing,
               error: '',
               loaded: true,
@@ -2144,18 +2320,18 @@ window.__ModuleLoader__.load({
       const tag = hostTagOf(props.sessionId)
       // An untagged id is a local session: the native row says all there is to say.
       if (!tag) return null
-      const host = hosts.hosts.find((entry) => entry.hostId === tag.hostId)
-      const remote = hosts.remotes.find((entry) => entry.id === tag.hostId)
-      // A tagged row whose host holds no link is still the owner's session (an
-      // offline copy), so it keeps the name and only the dot reads as dead.
-      const online = !!(host && host.online !== false)
-      const name = (host && host.hostName) || (remote && remote.name) || tag.hostId
+      // A tagged row whose host holds no link is still the owner's session (its rows
+      // are retained and its transcript is cached), so it keeps the name and only the
+      // dot reads as dead; the title says which kind of dead it is.
+      const link = hostLinkOf(hosts, tag.hostId)
+      const state = link.online ? 'online' : link.revoked ? 'revoked' : link.disconnected ? 'disconnected' : 'offline'
       return h('span', {
         className: 'dshdev-hostbadge', 'data-testid': 'session-host-badge', 'data-host': tag.hostId,
-        title: `${tr('hostChip')}: ${name}`,
+        'data-link': state,
+        title: `${tr('hostChip')}: ${link.name}${link.online ? '' : ` — ${tr(`status.${state}`)}`}`,
       },
-      h('span', { className: `dshdev-dot ${online ? 'ok' : 'off'}`, 'data-testid': 'session-host-dot', 'aria-hidden': true }),
-      h('span', { className: 'dshdev-hostbadge-name' }, name))
+      h('span', { className: `dshdev-dot ${link.online ? 'ok' : 'off'}`, 'data-testid': 'session-host-dot', 'aria-hidden': true }),
+      h('span', { className: 'dshdev-hostbadge-name' }, link.name))
     }
 
     // Composer chip: only a TAGGED session has a host to name. Clicking it toggles a
@@ -2171,10 +2347,10 @@ window.__ModuleLoader__.load({
       const tag = hostTagOf(props.sessionId)
       if (!tag) return null
       const id = tag.hostId
-      const host = hosts.hosts.find((entry) => entry.hostId === id)
-      const remote = hosts.remotes.find((entry) => entry.id === id)
-      const online = !!(host && host.online !== false)
-      const name = (host && host.hostName) || (remote && remote.name) || id
+      const link = hostLinkOf(hosts, id)
+      const remote = link.remote
+      const online = link.online
+      const name = link.name
       const scopes = (remote && remote.scopes) || []
       const run = async (work) => {
         if (busy) return
@@ -2194,7 +2370,13 @@ window.__ModuleLoader__.load({
         open ? h('div', { className: 'dshdev-pop', role: 'dialog', 'aria-label': tr('popoverTitle'), 'data-testid': 'host-popover' },
           h('div', { className: 'dshdev-pop-row' }, h('span', null, tr('popoverTitle')), h('strong', null, name)),
           h('div', { className: 'dshdev-pop-row' }, h('span', null, tr('status.online')),
-            h('span', { 'data-testid': 'popover-state' }, online ? tr('status.online') : tr('status.offline'))),
+            h('span', { 'data-testid': 'popover-state' }, online ? tr('status.online')
+              : link.revoked ? tr('status.revoked') : link.disconnected ? tr('status.disconnected') : tr('status.offline'))),
+          // Sessions of a disconnected host stay listed and readable, so "Offline"
+          // alone would suggest a dead end: say what still works.
+          link.disconnected
+            ? h('div', { className: 'dshdev-muted', 'data-testid': 'popover-disconnected', role: 'status' }, tr('status.disconnectedSessions'))
+            : null,
           // While the supervisor holds a retry, the popover says the link is coming
           // back by itself instead of leaving "Offline" as the whole story.
           remote && remote.retry
@@ -2233,12 +2415,12 @@ window.__ModuleLoader__.load({
       const hosts = useHosts(hostsStore)
       const tag = hostTagOf(props.sessionId)
       if (!tag) return null
-      const host = hosts.hosts.find((entry) => entry.hostId === tag.hostId)
-      const remote = hosts.remotes.find((entry) => entry.id === tag.hostId)
-      const online = !!(host && host.online !== false)
-      const name = (host && host.hostName) || (remote && remote.name) || tag.hostId
+      const link = hostLinkOf(hosts, tag.hostId)
       const banners = []
-      if (!online) banners.push(h(OfflineBanner, { key: 'offline', hostId: tag.hostId, rawId: tag.rawId, name, known: !!remote }))
+      if (!link.online) {
+        banners.push(h(OfflineBanner, { key: 'offline', hostId: tag.hostId, rawId: tag.rawId, name: link.name,
+          known: !!link.remote, disconnected: link.disconnected, revoked: link.revoked }))
+      }
       // The model complaint is read from the session the shell already follows, i.e.
       // from the HOST's answer; nothing here can substitute a local model.
       if (typeof props.useSession === 'function') banners.push(h(ModelStatusBanner, { key: 'model', useSession: props.useSession }))
@@ -2247,7 +2429,7 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'dshdev-dock', 'data-testid': 'session-banners' }, banners)
     }
 
-    function OfflineBanner({ hostId, rawId, name, known }) {
+    function OfflineBanner({ hostId, rawId, name, known, disconnected = false, revoked = false }) {
       useLang()
       const [busy, setBusy] = React.useState(false)
       const [note, setNote] = React.useState('')
@@ -2260,9 +2442,15 @@ window.__ModuleLoader__.load({
           setNote(answer.removed ? tr('localCopyRemoved') : tr('localCopyGone'))
         } catch (cause) { setError(cause.message) } finally { setBusy(false) }
       }
-      return h('div', { className: 'dshdev-banner', 'data-testid': 'offline-banner', role: 'status' },
+      // A paired host that is only disconnected keeps its sessions listed: the title
+      // names that state instead of claiming the task is gone. A revoked grant is
+      // not that state — nothing is coming back — so it says what happened instead.
+      const state = revoked ? 'revoked' : disconnected ? 'disconnected' : 'offline'
+      const title = revoked ? `${tr('status.revoked')} — ${name}`
+        : disconnected ? `${tr('status.disconnected')} — ${name}` : `${tr('bannerOfflineTitle')} ${name}`
+      return h('div', { className: 'dshdev-banner', 'data-testid': 'offline-banner', 'data-link': state, role: 'status' },
         h('div', { className: 'dshdev-grow' },
-          h('strong', null, `${tr('bannerOfflineTitle')} ${name}`),
+          h('strong', null, title),
           h('div', { className: 'dshdev-muted' }, `${tr('bannerReadOnly')} — ${tr('bannerOfflineBody')}`),
           error ? h('div', { className: 'dshdev-err', role: 'alert' }, error) : null,
           note ? h('div', { className: 'dshdev-muted', 'data-testid': 'local-copy-note' }, note) : null),
@@ -2756,8 +2944,8 @@ window.__ModuleLoader__.load({
       FlowStrip, flowState, connectedCount, localName,
       // spec 008 P2b
       HostChip, SessionBanners, OfflineBanner, ModelStatusBanner, RemoteTerminalEntry,
-      SessionHostBadge,
-      RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText,
+      SessionHostBadge, PermissionsEditor, scopesForKind,
+      RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText, hostLinkOf,
       // spec 016 Phase 3
       BrowserAgentTab, agentKindOf,
       // spec 016 Phase 1: the per-machine Start-page doorways, their numbers and the

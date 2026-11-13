@@ -114,6 +114,16 @@ export const ID_FIELDS = Object.freeze({
   rpcId: 'id',
   eventId: 'id',
   approvalId: 'id',
+  // The ANCHOR of a reorder: the row the moved one lands before
+  // (`workspace/insertBefore` → `beforeWorkspaceId`, `workspace/insertSessionBefore`
+  // → `beforeSessionId`). It is an id like any other, and the merged sidebar is what
+  // makes that matter: the anchor it hands back belongs to the list the user sees, so
+  // for a remote row it is `h:<hostId>:<id>`. Without these two entries the anchor was
+  // the one id the table never rewrote, so moving a remote Workspace reached its Host
+  // as `{workspaceId:'wb1', beforeWorkspaceId:'h:<hostId>:<wb2>'}` and the registry
+  // answered `workspace/not-found` — the drag simply did nothing.
+  beforeWorkspaceId: 'id',
+  beforeSessionId: 'id',
   sessionIds: 'ids',
   archivedSessionIds: 'ids',
   pinnedSessionIds: 'ids',
@@ -126,6 +136,18 @@ export const ID_FIELDS = Object.freeze({
 
 /** Endpoints the wrapper answers with a merged view instead of routing. */
 export const MERGED_ENDPOINTS = Object.freeze(['session/list', 'workspace/follow', 'session/modelCatalog'])
+
+/**
+ * The two reorder endpoints and the argument that anchors them. Both take the row
+ * being moved plus an optional "land before this one" (`dsh-workspace`
+ * `insertBefore` / `insertSessionBefore`); the anchor is the id the merged sidebar
+ * produces from the row it was dropped on, so it is the one that has to be checked
+ * for a cross-list drop (see `#assertSameReorderList`).
+ */
+const REORDER_ANCHOR_FIELDS = Object.freeze({
+  'workspace/insertBefore': 'beforeWorkspaceId',
+  'workspace/insertSessionBefore': 'beforeSessionId',
+})
 
 /** The endpoints whose cards carry an approval hash the bridge requires. */
 const APPROVAL_RESULT_ENDPOINT = '$events/result'
@@ -211,6 +233,12 @@ const QUESTION_EVENT = 'user-questions/request'
 const MAX_TRACKED_CARDS = 128
 /** How many per-host refusals the status keeps for the Devices page (bounded). */
 const MAX_HOST_ERRORS = 32
+/**
+ * How many hosts keep their last-known session list while they are disconnected.
+ * Bounded like every other per-host table here: a paired set is small, and a
+ * forgotten host is dropped from the retention entirely (see `#knownHostIds`).
+ */
+const MAX_RETAINED_HOSTS = 32
 
 /** A refusal this module produced; `code` rides the Gateway failure vocabulary. */
 export class HostRouterError extends Error {
@@ -560,6 +588,66 @@ function withoutHint(args) {
 }
 
 /**
+ * A failure that means "the link is momentarily gone" — worth resuming a follow
+ * stream for, and worth keeping a host's rows through — as opposed to a refusal the
+ * Host itself produced (`auth/forbidden-scope`, a protocol error), which is "no".
+ *
+ * A closed transport carries the socket's own close code; a socket-level failure
+ * carries the Node error code. Anything else presents a code, so it is classified by
+ * that code alone.
+ */
+function isLinkFailure(error) {
+  const code = typeof error?.code === 'string' ? error.code : ''
+  return error?.closeCode !== undefined || code === 'remote/host-offline'
+    || code === 'remote/unreachable' || code === 'remote/stream-open-timeout' || code === 'cancelled'
+    || code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'EPIPE'
+}
+
+/**
+ * The durable sequence one follow frame advances the reader to, or null for a frame
+ * that owns none (an assistant-stream frame is process-local, not durable).
+ */
+function followSeqOf(value) {
+  if (!isPlainObject(value)) return null
+  if (value.type === 'snapshot') return Number.isSafeInteger(value.cursor) ? value.cursor : null
+  if (value.type === 'event') return Number.isSafeInteger(value.event?.seq) ? value.event.seq : null
+  return null
+}
+
+/**
+ * What a RE-OPENED follow contributes to a stream the user is still reading.
+ *
+ * A follow always opens with a fresh snapshot, but this reader already has one: a
+ * second snapshot mid-stream is rejected by the consumer, and an event it has already
+ * seen is a duplicate row. So the snapshot contributes only the durable events the
+ * reader has not seen (`seq > lastSeq`), as plain `event` frames — which is exactly
+ * how the missed stretch of the transcript is filled in. Assistant-stream frames are
+ * dropped on a resumed attempt: their revision counter restarts with the snapshot, so
+ * a resumed one reads as a revision gap, while the committed message still arrives as
+ * a durable event.
+ * @param {unknown} value the raw frame the Host sent
+ * @param {number} lastSeq the durable sequence already delivered
+ * @returns {object[]} the raw frames to deliver
+ */
+function resumedFollowFrames(value, lastSeq) {
+  if (!isPlainObject(value)) return []
+  if (value.type === 'snapshot') {
+    const out = []
+    for (const record of Array.isArray(value.records) ? value.records : []) {
+      if (record?.type !== 'event' || !isPlainObject(record.event)) continue
+      const seq = record.event.seq
+      if (Number.isSafeInteger(seq) && seq > lastSeq) out.push({ type: 'event', event: record.event })
+    }
+    return out
+  }
+  if (value.type === 'event') {
+    const seq = value.event?.seq
+    return Number.isSafeInteger(seq) && seq <= lastSeq ? [] : [value]
+  }
+  return []
+}
+
+/**
  * The single session a `session/follow` request is about (its `request.address`),
  * or null for anything else (a subagent address names two sessions, so it is not
  * cached: the cache is keyed by exactly one id).
@@ -812,6 +900,10 @@ class MergeState {
  * @param {object} deps
  * @param {object} deps.gateway the Host `typertGateway` instance to patch
  * @param {() => Array<{hostId: string, hostName?: string, connection: object, online?: boolean}>} [deps.hosts]
+ * @param {() => Array<{hostId: string, hostName?: string}>} [deps.knownHosts] every PAIRED
+ *   host, connected or not: a disconnected host keeps its last-known rows in the merged
+ *   list (see `#retainedRows`). Omitted means the connected set is all there is, which is
+ *   the pre-retention behaviour.
  * @param {(listener: () => void) => (() => void)} [deps.onHostsChanged]
  * @param {{card?: (hostId: string, ids: object) => object|undefined,
  *   pending?: (hostId: string) => object[]}} [deps.approvals]
@@ -823,6 +915,7 @@ class MergeState {
 export class HostRouter {
   #gateway
   #hosts
+  #knownHosts
   #onHostsChanged
   #approvals
   #cache
@@ -836,6 +929,16 @@ export class HostRouter {
   #reason = null
   /** Stop functions of the merged streams currently being consumed. */
   #merges = new Set()
+  /**
+   * Stop functions of the `session/follow` pumps, keyed by host.
+   *
+   * A pump outlives the LINK on purpose, but not the PAIRING: once a host is
+   * forgotten or revoked its follow can never resume, so a pump still waiting for
+   * it would hold the reader's stream open forever instead of ending it. Keying
+   * them by host is what lets `forgetHost` end exactly that host's streams.
+   * @type {Map<string, Set<() => void>>}
+   */
+  #followStops = new Map()
   /** Push functions of the `$events` streams currently open in the native UI. */
   #eventSinks = new Set()
   /** The connected-host set last announced (`#connectedKey`), so flapping stays quiet. */
@@ -856,10 +959,33 @@ export class HostRouter {
    * @type {Map<string, {code: string, scope?: string, at: number}>}
    */
   #hostErrors = new Map()
+  /**
+   * The last `session/list` rows of each host, kept AFTER they were renamed into that
+   * host's namespace.
+   *
+   * A disconnected host must not take the user's sessions off the screen: the merged
+   * list is the only thing the native sidebar renders, so dropping a host's rows made
+   * every one of its sessions vanish the moment the link dropped, and the row could
+   * not even be clicked to read the local copy the cache keeps. Retention is keyed by
+   * the stable remote record id, which is also the id every alias was minted under
+   * (`h:<hostId>:<sid>`), so a reconnected host hands the SAME ids back: the native
+   * catalog replaces rows by id and nothing is duplicated, and an open session resumes
+   * under the alias the user already had.
+   *
+   * Rows are stored already renamed and already `cwd`-stripped, so replaying them here
+   * never runs `namespaceId` twice (a second pass would refuse its own tag as
+   * `remote/id-leak`) and never re-adds this machine's `cwd`.
+   *
+   * Cleared only by an explicit forget/revoke (`forgetHost`) or eviction once
+   * MAX_RETAINED_HOSTS paired hosts are remembered — never by a transient drop.
+   * @type {Map<string, object[]>}
+   */
+  #retainedRows = new Map()
 
   constructor(deps = {}) {
     this.#gateway = deps.gateway
     this.#hosts = typeof deps.hosts === 'function' ? deps.hosts : () => []
+    this.#knownHosts = typeof deps.knownHosts === 'function' ? deps.knownHosts : null
     this.#onHostsChanged = typeof deps.onHostsChanged === 'function' ? deps.onHostsChanged : () => () => {}
     this.#approvals = deps.approvals ?? null
     this.#cache = deps.cache ?? null
@@ -917,9 +1043,15 @@ export class HostRouter {
   uninstall() {
     for (const stop of [...this.#merges]) stop()
     this.#merges.clear()
+    for (const stops of [...this.#followStops.values()]) for (const stop of [...stops]) stop()
+    this.#followStops.clear()
     this.#eventSinks.clear()
     this.#cards.clear()
     this.#hostErrors.clear()
+    // Retention describes hosts this controller was reading a moment ago: a torn-down
+    // router must not replay them out of its own state on the next install.
+    this.#retainedRows.clear()
+    this.#lastHostSet = null
     if (!this.#installed) return
     const gateway = this.#gateway
     const dispatchOurs = gateway.dispatchRpc === this.#wrapped.dispatchRpc
@@ -941,7 +1073,13 @@ export class HostRouter {
    * What the Devices page shows: whether remote routing is live, and why not.
    * A host whose last call was refused also carries that refusal (`error`), so the
    * page never presents an empty-but-connected host as a healthy one.
-   * @returns {{remote: boolean, reason: string|null, hosts: object[], merged: string[]}}
+   *
+   * `hosts` stays exactly the CONNECTED set (it is what the merged views read); a
+   * paired host that is only momentarily away is reported separately in
+   * `disconnected`, with how many of its sessions are still on screen from the
+   * retention. That is the difference between "disconnected, read-only" and "no such
+   * host", which the row has to be able to say.
+   * @returns {{remote: boolean, reason: string|null, hosts: object[], disconnected: object[], merged: string[]}}
    */
   status() {
     let hosts = []
@@ -959,7 +1097,18 @@ export class HostRouter {
         }
       })
     } catch { hosts = [] }
-    return { remote: this.#installed, reason: this.#installed ? null : this.#reason, hosts, merged: [...MERGED_ENDPOINTS] }
+    const disconnected = this.#disconnectedHosts().map((host) => ({
+      hostId: host.hostId,
+      hostName: String(host.hostName ?? host.hostId),
+      online: false,
+      // Rows the merged list still carries for it: 0 means the user simply has none
+      // listed yet, which is not a failure.
+      retainedSessions: (this.#retainedRows.get(host.hostId) ?? []).length,
+    }))
+    return {
+      remote: this.#installed, reason: this.#installed ? null : this.#reason,
+      hosts, disconnected, merged: [...MERGED_ENDPOINTS],
+    }
   }
 
   /** Remember the last refusal of one host (the log line stays the audit trail). */
@@ -1094,6 +1243,38 @@ export class HostRouter {
     return { kind: 'remote', hostId, hostName: host.hostName ?? hostId, connection: host.connection }
   }
 
+  /**
+   * A reorder moves one row next to `beforeWorkspaceId` / `beforeSessionId`. The
+   * merged sidebar renders Local and every remote Workspace in ONE list, so it can
+   * hand back an anchor that belongs to a different list than the row being moved —
+   * but each Host stores its own durable order and no Host can express a position in
+   * another's (or in Local's). Such a drag is refused here, once, with a code the UI
+   * can show; forwarding it would ask a Host to place a row it does not own.
+   *
+   * This is the mover/anchor counterpart of `#route`'s one-host rule, and it is
+   * deliberately narrow: only the two reorder endpoints carry an anchor, and only
+   * they are checked. An omitted anchor (append) is always same-list by definition.
+   * @param {string} endpoint the call being dispatched
+   * @param {object} payload the call as the local UI issued it
+   */
+  #assertSameReorderList(endpoint, payload) {
+    const args = payloadArgs(payload)
+    const anchorKey = Object.hasOwn(REORDER_ANCHOR_FIELDS, endpoint) ? REORDER_ANCHOR_FIELDS[endpoint] : undefined
+    if (anchorKey === undefined) return
+    const anchor = args[anchorKey]
+    // No anchor appends within the mover's own list: nothing crosses.
+    if (typeof anchor !== 'string' || anchor === '') return
+    const movedHost = hostIdOfId(typeof args.workspaceId === 'string' ? args.workspaceId : '')
+    const anchorHost = hostIdOfId(anchor)
+    if (movedHost === anchorHost) return
+    // The two ways to cross a boundary, each named so the row can say which list the
+    // user aimed at instead of dropping the drag on the floor.
+    const listOf = (hostId) => (hostId === null ? 'Local' : `remote host ${hostId}`)
+    throw new HostRouterError('remote/reorder-cross-host',
+      `a reorder cannot place a row of ${listOf(movedHost)} next to a row of ${listOf(anchorHost)}; `
+      + 'each list keeps its own order', { movedHost, anchorHost })
+  }
+
   #localDispatch(endpoint, payload, signal, peer) {
     const target = this.#root?.dispatchRpc ?? rootOriginal(this.#gateway.dispatchRpc)
     if (typeof target !== 'function') {
@@ -1122,6 +1303,10 @@ export class HostRouter {
     if (endpoint === MODEL_CATALOG_ENDPOINT && hostIdsIn(payload).size === 0) return this.#mergeModelCatalog(payload, signal, peer)
     let target
     try {
+      // A drag that spans two lists cannot be stored by any one Host (the merged
+      // sidebar draws them as one list; the durable orders are separate). Refused
+      // before routing, so neither a Host nor Local is asked to place a foreign row.
+      this.#assertSameReorderList(endpoint, payload)
       target = this.#route(payload)
     } catch (error) {
       return { ok: false, error: failureOf(error) }
@@ -1277,6 +1462,7 @@ export class HostRouter {
     if (!local || local.ok !== true) return local
     const items = Array.isArray(local.value?.items) ? [...local.value.items] : []
     const hosts = this.#connectedHosts()
+    const answered = new Set()
     const remote = await Promise.all(hosts.map(async (host) => {
       try {
         const value = await host.connection.call('session/list', args, { signal })
@@ -1285,17 +1471,112 @@ export class HostRouter {
         // and takes that host's whole contribution with it.
         const renamed = rows.map((row) => withoutRemoteCwd(this.#ingress(host.hostId, row, 'session/list row')))
         this.#hostErrors.delete(host.hostId)
+        answered.add(host.hostId)
+        this.#rememberRows(host.hostId, renamed)
         return renamed
       } catch (error) {
         this.#noteHostError(host.hostId, error)
         this.#log(`session/list from ${host.hostId} failed: ${error?.code ?? 'error'}`)
-        return []
+        // A host that just failed is offline as far as the list is concerned: its
+        // last-known rows keep the user's sessions on screen (read-only) instead of
+        // making them vanish. A refusal with a real answer (`auth/forbidden-scope`)
+        // lists nothing, so retention would only resurrect a list that host no longer
+        // grants — those rows are dropped instead.
+        return this.#retainedOrNothing(host.hostId, error)
       }
     }))
     for (const rows of remote) items.push(...rows)
+    // A host that is paired but not connected contributes what it last told us.
+    for (const host of this.#disconnectedHosts()) {
+      if (answered.has(host.hostId)) continue
+      items.push(...(this.#retainedRows.get(host.hostId) ?? []))
+    }
     // Stable sort: equal `updatedAt` keeps Local first, then host order.
     items.sort((a, b) => Number(b?.updatedAt ?? 0) - Number(a?.updatedAt ?? 0))
     return { ...local, value: { ...(isPlainObject(local.value) ? local.value : {}), items } }
+  }
+
+  /**
+   * Remember one host's last `session/list` rows (already renamed, already stripped).
+   * Retention is bounded and never applies to a host this controller has forgotten:
+   * only a paired host is ever replayed (see `#disconnectedHosts`).
+   */
+  #rememberRows(hostId, rows) {
+    if (typeof hostId !== 'string' || hostId === '') return
+    this.#retainedRows.delete(hostId)
+    this.#retainedRows.set(hostId, rows)
+    while (this.#retainedRows.size > MAX_RETAINED_HOSTS) {
+      this.#retainedRows.delete(this.#retainedRows.keys().next().value)
+    }
+  }
+
+  /**
+   * What a host contributes when its `session/list` call failed.
+   *
+   * A transport failure (`remote/host-offline`, a closed socket, a timeout) leaves the
+   * rows it last listed intact: they are the user's sessions and their host is only
+   * momentarily away. A refusal the Host itself produced (`auth/forbidden-scope`, a
+   * protocol error) means the answer is "nothing for you", so the retained rows are
+   * dropped rather than shown behind a permission that no longer exists.
+   * @returns {object[]} the rows this failing host still contributes
+   */
+  #retainedOrNothing(hostId, error) {
+    if (!isLinkFailure(error)) {
+      // The Host spoke and refused: it grants nothing, so nothing is retained.
+      this.#retainedRows.delete(hostId)
+      return []
+    }
+    return this.#retainedRows.get(hostId) ?? []
+  }
+
+  /**
+   * The PAIRED hosts that hold no live link right now, from `deps.knownHosts`.
+   * Their rows are retained, so the merged list still carries them; the Devices page
+   * marks them disconnected from the same host set. A controller mounted without
+   * `knownHosts` (a router test harness, an older caller) reports none, which is
+   * exactly the pre-retention answer.
+   */
+  #disconnectedHosts() {
+    if (!this.#knownHosts) return []
+    let known
+    try { known = this.#knownHosts() } catch { return [] }
+    const connected = new Set(this.#connectedHosts().map((host) => host.hostId))
+    return (Array.isArray(known) ? known : [])
+      .filter((host) => host && typeof host.hostId === 'string' && host.hostId !== '' && !connected.has(host.hostId))
+  }
+
+  /**
+   * Drop everything retained for one host: the one caller is an explicit
+   * forget/revoke. A transient disconnect keeps the rows (that is the point of the
+   * retention), so this must never be reached from a state change.
+   *
+   * The host's follow pumps are ended here too: a forgot/revoked host can never
+   * come back, so a pump waiting for it would keep the reader's stream open with
+   * nothing coming. Ending them lets each stream close normally (or with the
+   * refusal it was holding) instead of stalling.
+   * @returns {boolean} whether anything was retained for `hostId`
+   */
+  forgetHost(hostId) {
+    if (typeof hostId !== 'string' || hostId === '') return false
+    this.#hostErrors.delete(hostId)
+    const stops = this.#followStops.get(hostId)
+    this.#followStops.delete(hostId)
+    if (stops) for (const stop of [...stops]) stop()
+    return this.#retainedRows.delete(hostId)
+  }
+
+  /** Remember one host's follow stop, so `forgetHost` can end it. */
+  #trackFollow(hostId, stop) {
+    let stops = this.#followStops.get(hostId)
+    if (!stops) { stops = new Set(); this.#followStops.set(hostId, stops) }
+    stops.add(stop)
+  }
+
+  #untrackFollow(hostId, stop) {
+    const stops = this.#followStops.get(hostId)
+    if (!stops) return
+    stops.delete(stop)
+    if (stops.size === 0) this.#followStops.delete(hostId)
   }
 
   /**
@@ -1438,6 +1719,9 @@ export class HostRouter {
       return Promise.reject(error)
     }
     if (target.kind === 'local') return this.#localOpen(endpoint, payload, uplink, peer, signal, control, uplinkWindow)
+    // A followed session outlives one link: it is the transcript the user is watching,
+    // so it resumes on its own instead of ending with the socket (see #openRemoteFollow).
+    if (endpoint === SESSION_FOLLOW_ENDPOINT) return this.#openRemoteFollow(target, payload, signal)
     return this.#openRemote(target, endpoint, payload, uplink, signal)
   }
 
@@ -1467,6 +1751,154 @@ export class HostRouter {
         yield frame
       }
     })()
+  }
+
+  /**
+   * One `session/follow` on a remote Host, kept alive across a reconnect.
+   *
+   * A followed session is the transcript the user is watching. Wiring it to one
+   * `openStream` meant the stream ENDED when the socket closed — a clean end, which
+   * the consumer reads as "this session has nothing more", so the conversation froze
+   * until the whole page was reopened. The only way back was to restart DSH.
+   *
+   * So the follow is a pump rather than a pass-through: when the link drops it waits
+   * for that host to come back (`onHostsChanged`, which the link supervisor already
+   * fires on every state change) and re-opens the SAME follow. A follow re-opened on a
+   * live session opens with a fresh snapshot holding everything committed meanwhile,
+   * so the reader gets the missed stretch as `event` frames and nothing it already
+   * showed (`resumedFollowFrames`): no duplicate row and no gap.
+   *
+   * The reader's guarantee is unchanged: `signal` ending (or the caller abandoning the
+   * iterator) stops the pump for good, retry included, and no attempt outlives it.
+   * Cancelling during the offline wait does not have to wait for the host either.
+   */
+  async #openRemoteFollow(target, payload, signal) {
+    const { hostId } = target
+    const args = this.#forwardArgs(payload, hostId)
+    this.#assertNoNamespace(args, hostId)
+    const sessionId = this.#cache ? followSessionId(args) : null
+    const cache = this.#cache
+    const lifetime = new AbortController()
+    const queue = new ValueQueue()
+    const stop = () => { lifetime.abort(); queue.close() }
+    this.#merges.add(stop)
+    this.#trackFollow(hostId, stop)
+    const onAbort = () => stop()
+    if (signal) {
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+    }
+    /** The last committed durable sequence already delivered to the reader. */
+    let lastSeq = null
+    /** Whether a frame ever reached the reader: a later opening is a RESUME. */
+    let opened = false
+    // The first attempt is awaited like a plain open always was: a caller that got a
+    // stream from here has one open, and a refusal it can never retry still rejects.
+    let settleFirst
+    const firstAttempt = new Promise((resolve, reject) => { settleFirst = { resolve, reject } })
+    firstAttempt.catch(() => {})
+    void (async () => {
+      let attempt = 0
+      let first = true
+      while (!lifetime.signal.aborted) {
+        try {
+          // The host is connected when this pump starts; if it drops in between, the
+          // wait below is bounded by the reader, not by a fixed timeout.
+          const host = this.#hostById(hostId)
+          if (!host) { await this.#awaitHost(hostId, lifetime.signal); continue }
+          const source = await host.connection.openStream(SESSION_FOLLOW_ENDPOINT, args,
+            { signal: lifetime.signal })
+          attempt = 0
+          if (first) { first = false; settleFirst.resolve() }
+          for await (const value of source) {
+            if (lifetime.signal.aborted) break
+            // Refuse before anything is cached: a frame that names a namespace must
+            // never reach the UI, and it must not survive in the local copy either.
+            const frames = opened ? resumedFollowFrames(value, lastSeq ?? -1) : [value]
+            for (const frame of frames) {
+              const renamed = this.#ingress(hostId, frame, SESSION_FOLLOW_ENDPOINT)
+              if (sessionId) cache?.append(hostId, sessionId, frame)
+              const seq = followSeqOf(frame)
+              if (seq !== null) lastSeq = seq
+              opened = true
+              queue.push(renamed)
+            }
+          }
+        } catch (error) {
+          if (lifetime.signal.aborted) break
+          // A refusal the Host itself produced is not going to change by re-opening:
+          // report it and end, exactly as a single attempt always did.
+          if (!isLinkFailure(error)) {
+            if (first) { first = false; settleFirst.reject(error) }
+            queue.fail(error)
+            return
+          }
+          this.#log(`session/follow for ${hostId} stopped (${error?.code ?? error?.closeCode ?? 'link'}); it resumes with the link`)
+          if (first) { first = false; settleFirst.resolve() }
+        }
+        if (lifetime.signal.aborted) break
+        // The link went away (or the Host closed the stream): wait for it and re-open.
+        // `attempt` only paces the loop so a host that greets and drops cannot spin it.
+        attempt += 1
+        await this.#awaitHost(hostId, lifetime.signal, Math.min(100 * attempt, 1000))
+      }
+    })().catch((error) => {
+      if (!lifetime.signal.aborted) queue.fail(error)
+      settleFirst.reject(error)
+    }).finally(() => {
+      signal?.removeEventListener?.('abort', onAbort)
+      this.#merges.delete(stop)
+      this.#untrackFollow(hostId, stop)
+      queue.close()
+    })
+    await firstAttempt
+    // Abandoning the iterator is a cancellation too: the pump must not keep a link,
+    // a subscription or a timer alive behind a stream nobody reads.
+    const iterator = queue[Symbol.asyncIterator]()
+    return {
+      [Symbol.asyncIterator]() { return this },
+      next: () => iterator.next(),
+      return(value) {
+        stop()
+        return iterator.return?.(value) ?? Promise.resolve({ value: undefined, done: true })
+      },
+    }
+  }
+
+  /**
+   * Resolve when `hostId` is connected again, the reader cancels, or `delayMs`
+   * passes — whichever is first. The subscription is what makes this exact: the link
+   * supervisor notifies on every state change, so nothing here polls the host.
+   *
+   * The delay is always honoured, even for a host that is still connected (its stream
+   * ended on its own): re-opening at once would spin the pump against a host that
+   * greets and drops.
+   */
+  #awaitHost(hostId, signal, delayMs = 0) {
+    if (signal.aborted) return Promise.resolve()
+    const ready = this.#hostById(hostId)
+    if (!ready && delayMs === 0) {
+      return new Promise((resolve) => {
+        const finish = () => { unsubscribe(); signal.removeEventListener('abort', finish); resolve() }
+        const unsubscribe = this.#onHostsChanged(() => { if (this.#hostById(hostId)) finish() })
+        signal.addEventListener('abort', finish, { once: true })
+      })
+    }
+    return new Promise((resolve) => {
+      let timer = null
+      const finish = () => {
+        unsubscribe()
+        if (timer) clearTimeout(timer)
+        signal.removeEventListener('abort', finish)
+        resolve()
+      }
+      // With a delay, both the timer and a reconnect end the wait: a host that comes
+      // back earlier is re-opened earlier, and the timer bounds a host that is still up.
+      const unsubscribe = ready ? () => {} : this.#onHostsChanged(() => { if (this.#hostById(hostId)) finish() })
+      signal.addEventListener('abort', finish, { once: true })
+      timer = setTimeout(finish, delayMs)
+      timer.unref?.()
+    })
   }
 
   /** The local copy of a session whose host is offline, as a read-only stream. */

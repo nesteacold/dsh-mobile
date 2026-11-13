@@ -14,7 +14,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { AppController, type AppStateSnapshot, type WebLockSnapshot } from '../src/app-state';
 import { parseSessionDeepLink, type UpdateRequired } from '../src/core';
-import { StartupSequence } from '../src/core/startup';
+import { StartupSequence, type StartupStatus } from '../src/core/startup';
 import { UnlockAttempts } from '../src/core/unlock-attempt';
 import { lockAction, unlockCopyKey } from '../src/core/web-lock';
 import { authenticate, initialNotificationUrl, unlockCapability, unlockUnavailableKey } from '../src/platform';
@@ -79,6 +79,20 @@ export default function RootLayout() {
     () => new StartupSequence({ start: () => controller.start(), reset: () => controller.stop() }),
     [controller],
   );
+  /**
+   * The web bootstrap renders pairing from this: `pair()` reads the stored host list, so an attempt
+   * made before a failed start has finished comes back `client/bad-state` ("not ready") forever, and
+   * the native gate's retry (`attemptUnlock`) never runs on web. The bootstrap therefore shows the
+   * failure and retries the same startup path instead.
+   */
+  const [startupStatus, setStartupStatus] = useState<StartupStatus>(() => startup.status);
+  const runStartup = useCallback(async (): Promise<boolean> => {
+    setStartupStatus('starting');
+    // `ensure()` never rejects; a failure is recorded on the sequence and resolved as `false`.
+    const started = await startup.ensure();
+    setStartupStatus(startup.status);
+    return started;
+  }, [startup]);
 
   useEffect(() => {
     // A020/M5: an unlock prompt that outlives the layout must not touch state or the controller.
@@ -89,13 +103,14 @@ export default function RootLayout() {
   useEffect(() => {
     const unsubscribe = controller.subscribe(setSnapshot);
     // One attempt, shared with the unlock path below: the gate may run before the host list is
-    // loaded. `ensure()` records a failure (it never rejects); the unlock path reports it.
-    void startup.ensure();
+    // loaded. `ensure()` records a failure (it never rejects); the unlock path reports it, and on
+    // web the bootstrap does (see `startupStatus`).
+    void runStartup();
     return () => {
       unsubscribe();
       controller.stop();
     };
-  }, [controller, startup]);
+  }, [controller, runStartup]);
 
   const attemptUnlock = useCallback(
     async (auto: boolean) => {
@@ -247,6 +262,8 @@ export default function RootLayout() {
             controller={controller}
             snapshot={snapshot}
             tr={tr}
+            startupStatus={startupStatus}
+            onRetryStartup={() => void runStartup()}
             onRegister={() => void controller.registerAndUnlockWebPasskey()}
             onUnlock={() => void controller.unlockWithPasskey()}
           />
@@ -345,15 +362,56 @@ function WebBootstrap(props: {
   controller: AppController;
   snapshot: AppStateSnapshot;
   tr: Interpolate;
+  startupStatus: StartupStatus;
+  onRetryStartup: () => void;
   onRegister: () => void;
   onUnlock: () => void;
 }) {
-  const { controller, snapshot, tr, onRegister, onUnlock } = props;
+  const { controller, snapshot, tr, startupStatus, onRetryStartup, onRegister, onUnlock } = props;
   const palette = paletteFor(useColorScheme() === 'light' ? 'light' : 'dark');
+  /**
+   * A failed cold start is shown here and nowhere else on web: `pair()` reads the stored host list,
+   * so every attempt made before it loaded is refused `client/bad-state` ("not ready"), and on web
+   * no native retry path exists. Retry re-runs the same startup (`ensure()` → `start()`, after
+   * `reset()`), so the bootstrap recovers instead of staying stuck on the pair screen.
+   */
+  const startupFailed = startupStatus === 'failed';
+  const startupPending = startupStatus === 'idle' || startupStatus === 'starting';
+  const startupNotice =
+    startupFailed || startupPending ? (
+      <View style={styles.startupNotice} testID="web-startup-notice">
+        <Text style={[styles.message, { color: startupFailed ? palette.warning : palette.textMuted }]}>
+          {tr(startupFailed ? 'startup.failed' : 'startup.starting')}
+        </Text>
+        {startupFailed ? (
+          <TouchableOpacity
+            style={[styles.secondary, { backgroundColor: palette.surface }]}
+            accessibilityRole="button"
+            testID="web-startup-retry"
+            accessibilityLabel={tr('startup.retry')}
+            onPress={onRetryStartup}
+          >
+            <Text style={[styles.secondaryText, { color: palette.text }]}>{tr('startup.retry')}</Text>
+          </TouchableOpacity>
+        ) : null}
+      </View>
+    ) : null;
   if (snapshot.activeHost === null) {
     // The pair panel takes the controller through props, so the bootstrap needs no `useApp` context
     // (there is no navigator it could belong to) and the pairing rules stay in one place.
-    return <PairPanel controller={controller} snapshot={snapshot} tr={tr} />;
+    //
+    // While startup is pending or failed the panel cannot be pressed: `pair()` reads the stored host
+    // list, so an attempt would only be refused `client/bad-state` ("not ready"). Its state is kept
+    // (a pasted code stays on screen) and the retry button above it stays reachable, because it sits
+    // outside the blocked view.
+    return (
+      <View style={styles.bootstrap}>
+        {startupNotice}
+        <View style={styles.bootstrapBody} pointerEvents={startupFailed || startupPending ? 'none' : 'auto'}>
+          <PairPanel controller={controller} snapshot={snapshot} tr={tr} />
+        </View>
+      </View>
+    );
   }
   const lock: WebLockSnapshot = snapshot.webLock ?? {
     // Paired but no `hello` yet (no socket): a web install waits for its passkey, which is the same
@@ -364,7 +422,12 @@ function WebBootstrap(props: {
     approval: null,
     error: null,
   };
-  return <WebLockGate lock={lock} tr={tr} onRegister={onRegister} onUnlock={onUnlock} />;
+  return (
+    <View style={styles.bootstrap}>
+      {startupNotice}
+      <WebLockGate lock={lock} tr={tr} onRegister={onRegister} onUnlock={onUnlock} />
+    </View>
+  );
 }
 
 /**
@@ -514,6 +577,9 @@ export function useApp(): AppContextValue {
 // src/ui/theme.ts); these styles carry layout/typography only.
 const styles = StyleSheet.create({
   overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  bootstrap: { flex: 1 },
+  bootstrapBody: { flex: 1 },
+  startupNotice: { paddingHorizontal: 20, paddingVertical: 12, gap: 8, alignItems: 'flex-start' },
   gate: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32, gap: 12 },
   title: { fontSize: 26, fontWeight: '700' },
   subtitle: { fontSize: 15, textAlign: 'center' },

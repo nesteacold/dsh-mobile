@@ -458,3 +458,71 @@ test('remote terminal: hidden without the terminal grant, an entry with it, and 
   assert.equal(localPage.toJSON(), null)
   localPage.unmount()
 })
+
+test('a revoked host never reads as disconnected, even when the router still lists it', async () => {
+  // `revoked` is decided BEFORE the router's retained entry: a grant that was taken
+  // away is not "read-only, it comes back".
+  const ui = load({
+    remotes: [{ ...REMOTE, id: 'r1', status: 'revoked' }],
+    routing: { remote: true, reason: null, merged: ['session/list'], hosts: [],
+      disconnected: [{ hostId: 'r1', hostName: 'Qoder-Sigma', online: false, retainedSessions: 3 }] },
+  })
+  await flush()
+  const link = ui.api.testing.hostLinkOf(ui.api.testing.hostsStore.getSnapshot(), 'r1')
+  assert.equal(link.revoked, true)
+  assert.equal(link.disconnected, false, 'a revoked grant is not a disconnected link')
+})
+
+test('a disconnected host is labelled as such, not as a host that was never there', async () => {
+  // The router retains a paired host's session rows while its link is down, so the row
+  // and the composer must say "Disconnected" — the sessions are still there and
+  // readable, only sending is refused. `routing.disconnected` is what carries that.
+  const DISCONNECTED = {
+    remote: true, reason: null, merged: ['session/list'],
+    hosts: [],
+    disconnected: [{ hostId: 'r1', hostName: 'Qoder-Sigma', online: false, retainedSessions: 3 }],
+  }
+  const ui = load({ routing: DISCONNECTED })
+  await flush()
+  // The single answer every surface reads.
+  const link = ui.api.testing.hostLinkOf(ui.api.testing.hostsStore.getSnapshot(), 'r1')
+  assert.equal(link.online, false)
+  assert.equal(link.disconnected, true, 'a paired host with no link is disconnected, not unknown')
+  assert.equal(link.retainedSessions, 3, 'and it says how much is still listed')
+  assert.equal(link.name, 'Qoder-Sigma', 'the paired name survives the drop')
+  // A tag naming a host the window has no record of is NOT disconnected: nothing is
+  // retained for it, so claiming otherwise would invent a retention.
+  assert.equal(ui.api.testing.hostLinkOf(ui.api.testing.hostsStore.getSnapshot(), 'r-unknown').disconnected, false)
+
+  // The native row badge: dot off, and the title names the state.
+  const badge = await mount(React.createElement(ui.entryOf('sidebar.session.row.trailing').component, { sessionId: 'h:r1:s-remote' }))
+  const node = byTestId(badge, 'session-host-badge')[0]
+  assert.equal(node.props['data-link'], 'disconnected')
+  assert.match(byTestId(badge, 'session-host-dot')[0].props.className, /(^|\s)off(\s|$)/)
+  assert.match(node.props.title, /Disconnected/, 'the badge says which kind of dead the link is')
+  assert.match(text(badge), /Qoder-Sigma/, 'the host name is still shown')
+  badge.unmount()
+
+  // The composer chip's popover says what still works, so "Offline" is not the whole story.
+  const chip = await mount(React.createElement(ui.entryOf('conversation.input.left').component, { sessionId: 'h:r1:s-remote' }))
+  await click(byTestId(chip, 'host-chip')[0])
+  assert.equal(byTestId(chip, 'popover-state')[0].children.join(''), ui.api.testing.DICT.en['status.disconnected'])
+  assert.ok(byTestId(chip, 'popover-disconnected').length, 'the read-only note is offered')
+  assert.match(text(chip), /Sessions stay listed and readable/)
+  chip.unmount()
+
+  // The banner above the conversation: the task is NOT gone, it is disconnected.
+  const dock = await mount(React.createElement(ui.entryOf('conversation.input.dock').component, { sessionId: 'h:r1:s-remote' }))
+  const banner = byTestId(dock, 'offline-banner')[0]
+  assert.ok(banner, 'a notice is still shown')
+  assert.equal(banner.props['data-link'], 'disconnected')
+  assert.doesNotMatch(text(dock), /no longer available/, 'it never claims the task was lost')
+  assert.match(text(dock), /Disconnected/)
+  dock.unmount()
+
+  // Both dictionaries carry the new strings.
+  const { DICT } = ui.api.testing
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
+  assert.notEqual(DICT.vi['status.disconnected'], DICT.en['status.disconnected'], 'a real translation, not a copy')
+  assert.notEqual(DICT.vi['status.disconnectedSessions'], DICT.en['status.disconnectedSessions'])
+})

@@ -388,6 +388,27 @@ function createRegistry(file, options = {}) {
     },
 
     /**
+     * Spec 025 R3: replace one live record's scope list, persisted with the same atomic save every
+     * other mutation uses. The credential (its digest) and the record's id are untouched, so a
+     * device stays paired; `undefined` means there is no such live device.
+     *
+     * The generation is bumped even though the token does not change: a socket that authenticated
+     * before this call holds the grant it opened with, and the per-message `credentialStillLive`
+     * check is what makes "the next connection carries the new scopes" true for a message that was
+     * already in flight. The device reconnects with the SAME token and is live again immediately.
+     */
+    updateScopes(deviceId, scopes) {
+      const device = devices.find((candidate) => candidate.id === deviceId && !candidate.revokedAt)
+      if (!device) return undefined
+      // The registry never widens a kind's vocabulary on a caller's word: the list is filtered by the
+      // same rule that loads the record (a desktop-only scope on a mobile record is dropped, not saved).
+      device.scopes = normalizeScopes(scopes, device.kind)
+      generations.set(device.id, (generations.get(device.id) || 0) + 1)
+      save()
+      return publicDevice(device, online.get(device.id) || 0)
+    },
+
+    /**
      * Credential generation of a live device, `undefined` when no such device is
      * paired. A connection stores the value it authenticated with and compares
      * it before serving, so neither a re-pair nor a revocation can be outlived.

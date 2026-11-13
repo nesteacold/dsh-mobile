@@ -154,7 +154,28 @@ export const CLIENT_ERROR_CODES = [
   'client/pairing-timeout',
   /** The one-time code or the pending approval request expired (pairing close 4410). */
   'client/pairing-expired',
-  /** The Host asked for a one-time code; this app version has no OTP flow yet (contract §3.8). */
+  /**
+   * `paired` stated no `gatewayId` and the payload had none either (an OTP pairing). The token
+   * would be stored under an empty key nothing can read back or revoke, so nothing is stored.
+   */
+  'client/pairing-no-host-id',
+  /**
+   * `paired` named a Host this device already has a record for, with a different pin or address:
+   * a frame claiming another computer's identity. Refused so the existing record and its token are
+   * never replaced by a pairing that did not prove it is that computer.
+   */
+  'client/pairing-host-conflict',
+  /**
+   * The two pairing flows disagree (contract revision 5 §3.8): the Host is running the
+   * OTP flow and this attempt carries no one-time code, or a code was supplied and the Host
+   * is running the long-pairing-string flow. Nothing was sent — a proof without the code is
+   * exactly what the Host answers 4410 for.
+   */
+  'client/pairing-otp-required',
+  /**
+   * No longer produced (kept for stored diagnostics): the OTP flow used to be unimplemented and
+   * a `otpRequired` challenge failed with this code. `test/i18n.test.ts` still maps its copy.
+   */
   'client/pairing-otp-unsupported',
   /**
    * The platform's credential store cannot be used at all (web: no IndexedDB or no WebCrypto).

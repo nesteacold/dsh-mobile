@@ -319,12 +319,33 @@ for (const [label, offer] of [['mobile', AUTHOR.mobile], ['desktop', AUTHOR.desk
     assert.equal(selectCalls.length, 1, JSON.stringify(selectCalls))
     assert.deepEqual(selectCalls[0].args, { request: { sessionId: 's1', provider: 'p', model: 'm' } })
 
-    // Every authoring call went through THIS device's non-owner adapter: the
-    // Host-side policy and the positive guard see all of them (never the owner).
+    // Every authoring call the DEVICE caused went through THIS connection's
+    // non-owner adapter: the Host-side policy and the positive guard see all of
+    // them (never the owner).
+    //
+    // The one owner-principal call this window may contain is the plugin's own
+    // workspace-id refresh — `workspace/follow` on the owner adapter, re-read when
+    // its 2 s TTL has expired (`refreshWorkspaceIds`). That read CANNOT be done as
+    // the device: DSH filters the device's baseline item by item through the very
+    // policy bindings this refresh feeds, so the full id list is only readable on
+    // the owner adapter (PROTOCOL.md §workspaces, spec 011 FR-003). It is a read the
+    // plugin performs for itself, not a device request; whether it lands inside this
+    // window depends on how long pairing took, so it is excluded from the device
+    // assertion and bounded here instead: nothing else may run as the owner, and
+    // the device's OWN listing must still be device-principal (asserted below).
     const authoring = instance.hostCalls.slice(since).filter((call) =>
       ['session/create', 'session/selectModel', 'session/modelCatalog', 'workspace/follow'].includes(call.endpoint))
     assert.ok(authoring.length > 0)
-    for (const call of authoring) {
+    const internalRefresh = authoring.filter((call) => call.principal?.kind === 'owner')
+    for (const call of internalRefresh) {
+      assert.equal(call.endpoint, 'workspace/follow', `${call.endpoint} must never run as the owner`)
+      assert.equal(call.kind, 'stream', 'the internal refresh is the workspace baseline stream')
+      assert.equal(call.principal?.deviceId, undefined, 'the internal refresh names no device')
+    }
+    const deviceAuthoring = authoring.filter((call) => call.principal?.kind !== 'owner')
+    assert.ok(deviceAuthoring.some((call) => call.endpoint === 'workspace/follow'),
+      "the device's own workspace listing must run as the device")
+    for (const call of deviceAuthoring) {
       assert.equal(call.principal?.kind, 'dsh-ext-mobile-device', `${call.endpoint} must run as the device`)
       assert.equal(typeof call.principal?.deviceId, 'string')
     }

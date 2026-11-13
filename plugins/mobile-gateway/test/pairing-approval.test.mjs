@@ -1,6 +1,6 @@
 // Spec 008 P1b — pairing with manual Host approval (OTP offer -> pending -> Approve/Reject).
 //
-//   P1  wrong OTP x3 burns the code (a later correct proof is refused too)
+//   P1  wrong OTP x3 burns the code (spec 023: 2 from one source, the 3rd from another)
 //   P2  a pending socket cannot call anything and holds no token
 //   P3  approve issues the token on the waiting socket; scopes are narrowed
 //   P4  reject closes 4403 and issues nothing
@@ -126,10 +126,16 @@ let counter = 0
 const nonce = () => crypto.randomBytes(18).toString('base64url')
 
 /** Open the OTP pairing socket and collect every frame it receives. */
-async function openPairing(instance, { deviceId, name = 'Test laptop', protocols = OTP_PROTOCOLS } = {}) {
+async function openPairing(instance, { deviceId, name = 'Test laptop', protocols = OTP_PROTOCOLS, forwarded = false } = {}) {
   const id = deviceId ?? `p1bdev-${String(++counter).padStart(4, '0')}-aaaa`
   const ws = instance.track(new WebSocket(instance.lanUrl, protocols, {
-    headers: { 'X-DSH-Device-ID': id, 'X-DSH-Device-Name': Buffer.from(name).toString('base64') },
+    headers: {
+      'X-DSH-Device-ID': id,
+      'X-DSH-Device-Name': Buffer.from(name).toString('base64'),
+      // Spec 023: a forwarding-family header puts this connection in the ONE shared `proxied`
+      // source bucket; without it the socket peer address is the source.
+      ...(forwarded ? { 'X-Forwarded-For': '203.0.113.9' } : {}),
+    },
     origin: undefined, rejectUnauthorized: false,
   }))
   const frames = []
@@ -192,24 +198,29 @@ test('P0: an OTP offer is 8 digits, 10-minute TTL, and the registry never sees t
   assert.equal((await instance.post('pair', { mode: 'qr' })).status, 400)
 })
 
-test('P1: wrong OTP x3 burns the code', async (t) => {
+test('P1: wrong OTP x3 from two sources burns the code', async (t) => {
   const instance = await factory(t)
   const offer = await newOtp(instance)
   const wrong = offer.otp === '00000000' ? '11111111' : '00000000'
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  // Spec 023 decision 2026-11-13: one source spends its budget (2) and is limited, so it cannot burn
+  // alone; the third tested proof has to come from a second source.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     const session = await openPairing(instance)
     prove(session, wrong, instance)
     assert.equal(await session.closed, 4410, `wrong proof #${attempt + 1} is refused`)
   }
-  // The code is burned: the CORRECT proof no longer works.
-  const session = await openPairing(instance)
+  const second = await openPairing(instance, { forwarded: true })
+  prove(second, wrong, instance)
+  assert.equal(await second.closed, 4410, 'the third tested proof comes from another source')
+  // The code is burned: the CORRECT proof no longer works, from either source.
+  const session = await openPairing(instance, { forwarded: true })
   prove(session, offer.otp, instance)
   assert.equal(await session.closed, 4410, 'a burned code is refused even with the right proof')
   assert.equal((await instance.get('pending')).data.pending.length, 0)
   assert.equal((await instance.get('devices')).data.devices.length, 0)
 })
 
-test('P1b: two wrong proofs do not burn the code; the third attempt can still be right', async (t) => {
+test('P1b: two wrong proofs do not burn the code, and an unlimited source can still pair with it', async (t) => {
   const instance = await factory(t)
   const offer = await newOtp(instance)
   const wrong = offer.otp === '00000000' ? '11111111' : '00000000'
@@ -218,12 +229,14 @@ test('P1b: two wrong proofs do not burn the code; the third attempt can still be
     prove(session, wrong, instance)
     assert.equal(await session.closed, 4410)
   }
-  const session = await openPairing(instance)
+  // 2 tested proofs are below OTP_MAX_FAILURES, and the source that spent them is limited — so the
+  // right code arrives from a different source, which is exactly what spec 023 allows.
+  const session = await openPairing(instance, { forwarded: true })
   prove(session, offer.otp, instance)
   await session.take((frame) => frame.kind === 'pairing-pending')
   assert.equal((await instance.get('pending')).data.pending.length, 1)
-  // Single use: the same OTP does not open a second request.
-  const again = await openPairing(instance)
+  // Single use: the same OTP does not open a second request (a fresh source, so not the limiter).
+  const again = await openPairing(instance, { forwarded: true })
   prove(again, offer.otp, instance)
   assert.equal(await again.closed, 4410)
 })
@@ -422,6 +435,52 @@ test('P9: the admin routes refuse non-loopback and cross-origin callers', async 
   assert.equal((await instance.get('pending')).data.pending.length, 1)
   assert.equal(session.ws.readyState, 1)
   assert.equal((await instance.get('devices')).data.devices.length, 0)
+})
+
+test('P16: spec 023 — one proxied source cannot burn the owner\'s offer alone; 3 tested proofs can', async (t) => {
+  const instance = await factory(t)
+  const offer = await newOtp(instance)
+  const wrong = offer.otp === '00000000' ? '11111111' : '00000000'
+  const attempt = async ({ forwarded }, code = wrong) => {
+    const session = await openPairing(instance, { forwarded })
+    prove(session, code, instance)
+    return session.closed
+  }
+  // Every forwarded attempt is the SAME source (the shared `proxied` bucket), so the limiter trips at
+  // SOURCE_MAX_FAILURES = 2. Both proofs were tested (2 < OTP_MAX_FAILURES), so nothing is burned.
+  for (let i = 0; i < 2; i += 1) assert.equal(await attempt({ forwarded: true }), 4410, `proxied junk #${i + 1} refused`)
+  // The shared bucket is now spent: further proofs from it are refused UNTESTED (same wire answer),
+  // so the bucket alone cannot reach the offer's burn ceiling of 3.
+  assert.equal(await attempt({ forwarded: true }), 4410, 'the limited bucket is refused')
+  // A second, unlimited source supplies the third TESTED proof, and that burns the owner's offer.
+  assert.equal(await attempt({ forwarded: false }), 4410)
+  // Proven by the right code: this direct source has spent only ONE of its two failures, so it is
+  // NOT limited — the refusal can only be the burn.
+  assert.equal(await attempt({ forwarded: false }, offer.otp), 4410, 'the offer is burned: the right code no longer works')
+  assert.equal((await instance.get('pending')).data.pending.length, 0)
+  assert.equal((await instance.get('devices')).data.devices.length, 0)
+})
+
+test('P16b: spec 023 — a correct proof from an unlimited source still pairs before any burn', async (t) => {
+  const instance = await factory(t)
+  const offer = await newOtp(instance)
+  const wrong = offer.otp === '00000000' ? '11111111' : '00000000'
+  // Spend the shared `proxied` bucket (2 tested proofs, still below OTP_MAX_FAILURES = 3), so the
+  // owner's offer is alive and that bucket is limited. Nothing is burned.
+  for (let i = 0; i < 2; i += 1) {
+    const session = await openPairing(instance, { forwarded: true })
+    prove(session, wrong, instance)
+    assert.equal(await session.closed, 4410, `junk proof #${i + 1} refused`)
+  }
+  // The limited bucket cannot use its knowledge: the RIGHT code is refused there.
+  const limited = await openPairing(instance, { forwarded: true })
+  prove(limited, offer.otp, instance)
+  assert.equal(await limited.closed, 4410, 'a limited source is refused even with the right code')
+  // A different, unlimited source pairs with the same untouched offer.
+  const pairer = await openPairing(instance)
+  prove(pairer, offer.otp, instance)
+  await pairer.take((frame) => frame.kind === 'pairing-pending')
+  assert.equal((await instance.get('pending')).data.pending.length, 1, 'the right code pairs from an unlimited source')
 })
 
 test('P10: the long pairing string goes through pending too (requireHostApproval)', async (t) => {

@@ -74,7 +74,20 @@ describe('pair screen hooks', () => {
   it('exposes the paste field and the submit button the pair-paste subflow needs', () => {
     assert.equal(count(ids, 'pair-manual-input'), 1);
     assert.equal(count(ids, 'pair-submit'), 1);
-    assert.deepEqual(ids.toSorted(), ['pair-manual-input', 'pair-submit']);
+    // Contract revision 5: the one-time-code flow adds a mode switch and its own two inputs. Every
+    // hook is static (a pairing code never reaches a testID, FR-011), and each is rendered once.
+    for (const id of ['pair-mode-code', 'pair-mode-otp', 'pair-otp-address', 'pair-otp-input', 'pair-otp-submit']) {
+      assert.equal(count(ids, id), 1, `${id} is rendered exactly once`);
+    }
+    assert.deepEqual(ids.toSorted(), [
+      'pair-manual-input',
+      'pair-mode-code',
+      'pair-mode-otp',
+      'pair-otp-address',
+      'pair-otp-input',
+      'pair-otp-submit',
+      'pair-submit',
+    ]);
   });
 });
 
@@ -124,6 +137,34 @@ describe('session screen hooks', () => {
   it('marks the banner and keeps its localized accessibility label', () => {
     assert.equal(count(ids, 'banner'), 1);
     assert.match(source, /testID="banner"\s+accessibilityLabel=\{banner\}/);
+  });
+});
+
+describe('pair screen: the one-time-code form on a phone', () => {
+  const source = readFileSync(PAIR, 'utf8');
+
+  it('refuses the 8-digit code on native BEFORE any connection is attempted', () => {
+    // A code carries no certificate, and the native transport refuses an unpinned socket outright,
+    // so the attempt would burn one of the Host's three proofs before failing. The guard must
+    // therefore sit before this form's own `controller.pair(...)` call, not after it.
+    const guard = source.indexOf("if (Platform.OS !== 'web')");
+    assert.ok(guard > 0, 'the native guard is rendered');
+    // The OTP form's connect: the FIRST `controller.pair(` after the guard. (The QR form's call
+    // appears earlier in the file and is a different flow.)
+    const connect = source.indexOf('controller.pair(', guard);
+    assert.ok(connect > 0, 'the OTP form does connect on the web');
+    assert.ok(guard < connect, 'the guard runs before the connection is opened');
+    // It refuses through the localized failure state, which is what the screen renders.
+    const guarded = source.slice(guard, connect);
+    assert.match(guarded, /setFailure\('pair\.error\.otpNative'\)/);
+    assert.match(guarded, /return;/, 'nothing reaches the controller');
+  });
+
+  it('keeps the web on the one-time-code flow', () => {
+    // Spec 020: a browser cannot pin by construction, so the code flow is its honest first-use path.
+    // The guard is an early return for native only; it must not remove the web call.
+    assert.match(source, /if \(Platform\.OS !== 'web'\) \{[\s\S]*?return;[\s\S]*?\}/);
+    assert.equal(source.includes("if (Platform.OS === 'web') return;"), false, 'the web path is not short-circuited');
   });
 });
 

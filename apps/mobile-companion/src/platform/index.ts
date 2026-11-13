@@ -10,3 +10,5 @@ export * from './random';
 export * from './unlock-copy';
 // Spec 021: the pairing's `web:unlock` grant (a no-op pair on native, the real store on web).
 export * from './web-grant';
+// Spec 020: the page origin for the same-origin gateway address (`null` on native).
+export * from './web-location';

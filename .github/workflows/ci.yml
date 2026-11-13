@@ -1,0 +1,154 @@
+# CI for dsh-mobile (roadmap P0-2, spec 022). One workflow, five independent jobs; each package is
+# gated by the commands AGENTS.md lists for it. Nothing here deploys, publishes or needs a secret.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Read-only token: no job writes to the repository, a release or a package registry.
+permissions:
+  contents: read
+
+# A newer push to the same ref makes the older run obsolete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Every package declares engines.node >=24.9 (built-in WebSocket/crypto features the tests use);
+  # CI runs the same major the developers run locally.
+  NODE_VERSION: '24'
+
+jobs:
+  repo:
+    name: repo gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # Tree completeness: every relative import resolves, every test named by `npm test` exists.
+      - name: verify-publish
+        run: node tools/verify-publish.mjs
+      # PII / secret scan over every tracked file (the same gate the pre-push hook runs).
+      - name: scan-pii
+        run: node tools/scan-pii.mjs --all
+      - name: scan-pii self-test
+        run: node --test tools/scan-pii.test.mjs
+      # Read-only deployment tooling tests (tools/ops/): temp fixtures, no network, no host state.
+      - name: ops tooling tests
+        run: node --test tools/ops/check-profile.test.mjs
+
+  protocol:
+    name: protocol (packages/mobile-protocol)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # The package has no dependencies (its lockfile lists only itself), so there is nothing to
+      # install. `npm test` also checks that the gateway's vendored copy is in sync.
+      - name: npm test
+        run: npm test
+        working-directory: packages/mobile-protocol
+
+  gateway:
+    name: gateway (plugins/mobile-gateway)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: plugins/mobile-gateway/package-lock.json
+      - name: npm ci
+        run: npm ci
+        working-directory: plugins/mobile-gateway
+      - name: npm test
+        run: npm test
+        working-directory: plugins/mobile-gateway
+      - name: check:protocol
+        run: npm run check:protocol
+        working-directory: plugins/mobile-gateway
+      # `npm pack` + `npm install --offline` of the tarball. `--offline` reads the npm cache, which
+      # the `npm ci` above (and setup-node's cache) just filled on this runner.
+      - name: test:package
+        run: npm run test:package
+        working-directory: plugins/mobile-gateway
+
+  devices:
+    name: devices (plugins/devices)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: plugins/mobile-gateway/package-lock.json
+      # WHY the gateway is installed here: plugins/devices has no dependencies of its own (its
+      # lockfile lists only itself). Its tests, and lib/remote-client.mjs, deliberately borrow
+      # `ws`, `selfsigned`, `react` and `react-test-renderer` from
+      # ../mobile-gateway/node_modules (see plugins/devices/README.md), so the gateway's
+      # dependencies must exist on disk before any devices test runs. Without this step every
+      # devices test dies at its first `require('../../mobile-gateway/node_modules/...')`.
+      - name: npm ci (gateway; supplies the devices tests' dependencies)
+        run: npm ci
+        working-directory: plugins/mobile-gateway
+      - name: npm test
+        run: npm test
+        working-directory: plugins/devices
+
+  app:
+    name: app (apps/mobile-companion)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/mobile-companion/package-lock.json
+      - name: npm ci
+        run: npm ci
+        working-directory: apps/mobile-companion
+      - name: typecheck
+        run: npm run typecheck
+        working-directory: apps/mobile-companion
+      - name: check:core
+        run: npm run check:core
+        working-directory: apps/mobile-companion
+      # Static check of the Maestro flows: needs no Maestro, adb or device.
+      - name: check-flows
+        run: node e2e/check-flows.mjs
+        working-directory: apps/mobile-companion
+      # The AGENTS.md app test command, spelled out (it is also `npm test`).
+      - name: unit tests
+        run: node --import tsx --import ./test/support/resolve.ts --import ./test/support/stub-platform.ts --test "test/*.test.ts"
+        working-directory: apps/mobile-companion
+      # `test/serve-web.test.mjs` is the only app test file the `test/*.test.ts` glob cannot reach,
+      # and nothing else runs it. It gates the PWA static server that tools/ops/deploy.ps1 starts as
+      # a logon task (path containment, CSP header, loopback refusal), so it is run here explicitly
+      # rather than left unexecuted. Wiring it into the app's own `npm test` is a separate change to
+      # apps/, which this workflow must not make on its behalf.
+      - name: serve-web (PWA server) tests
+        run: node --test test/serve-web.test.mjs
+        working-directory: apps/mobile-companion
+
+# Deliberately not run in CI; each is skipped by name, never made non-failing:
+#  - gateway `npm run test:security-real` (and test/device-access-real.test.mjs as a proof): needs
+#    DSH_INSTALL_ROOT, a real DSH install. Inside `npm test` it prints UNVERIFIED and exits 0, which
+#    is not a pass; CI inherits that same explicit skip and the log says so.
+#  - app `e2e/run-e2e.mjs` and the Maestro flows: need an emulator or a physical device.
+#  - plugins/mobile-gateway/pnpm-lock.yaml is not used here: CI installs with npm from the committed
+#    package-lock.json. Profile lockfile drift is checked by tools/ops/check-profile.mjs, which needs
+#    a real %USERPROFILE% and is therefore a host gate, not a CI gate.

@@ -432,6 +432,10 @@ export const plugin = {
         store.wipeToken(remote.id)
         store.update(remote.id, { revoked: true })
         entry.approvals.clear()
+        // The grant is gone, so the retained rows are too: they are not "a host that
+        // is briefly away", they are sessions this device may no longer read.
+        hostRouter?.forgetHost(remote.id)
+        sessionListCache.delete(remote.id)
         log(`remote ${remote.id} revoked this device (4401); token wiped`)
       })
       live.set(remote.id, entry)
@@ -619,6 +623,13 @@ export const plugin = {
         }
         return hosts
       },
+      // Every PAIRED host, connected or not: the router keeps a disconnected host's
+      // last-known session rows in the merged list, so losing the link stops
+      // vanishing the user's sessions from the native sidebar. Only a forget or a
+      // revoke takes them away (`hostRouter.forgetHost`), never a transient drop.
+      knownHosts: () => store.list()
+        .filter((remote) => !remote.revoked)
+        .map((remote) => ({ hostId: remote.id, hostName: remote.name })),
       onHostsChanged: (listener) => {
         hostListeners.add(listener)
         return () => hostListeners.delete(listener)
@@ -978,8 +989,12 @@ export const plugin = {
             const entry = live.get(id)
             if (entry) { cancelRedial(entry); entry.connection.close() }
             live.delete(id)
-            // A paired host that is forgotten must not leave its browser running.
+            // A paired host that is forgotten must not leave its browser running,
+            // nor its last-known session rows in the merged list: this is the one
+            // explicit removal the retention answers to.
             browsers?.stopHost(id)
+            hostRouter?.forgetHost(id)
+            sessionListCache.delete(id)
             store.remove(id)
             log(`removed remote ${id}`)
             sendJson(res, 200, { removed: true })

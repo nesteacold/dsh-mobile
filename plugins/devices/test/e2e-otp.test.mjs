@@ -3,7 +3,8 @@
 //   - OTP -> pending (verification code on both sides) -> Host approves -> connected, token stored 0600
 //   - the Host narrows scopes on Approve and the stored device reflects it
 //   - Host rejects -> the pairing ends "rejected", nothing is stored
-//   - wrong OTP -> "wrong or expired", nothing is stored; a burned code stays burned
+//   - wrong OTP -> "wrong or expired", nothing is stored; one source's brake is
+//     spent after two wrong proofs (spec 023), so it cannot burn the code alone
 //   - cancel while waiting removes the pending request on the Host
 //   - the advanced long pairing string also waits for approval
 // The gateway is imported read-only; nothing in it is edited.
@@ -96,8 +97,8 @@ const waitPending = async (count) => {
   }
   throw new Error(`expected ${count} pending requests on the host`)
 }
-const newOtp = async (body = {}) => {
-  const created = await gateway.post('pair', { mode: 'otp', kind: 'desktop', ...body })
+const newOtp = async (body = {}, host = gateway) => {
+  const created = await host.post('pair', { mode: 'otp', kind: 'desktop', ...body })
   assert.equal(created.status, 201, JSON.stringify(created.data))
   return created.data.otp
 }
@@ -151,19 +152,35 @@ await check('Host rejects -> the pairing ends "rejected" and nothing is stored',
   assert.equal((await gateway.get('devices')).devices.length, 1, 'only the first, approved device exists')
 })
 
-await check('wrong OTP -> "wrong or expired", nothing stored; three wrong tries burn the code', async () => {
-  const otp = await newOtp()
-  const wrong = otp === '00000000' ? '11111111' : '00000000'
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const started = await startPairing({ address: gateway.address, otp: wrong })
-    const done = await poll(started.json.pairing.id, (view) => view.state === 'failed')
-    assert.match(done.error, /wrong or expired|closed the connection/)
+await check('wrong OTP -> "wrong or expired", nothing stored; one source is limited and cannot burn the code alone', async () => {
+  // Spec 023 (decision 2026-11-13): wrong proofs are braked per source (2 / 10 min, keyed by the
+  // socket peer address) BELOW the per-offer ceiling (3 tested proofs), so this loopback source
+  // can never burn the offer alone. Its own gateway instance keeps that spent budget off the
+  // shared one the later tests still need, and every attempt here dials from the one same source.
+  const scratch = await startGateway()
+  try {
+    const otp = await newOtp({}, scratch)
+    const wrong = otp === '00000000' ? '11111111' : '00000000'
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const started = await startPairing({ address: scratch.address, otp: wrong })
+      const done = await poll(started.json.pairing.id, (view) => view.state === 'failed')
+      assert.match(done.error, /wrong or expired|closed the connection/)
+    }
+    // The budget is spent: the third wrong proof is refused untested by the brake.
+    const limited = await startPairing({ address: scratch.address, otp: wrong })
+    const limitedDone = await poll(limited.json.pairing.id, (view) => view.state === 'failed')
+    assert.match(limitedDone.error, /wrong or expired|closed the connection/, 'a limited source gets the same answer')
+    // And it learns nothing more: the right code is refused from the same limited source. The offer
+    // itself is not burned (that takes 3 tested proofs from 2+ sources; the gateway's own tests
+    // cover it), so nothing about the code can be concluded from this one source.
+    const late = await startPairing({ address: scratch.address, otp })
+    const done = await poll(late.json.pairing.id, (view) => view.state === 'failed')
+    assert.match(done.error, /wrong or expired|closed the connection/, 'a limited source is refused even with the right code')
+    assert.equal((await scratch.get('pending')).pending.length, 0)
+    assert.equal((await mounted.call('GET', '/devices/remotes')).json.remotes.length, 1)
+  } finally {
+    await scratch.close()
   }
-  const late = await startPairing({ address: gateway.address, otp })
-  const done = await poll(late.json.pairing.id, (view) => view.state === 'failed')
-  assert.match(done.error, /wrong or expired|closed the connection/, 'the burned code is refused even when right')
-  assert.equal((await gateway.get('pending')).pending.length, 0)
-  assert.equal((await mounted.call('GET', '/devices/remotes')).json.remotes.length, 1)
 })
 
 await check('bad input is refused before anything is dialled', async () => {

@@ -165,7 +165,9 @@ function assertNoNamespacedId(remote) {
 
 test('the rename table is one place and covers the documented fields', () => {
   for (const field of ['sessionId', 'workspaceId', 'agentId', 'parentSessionId', 'childSessionId', 'workspaceFileScopeId',
-    'rpcId', 'sessionIds', 'archivedSessionIds', 'pinnedSessionIds', 'workspaceIds', 'subagentCatalog']) {
+    'rpcId', 'sessionIds', 'archivedSessionIds', 'pinnedSessionIds', 'workspaceIds', 'subagentCatalog',
+    // The reorder ANCHORS: a merged row's "land before this one".
+    'beforeWorkspaceId', 'beforeSessionId']) {
     assert.ok(Object.hasOwn(ID_FIELDS, field), `${field} must be routable`)
   }
   assert.equal(hostIdOfId('h:hostB:s1'), 'hostB')
@@ -774,6 +776,189 @@ test('workspace/rename strips the display suffix: the remote Host keeps its own 
   await harness.gateway.dispatchRpc('workspace/rename', { args: { workspaceId: 'h:hostB:wb1', title: 'REA_Project · Host C' } }, undefined, {})
   assert.deepEqual(hostB.calls[2].args, { workspaceId: 'wb1', title: 'REA_Project · Host C' })
   assertNoNamespacedId(hostB)
+})
+
+// -- reorder (workspace/insertBefore, workspace/insertSessionBefore) -------
+
+/** A remote Host that keeps a real durable order, like dsh-workspace's registry. */
+function createOrderedRemote(hostId, hostName, order) {
+  const runtime = {
+    order: [...order],
+    async call(endpoint, args) {
+      if (endpoint !== 'workspace/insertBefore') return { ok: true, workspace: { workspaceId: args.workspaceId } }
+      // The registry's own semantics: an unknown mover or anchor is not-found, and
+      // without an anchor the row appends (dsh-workspace `insertBefore`).
+      if (!runtime.order.includes(args.workspaceId)) {
+        return { ok: false, error: { code: 'workspace/not-found', message: `unknown workspace '${args.workspaceId}'` } }
+      }
+      if (args.beforeWorkspaceId !== undefined && !runtime.order.includes(args.beforeWorkspaceId)) {
+        return { ok: false, error: { code: 'workspace/not-found', message: `unknown workspace '${args.beforeWorkspaceId}'` } }
+      }
+      const without = runtime.order.filter((id) => id !== args.workspaceId)
+      const at = args.beforeWorkspaceId === undefined ? without.length : without.indexOf(args.beforeWorkspaceId)
+      runtime.order = [...without.slice(0, at), args.workspaceId, ...without.slice(at)]
+      return { ok: true, workspaceIds: [...runtime.order] }
+    },
+  }
+  const remote = createFakeRemote(hostId, hostName)
+  remote.connection.call = async (endpoint, args, options) => {
+    remote.calls.push({ endpoint, args: clone(args), options })
+    return runtime.call(endpoint, args)
+  }
+  return { remote, runtime }
+}
+
+test('a reorder of a remote Workspace reaches its Host untagged, anchor included', async () => {
+  // Measured live before this test: the merged sidebar produces the anchor from the
+  // row the user dropped on (`h:hostB:wb2`), and the rename table did not cover
+  // `beforeWorkspaceId`, so the Host was asked to place `wb1` before a workspace
+  // named `h:hostB:wb2` and answered `workspace/not-found`. The drag did nothing.
+  const { remote: hostB, runtime } = createOrderedRemote('hostB', 'Host B', ['wb1', 'wb2'])
+  const harness = createHarness({ remotes: [hostB] })
+  // Drag the SECOND row above the first: `wb1` was already before `wb2`, and the
+  // registry treats that as a no-op (it would mask the bug this test pins).
+  const answer = await harness.gateway.dispatchRpc('workspace/insertBefore',
+    { args: { workspaceId: 'h:hostB:wb2', beforeWorkspaceId: 'h:hostB:wb1' } }, undefined, {})
+
+  assert.deepEqual(hostB.calls[0].args, { workspaceId: 'wb2', beforeWorkspaceId: 'wb1' }, 'both ids are the Host\'s own')
+  assert.deepEqual(runtime.order, ['wb2', 'wb1'], 'the Host actually reordered')
+  // What comes back is a local id list, so the native sidebar can rank its rows.
+  assert.deepEqual(answer, { ok: true, value: { ok: true, workspaceIds: ['h:hostB:wb2', 'h:hostB:wb1'] } })
+  assertNoNamespacedId(hostB)
+})
+
+test('a reorder of a remote session within its Workspace strips beforeSessionId too', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B', {
+    replies: { 'workspace/insertSessionBefore': { workspace: workspaceView('wb1', ['sb2', 'sb1']) } },
+  })
+  const harness = createHarness({ remotes: [hostB] })
+  const answer = await harness.gateway.dispatchRpc('workspace/insertSessionBefore',
+    { args: { workspaceId: 'h:hostB:wb1', sessionId: 'h:hostB:sb1', beforeSessionId: 'h:hostB:sb2' } }, undefined, {})
+
+  assert.deepEqual(hostB.calls[0].args, { workspaceId: 'wb1', sessionId: 'sb1', beforeSessionId: 'sb2' })
+  // The reply is a Workspace projection: its `sessionIds` come back in the host's
+  // namespace, including the two rows the reorder just swapped.
+  assert.deepEqual(answer.value.workspace.sessionIds, ['h:hostB:sb2', 'h:hostB:sb1'])
+  assertNoNamespacedId(hostB)
+})
+
+test('a reorder with no anchor appends within the mover\'s own list', async () => {
+  const { remote: hostB, runtime } = createOrderedRemote('hostB', 'Host B', ['wb1', 'wb2'])
+  const harness = createHarness({ remotes: [hostB] })
+  const answer = await harness.gateway.dispatchRpc('workspace/insertBefore',
+    { args: { workspaceId: 'h:hostB:wb1' } }, undefined, {})
+  assert.deepEqual(hostB.calls[0].args, { workspaceId: 'wb1' }, 'no anchor is invented')
+  assert.deepEqual(runtime.order, ['wb2', 'wb1'])
+  assert.deepEqual(answer.value.workspaceIds, ['h:hostB:wb2', 'h:hostB:wb1'])
+})
+
+test('a reorder that crosses lists is refused, and reaches no Host and no Local carrier', async () => {
+  // The merged sidebar draws Local and every remote Workspace as ONE list, so a drag
+  // can land a row of one list beside a row of another. No Host stores another
+  // list's order, so this is refused rather than forwarded: a tag naming someone
+  // else's namespace must never travel, and Local must not be asked to place a
+  // foreign row either.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const hostC = createFakeRemote('hostC', 'Host C')
+  const harness = createHarness({ remotes: [hostB, hostC] })
+
+  const cases = [
+    { args: { workspaceId: 'w1', beforeWorkspaceId: 'h:hostB:wb2' }, movedHost: null, anchorHost: 'hostB' },
+    { args: { workspaceId: 'h:hostB:wb1', beforeWorkspaceId: 'w1' }, movedHost: 'hostB', anchorHost: null },
+    { args: { workspaceId: 'h:hostB:wb1', beforeWorkspaceId: 'h:hostC:wc1' }, movedHost: 'hostB', anchorHost: 'hostC' },
+  ]
+  for (const { args, movedHost, anchorHost } of cases) {
+    const answer = await harness.gateway.dispatchRpc('workspace/insertBefore', { args }, undefined, {})
+    assert.equal(answer.ok, false, `${JSON.stringify(args)} must be refused`)
+    assert.equal(answer.error.code, 'remote/reorder-cross-host')
+    assert.deepEqual({ movedHost: answer.error.details.movedHost, anchorHost: answer.error.details.anchorHost },
+      { movedHost, anchorHost })
+    // The refusal names lists, never a raw id or a namespace tag.
+    assert.equal(/h:[A-Za-z0-9._-]+:/.test(answer.error.message), false)
+  }
+  assert.deepEqual([...hostB.calls, ...hostC.calls], [], 'no remote Host was asked')
+  assert.deepEqual(harness.localCalls, [], 'the Local carrier was not asked either')
+})
+
+test('a Local reorder stays Local, anchor included, and is never renamed', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const harness = createHarness({ remotes: [hostB] })
+  await harness.gateway.dispatchRpc('workspace/insertBefore',
+    { args: { workspaceId: 'w1', beforeWorkspaceId: 'w2' } }, undefined, {})
+  assert.deepEqual(harness.localCalls.at(-1).payload.args, { workspaceId: 'w1', beforeWorkspaceId: 'w2' })
+  assert.deepEqual(hostB.calls, [], 'a Local reorder asks no remote')
+})
+
+test('a reorder survives as the merged `order` frame, and each list keeps its own order', async () => {
+  // The durable order of a Host is republished as a `workspace/follow` `order`
+  // increment (dsh-api-workspace-controller `feed.changed`). That is the frame the
+  // sidebar ranks rows by, so a reorder is only real if it comes back through it —
+  // and a remote `order` may only ever reseat the rows of its OWN list.
+  const hostB = createFakeRemote('hostB', 'Host B', { workspaces: [workspaceView('wb1', ['sb1']), workspaceView('wb2', ['sb2'])] })
+  const harness = createHarness({
+    remotes: [hostB],
+    baseline: { items: [workspaceView('w1', ['s1']), workspaceView('w2', ['s2'])], archivedSessionIds: [], pinnedSessionIds: [] },
+  })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('workspace/follow', { args: {} }, undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const first = await nextFrame(iterator, 'merged baseline')
+  assert.deepEqual(first.value.value.items.map((item) => item.workspaceId), ['w1', 'w2', 'h:hostB:wb1', 'h:hostB:wb2'])
+
+  // The Host committed `wb2, wb1` (the reorder above): it pushes the whole order.
+  hostB.send({ type: 'order', workspaceIds: ['wb2', 'wb1'] })
+  const reordered = await nextFrame(iterator, 'order')
+  assert.deepEqual(reordered.value, {
+    // Local first, untouched, then that host's rows in ITS new order.
+    type: 'order', workspaceIds: ['w1', 'w2', 'h:hostB:wb2', 'h:hostB:wb1'],
+  })
+  // A raw remote order must never reach the UI untagged: the ids are the aliases.
+  assert.equal(JSON.stringify(reordered.value).includes('"wb1"'), false)
+
+  // Reconnect: the host's baseline comes back and the order is republished from it,
+  // so a refresh does not undo the move.
+  harness.disconnect('hostB')
+  const dropped = await nextFrame(iterator, 'replace after disconnect')
+  assert.deepEqual(dropped.value.value.items.map((item) => item.workspaceId), ['w1', 'w2'])
+  harness.connect('hostB')
+  const back = await nextFrame(iterator, 'replace after reconnect')
+  assert.deepEqual(back.value.value.items.map((item) => item.workspaceId), ['w1', 'w2', 'h:hostB:wb1', 'h:hostB:wb2'],
+    'the Host resends its own durable order; nothing here invents one')
+
+  // A Local reorder reseats only Local rows: the remote rows keep their places.
+  hostB.send({ type: 'order', workspaceIds: ['wb1', 'wb2'] })
+  const awaiting = nextFrame(iterator, 'order before local move')
+  await awaiting
+  const localSource = harness.localStreams.at(-1)
+  localSource.queue.push({ type: 'order', workspaceIds: ['w2', 'w1'] })
+  const localMove = await nextFrame(iterator, 'local order')
+  assert.deepEqual(localMove.value, { type: 'order', workspaceIds: ['w2', 'w1', 'h:hostB:wb1', 'h:hostB:wb2'] })
+
+  control.abort()
+  await iterator.return()
+  assertNoNamespacedId(hostB)
+})
+
+test('a remote `order` frame that names a host namespace is refused, not merged', async () => {
+  // The order frame is a list of ids like any other, so the same rule applies: a
+  // Host may not name another controller's namespace, and it may not pretend a row
+  // is Local by sending an untagged-but-already-tagged id.
+  const hostB = createFakeRemote('hostB', 'Host B', { workspaces: [workspaceView('wb1', ['sb1'])] })
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('workspace/follow', { args: {} }, undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  await nextFrame(iterator, 'merged baseline')
+
+  hostB.send({ type: 'order', workspaceIds: ['h:hostC:wc1'] })
+  // The hostile frame drops that host's merged rows rather than reseating them.
+  const after = await nextFrame(iterator, 'replace after refusal')
+  assert.equal(after.value.type, 'replace')
+  assert.deepEqual(after.value.value.items, [], 'nothing of the refused host survives')
+  assert.ok(harness.logs.some((line) => line.includes('remote/id-leak')), JSON.stringify(harness.logs))
+
+  control.abort()
+  await iterator.return()
 })
 
 // -- merge: session/list ---------------------------------------------------

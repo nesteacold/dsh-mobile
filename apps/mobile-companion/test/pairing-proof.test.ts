@@ -121,7 +121,11 @@ describe('pairing proof exchange (contract §3.8)', () => {
     client.close();
   });
 
-  it('fails honestly when the challenge asks for a one-time code instead of sending a proof', () => {
+  it('refuses an OTP challenge when the attempt carries no one-time code, without sending a proof', () => {
+    // Contract revision 5: the Host runs the OTP flow and this attempt has no code (a QR attempt
+    // against an "Add device" code). A proof without `otpProof` is exactly what the Host closes
+    // 4410 on, so nothing is written — but the outcome now names the real problem instead of
+    // "this app version cannot answer", which the app CAN.
     const transport = new ScriptedTransport();
     const client = scriptedClient(transport);
     const seen = record(client);
@@ -130,8 +134,8 @@ describe('pairing proof exchange (contract §3.8)', () => {
     transport.fireOpen();
     transport.deliver({ ...CHALLENGE, otpRequired: true });
 
-    assert.deepEqual(transport.sentFrames(), [], 'nothing is written for a flow this build cannot finish');
-    assert.equal(seen.errors[0]?.code, 'client/pairing-otp-unsupported');
+    assert.deepEqual(transport.sentFrames(), [], 'nothing is written for a flow that cannot be proved');
+    assert.equal(seen.errors[0]?.code, 'client/pairing-otp-required');
     assert.equal(client.state, 'closed');
     assert.equal(seen.closed.length, 1);
   });

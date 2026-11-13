@@ -188,6 +188,8 @@ import {
 // `permissionPresets` cordis service (never a command string).
 import { createPermissionLower } from './permission-lower.mjs'
 import { createPairingRequests, otpProof, verificationCode } from './pairing-requests.mjs'
+import { pairingSourceKey } from './pairing-source-limiter.mjs'
+import { planScopeUpdate } from './device-scope-update.mjs'
 import { createSpeechInputManager, SPEECH_REQUEST_TYPES } from './speech-input.mjs'
 import {
   createFileUploadManager, FILE_UPLOAD_REQUEST_TYPES, FILE_UPLOAD_DEFAULTS, handleRemoteUpload,
@@ -2444,9 +2446,57 @@ async function createdSessionRefusal(api, msg, device) {
 // stores only the token digest. Management endpoints are local-machine only by
 // default and mutating requests also require a same-origin browser context.
 // ---------------------------------------------------------------------------
-function isLoopback(req) {
+// A request is NOT this machine's local caller. ONE predicate answers that question for every
+// surface below — the loopback classification, the `/mgw` fence, and the Host/Origin guard — so no
+// route can be fenced by a weaker rule than another, and none of it depends on the owner's
+// `adminLoopbackOnly` switch. Two independent signals, either one sufficient:
+//
+//  1. A FORWARDING-FAMILY HEADER IS PRESENT. `tailscale serve` terminates TLS in front of this
+//     process and dials the local target from this machine, so a proxied request arrives from the
+//     machine's OWN address — 127.0.0.1, or this host's own tailnet address — and `remoteAddress`
+//     stops naming the caller. The family is matched by PREFIX, never by a list of the names one
+//     proxy happens to write: `x-forwarded-ssl`, `tailscale-foo`, or a header this gateway has
+//     never heard of is still a proxy talking, and a fixed list would silently stop covering the
+//     next one. Header VALUES are never read for anything — they are caller-supplied text.
+//  2. THE HOST THE CALLER ADDRESSED IS NOT THIS MACHINE'S LOOPBACK AUTHORITY
+//     (`Host: 127.0.0.1[:port]`, `localhost` or `[::1]`). A browser reaching the same process
+//     through `tailscale serve` sends the tailnet name as `Host`, because that is the origin it
+//     typed. So even a proxy that added no forwarding header at all — or stripped the ones a test
+//     expects — cannot make a forwarded request look local. Reuses the exact authority set
+//     `assertTrustedLocalAuthority` enforces; do not widen it into a suffix check.
+const FORWARDING_HEADER_NAMES = Object.freeze(['forwarded', 'x-real-ip'])
+const FORWARDING_HEADER_PREFIXES = Object.freeze(['x-forwarded-', 'tailscale-'])
+
+function isForwardedRequest(req) {
+  const headers = req && req.headers
+  if (!headers) return false
+  return Object.keys(headers).some((name) => {
+    const key = name.toLowerCase()
+    return FORWARDING_HEADER_NAMES.includes(key)
+      || FORWARDING_HEADER_PREFIXES.some((prefix) => key.startsWith(prefix))
+  })
+}
+
+function addressesLoopbackAuthority(req) {
+  const host = req && req.headers && typeof req.headers.host === 'string' ? req.headers.host.trim() : ''
+  return TRUSTED_LOCAL_AUTHORITY.test(host)
+}
+
+/** The single classification: a proxied request, or one addressed elsewhere, is never local. */
+function isNonLocalRequest(req) {
+  return isForwardedRequest(req) || !addressesLoopbackAuthority(req)
+}
+
+/** The peer address, seen on its own: a proxy makes it name the proxy, never the caller. */
+function isLoopbackPeer(req) {
   const addr = req.socket && req.socket.remoteAddress
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
+}
+
+function isLoopback(req) {
+  // A proxied request is not loopback, however it looks: the peer address is the proxy's.
+  if (isNonLocalRequest(req)) return false
+  return isLoopbackPeer(req)
 }
 
 function parseProtocols(req) {
@@ -2788,18 +2838,25 @@ const TRUSTED_LOCAL_AUTHORITY = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})
  * `localhost.`, other 127/8 addresses, `127.1` and `::ffff:127.0.0.1` are refused
  * on purpose; do not widen this into a permissive suffix check.
  * @param {object} req the management request
- * @throws {Error} 403 when the Host/Origin pair is not this machine's loopback
+ * @throws {Error} 403 when a forwarding-family header is present, or the Host/Origin
+ *   pair is not this machine's loopback
  */
 function assertTrustedLocalAuthority(req) {
-  const host = typeof req.headers.host === 'string' ? req.headers.host.trim() : ''
-  if (!TRUSTED_LOCAL_AUTHORITY.test(host)) {
-    const error = new Error('this route requires a Host header naming this machine (127.0.0.1, localhost or [::1])')
+  // The same ONE classification the `/mgw` fence uses, applied here alone for callers that reach a
+  // guarded route some other way. A forwarding-family header means a proxy spoke, so this is not
+  // the owner at the keyboard whatever the Host says; otherwise the Host itself must be local.
+  // Neither refusal echoes caller input.
+  if (isNonLocalRequest(req)) {
+    const error = new Error(isForwardedRequest(req)
+      ? 'this route is not reachable through a proxy'
+      : 'this route requires a Host header naming this machine (127.0.0.1, localhost or [::1])')
     error.status = 403
     error.code = 'forbidden'
     throw error
   }
   const origin = req.headers.origin
   if (origin === undefined) return
+  const host = req.headers.host.trim()
   let url = null
   try { url = new URL(String(origin)) } catch { url = null }
   // `URL.host` keeps the port: the same loopback name on another port is still
@@ -4507,7 +4564,27 @@ const plugin = {
       path: '/mgw',
       handler: async (req, res) => {
         try {
-          if (adminLoopbackOnly && !isLoopback(req)) {
+          // A REVERSE PROXY MUST NEVER REACH THIS SURFACE (owner decision 2026-11-13). `tailscale
+          // serve` (and any other in-front proxy) terminates TLS and then dials a local target, so
+          // a request it forwards arrives from THIS machine — 127.0.0.1 or this host's own tailnet
+          // address — and the peer address would read it as the owner at the keyboard. The route
+          // the owner routes to the gateway is `/ws/mobile` only; any `/mgw` path that is not this
+          // machine's local caller is refused before routing, even when the peer really is loopback
+          // and even when the owner turned `adminLoopbackOnly` off: that switch relaxes the PEER
+          // test below, never the proxy/authority classification. This is the one place the
+          // decision is made, so no route can be added later that forgets it.
+          if (isNonLocalRequest(req)) {
+            const viaProxy = isForwardedRequest(req)
+            if (viaProxy) log('management request refused: it arrived through a reverse proxy')
+            sendJson(res, 403, {
+              error: 'forbidden',
+              message: viaProxy ? 'management API is not reachable through a proxy' : 'management API is loopback-only',
+            })
+            return
+          }
+          if (adminLoopbackOnly && !isLoopbackPeer(req)) {
+            // One condition left, because the other is unconditional above: the peer address, which
+            // a proxy makes look local. Same answer for both, so a probe cannot tell which tripped.
             sendJson(res, 403, { error: 'forbidden', message: 'management API is loopback-only' })
             return
           }
@@ -5066,6 +5143,44 @@ const plugin = {
             { deviceId: device.id, channel: 'legacy', paired: true })
             log(`pairing approved by the host user: ${id} -> ${device.id}, scopes=${device.scopes.join(', ')}`)
             sendJson(res, 200, { approved: true, device })
+          } else if (req.method === 'POST' && p.startsWith('/mgw/devices/') && p.endsWith('/scopes')) {
+            // Spec 025: the owner widens or narrows a paired record without re-pairing it. This is
+            // the SAME owner-side surface as `/mgw/listen` and takes the same guards in the same
+            // order — the proxy/authority fence and the same-origin check already ran on every
+            // `/mgw` write above, the listener test is repeated here because this route changes what
+            // a paired credential may do, and the Host/Origin pair is checked again because the
+            // shared same-origin check only compares two caller-supplied headers. A device socket
+            // can never reach it: device frames are dispatched on `/ws/mobile`, not on this
+            // management listener.
+            if (!isLoopback(req)) {
+              sendJson(res, 403, { error: 'forbidden', message: 'device scope changes are loopback-only' })
+              return
+            }
+            assertTrustedLocalAuthority(req)
+            const id = decodeURIComponent(p.slice('/mgw/devices/'.length, -'/scopes'.length))
+            // The record is looked up BEFORE the body is read: an unknown id answers 404 without
+            // waiting on (or parsing, or size-limiting) a body it could never use.
+            const device = registry.get(id)
+            if (!device) { sendJson(res, 404, { error: 'not-found', message: 'no such device' }); return }
+            const body = await readBody(req)
+            // Validate fully BEFORE anything is written: a refused request leaves the record as it was.
+            const plan = planScopeUpdate({ body, device })
+            if (!plan.scopesChanged) {
+              sendJson(res, 200, { device, added: [], removed: [], unchanged: true })
+              return
+            }
+            const updated = registry.updateScopes(id, plan.scopes)
+            if (!updated) { sendJson(res, 404, { error: 'not-found', message: 'no such device' }); return }
+            // R3: the live sockets of this device close with the contract's re-auth code, so the next
+            // connection carries the new grant. The credential itself is unchanged, which is why the
+            // code is CLOSE_REVOKED (the code a re-pair uses for the very same reason) and not a
+            // literal 4401 in this file. R4: id and scope NAMES only.
+            rtc.closeDevice(id)
+            for (const client of clients) {
+              if (client.deviceId === id) client.close(CLOSE_REVOKED, 'device scopes changed')
+            }
+            log(`device scopes updated: ${id}, added=[${plan.added.join(', ')}], removed=[${plan.removed.join(', ')}]`)
+            sendJson(res, 200, { device: updated, added: plan.added, removed: plan.removed })
           } else if (req.method === 'POST' && p.startsWith('/mgw/devices/') && p.endsWith('/revoke')) {
             const id = decodeURIComponent(p.slice('/mgw/devices/'.length, -'/revoke'.length))
             const revoked = registry.revoke(id)
@@ -6291,7 +6406,21 @@ const plugin = {
 
     const acceptPendingSocket = (socketClient, { req, clientDeviceId, deviceName, transport, longCode }) => {
       const certSha256 = transport.certSha256
-      const clientIp = String(req.socket?.remoteAddress ?? '').replace(/^::ffff:/, '')
+      // The peer address is the PROXY's when a reverse proxy fronts this listener (`tailscale
+      // serve` dials the local target, so it arrives from this very machine). That address is
+      // recorded for the owner's eyes only, so a proxied request records nothing rather than a
+      // confident wrong answer: no forwarding header is trusted for it, because every one of them
+      // is caller-supplied text on an unauthenticated hop.
+      // A forwarding-family header means the peer address names the proxy, not the caller; the Host
+      // it addressed may legitimately be a tailnet name for a DIRECT tailnet client, so the display
+      // field keys on the header family alone and leaves a real tailnet peer's address intact.
+      const proxied = isForwardedRequest(req)
+      const clientIp = proxied ? '' : String(req.socket?.remoteAddress ?? '').replace(/^::ffff:/, '')
+      // Spec 023 R2: every proxied request shares the one `proxied` bucket (the peer address names
+      // the proxy, not the caller). A DIRECT tailnet peer also addresses a non-loopback Host, so the
+      // Host alone cannot be the signal or direct peers would share a bucket (acceptance: they do
+      // not); the forwarding-family header is. Same classifier as `clientIp` above.
+      const pairingSource = pairingSourceKey({ proxied, peerAddress: req.socket?.remoteAddress })
       const serverNonce = crypto.randomBytes(24).toString('base64url')
       let state = longCode !== undefined ? 'proof-long' : 'proof-otp'
       let request
@@ -6406,9 +6535,15 @@ const plugin = {
           admit({ kind: offer.kind, scopes: offer.scopes })
           return
         }
-        const result = pairingRequests.verifyProof({ proof: msg.otpProof, certSha256, clientNonce, serverNonce })
+        // Spec 023: the per-source brake keys on the peer address, or ONE shared key for every
+        // proxied request (the classifier above; header values are never read).
+        const result = pairingRequests.verifyProof({ proof: msg.otpProof, certSha256, clientNonce, serverNonce, source: pairingSource })
         if (!result.ok) {
-          log('pairing proof rejected (wrong or expired one-time code)')
+          // Same wire answer whether the source is limited, the proof wrong, or the code burned:
+          // a probe learns nothing about which. No wire code is added (contract unchanged).
+          log(result.reason === 'source-limited'
+            ? 'pairing proof refused: source limit reached'
+            : 'pairing proof rejected (wrong or expired one-time code)')
           // Wrong proof: one attempt spent. The code may be burned by now; either
           // way this socket is done, the client retries on a fresh connection.
           finish('pairing/expired', CLOSE_PAIRING_EXPIRED)

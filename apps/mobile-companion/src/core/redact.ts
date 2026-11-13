@@ -28,6 +28,13 @@ export const SENSITIVE_KEYS: readonly string[] = [
   'pairingcode',
   'pairing_code',
   'code',
+  // OTP pairing (contract revision 5): the 8-digit one-time code is as secret as the QR string —
+  // it authorises one pairing — so an object carrying it must never print it.
+  'otp',
+  'otpcode',
+  'otp_code',
+  'onetimecode',
+  'one_time_code',
   'credential',
   'privatekey',
   'private_key',

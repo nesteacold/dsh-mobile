@@ -35,6 +35,15 @@
 // A Host that never sends a challenge still works exactly as before (a bare `paired` is
 // accepted), which keeps the app compatible with fixtures and older Hosts mid-migration.
 //
+// OTP pairing (contract revision 5, `dsh-pair-otp.v1`): the challenge carries
+// `otpRequired: true` when the Host user pressed "Generate pairing code" instead of showing a QR.
+// The proof then also carries `otpProof = HMAC-SHA256(otp, certSha256||clientNonce||serverNonce)`
+// (`./pairing-otp`). The code is supplied per attempt as `otp` and is used for the proof only: it
+// is never written to a frame, a log, an event or an error, and the client drops its own
+// reference as soon as the proof is built. A challenge that demands a code this attempt has none
+// for is an honest `client/pairing-otp-required` (nothing is sent, because a proof without the
+// code is exactly what the Host closes 4410 on).
+//
 // Hard invariant (SC-002): no frame is handed to the transport before the socket is open. An
 // inbound application frame can only travel over a socket whose TLS handshake and certificate
 // pin already succeeded, so it is accepted as proof of `open`: a native `onMessage` can reach JS
@@ -52,6 +61,7 @@ import {
   PAIRING_PROOF_TYPE,
   PASSKEY_CLIENT_TYPES,
   PING_INTERVAL_MS,
+  PROTOCOL_SUBPROTOCOL,
   WEB_LOCK_STATES,
   authSubprotocols,
   createClientNonce,
@@ -66,6 +76,7 @@ import {
 } from '@dsh-ext/mobile-protocol';
 
 import { CoreError, normaliseErrorCode, type CoreErrorCode } from './errors';
+import { OTP_SUBPROTOCOL, normalizeOtp, otpProof } from './pairing-otp';
 import { TRANSPORT_ERROR, type ListenerFailureReporter, type Transport, type TransportEvent } from './transport';
 
 export interface UpdateRequired {
@@ -92,8 +103,15 @@ export type ClientState =
 
 export interface ClientEventMap {
   state: ClientState;
-  /** `paired` arrived: store the token now, it is sent only once. */
-  paired: { token: string; device: DeviceInfo };
+  /**
+   * `paired` arrived: store the token now, it is sent only once.
+   *
+   * `gatewayId` is the Host's own id when the frame carried `...gatewayIdentity` (the gateway adds
+   * it to `paired`, `hello` and the QR payload alike). It is absent only from a fixture or an older
+   * Host that sends the bare contract shape; an OTP pairing — which has no QR to take the id from —
+   * then reads it from `hello`.
+   */
+  paired: { token: string; device: DeviceInfo; gatewayId?: string };
   /**
    * Contract §3.8: the Host accepted the proof and reserved the one-time code; it now waits for
    * a human to approve this phone on the desktop. Show `verificationCode` (the desktop displays
@@ -152,17 +170,38 @@ export type ClientTransportSource = Transport | { create(): Transport };
 export interface ConnectionTarget {
   /** `wss://` URL (from the QR `publicUrl`). */
   url: string;
-  /** SHA-256 of the host leaf certificate (from the QR). */
-  certSha256: string;
+  /**
+   * SHA-256 of the host leaf certificate (from the QR, or from the Host's one-time-code offer).
+   *
+   * Always required. For an OTP attempt it MAY be `''`, meaning "no pin is known yet": an 8-digit
+   * code cannot carry a fingerprint, and a browser cannot read one, so the leaf is taken from the
+   * Host's `pairing-challenge` instead (`adoptedPin`) and the proof is keyed to it. That is the one
+   * flow allowed to arrive without a pin, and it still sends nothing until the leaf is known.
+   */
+  certSha256?: string;
   /** Install-scoped device UUID; sent as `X-DSH-Device-ID` during pairing. */
   installId: string;
   /** Device display name sent to the host during pairing. */
   deviceName?: string;
 }
 
+/**
+ * What a first connection presents as its credential (exactly one of them):
+ *   - `token`: a paired device (bearer).
+ *   - `pairingCode`: the long QR string, offered as the `dsh-pair.<code>` subprotocol.
+ *   - `otp`: the 8-digit one-time code from the Host's "Generate pairing code", offered as the
+ *     `dsh-pair-otp.v1` subprotocol. The Host selects the OTP flow BY that subprotocol (it is not
+ *     inferred from a frame), so this is the only difference on the wire: no `dsh-pair.<code>` is
+ *     sent, because an 8-digit code is not a pairing string and never travels in a subprotocol.
+ */
 export type ConnectOptions =
-  | (ConnectionTarget & { token: string; pairingCode?: undefined })
-  | (ConnectionTarget & { pairingCode: string; token?: undefined });
+  | (ConnectionTarget & { token: string; pairingCode?: undefined; otp?: undefined })
+  | (ConnectionTarget & { pairingCode: string; token?: undefined; otp?: undefined })
+  /**
+   * `otp` is the normalized 8-digit code (see `normalizeOtp`). It is used to build the proof and
+   * dropped afterwards: never written to a frame, an event, a log or an error.
+   */
+  | (ConnectionTarget & { otp: string; token?: undefined; pairingCode?: undefined });
 
 export interface ClientOptions {
   transport: ClientTransportSource;
@@ -271,6 +310,21 @@ const TRANSPORT_RETRYABLE: ReadonlySet<string> = new Set<string>([
 
 /** Close codes after which automatic reconnection is pointless (contract §3). */
 export const NO_AUTO_RECONNECT_CLOSE_CODES: ReadonlySet<number> = new Set([CLOSE_CODES.gatewayDisabled]);
+
+/**
+ * Subprotocols offered for an OTP pairing (contract revision 5): `dsh-mobile-v1` plus
+ * `dsh-pair-otp.v1`. The second one is how the Host knows to run the OTP state machine — the code
+ * itself never travels in a subprotocol (unlike the long pairing string, which IS the secret) or
+ * anywhere else, so this list carries no credential and is safe in a handshake log.
+ *
+ * The literal is pinned to the gateway's own `PAIR_OTP_PROTOCOL`
+ * (`plugins/mobile-gateway/lib/index.mjs:268`) by `test/pairing-otp.test.ts`: it is a contract
+ * constant the app must not invent, and the protocol package (owned elsewhere) has no export for
+ * it yet.
+ */
+export function otpSubprotocols(): string[] {
+  return [PROTOCOL_SUBPROTOCOL, OTP_SUBPROTOCOL];
+}
 
 /**
  * The terminal contract outcome of a **permanent** HTTP upgrade refusal, or `null` when the
@@ -468,6 +522,31 @@ export class CompanionClient {
   private pairingProofSent = false;
   /** `reason` of an in-band `pairing-rejected`, kept for the close-code error message. */
   private pairingRejectedReason: string | null = null;
+  /**
+   * The normalized one-time code of an OTP pairing (contract revision 5), or null for a long
+   * pairing string / bearer connection. In MEMORY only, for the single proof this connection may
+   * send: `handlePairingChallenge` clears it as soon as the proof is built, and it is never put in
+   * a frame, an event, an error, `details` or a log line. A union key in `SENSITIVE_KEYS` masks it
+   * even if a caller ever serialises this object for diagnostics.
+   */
+  private pairingOtp: string | null = null;
+  /**
+   * The pin this connection asked the transport to verify (`ConnectionTarget.certSha256`), lowercase.
+   * The OTP proof is keyed to it (the Host recomputes with the leaf it presents), and the
+   * challenge must name the same one — see `handlePairingChallenge`. Not a secret: it is the
+   * PUBLIC leaf hash the QR already carries.
+   */
+  private pairingPin = '';
+  /**
+   * The leaf the `pairing-challenge` named, when this attempt arrived WITHOUT a pin (OTP only), so
+   * the caller can store it as the record's fingerprint.
+   *
+   * This is what makes trust-on-first-use a ONE-TIME event rather than a permanent stance: the
+   * first-use trust happens on this connection, and every later connection is pinned to exactly
+   * what was adopted here. `null` when the attempt was already pinned (nothing was adopted) or no
+   * challenge arrived.
+   */
+  private _adoptedPin: string | null = null;
   /** Spec 021: `hello.webLock` of the current connection (see `get webLock`). */
   private _webLock: WebLockState | null = null;
   /**
@@ -551,6 +630,15 @@ export class CompanionClient {
   }
 
   /**
+   * The certificate fingerprint adopted from the Host's `pairing-challenge` by an OTP attempt that
+   * started without a pin (trust on first use), or `null` when nothing was adopted. Public leaf
+   * hash, not a secret. See `_adoptedPin`.
+   */
+  get adoptedPin(): string | null {
+    return this._adoptedPin;
+  }
+
+  /**
    * Drop the in-memory copy of the token. The app calls this as soon as the credential is in the
    * secure store (N6): the one-time token must not linger in JS memory or in logs/diagnostics.
    */
@@ -585,6 +673,10 @@ export class CompanionClient {
    *                                 so one lost header cannot leave the socket unauthenticated)
    *   - pairing -> `pairingCode` => subprotocols `dsh-mobile-v1, dsh-pair.<code>` +
    *                                 header `X-DSH-Device-ID: <installId>`
+   *   - OTP     -> `otp`         => subprotocols `dsh-mobile-v1, dsh-pair-otp.v1` +
+   *                                 the same header. The code is NOT offered anywhere: the Host
+   *                                 chooses the OTP flow by that subprotocol and learns the code
+   *                                 only from the proof (`./pairing-otp`).
    * The pin (`certSha256`) is passed through; the transport refuses before `open` on mismatch.
    */
   connect(target: ConnectOptions): void {
@@ -592,12 +684,25 @@ export class CompanionClient {
       && this._state !== 'gateway-disabled' && this._state !== 'reauth-required') {
       throw new CoreError({ code: 'client/bad-state', message: `connect() called in state ${this._state}` });
     }
-    const isPairing = target.pairingCode !== undefined;
-    if (isPairing && target.token !== undefined) {
+    const isOtp = typeof target.otp === 'string';
+    const isPairingCode = target.pairingCode !== undefined;
+    const isPairing = isOtp || isPairingCode;
+    if ([isOtp, isPairingCode, target.token !== undefined].filter(Boolean).length > 1) {
       throw new CoreError({
         code: 'client/bad-state',
-        message: 'A connection is either a pairing or an authenticated connection, not both',
+        message: 'A connection takes exactly one of a token, a pairing code or a one-time code',
       });
+    }
+    // The OTP flow needs a well-formed code up front: a proof computed from anything else is
+    // exactly what the Host answers 4410 for, so refuse before a socket exists (and before the
+    // code can be held any longer than this turn). Normalized once, here.
+    let otp: string | null = null;
+    if (isOtp) {
+      const normalized = normalizeOtp(target.otp as string);
+      if (!normalized.ok) {
+        throw new CoreError({ code: 'client/bad-state', message: 'The one-time code is not 8 digits' });
+      }
+      otp = normalized.otp;
     }
     this.unsubscribe?.();
     // Each connection gets a fresh transport from a factory: a closed socket cannot be
@@ -621,11 +726,40 @@ export class CompanionClient {
     // guard or rejection reason into the next one.
     this.pairingProofSent = false;
     this.pairingRejectedReason = null;
+    // The code is per attempt and in memory only: held for the single proof this connection may
+    // send, then cleared by `handlePairingChallenge`.
+    this.pairingOtp = otp;
+    this._adoptedPin = null;
+    // The pin this connection is pinned to: the transport compares it inside the TLS handshake and
+    // the OTP proof is keyed to it.
+    //
+    // An OTP attempt MAY arrive without one — an 8-digit code carries no fingerprint and a browser
+    // cannot read the leaf — and then the `pairing-challenge` is the statement it is keyed to
+    // (`adoptedPin`). Every OTHER flow is refused here without a pin, before `open`: a token or a
+    // long pairing string always comes with a fingerprint, so "no pin" there is a broken caller,
+    // and an unpinned socket is what the native module refuses anyway.
+    this.pairingPin = String(target.certSha256 ?? '').toLowerCase();
+    if (isPairing && this.pairingPin === '' && !isOtp) {
+      throw new CoreError({
+        code: 'client/pin-mismatch',
+        message: 'This pairing has no certificate fingerprint to check the computer against, so it was refused',
+      });
+    }
+    if (this.pairingPin !== '' && !/^[0-9a-f]{64}$/.test(this.pairingPin)) {
+      throw new CoreError({
+        code: 'client/pin-mismatch',
+        message: 'The certificate fingerprint for this pairing is not a SHA-256 hash',
+      });
+    }
     this.unsubscribe = this.transport.on((event) => this.onTransportEvent(event));
 
     const headers: Record<string, string> = {};
     let protocols: string[];
-    if (isPairing) {
+    if (isOtp) {
+      protocols = otpSubprotocols();
+      headers['X-DSH-Device-ID'] = target.installId;
+      if (target.deviceName !== undefined && target.deviceName !== '') headers['X-DSH-Device-Name'] = target.deviceName;
+    } else if (isPairingCode) {
       protocols = pairingSubprotocols(target.pairingCode as string);
       // Header preferred; the transport may also offer `dsh-device.<id>` (see platforms).
       headers['X-DSH-Device-ID'] = target.installId;
@@ -645,7 +779,10 @@ export class CompanionClient {
     // close once the socket is open.
     this.armHandshakeTimer();
     try {
-      this.transport.connect(target.url, { certSha256: target.certSha256, protocols, headers });
+      // The pin as given: an OTP attempt that had none passes '' and the transport decides. A
+      // pinning transport refuses it before any byte moves (native: `client/pin-mismatch`); the web
+      // transport ignores the field by design and the challenge supplies the leaf to adopt.
+      this.transport.connect(target.url, { certSha256: target.certSha256 ?? '', protocols, headers });
     } catch (error) {
       // A transport that throws instead of reporting the failure must not leave the client
       // waiting forever: report the same terminal outcome a failed connect produces.
@@ -1110,10 +1247,17 @@ export class CompanionClient {
    * Contract §3.8: the Host challenges the pairing connection immediately after accepting it and
    * refuses every frame but the proof until it is admitted. Answer exactly once.
    *
-   * Failure modes are reported instead of written to the wire: an `otpRequired` challenge is a
-   * flow this build does not implement (decision: fail honestly rather than send a proof the Host
-   * would close with 4410), and an unusable nonce is a broken random source on this device — the
-   * Host would refuse it with 4403 and the user would read "rejected" for our own bug.
+   * Both pairing secrets are answered here (contract revision 5):
+   *   - long pairing string (`otpRequired: false`): the string is itself the secret and already
+   *     travelled in the `dsh-pair.<code>` subprotocol, so the proof carries only `clientNonce`;
+   *   - OTP (`otpRequired: true`): the proof also carries
+   *     `otpProof = HMAC-SHA256(otp, certSha256||clientNonce||serverNonce)`.
+   *
+   * Failure modes are reported instead of written to the wire: an OTP challenge when this attempt
+   * has no code is `client/pairing-otp-required` (a proof without the code is what the Host closes
+   * 4410 on, and a bogus proof would spend one of its three attempts), a flow mismatch is the
+   * same, and an unusable nonce is a broken random source on this device — the Host would refuse
+   * it with 4403 and the user would read "rejected" for our own bug.
    */
   private handlePairingChallenge(f: Record<string, unknown>): void {
     if (!this.pairing) {
@@ -1133,17 +1277,110 @@ export class CompanionClient {
       );
       return;
     }
-    if (f.otpRequired === true) {
+    const wantsOtp = f.otpRequired === true;
+    const otp = this.pairingOtp;
+    if (wantsOtp && otp === null) {
+      // The Host selected the OTP flow and this attempt has no code to prove (a QR attempt against
+      // an "Add device" code, most likely). Say so honestly instead of sending a proof the Host
+      // would burn an attempt on and close 4410 for.
       this.emit(
         'error',
         new CoreError({
-          code: 'client/pairing-otp-unsupported',
-          message: 'This computer asks for a one-time code, which this app version cannot answer',
+          code: 'client/pairing-otp-required',
+          message: 'This computer asked for its one-time pairing code, which this attempt does not have',
           retryable: false,
         }),
         'frame:pairing-challenge',
       );
-      this.finishConnection(1002, 'pairing-otp-unsupported', false);
+      this.finishConnection(1002, 'pairing-otp-required', false);
+      return;
+    }
+    if (!wantsOtp && otp !== null) {
+      // The reverse mismatch: a one-time code was supplied, but the Host is running the long-string
+      // flow (no `dsh-pair-otp.v1`). Its code was never redeemed, so fail honestly and let the user
+      // enter it again rather than report a pairing that this code did not create.
+      this.emit(
+        'error',
+        new CoreError({
+          code: 'client/pairing-otp-required',
+          message: 'This computer is not asking for a one-time code; start the pairing from its "Generate pairing code" button',
+          retryable: false,
+        }),
+        'frame:pairing-challenge',
+      );
+      this.finishConnection(1002, 'pairing-otp-required', false);
+      return;
+    }
+    // Contract §3.8: the challenge pins the leaf this connection verified. The transport already
+    // compared the pin before `open`, so this is a second, in-band statement of the same fact; a
+    // disagreement means the frame did not come from the socket it claims to, and a proof keyed to
+    // an identity that was never verified is exactly what a relay wants.
+    const challengePin = typeof f.certSha256 === 'string' ? f.certSha256.toLowerCase() : null;
+    if (this.pairingPin === '') {
+      // Trust on first use, and ONLY here: an OTP attempt that arrived without a pin (an 8-digit
+      // code cannot carry a fingerprint, and a browser cannot read the leaf) adopts the one the
+      // challenge states, and the proof is keyed to it so the Host verifies against the same leaf
+      // it presents. Nothing was verified on the wire beforehand, so this trust is real — it is
+      // not a bypass of the transport's check, it is the absence of one, made explicit and
+      // recorded for every later connection to pin against.
+      if (challengePin === null || !/^[0-9a-f]{64}$/.test(challengePin)) {
+        this.emit(
+          'error',
+          new CoreError({
+            code: 'client/pin-mismatch',
+            message: 'This computer did not state a certificate fingerprint to trust',
+            retryable: false,
+            details: { stage: 'pairing-challenge' },
+          }),
+          'frame:pairing-challenge',
+        );
+        this.finishConnection(1002, 'pairing-no-pin', false);
+        return;
+      }
+      this.pairingPin = challengePin;
+      this._adoptedPin = challengePin;
+    } else if (challengePin === null) {
+      // A pin was supplied, so this attempt is pinned to a leaf it verified — and the challenge
+      // states none at all. That is not a disagreement to accept silently: the proof is keyed to
+      // `this.pairingPin`, so a frame that names no leaf cannot show the Host is the one verified.
+      this.emit(
+        'error',
+        new CoreError({
+          code: 'client/pin-mismatch',
+          message: 'The pairing challenge stated no certificate, so it cannot be the computer this connection verified',
+          retryable: false,
+          details: { stage: 'pairing-challenge' },
+        }),
+        'frame:pairing-challenge',
+      );
+      this.finishConnection(1002, 'pairing-bad-challenge', false);
+      return;
+    } else if (challengePin !== this.pairingPin) {
+      this.emit(
+        'error',
+        new CoreError({
+          code: 'client/pin-mismatch',
+          message: 'The pairing challenge named a certificate this connection did not verify',
+          retryable: false,
+          details: { stage: 'pairing-challenge' },
+        }),
+        'frame:pairing-challenge',
+      );
+      this.finishConnection(1002, 'pairing-pin-mismatch', false);
+      return;
+    }
+    const serverNonce = typeof f.serverNonce === 'string' && f.serverNonce !== '' ? f.serverNonce : null;
+    if (serverNonce === null) {
+      this.emit(
+        'error',
+        new CoreError({
+          code: 'client/bad-message',
+          message: 'pairing-challenge carried no server nonce',
+          details: { stage: 'pairing-challenge' },
+        }),
+        'frame:pairing-challenge',
+      );
+      this.finishConnection(1002, 'pairing-bad-challenge', false);
       return;
     }
     const clientNonce = this.clientNonce();
@@ -1160,10 +1397,21 @@ export class CompanionClient {
       this.finishConnection(1011, 'pairing-bad-nonce', false);
       return;
     }
+    // The OTP proof is computed once, synchronously, then the code reference is dropped: the
+    // secret is not needed again on this connection (the Host verifies it, and any retry is a
+    // fresh connection with a fresh code).
+    let proof: string | undefined;
+    if (otp !== null) {
+      proof = otpProof(otp, this.pairingPin, clientNonce, serverNonce);
+      this.pairingOtp = null;
+    }
     this.pairingProofSent = true;
+    const frame: Record<string, unknown> = { type: PAIRING_PROOF_TYPE, clientNonce };
+    // Contract §3.8: `otpProof` MUST be absent for a long pairing string.
+    if (proof !== undefined) frame.otpProof = proof;
     let sent = false;
     try {
-      sent = this.transport.send(JSON.stringify({ type: PAIRING_PROOF_TYPE, clientNonce }));
+      sent = this.transport.send(JSON.stringify(frame));
     } catch (error) {
       // A transport may throw instead of returning false; both mean the frame never left.
       this.emit(
@@ -1267,7 +1515,15 @@ export class CompanionClient {
     // The approval wait is over; the deadline for it must not fire during the rest of the
     // handshake. (It only exists after `pairing-pending`; clearing it is a no-op otherwise.)
     this.clearApprovalTimer();
-    this.emit('paired', { token, device }, 'frame:paired');
+    // The gateway adds `...gatewayIdentity` to this frame, which is the ONLY place an OTP pairing
+    // can learn the Host's id (there is no QR payload to read it from). Optional: a bare contract
+    // frame omits it, and `hello` carries it as well.
+    const gatewayId = typeof f.gatewayId === 'string' && f.gatewayId !== '' ? f.gatewayId : undefined;
+    this.emit(
+      'paired',
+      { token, device, ...(gatewayId === undefined ? {} : { gatewayId }) },
+      'frame:paired',
+    );
   }
 
   private handleHello(f: Record<string, unknown>): void {

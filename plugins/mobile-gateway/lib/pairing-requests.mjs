@@ -16,6 +16,7 @@
 // the offer is consumed / burned / expired, and every view exposes the digest
 // only. The proof never carries the OTP over the wire.
 import crypto from 'node:crypto'
+import { createSourceLimiter, UNKNOWN_SOURCE_KEY } from './pairing-source-limiter.mjs'
 
 export const OTP_DIGITS = 8
 export const OTP_TTL_MS = 10 * 60 * 1000
@@ -69,6 +70,8 @@ export function createPairingRequests(options = {}) {
   const now = options.now ?? Date.now
   const otpTtlMs = options.otpTtlMs ?? OTP_TTL_MS
   const pendingTtlMs = options.pendingTtlMs ?? PENDING_TTL_MS
+  // Same injectable clock, so the limiter window and the offer TTL move together in tests.
+  const sourceLimiter = createSourceLimiter({ now })
   /** @type {Map<string, object>} offer id -> offer */
   const offers = new Map()
   /** @type {Map<string, object>} request id -> pending request */
@@ -116,7 +119,10 @@ export function createPairingRequests(options = {}) {
         kind,
         scopes: [...scopes],
         endpoint: endpoint ?? null,
-        failures: 0,
+        // Spec 023 (decision 2026-11-13): how many wrong proofs have been TESTED against this
+        // offer, from any sources. One peer cannot drive this alone: its own source budget
+        // (SOURCE_MAX_FAILURES = 2) is spent first, so burning needs a second source.
+        failedProofs: 0,
         createdAt: now(),
         expiresAt: now() + otpTtlMs,
       }
@@ -131,8 +137,17 @@ export function createPairingRequests(options = {}) {
      * meant, so the proof is tried against every live offer; all are evaluated
      * (no early exit) so timing does not reveal how many exist.
      */
-    verifyProof({ proof, certSha256, clientNonce, serverNonce }) {
+    verifyProof({ proof, certSha256, clientNonce, serverNonce, source }) {
       pruneOffers()
+      // Spec 023 R2: the per-source brake runs BEFORE any offer is tested. A limited source is
+      // refused untested — its proof is not compared with any offer (so it cannot burn an offer's
+      // guess budget, R3) and, correct or not, it learns nothing until the window passes.
+      // A proof with no source is charged to the shared `unknown` bucket rather than skipping the
+      // brake: a missing key must never be the way around it.
+      const sourceKey = source === undefined ? UNKNOWN_SOURCE_KEY : source
+      if (sourceLimiter.isLimited(sourceKey)) {
+        return { ok: false, reason: 'source-limited', burned: [] }
+      }
       let matched
       for (const offer of offers.values()) {
         const expected = otpProof(offer.otp, certSha256, clientNonce, serverNonce)
@@ -143,12 +158,16 @@ export function createPairingRequests(options = {}) {
         forget(matched) // single use: consumed by the first valid proof
         return { ok: true, offer: result }
       }
-      // A wrong proof costs one attempt on every live offer; an offer that
-      // reaches the limit is burned (its OTP is dropped from memory).
+      // Spec 023 R1/R3, decision 2026-11-13: each offer counts the wrong proofs TESTED against it,
+      // from any source, and burns at OTP_MAX_FAILURES. The per-source budget (2) is below that
+      // ceiling on purpose, so one source — or every proxied peer sharing the `proxied` key — can
+      // never burn the owner's code alone; it takes a second source spending its first wrong proof.
+      // The limit therefore bounds guessing per offer at 3 tested proofs, exactly as before.
+      sourceLimiter.recordFailure(sourceKey)
       const burned = []
       for (const offer of [...offers.values()]) {
-        offer.failures += 1
-        if (offer.failures >= OTP_MAX_FAILURES) { burned.push(offer.id); forget(offer) }
+        offer.failedProofs += 1
+        if (offer.failedProofs >= OTP_MAX_FAILURES) { burned.push(offer.id); forget(offer) }
       }
       return { ok: false, reason: 'bad-proof', burned }
     },
@@ -184,6 +203,6 @@ export function createPairingRequests(options = {}) {
     },
     pendingCount() { prunePending(); return pending.size },
     prune() { return prunePending() },
-    clear() { for (const offer of [...offers.values()]) forget(offer); pending.clear() },
+    clear() { for (const offer of [...offers.values()]) forget(offer); pending.clear(); sourceLimiter.clear() },
   }
 }

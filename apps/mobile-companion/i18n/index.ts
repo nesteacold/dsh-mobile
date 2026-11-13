@@ -29,6 +29,10 @@ export type MessageKey =
   | 'unlock.passkeyApproval'
   | 'unlock.passkeyUnsupported'
   | 'unlock.passkeyHostVersion'
+  // Spec 021 — the web bootstrap's cold start (a failure blocks pairing until it is retried).
+  | 'startup.failed'
+  | 'startup.retry'
+  | 'startup.starting'
   // tabs / sessions
   | 'tabs.running'
   | 'tabs.idle'
@@ -114,17 +118,36 @@ export type MessageKey =
   | 'pair.cameraPermissionButton'
   | 'pair.manual'
   | 'pair.manualPlaceholder'
+  | 'pair.webAddress'
   | 'pair.submit'
   | 'pair.connecting'
   | 'pair.waitingApproval'
   | 'pair.success'
+  // Contract revision 5 — the one-time-code flow ("Generate pairing code" on the Host).
+  | 'pair.modeCode'
+  | 'pair.modeOtp'
+  | 'pair.otpAddress'
+  | 'pair.otpAddressPlaceholder'
+  | 'pair.otpCode'
+  | 'pair.otpPlaceholder'
   | 'pair.errorTitle'
   | 'pair.error.remoteDisabled'
   | 'pair.error.expired'
   | 'pair.error.rejected'
   | 'pair.error.timeout'
   | 'pair.error.otpUnsupported'
+  | 'pair.error.otpRequired'
+  | 'pair.error.otpBadLength'
+  | 'pair.error.badAddress'
   | 'pair.error.pinMismatch'
+  // An 8-digit code cannot carry the computer's certificate, and a phone cannot pin an unpinned
+  // socket — so the code flow is refused here, before any connection, with the alternative.
+  | 'pair.error.otpNative'
+  // The Host's own identity could not be trusted: it stated none, or it claimed another known one.
+  | 'pair.error.noHostId'
+  | 'pair.error.hostConflict'
+  // The stored host list had not loaded yet, so the identity check could not run at all.
+  | 'pair.error.notReady'
   | 'pair.error.unavailable'
   | 'pair.error.appUpdate'
   | 'pair.error.hostUpdate'
@@ -358,6 +381,9 @@ const en = {
   'unlock.passkeyApproval': 'A passkey already exists. Ask the owner to approve replacing it on the computer, then create it again.',
   'unlock.passkeyUnsupported': 'This browser cannot use a passkey. Open the page in a recent browser over https.',
   'unlock.passkeyHostVersion': 'Your computer does not support passkey unlock yet. Update it, then try again.',
+  'startup.failed': 'This app could not finish starting, so pairing is unavailable until it does.',
+  'startup.retry': 'Retry',
+  'startup.starting': 'Starting…',
   'tabs.running': 'Running',
   'tabs.idle': 'Idle',
   'tabs.archived': 'Archived',
@@ -445,17 +471,33 @@ const en = {
   'pair.cameraPermissionButton': 'Allow camera',
   'pair.manual': 'Or paste the code shown on your computer',
   'pair.manualPlaceholder': 'Paste the pairing code',
+  'pair.webAddress': 'This browser reaches your computer at {url}',
   'pair.submit': 'Pair',
   'pair.connecting': 'Connecting to {host}…',
   'pair.waitingApproval': 'Approve this phone on your computer. Check the code: {code}',
   'pair.success': 'Paired with {host}',
+  // Contract revision 5: the Host has two buttons ("Show QR code" and "Generate pairing code"), so
+  // the app asks which secret the user was given instead of guessing.
+  'pair.modeCode': 'QR or code',
+  'pair.modeOtp': '8-digit code',
+  'pair.otpAddress': 'Your computer’s address',
+  'pair.otpAddressPlaceholder': '192.168.1.20:3081',
+  'pair.otpCode': 'Pairing code from your computer',
+  'pair.otpPlaceholder': '8 digits',
   'pair.errorTitle': 'Could not pair',
   'pair.error.remoteDisabled': 'Remote control is off on your computer. Turn it on in DSH, then scan a new code.',
   'pair.error.expired': 'This pairing code expired or was already used. Show a new one on your computer.',
   'pair.error.rejected': 'Your computer refused this pairing. Check the approval prompt on your computer and try again with a new code.',
   'pair.error.timeout': 'The approval window ran out before the pairing finished. Show a new code on your computer and try again.',
   'pair.error.otpUnsupported': 'This computer asks for a one-time code, which this app version cannot enter. Update DSH Companion, or pair with the QR code instead.',
+  'pair.error.otpRequired': 'This computer is waiting for its 8-digit pairing code. Generate one on your computer and type it here.',
+  'pair.error.otpBadLength': 'The pairing code is 8 digits. Check it on your computer and type it again.',
+  'pair.error.badAddress': 'Type your computer’s address, for example 192.168.1.20:3081.',
   'pair.error.pinMismatch': 'That computer is not the one the code belongs to. Nothing was sent. If its certificate changed, pair again with a fresh code.',
+  'pair.error.otpNative': 'On a phone, use the QR code or the long pairing string instead of the 8-digit code: a code carries no certificate for the phone to verify the computer against. Tap “QR or code” above.',
+  'pair.error.noHostId': 'This computer did not identify itself, so this phone cannot remember it. Show a new code on your computer and try again.',
+  'pair.error.hostConflict': 'This phone already has a different computer saved under that identity, so the pairing was refused. Forget that computer first if it really was replaced.',
+  'pair.error.notReady': 'Pairing is not ready yet. Wait a moment, then tap pair again.',
   'pair.error.unavailable': 'Could not reach that computer. Check you are on the same network and the gateway is running.',
   'pair.error.appUpdate': 'Your computer needs a newer DSH Companion. Update the app.',
   'pair.error.hostUpdate': 'Your computer runs an older protocol. Update DSH on the desktop.',
@@ -668,6 +710,9 @@ const vi = {
   'unlock.passkeyApproval': 'Đã có passkey. Hãy nhờ chủ máy duyệt thay thế trên máy tính rồi tạo lại.',
   'unlock.passkeyUnsupported': 'Trình duyệt này không dùng được passkey. Mở trang bằng trình duyệt mới qua https.',
   'unlock.passkeyHostVersion': 'Máy tính chưa hỗ trợ mở khoá bằng passkey. Hãy cập nhật rồi thử lại.',
+  'startup.failed': 'Ứng dụng chưa khởi động xong nên chưa thể ghép đôi.',
+  'startup.retry': 'Thử lại',
+  'startup.starting': 'Đang khởi động…',
   'tabs.running': 'Đang chạy',
   // Session state, not a queue: "Chờ" (= waiting) mislabelled an idle session; "Rảnh" = free/idle.
   'tabs.idle': 'Rảnh',
@@ -752,17 +797,31 @@ const vi = {
   'pair.cameraPermissionButton': 'Cho phép camera',
   'pair.manual': 'Hoặc dán mã hiển thị trên máy tính',
   'pair.manualPlaceholder': 'Dán mã ghép đôi',
+  'pair.webAddress': 'Trình duyệt này kết nối tới máy tính qua {url}',
   'pair.submit': 'Ghép đôi',
   'pair.connecting': 'Đang kết nối tới {host}…',
   'pair.waitingApproval': 'Hãy phê duyệt điện thoại này trên máy tính. Đối chiếu mã: {code}',
   'pair.success': 'Đã ghép đôi với {host}',
+  'pair.modeCode': 'Mã QR hoặc mã chuỗi',
+  'pair.modeOtp': 'Mã 8 số',
+  'pair.otpAddress': 'Địa chỉ máy tính của bạn',
+  'pair.otpAddressPlaceholder': '192.168.1.20:3081',
+  'pair.otpCode': 'Mã ghép đôi trên máy tính',
+  'pair.otpPlaceholder': '8 chữ số',
   'pair.errorTitle': 'Không ghép đôi được',
   'pair.error.remoteDisabled': 'Điều khiển từ xa đang tắt trên máy tính. Hãy bật trong DSH và quét mã mới.',
   'pair.error.expired': 'Mã ghép đôi đã hết hạn hoặc đã dùng. Hãy hiển thị mã mới trên máy tính.',
   'pair.error.rejected': 'Máy tính đã từ chối lần ghép đôi này. Hãy kiểm tra hộp thoại phê duyệt trên máy tính rồi thử lại bằng mã mới.',
   'pair.error.timeout': 'Hết thời gian chờ phê duyệt trước khi ghép đôi xong. Hãy hiển thị mã mới trên máy tính và thử lại.',
   'pair.error.otpUnsupported': 'Máy tính yêu cầu mã dùng một lần, phiên bản ứng dụng này chưa nhập được. Hãy cập nhật DSH Companion, hoặc ghép đôi bằng mã QR.',
+  'pair.error.otpRequired': 'Máy tính đang chờ mã ghép đôi 8 số. Hãy tạo mã trên máy tính rồi nhập vào đây.',
+  'pair.error.otpBadLength': 'Mã ghép đôi gồm 8 chữ số. Hãy kiểm tra lại trên máy tính và nhập lại.',
+  'pair.error.badAddress': 'Hãy nhập địa chỉ máy tính, ví dụ 192.168.1.20:3081.',
   'pair.error.pinMismatch': 'Máy tính này không khớp với mã. Không có dữ liệu nào được gửi. Nếu chứng chỉ vừa đổi, hãy ghép đôi lại bằng mã mới.',
+  'pair.error.otpNative': 'Trên điện thoại, hãy dùng mã QR hoặc chuỗi ghép đôi dài thay cho mã 8 số: mã này không mang chứng chỉ để điện thoại xác minh máy tính. Nhấn “Mã QR hoặc mã chuỗi” ở trên.',
+  'pair.error.noHostId': 'Máy tính này không cho biết danh tính nên điện thoại không thể ghi nhớ. Hãy hiển thị mã mới trên máy tính và thử lại.',
+  'pair.error.hostConflict': 'Điện thoại đã lưu một máy tính khác dưới cùng danh tính đó, nên lần ghép đôi này bị từ chối. Nếu máy tính thật sự đã được thay, hãy xoá máy tính cũ trước.',
+  'pair.error.notReady': 'Ứng dụng vẫn đang khởi động. Hãy đợi một chút rồi nhấn ghép đôi lại.',
   'pair.error.unavailable': 'Không kết nối được máy tính. Kiểm tra cùng mạng và gateway đang chạy.',
   'pair.error.appUpdate': 'Máy tính cần bản DSH Companion mới hơn. Hãy cập nhật ứng dụng.',
   'pair.error.hostUpdate': 'Máy tính dùng giao thức cũ hơn. Hãy cập nhật DSH trên máy tính.',
@@ -983,7 +1042,17 @@ export type PairErrorKind =
   | 'rejected'
   | 'timeout'
   | 'otpUnsupported'
+  // Contract revision 5: the OTP flow itself (no code, a code of the wrong shape, a flow mismatch).
+  | 'otpRequired'
+  | 'otpBadLength'
+  | 'badAddress'
   | 'pinMismatch'
+  // The one-time-code form on a phone, and the Host's own identity: both are refused locally.
+  | 'otpNative'
+  | 'noHostId'
+  | 'hostConflict'
+  // The stored host list was not loaded yet, so the identity check could not run.
+  | 'notReady'
   | 'unavailable'
   | 'appUpdate'
   | 'hostUpdate'
@@ -1022,8 +1091,24 @@ export function pairErrorFromCode(code: ClientErrorCode | ContractErrorCode | st
       return 'timeout';
     case 'client/pairing-otp-unsupported':
       return 'otpUnsupported';
+    // Contract revision 5: the two flows disagree, so nothing could be proved.
+    case 'client/pairing-otp-required':
+      return 'otpRequired';
+    case 'otp/empty':
+      return 'otpRequired';
+    case 'otp/bad-length':
+      return 'otpBadLength';
     case 'client/pin-mismatch':
       return 'pinMismatch';
+    // The Host's identity could not be trusted, so nothing was stored (`AppController.pair`).
+    case 'client/pairing-no-host-id':
+      return 'noHostId';
+    case 'client/pairing-host-conflict':
+      return 'hostConflict';
+    // The stored host list had not loaded, so the identity check could not run: the attempt was
+    // refused before a socket existed, and the same tap works once startup has finished.
+    case 'client/bad-state':
+      return 'notReady';
     case 'client/update-app-required':
       return 'appUpdate';
     case 'client/update-host-required':

@@ -70,6 +70,14 @@ const CSP = [
   // by another service (owner decision 2026-11-11, spec 020 §Port), so the Host listens on e.g.
   // 8443 and a port-less source expression would not match it. `https:` is NOT allowed: the app
   // makes no cross-origin HTTP request (the API rides the same-origin shell or the WSS socket).
+  //
+  // SAME-ORIGIN case (owner decision 2026-11-13): the PWA and the gateway share one tailnet HTTPS
+  // origin, and the socket is `wss://<location.host>/ws/mobile` on it. The wildcard above is what
+  // admits it: `*.ts.net` is a host-part suffix match and `*` is any port, so the page's own
+  // `<name>.ts.net:<port>` is covered — and `src/core/gateway-address.ts` derives nothing else.
+  // `'self'` stays as a second, belt-and-braces allowance; the derivation never depends on CSP3's
+  // `'self'` scheme-upgrade rule being implemented. No source expression hardcodes the machine
+  // name, and `wss://*` is deliberately not added: it would re-open every host.
   "connect-src 'self' wss://*.ts.net:*",
   "manifest-src 'self'",
   "object-src 'none'",

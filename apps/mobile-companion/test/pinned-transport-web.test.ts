@@ -189,4 +189,13 @@ describe('PWA build input (built by scripts/build-web.mjs)', () => {
     assert.equal(source.includes("connect-src 'self' wss: https:'"), false, 'no blanket wss:/https: source');
     assert.ok(source.includes("script-src 'self'"), 'scripts stay same-origin only');
   });
+
+  it('sends the SAME connect-src from the host that serves the PWA (spec 020 same-origin gateway)', () => {
+    // The build injects the policy as a <meta>; `scripts/serve-web.mjs` sends it as a header so
+    // `frame-ancestors` is enforced too. The same-origin gateway socket rides `'self'` in both, and
+    // a divergence between the two copies would silently block pairing on one path only.
+    const serveWeb = readFileSync(path.resolve(import.meta.dirname, '..', 'scripts', 'serve-web.mjs'), 'utf8');
+    assert.ok(serveWeb.includes("connect-src 'self' wss://*.ts.net:*"), 'the header CSP matches the meta CSP');
+    assert.equal(serveWeb.includes("connect-src 'self' wss: https:'"), false, 'no blanket wss:/https: source in the header either');
+  });
 });

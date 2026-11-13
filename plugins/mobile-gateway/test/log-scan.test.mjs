@@ -26,6 +26,7 @@
 //
 // Run: `node --test test/log-scan.test.mjs` (node:test; the flow is one run).
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
 import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
@@ -35,6 +36,7 @@ import { once } from 'node:events'
 import test from 'node:test'
 import WebSocket from 'ws'
 import { approvalArgsHash } from '../lib/approval-hash.mjs'
+import { otpProof } from '../lib/pairing-requests.mjs'
 import { redactLine } from '../lib/redact.mjs'
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
 
@@ -310,6 +312,24 @@ test('pair -> prompt -> approve -> revoke leaves no token, pairing code, credent
       assert.equal(await upgradeOutcome(`${host.loopbackWsUrl}?token=${encodeURIComponent(token)}`,
         ['dsh-mobile-v1'], {}), 401, 'a credential in the query must be refused')
 
+      // ---------------------------------------------------- OTP offer + bad proof
+      // Spec 023 added a refusal path that logs a line of its own; the whole OTP code and the proof
+      // it was HMAC'd into are added to the scanned corpus, so "not in the log" covers them too.
+      const otpOffer = await host.post('/mgw/pair', { mode: 'otp', kind: 'desktop' })
+      assert.equal(otpOffer.status, 201, JSON.stringify(otpOffer.body))
+      const otpSocket = host.track(open(host.lanUrl, ['dsh-mobile-v1', 'dsh-pair-otp.v1'], {
+        headers: { 'X-DSH-Device-ID': 'logscan-otp-0001' },
+      }))
+      const otpFrames = collect(otpSocket)
+      await once(otpSocket, 'open')
+      await waitUntil(() => otpFrames.some((frame) => frame.kind === 'pairing-challenge'), 'OTP challenge')
+      const challenge = otpFrames.find((frame) => frame.kind === 'pairing-challenge')
+      const otpClientNonce = crypto.randomBytes(18).toString('base64url')
+      const otpProofValue = otpProof(otpOffer.body.otp === '00000000' ? '11111111' : '00000000',
+        otpOffer.body.certSha256, otpClientNonce, challenge.serverNonce)
+      otpSocket.send(JSON.stringify({ type: 'pairing-proof', clientNonce: otpClientNonce, otpProof: otpProofValue }))
+      await once(otpSocket, 'close')
+
       // --------------------------------------------------------------- login
       // Device credentials are accepted only on the plugin-owned TLS listener.
       const control = host.track(open(host.lanUrl, ['dsh-mobile-v1'], {
@@ -400,7 +420,10 @@ test('pair -> prompt -> approve -> revoke leaves no token, pairing code, credent
       assert.equal(await upgradeOutcome(host.lanUrl, ['dsh-mobile-v1', `dsh-auth.${token}`], {}), 401,
         'a revoked token in the `dsh-auth.` subprotocol must be refused')
 
-      sink = { token, deviceId, pairingCode: paired.pairingCode, qrPayload: paired.qrPayload }
+      sink = {
+        token, deviceId, pairingCode: paired.pairingCode, qrPayload: paired.qrPayload,
+        otp: otpOffer.body.otp, otpProof: otpProofValue,
+      }
     } finally {
       if (host) await host.close()
       stopLogCapture()
@@ -419,6 +442,8 @@ test('pair -> prompt -> approve -> revoke leaves no token, pairing code, credent
       ['Authorization header value', `Bearer ${sink.token}`],
       ['raw tool arguments (canary)', CANARY],
       ['raw tool arguments (JSON)', ARGUMENTS_ONE],
+      ['one-time pairing code (OTP offer)', sink.otp],
+      ['OTP proof (HMAC sent by the client)', sink.otpProof],
     ]
     const findLeaks = (text) => secrets.filter(([, value]) => typeof value === 'string' && value !== '' && text.includes(value))
       .map(([label]) => label)

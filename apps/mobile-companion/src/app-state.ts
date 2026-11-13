@@ -34,9 +34,12 @@ import {
   coerceHistoryEvents,
   defaultClientMsgId,
   isReconnectable,
+  normalizeOtp,
+  PAIRING_QR_VERSION,
   pairedHostFromPayload,
   parsePairingQr,
   parseSessionDeepLink,
+  withSameOriginEndpoint,
   type ApprovalCardStatus,
   type ApprovalRequestedFrame,
   type ApprovalResolvedFrame,
@@ -48,6 +51,7 @@ import {
   type ReconnectSnapshot,
   type SessionSummary,
   type UpdateRequired,
+  type WebLocation,
 } from '../src/core';
 import {
   addNotificationUrlListener,
@@ -61,6 +65,7 @@ import {
   notifyApproval,
   readHosts,
   readToken,
+  readWebLocation,
   saveHost,
   saveToken,
   type ApprovalNotification,
@@ -512,6 +517,16 @@ export interface ControllerOptions {
    * controller tests assert.
    */
   passkey?: { register: typeof registerPasskey; assert: typeof assertPasskey; lock: typeof lockPasskeySocket };
+  /**
+   * Spec 020 — the browser's own location, read lazily for every pairing attempt.
+   *
+   * Defaults to the real `window.location` on web and to `null` everywhere else (`src/platform` has
+   * a `.web.ts` sibling for exactly this). When it names a tailnet HTTPS origin, `pair()` connects
+   * through that origin instead of the QR's `wss://<tailnet ip>:<port>`: the PWA is served from the
+   * same origin, which is the only one the browser trusts (a self-signed listener is refused before
+   * any frame moves, and a browser cannot pin a leaf). Injected by tests, which have no `window`.
+   */
+  webLocation?: () => WebLocation | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +777,15 @@ export class AppController {
   private connectionCleanup: (() => void) | null = null;
   private host: PairedHost | null = null;
   private hosts: PairedHost[] = [];
+  /**
+   * True once `start()` really installed the stored host list.
+   *
+   * `pair()` decides whether a `paired` frame may replace an existing record by looking at that
+   * list, so an empty list is not the same as an empty store: before the load lands it must not be
+   * read as "this phone knows no computer" (web renders the pair screen in parallel with startup,
+   * and a failed start leaves the list unloaded until a retry).
+   */
+  private hostsLoaded = false;
   private unlocked = false;
   /**
    * Spec 021 (contract §14.2) — the web passkey lock of the CURRENT connection.
@@ -784,6 +808,8 @@ export class AppController {
   private passkeyInFlight = false;
   /** Spec 021: the browser steps (the platform default, or a test's fake). */
   private readonly passkeySteps: { register: typeof registerPasskey; assert: typeof assertPasskey; lock: typeof lockPasskeySocket };
+  /** Spec 020: the page location used for the same-origin gateway address (null on native). */
+  private readonly readWebLocation: () => WebLocation | null;
   private openSessionId: string | null = null;
   /**
    * Spec 018 item 5 — task list / goal per session, as the Host projected them.
@@ -827,6 +853,20 @@ export class AppController {
     this.handshakeTimeoutMs = options.handshakeTimeoutMs;
     this.pairApprovalTimeoutMs = options.pairApprovalTimeoutMs ?? DEFAULT_PAIR_APPROVAL_TIMEOUT_MS;
     this.passkeySteps = options.passkey ?? { register: registerPasskey, assert: assertPasskey, lock: lockPasskeySocket };
+    this.readWebLocation = options.webLocation ?? readWebLocation;
+  }
+
+  /**
+   * The page's location for the same-origin gateway address (spec 020), or `null` on native.
+   * A throwing reader is treated as "no location": an address optimisation must never fail a
+   * pairing that would otherwise work.
+   */
+  private webLocation(): WebLocation | null {
+    try {
+      return this.readWebLocation();
+    } catch {
+      return null;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -871,9 +911,14 @@ export class AppController {
     // Spec 021: whether this install's pairing carried `web:unlock` — read before anything else so
     // the gate knows, without a credential read, that a lock screen (not a biometric) is the way in.
     void this.loadWebUnlockGrant();
+    // Until this read lands, the list is not the store's: a start that fails leaves `hostsLoaded`
+    // false, so `pair()` refuses rather than checking a `paired` frame against a list it cannot
+    // stand behind (a previous lifecycle's, or an empty one).
+    this.hostsLoaded = false;
     const hosts = await readHosts();
     if (!this.isLifecycleCurrent(hook)) return;
     this.hosts = hosts;
+    this.hostsLoaded = true;
     this.host = this.hosts.find((candidate) => isReconnectable(candidate)) ?? null;
     this.loading = this.host === null;
     this.bump();
@@ -1257,6 +1302,14 @@ export class AppController {
    * Pair with a decoded payload: new socket, pinned TLS, subprotocols `dsh-mobile-v1,
    * dsh-pair.<code>` + `X-DSH-Device-ID`, token from `paired` into the secure store.
    *
+   * `otp` selects the OTHER first-pairing flow (contract revision 5, `dsh-pair-otp.v1`): the Host
+   * user pressed "Generate pairing code", so there is no QR to scan — the phone was given an
+   * 8-digit single-use code and reaches the Host's address itself. That flow still needs the
+   * Host's TLS leaf pin, which the code does NOT carry (8 digits cannot): the caller must have
+   * established it first (`certSha256` in `options.otpTarget`), and that only happens after the
+   * owner has confirmed the pinned fingerprint out of band (`origin.web/pairing-trust.ts`). A
+   * missing pin is refused here, never replaced by "trust whatever certificate answers".
+   *
    * M9 / A048 — the pairing contract:
    *   * the token from `paired` is persisted **immediately**, once (contract §3.3): the code is
    *     one-time, so a later failure must never strand it. Persistence is *independent* of the
@@ -1272,15 +1325,97 @@ export class AppController {
    *   * exactly one socket survives: the one-time pairing socket is closed before the live
    *     connection starts.
    */
-  async pair(raw: string): Promise<{ ok: true; host: PairedHost } | { ok: false; code: string; message: string }> {
-    const parsed = this.parsePairPayload(raw);
-    if (!parsed.ok) {
-      this.debug.warn('pair rejected: unusable pairing payload', { errorCode: parsed.code });
-      this.pairing = { kind: 'qr', code: parsed.code, message: parsed.message };
+  async pair(
+    raw: string,
+    options: { otp?: { otp: string; url: string; certSha256?: string; gatewayName: string } } = {},
+  ): Promise<{ ok: true; host: PairedHost } | { ok: false; code: string; message: string }> {
+    // The host-conflict decision below reads `this.hosts`, which is only meaningful once `start()`
+    // has installed the stored list. Web renders this screen in parallel with startup, and a failed
+    // start leaves the list unloaded until the retry, so an empty list must not be read as "nothing
+    // is stored": refuse instead of pairing against a list that is not there yet.
+    if (!this.hostsLoaded) {
+      const message = 'This app is still starting. Wait a moment, then tap pair again.';
+      this.debug.warn('pair rejected: the stored host list is not loaded yet', { errorCode: 'client/bad-state' });
+      this.pairing = { kind: 'connect', code: 'client/bad-state', message };
       this.bump();
-      return { ok: false, code: parsed.code, message: parsed.message };
+      return { ok: false, code: 'client/bad-state', message };
     }
-    const payload = parsed.payload;
+    // Two first-pairing flows reach the same state machine from here on; only how the target and
+    // its secret are established differs.
+    //
+    //  * QR / long pairing string: the payload IS the target and the secret (the string is offered
+    //    as the `dsh-pair.<code>` subprotocol), so it is decoded and the pin comes with it.
+    //  * OTP: the phone was given an 8-digit code by the Host user, and the target + pin came from
+    //    the caller (see the doc comment). The code never enters `payload` — it is a separate
+    //    argument that only ever reaches `connect({ otp })`, which turns it into a proof.
+    const otpFlow = options.otp !== undefined;
+    let payload: PairingPayload;
+    /** The normalized code, for the OTP flow only; null for a payload pairing. */
+    let otp: string | null = null;
+    if (otpFlow) {
+      const normalized = normalizeOtp(options.otp?.otp ?? '');
+      if (!normalized.ok) {
+        // A malformed code is refused before a socket exists: a proof built from anything else is
+        // exactly what the Host closes 4410 for, and it would spend one of its three attempts.
+        const code = normalized.reason;
+        this.debug.warn('pair rejected: unusable one-time code', { errorCode: code });
+        this.pairing = { kind: 'connect', code, message: 'The one-time code must be 8 digits' };
+        this.bump();
+        return { ok: false, code, message: 'The one-time code must be 8 digits' };
+      }
+      otp = normalized.otp;
+      const target = options.otp as { url: string; certSha256?: string; gatewayName: string };
+      // THE PIN (contract revision 5 §3.8). The one-time-code offer
+      // (`POST /mgw/pair {mode:'otp'}`) returns `certSha256` next to the code, and a caller that has
+      // it (a phone that scanned the offer, or a record already trusted) passes it through here.
+      //
+      // When it is ABSENT the pin is not invented and not waived: the attempt reaches the Host with
+      // no pin declared, and the `pairing-challenge` states the leaf the proof is keyed to, which
+      // this client adopts and stores (`adoptedPin`). Whether such an attempt is allowed at all is
+      // the TRANSPORT's decision, and that is deliberate: the native module refuses an unpinned
+      // socket outright (`PinnedTrustManager` — no code path returns success without a pin), while
+      // the web transport cannot pin by construction (a browser cannot read the leaf, spec 020) and
+      // relies on the CA store for the tailnet certificate instead. So "no pin" fails here on a
+      // device, exactly as it always did, and is the honest first-use path in a browser — never a
+      // silent bypass on either.
+      const suppliedPin = String(target.certSha256 ?? '').toLowerCase();
+      if (suppliedPin !== '' && !/^[0-9a-f]{64}$/.test(suppliedPin)) {
+        const code = 'client/pin-mismatch';
+        this.debug.warn('pair rejected: the one-time-code offer carried an unusable certificate pin', { errorCode: code });
+        this.pairing = { kind: 'connect', code, message: 'The computer certificate fingerprint is not valid' };
+        this.bump();
+        return { ok: false, code, message: 'The computer certificate fingerprint is not valid' };
+      }
+      payload = {
+        version: PAIRING_QR_VERSION,
+        // The record's identity for a code pairing: the address and pin the caller verified. A
+        // `gatewayId` is NOT known until `paired`/`hello`, so it stays empty here and is filled
+        // from the frame (`pairedGatewayId`) exactly as a QR pairing uses the payload's id.
+        publicUrl: target.url,
+        pairingCode: '',
+        // The code's own lifetime is the Host's 10-minute window; this record is replaced by the
+        // real one once `paired` lands, so a nominal value is honest here.
+        expiresAt: Date.now() + 10 * 60_000,
+        certSha256: suppliedPin,
+        gatewayId: '',
+        gatewayName: target.gatewayName,
+        endpoints: [target.url],
+      };
+    } else {
+      const parsed = this.parsePairPayload(raw);
+      if (!parsed.ok) {
+        this.debug.warn('pair rejected: unusable pairing payload', { errorCode: parsed.code });
+        this.pairing = { kind: 'qr', code: parsed.code, message: parsed.message };
+        this.bump();
+        return { ok: false, code: parsed.code, message: parsed.message };
+      }
+      // Spec 020 / owner decision 2026-11-13: a PWA served from the tailnet HTTPS origin reaches the
+      // gateway through that same origin (`/ws/mobile` is routed by `tailscale serve`), so its address
+      // is the page's own origin — never the self-signed listener the QR advertises, which a browser
+      // cannot trust. Injected (`webLocation`) so the controller stays free of globals and the native
+      // path is provably untouched: with no location, the payload is used exactly as before.
+      payload = withSameOriginEndpoint(parsed.payload, this.webLocation());
+    }
     this.pairing = null;
     // A new attempt never inherits the previous one's approval code (§3.8).
     this.pairingPending = null;
@@ -1300,6 +1435,11 @@ export class AppController {
     let tokenPersisted = false;
     /** Device from `paired`, kept for the recovery path below. */
     const pairedDeviceRef: { current: { id: string; name: string } | null } = { current: null };
+    /**
+     * The Host's own `gatewayId`, from `paired` (the gateway adds its identity to that frame). An
+     * OTP pairing has no QR to read it from, so this is what gives the record its identity.
+     */
+    let pairedGatewayId: string | undefined;
 
     const pairedOnce = new Promise<{ id: string; name: string }>((resolve, reject) => {
       let seenPaired = false;
@@ -1307,6 +1447,7 @@ export class AppController {
         // Single shot: a second `paired` on this socket must not replace the stored token.
         if (seenPaired) return;
         seenPaired = true;
+        if (frame.gatewayId !== undefined) pairedGatewayId = frame.gatewayId;
         const device = { id: frame.device.id, name: frame.device.name };
         // Spec 021: the `paired` frame is where a web pairing learns it must create a passkey. This
         // is recorded SYNCHRONOUSLY, because the decision below (keep the pairing socket for the
@@ -1326,7 +1467,34 @@ export class AppController {
           reject(new CoreError({ code: 'client/bad-state', message: 'Pairing was cancelled' }));
           return;
         }
-        void this.persistToken(payload.gatewayId, frame.token).then(
+        // The credential is stored under the Host's OWN id. For a QR pairing that is the payload's
+        // (the Host agreed to it by accepting the code); an OTP pairing has no payload id at all, so
+        // it takes the one this frame states — the same `gatewayId` the record is built with below.
+        // Reading it from the frame is what keeps the token and the host record on one key: storing
+        // under the empty payload id made the credential unreachable (`readToken('')` at reconnect)
+        // and the pairing then failed with "Pairing was cancelled" AFTER the code was spent.
+        const credentialGatewayId = payload.gatewayId !== '' ? payload.gatewayId : (frame.gatewayId ?? '');
+        // The pin this connection is keyed to: what the caller supplied, or the leaf an unpinned OTP
+        // attempt adopted from the `pairing-challenge` (which always arrives before this frame).
+        const attemptedPin = payload.certSha256 !== '' ? payload.certSha256 : (pairingClient.adoptedPin ?? '');
+        // Both identity refusals run SYNCHRONOUSLY, before the token write is even registered: no
+        // `await` may sit between `paired` and `persistToken`, or a concurrent forget/revoke could
+        // delete its own instance first and this write would then resurrect it (M5).
+        const identityRefusal = credentialGatewayId === ''
+          // A frame that states no id leaves nothing to key a credential or a record on:
+          // `readToken('')` can never find it and no revocation can name it. Refuse rather than
+          // persist a secret nothing can reach.
+          ? new CoreError({
+            code: 'client/pairing-no-host-id',
+            message: 'This computer did not identify itself, so this pairing cannot be stored',
+          })
+          : this.pairingHostConflict(this.hosts, credentialGatewayId, attemptedPin, payload.publicUrl);
+        if (identityRefusal !== null) {
+          pairingClient.forgetPairedToken();
+          reject(identityRefusal);
+          return;
+        }
+        void this.persistToken(credentialGatewayId, frame.token).then(
           (revision) => {
             tokenPersisted = true;
             // The approval wait ended with the approval itself: the screen must stop showing the
@@ -1338,11 +1506,11 @@ export class AppController {
             // The socket now owns exactly this credential instance (M5): revoking the pairing
             // connection may delete it, but never a newer token on the same gateway.
             attempt.revision = revision;
-            this.socketCredentials.set(pairingClient, { gatewayId: payload.gatewayId, revision });
+            this.socketCredentials.set(pairingClient, { gatewayId: credentialGatewayId, revision });
             pairedDeviceRef.current = device;
             // N6: the credential now lives in the secure store only — drop the JS copy.
             pairingClient.forgetPairedToken();
-            this.debug.info('paired: token stored', { gatewayId: payload.gatewayId, deviceId: device.id });
+            this.debug.info('paired: token stored', { gatewayId: credentialGatewayId, deviceId: device.id });
             // Spec 021: remember the grant across reloads (no-op on native), so a page that reopens
             // without ever reaching `hello` still knows a passkey is the way in. Best effort: it
             // never throws and never delays this pairing.
@@ -1453,15 +1621,26 @@ export class AppController {
       if (!this.isCurrent(generation)) throw new CoreError({ code: 'client/bad-state', message: 'Pairing was cancelled' });
       pairingClient.connect({
         url: payload.publicUrl,
-        certSha256: payload.certSha256,
-        pairingCode: payload.pairingCode,
+        // An OTP attempt may have NO pin yet (8 digits carry none): the field is then omitted
+        // entirely rather than set to '', because the transport refuses an empty pin before any
+        // I/O (correctly — it will not open an unpinned socket), while the client adopts the leaf
+        // from the Host's `pairing-challenge` (contract revision 5, trust on first use).
+        ...(payload.certSha256 === '' ? {} : { certSha256: payload.certSha256 }),
+        // Exactly one credential: an OTP attempt offers `dsh-pair-otp.v1` and NO `dsh-pair.<code>`
+        // (an 8-digit code is not a pairing string), while a payload pairing does the reverse.
+        ...(otp === null ? { pairingCode: payload.pairingCode } : { otp }),
         installId,
         deviceName: `${platformName()} phone`,
       });
       socketStarted = true;
       const device = await pairedWait;
       if (!this.isCurrent(generation)) throw new CoreError({ code: 'client/bad-state', message: 'Pairing was superseded' });
-      const host = pairedHostFromPayload(payload, { id: device.id, name: payload.gatewayName }, Date.now());
+      // Trust on first use, made durable (contract revision 5): when this attempt had no pin and
+      // the challenge supplied one, that leaf is what every LATER connection must present. Storing
+      // it here is what makes the first-use trust a one-time event instead of a permanent stance.
+      const adoptedPin = pairingClient.adoptedPin;
+      if (adoptedPin !== null && payload.certSha256 === '') payload.certSha256 = adoptedPin;
+      const host = pairedHostFromPayload(payload, { id: device.id, name: payload.gatewayName }, Date.now(), pairedGatewayId);
       attempt.host = host;
       const hosts = await this.serializeHostWrite(async () => {
         // Re-check *after* waiting for earlier reads/writes: a stale attempt writes nothing.
@@ -1557,7 +1736,7 @@ export class AppController {
           // The one-time code was consumed and its token is safely stored: keep the host record
           // so an update / retry can reconnect later instead of forcing a fresh QR.
           try {
-            const recovered = pairedHostFromPayload(payload, { id: savedDevice.id, name: payload.gatewayName }, Date.now());
+            const recovered = pairedHostFromPayload(payload, { id: savedDevice.id, name: payload.gatewayName }, Date.now(), pairedGatewayId);
             const hosts = await this.serializeHostWrite(async () => {
               if (!this.isCurrent(attemptGeneration)) return null;
               return saveHost(recovered);
@@ -2250,6 +2429,41 @@ export class AppController {
       if (this.credentialChain.get(gatewayId) === settled) this.credentialChain.delete(gatewayId);
     });
     return run;
+  }
+
+  /**
+   * The `paired` frame claims a Host this device already knows under DIFFERENT trust material, or
+   * null when the claim is consistent.
+   *
+   * The record and the credential are both keyed by `gatewayId`, so a frame that names an existing
+   * host's id would otherwise REPLACE that host's record and token (`saveHost` upserts by id, and
+   * `saveToken` overwrites the same key). Nothing in a pairing frame proves the sender is that
+   * computer: an OTP attempt learns the id only from this very frame, so a hostile or compromised
+   * Host could name a phone's existing computer and take over its entry.
+   *
+   * The one legitimate case is re-pairing the SAME computer (a replaced credential, a new code):
+   * its pin and address are unchanged, so an identical pin+URL is allowed to replace the record.
+   * Anything else is a different computer wearing a known id, and is refused before a byte reaches
+   * the store.
+   *
+   * DELIBERATELY SYNCHRONOUS, against the list `start()` loaded. It is called on the `paired` path
+   * immediately before `persistToken`, which contract §3.3 requires to land at once: an `await`
+   * there would let a concurrent forget/revoke finish its delete first, and this write would then
+   * resurrect a credential that wipe had already removed (M5).
+   */
+  private pairingHostConflict(knownHosts: readonly PairedHost[], gatewayId: string, pin: string, publicUrl: string): CoreError | null {
+    const existing = knownHosts.find((candidate) => candidate.gatewayId === gatewayId) ?? null;
+    if (existing === null) return null;
+    // Only the exact trust material of the known record may replace it. An attempt with NO pin
+    // count as a conflict whenever a record exists: the challenge-supplied leaf is adopted before
+    // `paired`, so an empty pin here is an anomaly, and it can never show this is that computer.
+    const pinAgrees = pin !== '' && existing.certSha256 === pin;
+    if (pinAgrees && existing.publicUrl === publicUrl) return null;
+    this.debug.warn('pair refused: the stated identity belongs to another known host', { gatewayId, errorCode: 'client/pairing-host-conflict' });
+    return new CoreError({
+      code: 'client/pairing-host-conflict',
+      message: 'This phone already has a different computer under that identity, so this pairing was refused',
+    });
   }
 
   /** Register a new credential instance; resolves with the revision that owns it. */

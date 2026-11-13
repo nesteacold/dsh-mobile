@@ -39,6 +39,19 @@ const UPLOAD_CONTENT_TYPE = 'application/octet-stream'
 /** The kind of every answer to a `remote-upload-*` frame. */
 const RESULT_KIND = 'remote-upload-result'
 /**
+ * The kind of a refusal the gateway mints BEFORE it dispatches the frame.
+ *
+ * Contract 8.2 says a TRANSFER failure never arrives as `kind: 'error'`, and that
+ * holds: everything `handleRemoteUpload` answers is a `remote-upload-result`. But
+ * the four frames still pass the dispatcher's own gates first — a live credential,
+ * the socket's web lock, the frame's `requestId`, and `attachments:write` itself
+ * (pinned gateway lib/index.mjs:5727-5751) — and those answer with the same
+ * `kind: 'error'` frame every other op gets. The scope gate is the one that fires
+ * in practice: `attachments:write` is in the desktop default OFFER but never on an
+ * existing record, so a device paired before spec 013 has to be ticked by the owner.
+ */
+const ERROR_KIND = 'error'
+/**
  * The largest body this side will stage before the remote has even been asked.
  * `fileUploadMaxBytes` is the remote Host's limit and is only known from the
  * `remote-upload-open` answer, which itself needs the size up front: so the spool
@@ -114,6 +127,21 @@ function publicText(value, fallback = 'the remote Host refused the file') {
  */
 const REMOTE_CODE = /^[A-Za-z][A-Za-z0-9/._:-]{0,63}$/
 const publicCode = (value) => (typeof value === 'string' && REMOTE_CODE.test(value) ? value : 'gateway/internal')
+
+/**
+ * Scope names a dispatcher refusal may name. A plain frozen copy of the contract's
+ * `SCOPES` (a test fails on drift): a remote-controlled `scope` string is relayed
+ * only when it is one of these, so a hostile Host cannot put free text in the
+ * composer's mouth.
+ */
+export const KNOWN_SCOPES = Object.freeze([
+  'sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'files:write',
+  'settings:write', 'stats:read', 'web:unlock', 'harness:remote', 'commands:execute',
+  'workspace:manage', 'credentials:write', 'plugins:manage', 'schedule:write',
+  'schedule:read', 'terminal', 'sessions:author', 'attachments:write',
+  'browser:control', 'permission:lower',
+])
+const knownScope = (value) => typeof value === 'string' && KNOWN_SCOPES.includes(value)
 
 /**
  * A remote's `error.details` is forwarded only while it is a small flat map of
@@ -309,7 +337,7 @@ export class UploadRoute {
   async #fetch(request) {
     const original = this.#root?.fetch
     if (typeof original !== 'function') {
-      return jsonResponse(200, { ok: false, error: { code: 'gateway/internal', message: 'the host upload handler is unavailable' } })
+      return this.#failureResponse(failure('gateway/internal', 'the host upload handler is unavailable'))
     }
     let url
     try { url = new URL(request.url) } catch {
@@ -425,6 +453,18 @@ export class UploadRoute {
   async #frame(connection, frame, { signal, timeoutMs }) {
     if (signal?.aborted) throw cancelled()
     const reply = await connection.request(frame, { signal, timeoutMs })
+    if (reply?.kind === ERROR_KIND) {
+      // A dispatcher refusal, not a transfer outcome: the gateway answers these
+      // before it ever reaches the manager (see ERROR_KIND). Relayed with its own
+      // code and scope so the composer can say what is actually wrong — an
+      // unticked `attachments:write` is the common one, and flattening it to
+      // "unexpected frame" hid both the cause and the fix.
+      const details = publicDetails(reply.details)
+      throw failure(publicCode(reply.code), publicText(reply.message), {
+        ...(details ?? {}),
+        ...(knownScope(reply.scope) ? { scope: reply.scope } : {}),
+      })
+    }
     if (reply?.kind !== RESULT_KIND) throw failure('gateway/internal', 'the remote Host answered with an unexpected frame')
     if (reply.ok !== true) {
       // The remote's code and text are mirrored, but only in the shape the
@@ -532,10 +572,21 @@ export class UploadRoute {
     return host
   }
 
-  /** The route's own failure envelope: HTTP 200, exactly like the native handler. */
+  /**
+   * The route's own failure envelope: HTTP 200, exactly like the native handler.
+   *
+   * `details` is ALWAYS a record, even when this module has nothing to put in it.
+   * The native route answers the Host's own `remoteErrorOf` details — `{}` at
+   * worst — and the composer's parser requires that shape: `parseUploadResult`
+   * (dsh-client-file-upload lib/client.js:294-309) throws
+   * `TypeError: file upload transport returned an invalid failure` when
+   * `error.details` is not a record, so an omitted `details` is not "no details",
+   * it is a failure the composer cannot even display. Measured: a remote
+   * `file-upload-offset` refusal without details took that path.
+   */
   #failureResponse(error) {
-    const envelope = { code: error.code ?? 'gateway/internal', message: error.message ?? 'the file could not be attached' }
-    if (error.details !== undefined) envelope.details = error.details
+    const envelope = { code: error.code ?? 'gateway/internal', message: error.message ?? 'the file could not be attached',
+      details: error.details ?? {} }
     return jsonResponse(200, { ok: false, error: envelope })
   }
 }

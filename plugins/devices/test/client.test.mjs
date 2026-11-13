@@ -41,6 +41,8 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     // Left undefined unless a test names it: the older-Host read, with no
     // `uploads` key at all (see the /devices/remotes route below).
     uploads,
+    // POST /mgw/devices/:id/scopes: one queued refusal, and the calls the page made.
+    scopeFailure: null,
   }
   const fetch = async (url, options = {}) => {
     const target = new URL(url)
@@ -50,7 +52,11 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     const reply = (data, ok = true, status = ok ? 200 : 400) => ({ ok, status, json: async () => data })
     if (fail[route]) return reply({ message: fail[route] }, false)
     if (route === '/mgw/status') return reply(state.status)
-    if (route === '/mgw/devices') return reply({ devices: state.devices })
+    // Fresh row objects on every poll, the way JSON over HTTP really delivers them: React cannot
+    // bail out of a re-render, so a test sees the rows the route persisted.
+    if (route === '/mgw/devices') {
+      return reply({ devices: state.devices.map((row) => ({ ...row, scopes: [...(row.scopes || [])] })) })
+    }
     // The connection plan: rebind the listener, and move the status the next poll
     // reads too — otherwise a test could pass on a bind the gateway never applied.
     if (route === '/mgw/listen' && options.method === 'POST') {
@@ -85,6 +91,23 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     if (/^\/devices\/pairings\/p-1$/.test(route) && options.method === 'DELETE') { state.pairing = { ...state.pairing, state: 'cancelled' }; return reply({ pairing: state.pairing }) }
     if (route === '/mgw/pair') return reply({ pairing: { expiresAt: Date.now() + 90_000, kind: body.kind, scopes: body.scopes }, pairingString: 'PAIRSTRING' + (body.scopes ? '-' + body.scopes.join('+') : ''), payload: {} })
     if (/^\/mgw\/devices\/.+\/revoke$/.test(route)) return reply({ revoked: true })
+    // POST /mgw/devices/:id/scopes (spec 025 R5): apply the diff the page sends to the row the
+    // test seeded, the way the gateway persists it, and answer the route's own shape.
+    if (/^\/mgw\/devices\/[^/]+\/scopes$/.test(route) && options.method === 'POST') {
+      if (state.scopeFailure) {
+        const failure = state.scopeFailure
+        state.scopeFailure = null
+        return reply(failure.body, false, failure.status)
+      }
+      const id = decodeURIComponent(route.split('/')[3])
+      const row = state.devices.find((entry) => entry.id === id)
+      if (!row) return reply({ error: 'not-found', message: 'no such device' }, false, 404)
+      const before = [...(row.scopes || [])]
+      const added = (body.add ?? []).filter((scope) => !before.includes(scope))
+      const removed = (body.remove ?? []).filter((scope) => before.includes(scope))
+      row.scopes = [...before.filter((scope) => !removed.includes(scope)), ...added]
+      return reply({ device: { ...row }, added, removed })
+    }
     if (route === '/devices/remotes' && (options.method ?? 'GET') === 'GET') {
       // `uploads` is only present when a test sets it: omitting the key is the
       // older-Host case, and the page must then claim nothing about attachments.
@@ -529,6 +552,79 @@ await check('authorized devices: shows name/kind/scopes/last used/Connected here
   await click(button(page, 'Remove access'))
   assert.ok(ui.calls.some((call) => call.method === 'POST' && call.route === '/mgw/devices/dev-1/revoke'))
   page.unmount()
+})
+
+await check('permissions editor (spec 025 R5): per-device in-place scope change, kind-limited list, explicit confirm, route codes; the missing-upload hint; vi + en', async () => {
+  // A record paired before spec 013: no `attachments:write`, so the row carries the hint.
+  const device = { id: 'dev-1', name: 'Work PC', displayName: 'Work PC', kind: 'desktop', scopes: ['sessions:read', 'prompt:send'], lastSeenAt: 1_700_000_000_000, online: true }
+  const ui = load({ devices: [device], status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  assert.match(text(page), /Re-grant file upload permission/, 'a grant without attachments:write is flagged')
+  // The row has three actions now: Permissions, Edit (re-pair) and Remove.
+  await click(button(page, 'Permissions'))
+  assert.ok(find(page, (node) => node.props['data-testid'] === 'permissions-editor').length === 1)
+  assert.match(text(page), /without re-pairing/)
+  const boxes = () => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
+  // The editor lists every scope a desktop may hold, and NOTHING for another kind (below).
+  assert.equal(boxes().length, ALL.length)
+  assert.deepEqual(boxes().filter((node) => node.props.checked).length, 2, 'the current grant is ticked')
+  // `web:unlock` is listed but not tickable: the passkey flow owns it.
+  assert.equal(boxes()[ALL.indexOf('web:unlock')].props.disabled, true)
+  // A no-op save is refused by the page itself (no confirm, no request).
+  assert.equal(button(page, 'Apply permissions').props.disabled, true)
+  // Add one, remove one, then confirm. The body is the DIFF, never the whole list.
+  await act(async () => { boxes()[ALL.indexOf('attachments:write')].props.onChange({ target: { checked: true } }) })
+  await act(async () => { boxes()[ALL.indexOf('prompt:send')].props.onChange({ target: { checked: false } }) })
+  ui.calls.length = 0
+  await click(button(page, 'Apply permissions'))
+  const call = ui.calls.find((entry) => entry.route === '/mgw/devices/dev-1/scopes')
+  assert.equal(call.method, 'POST')
+  assert.deepEqual(call.body, { add: ['attachments:write'], remove: ['prompt:send'] })
+  assert.match(text(page), /The device reconnects to pick them up/)
+  // The route's answer is the new baseline: the page re-reads the rows, and a second click sends
+  // nothing (the same change is not applied twice against a stale row).
+  assert.ok(ui.calls.some((entry) => entry.route === '/mgw/devices'), 'onApplied refreshes the rows')
+  assert.equal(button(page, 'Apply permissions').props.disabled, true, 'nothing left to apply')
+  // A refusal leaves the tick state alone, so the owner can correct it and try again.
+  assert.equal(boxes()[ALL.indexOf('attachments:write')].props.checked, true)
+  await act(async () => { for (const tick of [...ui.intervals.values()]) await tick() })
+  assert.doesNotMatch(text(page), /Re-grant file upload permission/, 'the hint goes once the scope is there')
+  // A named refusal is said in the page's language, not the route's English sentence.
+  ui.state.scopeFailure = { status: 400, body: { error: 'scope-not-for-kind', message: 'scope x is not available for a desktop device' } }
+  await act(async () => { boxes()[ALL.indexOf('terminal')].props.onChange({ target: { checked: true } }) })
+  await click(button(page, 'Apply permissions'))
+  assert.equal(find(page, (node) => node.props['data-testid'] === 'permissions-error')[0].children.join(''),
+    'That permission does not apply to this kind of device.')
+  ui.state.scopeFailure = { status: 404, body: { error: 'not-found', message: 'no such device' } }
+  await click(button(page, 'Apply permissions'))
+  assert.equal(find(page, (node) => node.props['data-testid'] === 'permissions-error')[0].children.join(''),
+    'That device is no longer paired. Reload the page.')
+  page.unmount()
+
+  // A `mobile` record: the desktop-only scopes are not even listed, so the gateway can never refuse
+  // a tick the page offered. That is the same DESKTOP_ONLY_SCOPES table the contract carries.
+  const phone = { id: 'dev-2', name: 'Phone', kind: 'mobile', scopes: ['sessions:read'], online: false }
+  const second = load({ devices: [phone], status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } } })
+  const mobilePage = await mount(React.createElement(second.api.testing.AllowTab))
+  await flush()
+  await click(button(mobilePage, 'Permissions'))
+  const mobileBoxes = () => find(mobilePage, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
+  assert.equal(mobileBoxes().length, ALL.length - DESKTOP_ONLY_SCOPES.length)
+  for (const scope of DESKTOP_ONLY_SCOPES) {
+    assert.equal(mobileBoxes().some((node) => node.props['data-scope'] === scope), false, `${scope} is not offered to a mobile`)
+  }
+  assert.deepEqual([...second.api.testing.scopesForKind('mobile')].sort(),
+    [...ALL.filter((scope) => !DESKTOP_ONLY_SCOPES.includes(scope))].sort(), 'the client mirror matches the contract table')
+  // vi: the editor's own strings are real translations and the dictionaries stay twins.
+  second.setLocale('vi')
+  await flush()
+  assert.match(text(mobilePage), /Áp dụng quyền/)
+  assert.match(text(mobilePage), /Cấp lại quyền tải tệp lên/)
+  const { DICT } = second.api.testing
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
+  assert.notEqual(DICT.vi.permsHelp, DICT.en.permsHelp)
+  mobilePage.unmount()
 })
 
 await check('connect tab: Add device dialog (LAN | Internet disabled, Address, 8-digit code, Display name, Advanced link); remote list shows status', async () => {

@@ -16,7 +16,7 @@ import { test } from 'node:test'
 
 import { PINNED_DSH_VERSION } from '../lib/host-router.mjs'
 import { RemoteInputError } from '../lib/remote-client.mjs'
-import { UPLOAD_PATH, createUploadRoute, splitTaggedSessionId } from '../lib/upload-route.mjs'
+import { KNOWN_SCOPES, UPLOAD_PATH, createUploadRoute, splitTaggedSessionId } from '../lib/upload-route.mjs'
 
 const HOST_ID = '2f1d1a52-6d7c-4d3e-9a58-1f0f1a2b3c4d'
 const TAGGED = `h:${HOST_ID}:s-1`
@@ -256,6 +256,113 @@ test('an answer that is not a revision-8 result is refused instead of trusted', 
   assert.equal(body.error.code, 'gateway/internal')
 })
 
+test('a dispatcher refusal before dispatch keeps its own code and scope', async (t) => {
+  // The gateway answers the four frames with `kind:'error'` when one of its own
+  // gates refuses them BEFORE the upload manager runs (pinned lib/index.mjs:
+  // 5727-5751: live credential, web lock, `requestId`, `attachments:write`).
+  // Contract 8.2's "a failure never arrives as kind:'error'" is about TRANSFER
+  // outcomes, so these are not a contract violation — but flattening them to
+  // "unexpected frame" hid the one that fires in practice: `attachments:write` is
+  // in the desktop default OFFER and never on an existing record, so a device
+  // paired before spec 013 uploads nothing until the owner ticks it, and the
+  // composer must be able to say so (R5) instead of reporting a generic failure.
+  const root = scratch(t)
+  const refused = {
+    'auth/forbidden-scope': { scope: 'attachments:write', message: 'this device was not paired with attachments:write' },
+    'bad-request': { message: 'requestId must be 1..64 characters from [A-Za-z0-9._-]' },
+    'auth/revoked': { message: 'this device credential is no longer valid' },
+  }
+  for (const [code, extra] of Object.entries(refused)) {
+    const link = fakeLink((frame) => ({ kind: 'error', code, requestType: frame.type, requestId: 'gw-1', ...extra }))
+    const { connection, record } = hostConnection()
+    route({ connection, connect: async () => ({ connection: link }), tmpDir: root }).install()
+    const body = await (await record.fetch(uploadRequest({ sessionId: TAGGED, body: Buffer.from('x') }))).json()
+    assert.equal(body.ok, false, code)
+    assert.equal(body.error.code, code, `a dispatcher refusal must keep ${code}`)
+    assert.equal(body.error.message, extra.message, code)
+    // The scope travels in `details`, the one map the route forwards to the
+    // composer: a flat string is what the page can render as the missing grant.
+    assert.deepEqual(body.error.details, extra.scope === undefined ? {} : { scope: extra.scope }, code)
+  }
+
+  // The same hardening the transfer path gets: a dispatcher frame is remote data
+  // too, so a code the contract does not define is generic and the text is
+  // bounded and stripped before the composer renders it.
+  const hostile = fakeLink((frame) => ({ kind: 'error', code: { nested: true }, requestType: frame.type,
+    requestId: 'gw-9', message: `bad\u0000request${'x'.repeat(1000)}` }))
+  const { connection, record } = hostConnection()
+  route({ connection, connect: async () => ({ connection: hostile }), tmpDir: root }).install()
+  const body = await (await record.fetch(uploadRequest({ sessionId: TAGGED, body: Buffer.from('x') }))).json()
+  assert.equal(body.error.code, 'gateway/internal', 'an unknown dispatcher code is not relayed')
+  assert.equal(body.error.message.startsWith('bad request'), true)
+  assert.equal(body.error.message.length <= 300, true)
+  assert.equal(body.error.message.includes('\u0000'), false)
+})
+
+test('a remote-controlled `scope` is relayed only when it is a known scope name', async (t) => {
+  const root = scratch(t)
+  const run = async (scope) => {
+    const link = fakeLink((frame) => ({ kind: 'error', code: 'auth/forbidden-scope', requestType: frame.type,
+      requestId: 'gw-1', message: 'refused', scope }))
+    const { connection, record } = hostConnection()
+    route({ connection, connect: async () => ({ connection: link }), tmpDir: root }).install()
+    return (await (await record.fetch(uploadRequest({ sessionId: TAGGED, body: Buffer.from('x') }))).json()).error
+  }
+  assert.deepEqual((await run('attachments:write')).details, { scope: 'attachments:write' })
+  for (const hostile of ['<script>alert(1)</script>', 'attachments:write ', 'not-a-scope', '', 42, { a: 1 }, null]) {
+    assert.equal('scope' in (await run(hostile)).details, false, `scope ${JSON.stringify(hostile)} must be omitted`)
+  }
+})
+
+test('KNOWN_SCOPES is frozen and matches the contract scope list', async () => {
+  const { SCOPES } = await import('../../../packages/mobile-protocol/src/index.mjs')
+  assert.equal(Object.isFrozen(KNOWN_SCOPES), true)
+  assert.deepEqual([...KNOWN_SCOPES].sort(), [...SCOPES].sort())
+})
+
+test('every failure carries a `details` record, because the composer requires one', async (t) => {
+  // The native route answers the Host's own details (`{}` at worst) and the
+  // desktop composer's `parseUploadResult` (dsh-client-file-upload
+  // lib/client.js:294-309) THROWS `file upload transport returned an invalid
+  // failure` when `error.details` is not a record. An omitted `details` is
+  // therefore not "no details": it is a failure the composer cannot display at
+  // all. Measured before this test: a remote `file-upload-offset` refusal with no
+  // details, and every dispatcher refusal, took exactly that path.
+  const root = scratch(t)
+  const isRecord = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
+  const cases = [
+    // A transfer refusal from the manager itself, with and without details.
+    ['no details', () => ({ kind: 'remote-upload-result', ok: false,
+      error: { code: 'file-upload-offset', message: 'offset must equal the next expected byte' } })],
+    ['with details', () => ({ kind: 'remote-upload-result', ok: false,
+      error: { code: 'session/attachment-invalid', message: 'Image type image/bmp is not accepted.',
+        details: { reason: 'UNSUPPORTED_IMAGE_TYPE' } } })],
+    // Host-side failures this module mints, which carry no details of their own.
+    ['host offline', () => { throw new Error('connect ECONNREFUSED 127.0.0.1:3081') }],
+  ]
+  for (const [label, answer] of cases) {
+    const { connection, record } = hostConnection()
+    route({
+      connection,
+      connect: async () => ({ connection: { requestTimeoutMs: 5_000, async request(frame) { return answer(frame) } } }),
+      tmpDir: root,
+    }).install()
+    const body = await (await record.fetch(uploadRequest({ sessionId: TAGGED, body: Buffer.from('x') }))).json()
+    assert.equal(body.ok, false, label)
+    assert.equal(isRecord(body.error.details), true, `${label}: details must be a record, got ${JSON.stringify(body.error.details)}`)
+  }
+  // The same holds for a file the local bound refuses: a DECLARED length is
+  // refused before any dial, and it must still carry a record.
+  const { connection, record } = hostConnection()
+  route({ connection, connect: noDial, tmpDir: root, maxSpoolBytes: 1 }).install()
+  const oversized = await (await record.fetch(uploadRequest({
+    sessionId: TAGGED, body: Buffer.from('0123456789'), contentLength: 10,
+  }))).json()
+  assert.equal(oversized.error.code, 'file-too-large')
+  assert.equal(isRecord(oversized.error.details), true)
+  assert.equal(oversized.error.details.maxBytes, 1)
+})
+
 test('a typed dial refusal keeps its own code, as every other remote route answers it', async (t) => {
   // `…/prompt` and `…/history` let a typed refusal through instead of flattening
   // it to "offline"; an upload must not be the one route that hides a revocation.
@@ -435,12 +542,15 @@ test('remote details travel only as the small flat map the contract defines', as
     // The contract's own shape (and a number/boolean) is forwarded verbatim.
     [{ reason: 'UNSUPPORTED_IMAGE_TYPE', retryable: false, limit: 12 }, { reason: 'UNSUPPORTED_IMAGE_TYPE', retryable: false, limit: 12 }],
     // Nested, oversized, array, scalar and null values are remote-controlled
-    // structure the composer would render, so they are dropped.
-    [{ nested: { path: '/home/someone/secret.png' } }, undefined],
-    [{ note: 'x'.repeat(600) }, undefined],
-    [{ values: ['a'] }, undefined],
-    ['a string', undefined],
-    [null, undefined],
+    // structure the composer would render, so they are DROPPED — and what is left
+    // is still a record (`{}`), never an omitted field: the native route always
+    // answers details (`{}` at worst) and the composer's parser requires a
+    // record, so `undefined` here would be a failure it cannot display.
+    [{ nested: { path: '/home/someone/secret.png' } }, {}],
+    [{ note: 'x'.repeat(600) }, {}],
+    [{ values: ['a'] }, {}],
+    ['a string', {}],
+    [null, {}],
   ]
   for (const [details, expected] of cases) {
     const link = fakeLink(() => refusal('session/attachment-invalid', 'the remote refused it', details))
@@ -449,10 +559,10 @@ test('remote details travel only as the small flat map the contract defines', as
     const body = await (await record.fetch(uploadRequest({ sessionId: TAGGED, body: Buffer.from('x') }))).json()
     assert.equal(body.ok, false)
     assert.equal(body.error.code, 'session/attachment-invalid')
-    if (expected === undefined) {
-      assert.equal(Object.hasOwn(body.error, 'details'), false, JSON.stringify(details))
-    } else {
-      assert.deepEqual(body.error.details, expected)
+    assert.deepEqual(body.error.details, expected, JSON.stringify(details))
+    // A dropped structure never leaks into the envelope in any form.
+    if (expected !== details && typeof details === 'object' && details !== null) {
+      assert.equal(JSON.stringify(body.error).includes('secret.png'), false)
     }
   }
 })
