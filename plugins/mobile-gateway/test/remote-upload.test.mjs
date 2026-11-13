@@ -217,16 +217,23 @@ test('R3-9 concurrent transfers: the manager enforces a global backstop and repo
 })
 
 test('R3-10 idle timeout: an idle transfer expires, its spool is deleted and its slot freed', async (t) => {
-  // Observe the spool by pointing the OS temp dir at a directory of our own.
+  // Observe the spool by pointing the OS temp dir at a directory of our own. All three variables
+  // are set because `os.tmpdir()` reads TMPDIR on POSIX and TEMP then TMP on Windows.
   const spoolRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-upload-idle-'))
-  const savedTemp = { TEMP: process.env.TEMP, TMP: process.env.TMP }
-  process.env.TEMP = spoolRoot
-  process.env.TMP = spoolRoot
+  const TEMP_VARS = ['TMPDIR', 'TEMP', 'TMP']
+  const savedTemp = new Map(TEMP_VARS.map((name) => [name, process.env[name]]))
+  for (const name of TEMP_VARS) process.env[name] = spoolRoot
   const f = fixture({ fileUploadIdleMs: -1, fileUploadMaxTransfers: 1 })
   t.after(async () => {
     await f.manager.dispose()
-    process.env.TEMP = savedTemp.TEMP
-    process.env.TMP = savedTemp.TMP
+    // Restore by DELETING what was unset: assigning `undefined` stores the string "undefined",
+    // after which `os.tmpdir()` answers "undefined" for every later test in this file (POSIX has
+    // no TEMP/TMP at all, so that is the normal case on CI).
+    for (const name of TEMP_VARS) {
+      const value = savedTemp.get(name)
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
     await fsp.rm(spoolRoot, { recursive: true, force: true })
   })
   const bytes = Buffer.from('abcdef')

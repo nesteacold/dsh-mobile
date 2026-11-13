@@ -20,14 +20,17 @@ env:
   # CI runs the same major the developers run locally.
   NODE_VERSION: '24'
 
+# Pinned to the majors whose `runs.using` is node24 (checkout v5+, setup-node v5+). The runner used to
+# force node20-targeted actions onto node24 and warn about it on every job; v4 targets node20
+# natively, so it is the version that produces the deprecation notice.
 jobs:
   repo:
     name: repo gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
       # Tree completeness: every relative import resolves, every test named by `npm test` exists.
@@ -47,8 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
       # The package has no dependencies (its lockfile lists only itself), so there is nothing to
@@ -62,8 +65,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -77,8 +80,19 @@ jobs:
       - name: check:protocol
         run: npm run check:protocol
         working-directory: plugins/mobile-gateway
-      # `npm pack` + `npm install --offline` of the tarball. `--offline` reads the npm cache, which
-      # the `npm ci` above (and setup-node's cache) just filled on this runner.
+      # `npm pack` + `npm install --offline` of the tarball. The test is hermetic on purpose
+      # (`--offline`, no registry), so the cache it reads must be warmed first: `npm ci` alone
+      # installs from the lockfile WITHOUT fetching the packuments an offline resolve needs
+      # (measured: ENOTCACHED for @deepseek-ai/schemastery right after `npm ci`), and the
+      # setup-node dependency cache is not written until the job's post step. So warm it with one
+      # real online install of the same runtime dependencies, in a scratch directory, which leaves
+      # the checkout and its lockfile untouched.
+      - name: warm the npm cache for the offline package gate
+        run: |
+          scratch="$(mktemp -d)"
+          node -e 'const m=require("./package.json");require("fs").writeFileSync(process.argv[1]+"/package.json",JSON.stringify({name:"cache-warm",version:"1.0.0",private:true,dependencies:m.dependencies},null,2))' "$scratch"
+          ( cd "$scratch" && npm install --omit=dev --ignore-scripts --no-audit --no-fund )
+        working-directory: plugins/mobile-gateway
       - name: test:package
         run: npm run test:package
         working-directory: plugins/mobile-gateway
@@ -88,8 +102,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -112,8 +126,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm

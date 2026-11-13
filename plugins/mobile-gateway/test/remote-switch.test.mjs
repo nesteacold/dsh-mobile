@@ -128,17 +128,37 @@ function listeningSockets() {
   return sockets
 }
 
-// Deterministic listener enumeration: bind the same port on 0.0.0.0 and see
-// whether the OS still hands it out. If the plugin's listener covers every
-// interface, the wildcard bind fails.
-function wildcardBindSucceeds(port) {
+/**
+ * True when `host:port` answers a TCP connect, i.e. some listener is reachable there.
+ * `undefined` when this host has no non-loopback IPv4 address to reach it at, so the
+ * caller can say so instead of claiming a pass it did not prove.
+ *
+ * WHY not "bind 0.0.0.0 on the same port and see if it is refused": that bind succeeds on
+ * Windows even while 127.0.0.1:port is taken (measured — Windows allows the overlap), so the
+ * assertion passed there for the wrong reason. On Linux the wildcard bind is refused for EITHER
+ * a loopback or a wildcard existing listener (measured both orders), so it failed even though the
+ * gateway was correctly loopback-only. Reaching the port over a non-loopback address asks the real
+ * question instead: is this listener visible off loopback. A loopback-only bind refuses it; a
+ * wildcard bind answers it.
+ */
+function reachableOffLoopback(port) {
+  const address = lanIPv4();
+  if (address === undefined) return undefined
   return new Promise((resolve) => {
-    const probe = net.createServer()
+    const probe = net.connect({ host: address, port })
+    probe.once('connect', () => { probe.destroy(); resolve(true) })
     probe.once('error', () => resolve(false))
-    probe.listen({ port, host: '0.0.0.0', exclusive: true }, () => {
-      probe.close(() => resolve(true))
-    })
   })
+}
+
+/** The first non-internal IPv4 address, which is what "off loopback" means on this host. */
+function lanIPv4() {
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries ?? []) {
+      if (entry.family === 'IPv4' && !entry.internal) return entry.address
+    }
+  }
+  return undefined
 }
 
 // Poll a predicate instead of racing promises: WS close notifications arrive
@@ -228,9 +248,23 @@ function openWedgedSocket(tlsUrl, token) {
       assert.equal(after.lan.listening, false, 'no LAN listener may be open while the switch is off')
       assert.deepEqual(after.lan.urls, [], 'no non-loopback URL may be advertised while the switch is off')
 
-      // The DSH loopback port must not also be reachable on a wildcard bind.
-      assert.equal(await wildcardBindSucceeds(instance.port), true,
-        `something is bound to 0.0.0.0:${instance.port}; default install must be loopback-only`)
+      // The DSH port must not also be reachable off loopback. This fixture binds that port on
+      // 127.0.0.1 itself, and a loopback-only port is invisible from a non-loopback address no
+      // matter which of the two owns it, so a `true` answer means something opened a wildcard.
+      // Proven non-vacuous first: the probe must be able to see a real wildcard listener here,
+      // otherwise "not reachable" would pass on a host where nothing is reachable (a firewall).
+      const control = net.createServer()
+      await new Promise((resolve) => control.listen(0, '0.0.0.0', resolve))
+      const controlVisible = await reachableOffLoopback(control.address().port)
+      await new Promise((resolve) => control.close(resolve))
+      if (controlVisible === undefined) {
+        console.log('SKIP: the off-loopback probe — this host has no non-loopback IPv4 address')
+      } else {
+        assert.equal(controlVisible, true,
+          'the off-loopback probe cannot see a wildcard listener on this machine, so it could not detect one')
+        assert.equal(await reachableOffLoopback(instance.port), false,
+          `something is bound to 0.0.0.0:${instance.port}; default install must be loopback-only`)
+      }
       passed('default config binds loopback only and opens no LAN listener')
     } finally {
       await instance.close()

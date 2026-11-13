@@ -291,7 +291,12 @@ test('--quiet prints no table but keeps the verdict', () => {
 
 test('the default profile is resolved from the home directory at runtime, not hardcoded', () => {
   const box = sandbox();
-  const target = checkout(box.root, 'target');
+  // The checkout sits INSIDE the home so every printed cell must fold to `~/...`: an absolute
+  // spelling anywhere in the row is then a real redaction failure. (A sibling checkout is printed
+  // absolute on purpose — the operator has to see where a drifted link points — and asserting
+  // "the temp path never appears" against it only held on Windows, where `toPosix` makes the
+  // backslash spelling of the fixture root fail to match the forward-slash spelling it prints.)
+  const target = checkout(box.home, 'target');
   writeProfile(box.profile, { links: { '@dsh-ext/mobile-gateway': { declared: target } } });
 
   // No --profile-dir and no --profiles-root: only --home, so DSH_HOME derives as <home>/.dsh and the
@@ -299,6 +304,7 @@ test('the default profile is resolved from the home directory at runtime, not ha
   const r = run(['--home', box.home]);
   assert.equal(r.status, 0, r.out);
   assert.match(r.stdout, /profile: ~\/\.dsh\/profiles\/desktop/);
+  assert.match(r.stdout, /~\/checkouts\/target/, 'a home-relative link target is printed as ~/...');
   assert.ok(!r.stdout.includes(box.root), `the temp path must be redacted:\n${r.stdout}`);
   rmSync(box.root, { recursive: true, force: true });
 });
