@@ -28,7 +28,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { HOST_PREFIX, PINNED_DSH_VERSION, hostIdOfId } from './host-router.mjs'
+import { DSH_ENGINES_RANGE, HOST_PREFIX, PINNED_DSH_VERSION, dshVersionInRange, hostIdOfId } from './host-router.mjs'
 import { RemoteInputError } from './remote-client.mjs'
 import { restrictToOwnerSync } from './secure-file.mjs'
 
@@ -204,7 +204,7 @@ export function uploadSelfTest(connection, { dshVersion } = {}) {
   // The version is checked last: a Host with no such route reports that, not a
   // version reason, whatever it runs (same ordering as the carrier self-test).
   if (typeof dshVersion !== 'string' || dshVersion === '') return 'dsh-version-unknown'
-  if (dshVersion !== PINNED_DSH_VERSION) return 'dsh-version-mismatch'
+  if (!dshVersionInRange(dshVersion)) return 'dsh-version-out-of-range'
   return null
 }
 
@@ -261,14 +261,14 @@ export class UploadRoute {
    * Wrap the live route record; on any self-test mismatch nothing is patched and
    * `status()` says why.
    * @returns {{route: string, wrapped: boolean, reason: string|null, dshVersion: string|undefined,
-   *   pinned: string}}
+   *   pinned: string, range: string}}
    */
   install() {
     if (this.#installed) return this.status()
     const reason = uploadSelfTest(this.#connection, { dshVersion: this.#dshVersion })
     if (reason !== null) {
       this.#reason = reason
-      this.#log(`remote attachments disabled: ${reason} (running DSH ${this.#dshVersion ?? 'unknown'}, pinned ${PINNED_DSH_VERSION})`)
+      this.#log(`remote attachments disabled: ${reason} (running DSH ${this.#dshVersion ?? 'unknown'}, declared ${DSH_ENGINES_RANGE}, last tested ${PINNED_DSH_VERSION})`)
       return this.status()
     }
     const route = this.#connection.fetchRoutes.get(UPLOAD_PATH)
@@ -320,13 +320,13 @@ export class UploadRoute {
    * route record and silently drops our wrapper, and that must be visible rather
    * than every tagged upload failing with the native 404.
    * @returns {{route: string, wrapped: boolean, reason: string|null, dshVersion: string|undefined,
-   *   pinned: string}}
+   *   pinned: string, range: string}}
    */
   status() {
     const route = this.#connection?.fetchRoutes?.get?.(UPLOAD_PATH)
     const live = this.#installed && typeof route?.fetch === 'function' && route.fetch === this.#wrapped
     const reason = this.#installed ? (live ? null : 'route-replaced') : this.#reason
-    return { route: UPLOAD_PATH, wrapped: live, reason, dshVersion: this.#dshVersion, pinned: PINNED_DSH_VERSION }
+    return { route: UPLOAD_PATH, wrapped: live, reason, dshVersion: this.#dshVersion, pinned: PINNED_DSH_VERSION, range: DSH_ENGINES_RANGE }
   }
 
   /**

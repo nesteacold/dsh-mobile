@@ -10,7 +10,7 @@ import { test } from 'node:test'
 
 import { RemoteConnection } from '../lib/remote-client.mjs'
 import {
-  HOST_HINT, ID_FIELDS, PINNED_DSH_VERSION, createHostRouter, hostHintOf, hostIdOfId, hostIdsIn, namespaceId,
+  DSH_ENGINES_RANGE, HOST_HINT, ID_FIELDS, PINNED_DSH_VERSION, createHostRouter, hostHintOf, hostIdOfId, hostIdsIn, namespaceId,
   namespaceIds, selfTest, stripHostIds, taggedIdsIn,
 } from '../lib/host-router.mjs'
 import { mountPlugin } from './helpers.mjs'
@@ -224,8 +224,8 @@ test('the most fundamental failure wins: gateway presence and carrier methods pr
   assert.equal(selfTest({}, {}), 'dispatchRpc-missing')
   assert.equal(selfTest({ dispatchRpc() {} }, { dshVersion: '0.3.0' }), 'openWireStream-missing')
   // Only a carrier that has both methods can be blamed on the version.
-  const carrier = () => ({ async dispatchRpc() { return { ok: true } }, openWireStream(a, b, c, d, e) {} })
-  assert.equal(selfTest(carrier(), { dshVersion: '0.3.0' }), 'dsh-version-mismatch')
+  const carrier = () => ({ async dispatchRpc(a, b, c, d) { return { ok: true } }, openWireStream(a, b, c, d, e, f) {} })
+  assert.equal(selfTest(carrier(), { dshVersion: '0.3.0' }), 'dsh-version-out-of-range')
   assert.equal(selfTest(carrier(), {}), 'dsh-version-unknown')
   // Correct version + correct carrier is the only null.
   assert.equal(selfTest(carrier(), { dshVersion: PINNED_DSH_VERSION }), null)
@@ -233,7 +233,7 @@ test('the most fundamental failure wins: gateway presence and carrier methods pr
 
 test('self-test mismatch: nothing is wrapped and status says why', () => {
   const legacy = (endpoint, payload, signal) => ({ endpoint, payload, signal }) // 3 params = pre-rc.1 opener
-  const gateway = { async dispatchRpc() { return { ok: true } }, openWireStream: legacy }
+  const gateway = { async dispatchRpc(endpoint, payload, signal, peer) { return { ok: true } }, openWireStream: legacy }
   const dispatch = gateway.dispatchRpc
   const router = createHostRouter({ gateway, dshVersion: PINNED_DSH_VERSION })
   const status = router.install()
@@ -244,20 +244,28 @@ test('self-test mismatch: nothing is wrapped and status says why', () => {
   assert.equal(selfTest(undefined, { dshVersion: PINNED_DSH_VERSION }), 'no-gateway')
   assert.equal(selfTest({}, { dshVersion: PINNED_DSH_VERSION }), 'dispatchRpc-missing')
   assert.equal(selfTest({ dispatchRpc() {} }, { dshVersion: PINNED_DSH_VERSION }), 'openWireStream-missing')
-  assert.equal(selfTest({ dispatchRpc() {}, openWireStream(a, b, c, d, e) {} }, { dshVersion: PINNED_DSH_VERSION }), null)
+  assert.equal(selfTest({ dispatchRpc(a, b, c, d) {}, openWireStream(a, b, c, d, e, f) {} }, { dshVersion: PINNED_DSH_VERSION }), null)
+  // A short dispatchRpc (pre-rc.3 shape, no peer) is refused.
+  assert.equal(selfTest({ dispatchRpc(a, b, c) {}, openWireStream(a, b, c, d, e, f) {} }, { dshVersion: PINNED_DSH_VERSION }), 'dispatchRpc-signature')
 })
 
 test('A1.1: an unknown or different DSH version means no wrap, and the reason is reported', async () => {
   // The pinned release is the only one this wrapper was self-tested against.
-  assert.equal(PINNED_DSH_VERSION, '0.2.2-rc.1')
-  const carrier = () => ({ async dispatchRpc() { return { ok: true } }, openWireStream(a, b, c, d, e) {} })
+  assert.equal(PINNED_DSH_VERSION, '0.2.2-rc.3')
+  const carrier = () => ({ async dispatchRpc(a, b, c, d) { return { ok: true } }, openWireStream(a, b, c, d, e, f) {} })
   assert.equal(selfTest(carrier(), {}), 'dsh-version-unknown')
   assert.equal(selfTest(carrier(), { dshVersion: '' }), 'dsh-version-unknown')
-  assert.equal(selfTest(carrier(), { dshVersion: '0.2.2-rc.2' }), 'dsh-version-mismatch')
-
+  // Layer 2 (owner 2026-11-13): gated on shapes + the declared engines range, not on equality.
+  assert.equal(DSH_ENGINES_RANGE, '>=0.2.2-rc.3 <0.3.0-0')
+  for (const ok of ['0.2.2-rc.3', '0.2.2-rc.10', '0.2.2', '0.2.3-rc.1', '0.2.9']) {
+    assert.equal(selfTest(carrier(), { dshVersion: ok }), null, ok)
+  }
+  for (const bad of ['0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-beta.1', '0.2.1', '0.3.0-rc.1', '0.3.0', '1.0.0', 'garbage']) {
+    assert.equal(selfTest(carrier(), { dshVersion: bad }), 'dsh-version-out-of-range', bad)
+  }
   for (const [label, options, reason] of [
     ['no version at all', {}, 'dsh-version-unknown'],
-    ['another release', { dshVersion: '0.3.0' }, 'dsh-version-mismatch'],
+    ['another minor', { dshVersion: '0.3.0' }, 'dsh-version-out-of-range'],
   ]) {
     const gateway = carrier()
     const dispatch = gateway.dispatchRpc
@@ -542,14 +550,20 @@ test('a payload nested past the depth bound is refused instead of passed through
     for (let index = 0; index < levels; index += 1) value = { child: value }
     return value
   }
-  // 32 levels are fine (the bound), 33 are refused — a deeper subtree would come
-  // back unrenamed, i.e. a raw remote id in the local UI.
-  const ok = createFakeRemote('hostB', 'Host B', { replies: { 'session/page': deep(32) } })
+  // A ~100-level session history loads and its deep id is still renamed; 256 is the
+  // bound, 257 are refused — a deeper subtree would come back unrenamed.
+  const ok = createFakeRemote('hostB', 'Host B', { replies: { 'session/page': deep(100) } })
   const bounded = createHarness({ remotes: [ok] })
   const fine = await bounded.gateway.dispatchRpc('session/page', { args: { sessionId: 'h:hostB:s1' } }, undefined, {})
   assert.equal(fine.ok, true, JSON.stringify(fine))
+  let leaf = fine.value
+  while (leaf.child) leaf = leaf.child
+  assert.equal(leaf.sessionId, 'h:hostB:s1', 'the deep id was renamed')
+  const edge = createFakeRemote('hostB', 'Host B', { replies: { 'session/page': deep(256) } })
+  const atBound = await createHarness({ remotes: [edge] }).gateway.dispatchRpc('session/page', { args: { sessionId: 'h:hostB:s1' } }, undefined, {})
+  assert.equal(atBound.ok, true, JSON.stringify(atBound))
 
-  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/page': deep(33) } })
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/page': deep(257) } })
   const harness = createHarness({ remotes: [hostB] })
   const refused = await harness.gateway.dispatchRpc('session/page', { args: { sessionId: 'h:hostB:s1' } }, undefined, {})
   assert.equal(refused.ok, false)
@@ -562,13 +576,13 @@ test('a payload nested past the depth bound is refused instead of passed through
   const hostC = createFakeRemote('hostC', 'Host C')
   const sending = createHarness({ remotes: [hostC] })
   const outbound = await sending.gateway.dispatchRpc('session/prompt',
-    { args: { ...deep(33), sessionId: 'h:hostC:s1' } }, undefined, {})
+    { args: { ...deep(257), sessionId: 'h:hostC:s1' } }, undefined, {})
   assert.equal(outbound.ok, false)
   assert.equal(outbound.error.code, 'remote/payload-too-deep')
   assert.equal(hostC.calls.length, 0, 'the Host never received the payload')
   // A too-deep payload that names no host is an ordinary Local call: nothing is
   // renamed on that path, so there is no id to leak.
-  const localDeep = await sending.gateway.dispatchRpc('session/page', { args: deep(33) }, undefined, {})
+  const localDeep = await sending.gateway.dispatchRpc('session/page', { args: deep(257) }, undefined, {})
   assert.deepEqual(localDeep, { ok: true, value: { local: 'session/page' } })
 })
 

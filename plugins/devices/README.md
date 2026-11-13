@@ -1,6 +1,6 @@
 # @dsh-ext/devices
 
-A **Devices** page inside DSH Settings (Qoder-style), spec `specs/008-devices-page`. Private package, `engines.dsh: 0.2.2-rc.1`.
+A **Devices** page inside DSH Settings (Qoder-style), spec `specs/008-devices-page`. Private package, `engines.dsh: 0.2.2-rc.3`.
 
 - **Allow connections to this device** — switch the local `mobile-gateway` on/off (LAN), generate a `desktop` pairing code (copy + expiry countdown), see this device's addresses, list authorized devices, remove access, edit permissions. The switch position is remembered in the gateway state file, so it survives a plugin reload or a DSH restart; the off position is remembered too, and that is the kill switch. If the write fails the page says so and the position applies only until the session ends.
 - **Connect to other devices** — paste an address + pairing string from another Host; this Host dials it (pinned WSS), then lists its sessions, shows history, sends prompts and decides approvals.
@@ -52,7 +52,7 @@ service object it obtains from the Host** — never a prototype, module export o
 
 Conditions, all implemented in `lib/host-router.mjs`:
 
-- **Self-test against the pinned release.** `engines.dsh` is `0.2.2-rc.1`, and the running DSH
+- **Self-test against the pinned release.** `engines.dsh` is `0.2.2-rc.3`, and the running DSH
   version is resolved from the Host's own boot package (`lib/dsh-runtime-version.mjs`). The wrap
   happens only when that version equals the pin and both carrier methods have the expected shape.
 - **Failure mode.** Any mismatch (unknown version, another version, a missing method, a changed
@@ -112,7 +112,7 @@ single object field the right seam. The whole implementation is `lib/upload-rout
 - **Cancel.** A request the client aborts (`request.signal`) stops between chunks and sends
   `remote-upload-cancel`, so the remote spool is freed; the composer sees `file-upload-cancelled`.
 - **Self-test against the pinned release.** Same pin and the same resolved running version as the
-  carrier wrapper (`0.2.2-rc.1`): the `connection` service must exist, `fetchRoutes` must be a `Map`,
+  carrier wrapper (`0.2.2-rc.3`): the `connection` service must exist, `fetchRoutes` must be a `Map`,
   the record must exist with `POST` in `methods`, `requestBody === 'streaming'`, a callable `fetch`, and
   the version must equal the pin.
 - **Failure mode.** Any mismatch means **no wrap at all**, the record is untouched, and the reason

@@ -104,7 +104,7 @@ function createHarness() {
   const localCalls = []
   const logs = []
   const gateway = {
-    async dispatchRpc(endpoint, payload) {
+    async dispatchRpc(endpoint, payload, signal, peer) { // eslint-disable-line no-unused-vars
       localCalls.push({ endpoint, payload })
       return { ok: true, value: { local: endpoint } }
     },

@@ -26,7 +26,7 @@ if (!process.env.DSH_INSTALL_ROOT) {
     console.error('DEVICE ACCESS REAL-SERVICE TEST: FAILED (DSH_REAL_REQUIRED=1 but DSH_INSTALL_ROOT is not set; the real-policy proof did not run)')
     process.exit(1)
   }
-  console.log('DEVICE ACCESS REAL-SERVICE TEST: UNVERIFIED (set DSH_INSTALL_ROOT to an installed DSH 0.2.2-rc.1; nothing was exercised)')
+  console.log('DEVICE ACCESS REAL-SERVICE TEST: UNVERIFIED (set DSH_INSTALL_ROOT to an installed DSH 0.2.2-rc.3; nothing was exercised)')
   process.exit(0)
 }
 
@@ -38,7 +38,7 @@ const { TypertGatewayService } = await load('@deepseek-ai/dsh-api-gateway')
 const { RemoteAccessService } = await load('@deepseek-ai/dsh-api-remote-access')
 const { TypertRegistry } = await load('@deepseek-ai/dsh-typert-registry')
 const { TYPERT } = await load('@deepseek-ai/dsh-api-session-controller/typert')
-assert.equal(require('@deepseek-ai/dsh-api-gateway/package.json').version, '0.2.2-rc.1')
+assert.equal(require('@deepseek-ai/dsh-api-gateway/package.json').version, '0.2.2-rc.3')
 
 const { createDeviceAccess, devicePrincipal } = await import('../lib/device-peers.mjs')
 const { createDshHostAdapter } = await import('../lib/dsh-host-adapter.mjs')
@@ -258,7 +258,7 @@ try {
     assert.equal(ctx.remoteAccess.policies.has(COMPANION_PRINCIPAL_KIND), false)
   })
 
-  console.log(`DEVICE ACCESS REAL-SERVICE TESTS PASSED (${results.length} checks, DSH 0.2.2-rc.1: real RemoteAccessService + TypertGatewayService + generated session descriptors; business services are fixtures)`)
+  console.log(`DEVICE ACCESS REAL-SERVICE TESTS PASSED (${results.length} checks, DSH 0.2.2-rc.3: real RemoteAccessService + TypertGatewayService + generated session descriptors; business services are fixtures)`)
 } finally {
   await ctx.fiber.dispose()
 }

@@ -32,7 +32,7 @@ async function startGateway() {
   const host = {
     async invoke() { return {} },
     async stream() { return (async function* () {})() },
-    async dispatchRpc() { return { ok: true, value: {} } },
+    async dispatchRpc(endpoint, payload, signal, peer) { return { ok: true, value: {} } },
     open: async () => { throw hostUnavailable() },
     async openWireStream(endpoint, payload, uplink, peer, signal, control) {
       return host.open(endpoint, payload, uplink, peer, signal, control)

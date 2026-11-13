@@ -22,7 +22,7 @@ Read this file first, then `CLAUDE.md` (standing rules, role split, hard rules).
 
 Upstream reference: Clarklevis1995's gateway, forked at v0.12.0 @ `74ac444` and hardened since
 (spec `001-gateway-hardening`); `UPSTREAM.md` and `NOTICE.md` record provenance and licences. DSH
-itself is **not** vendored: every plugin declares `engines.dsh`, pinned to `dsh-v0.2.2-rc.1`.
+itself is **not** vendored: every plugin declares `engines.dsh`, as a bounded range within the current DSH minor line (tested on 0.2.2-rc.3; see `CLAUDE.md`).
 
 ## Gates per package (run the one that covers what you touched)
 

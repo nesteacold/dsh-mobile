@@ -19,7 +19,7 @@ function requireArray(value, endpoint) {
 }
 
 // 适配基线，仅用于上游契约测试，不作为运行时版本上报。
-export const DSH_VERSION = '0.2.2-rc.1'
+export const DSH_VERSION = '0.2.2-rc.3'
 export const SESSION_FORMAT_VERSION = 4
 
 export function readHistoryRecords(records) {

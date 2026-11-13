@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 if (!process.env.DSH_INSTALL_ROOT) {
-  console.error('test:security-real FAILED: DSH_INSTALL_ROOT is not set; the real-policy proof requires an installed DSH 0.2.2-rc.1')
+  console.error('test:security-real FAILED: DSH_INSTALL_ROOT is not set; the real-policy proof requires an installed DSH 0.2.2-rc.3')
   process.exit(1)
 }
 const result = spawnSync(process.execPath, [fileURLToPath(new URL('./device-access-real.test.mjs', import.meta.url))], {

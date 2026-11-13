@@ -156,8 +156,45 @@ const APPROVAL_HASH = /^[a-f0-9]{64}$/
 /** The bridge call that answers a question card on rc.1 (`approval:respond`). */
 const QUESTION_ANSWER_ENDPOINT = 'userQuestions/answer'
 
-/** The pinned DSH release this wrapper was self-tested against (constitution A1.1). */
-export const PINNED_DSH_VERSION = '0.2.2-rc.1'
+/**
+ * The DSH release this wrapper was last self-tested against. Informational only
+ * (diagnostics): the wrap is gated on the live API shapes plus DSH_ENGINES_RANGE,
+ * not on equality with this value (owner 2026-11-13, auto-compat layer 2).
+ */
+export const PINNED_DSH_VERSION = '0.2.2-rc.3'
+
+/** Mirrors package.json engines.dsh; DSH evaluates it with semver includePrerelease. */
+export const DSH_ENGINES_RANGE = '>=0.2.2-rc.3 <0.3.0-0'
+
+const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+
+function comparePre(a, b) {
+  if (a === undefined) return b === undefined ? 0 : 1
+  if (b === undefined) return -1
+  const x = a.split('.'), y = b.split('.')
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    if (x[i] === undefined) return -1
+    if (y[i] === undefined) return 1
+    const nx = /^\d+$/.test(x[i]), ny = /^\d+$/.test(y[i])
+    if (nx && ny) { const d = Number(x[i]) - Number(y[i]); if (d) return Math.sign(d); continue }
+    if (nx !== ny) return nx ? -1 : 1
+    if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1
+  }
+  return 0
+}
+
+/**
+ * True when version satisfies DSH_ENGINES_RANGE (>=0.2.2-rc.3, same 0.2 minor,
+ * no 0.3 prerelease). Dependency-free so the devices plugin stays dep-less.
+ */
+export function dshVersionInRange(version) {
+  const m = typeof version === 'string' ? SEMVER.exec(version.trim()) : null
+  if (!m) return false
+  const [maj, min, pat] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  if (maj !== 0 || min !== 2) return false
+  if (pat !== 2) return pat > 2
+  return comparePre(m[4], 'rc.3') >= 0
+}
 
 /**
  * Marks one of our carrier wrappers with the function it replaced, so a router
@@ -180,7 +217,9 @@ function rootOriginal(fn) {
 }
 
 /** How deep an id-bearing payload may nest; anything deeper is refused. */
-const MAX_ID_DEPTH = 32
+// Session history (message parts, tool args/results, JSON trees) legitimately nests
+// well past 32; 256 recursive frames stay far below the stack limit.
+const MAX_ID_DEPTH = 256
 /**
  * Keys a payload may never carry. `JSON.parse` turns them into own properties, and
  * one plain assignment of `__proto__` rebuilds the prototype of the renamed copy
@@ -664,9 +703,9 @@ function followSessionId(args) {
  * carrier methods DSH calls with `this`; when a release renames or re-signs them,
  * remote mode must switch itself off instead of corrupting every call.
  *
- * Constitution A1.1: the wrap is allowed only while the self-test matches the
- * pinned `engines.dsh`. An unknown or different running version means no wrap at
- * all and a reason the Devices page shows — never a guess.
+ * Constitution A1.1: the wrap is allowed only while the structural self-test passes
+ * and the running version is inside the declared `engines.dsh` range gate. An unknown or
+ * out-of-range running version means no wrap at all and a reason the Devices page shows — never a guess.
  *
  * Order matters: the gateway itself and its two carrier methods are checked
  * BEFORE the version, because that is the more fundamental failure. A Host that
@@ -681,8 +720,10 @@ export function selfTest(gateway, { dshVersion } = {}) {
   if (typeof gateway.dispatchRpc !== 'function') return 'dispatchRpc-missing'
   if (typeof gateway.openWireStream !== 'function') return 'openWireStream-missing'
   if (typeof dshVersion !== 'string' || dshVersion === '') return 'dsh-version-unknown'
-  if (dshVersion !== PINNED_DSH_VERSION) return 'dsh-version-mismatch'
-  // rc.1: (endpoint, payload, uplink, peer, signal, control, uplinkWindow).
+  if (!dshVersionInRange(dshVersion)) return 'dsh-version-out-of-range'
+  // rc.3: dispatchRpc(endpoint, payload, signal, peer);
+  // openWireStream(endpoint, payload, uplink, peer, signal, control, uplinkWindow?).
+  if (gateway.dispatchRpc.length < 4) return 'dispatchRpc-signature'
   if (gateway.openWireStream.length < 5) return 'openWireStream-signature'
   return null
 }
@@ -991,7 +1032,7 @@ export class HostRouter {
     this.#cache = deps.cache ?? null
     this.#log = typeof deps.log === 'function' ? deps.log : () => {}
     this.#baselineTimeoutMs = Number.isFinite(deps.mergeBaselineTimeoutMs) ? deps.mergeBaselineTimeoutMs : 3000
-    // A1.1: the wrap is gated on the pinned `engines.dsh`, so the running version is
+    // A1.1: the wrap is gated on the declared `engines.dsh` range (not the pinned version), so the running version is
     // part of the self-test. A caller that cannot detect it gets no wrap.
     this.#dshVersion = typeof deps.dshVersion === 'string' ? deps.dshVersion : undefined
   }
@@ -1002,7 +1043,7 @@ export class HostRouter {
     const reason = selfTest(this.#gateway, { dshVersion: this.#dshVersion })
     if (reason !== null) {
       this.#reason = reason
-      this.#log(`multi-host routing disabled: ${reason} (running DSH ${this.#dshVersion ?? 'unknown'}, pinned ${PINNED_DSH_VERSION})`)
+      this.#log(`multi-host routing disabled: ${reason} (running DSH ${this.#dshVersion ?? 'unknown'}, declared ${DSH_ENGINES_RANGE}, last tested ${PINNED_DSH_VERSION})`)
       return this.status()
     }
     const gateway = this.#gateway

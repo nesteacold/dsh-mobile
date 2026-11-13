@@ -89,7 +89,7 @@ function createFakeRemote({ online = true, frames = [] } = {}) {
 function createHarness({ remotes = [], cache = null, connected = true } = {}) {
   const localCalls = []
   const gateway = {
-    async dispatchRpc(endpoint, payload) {
+    async dispatchRpc(endpoint, payload, signal, peer) { // eslint-disable-line no-unused-vars
       localCalls.push({ endpoint, payload })
       return { ok: true, value: { local: endpoint } }
     },

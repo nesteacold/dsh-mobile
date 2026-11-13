@@ -43,7 +43,11 @@ jobs:
         run: node --test tools/scan-pii.test.mjs
       # Read-only deployment tooling tests (tools/ops/): temp fixtures, no network, no host state.
       - name: ops tooling tests
-        run: node --test tools/ops/check-profile.test.mjs
+        run: node --test tools/ops/check-profile.test.mjs tools/ops/dsh-compat-check.test.mjs
+      # DSH auto-compat layer 3: prints SKIPPED and exits 0 when DSH_INSTALL_ROOT is unset (CI has
+      # no DSH install); on a host with one it checks engines ranges, upgrade guides and official tests.
+      - name: dsh compat check
+        run: node tools/ops/dsh-compat-check.mjs
 
   protocol:
     name: protocol (packages/mobile-protocol)

@@ -22,6 +22,7 @@ import { createAgentBrowserPool } from './agent-browser.mjs'
 import { resolveDshRuntimeVersion } from './dsh-runtime-version.mjs'
 import { createSessionCache } from './session-cache.mjs'
 import { createUploadRoute } from './upload-route.mjs'
+import { createGitRunner, createNpmCi, createSelfUpdater, defaultRepoRoot, handleSelfUpdateRoute } from './self-update.mjs'
 import {
   ensureOwnerOnlyDirectory, restrictToOwnerSync, setSecureFileLogger, writeSecretFile,
 } from './secure-file.mjs'
@@ -48,6 +49,33 @@ const SESSION_LIST_TTL_MS = 5000
 export function isLoopback(req) {
   const addr = req.socket && req.socket.remoteAddress
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
+}
+
+// Copied from plugins/mobile-gateway/lib/index.mjs (isForwardedRequest, isNonLocalRequest):
+// a reverse proxy (e.g. `tailscale serve`) dials from this machine, so the loopback peer test
+// alone would read a forwarded request as the local owner. Either signal refuses it.
+const FORWARDING_HEADER_NAMES = Object.freeze(['forwarded', 'x-real-ip'])
+const FORWARDING_HEADER_PREFIXES = Object.freeze(['x-forwarded-', 'tailscale-'])
+const TRUSTED_LOCAL_AUTHORITY = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i
+
+export function isForwardedRequest(req) {
+  const headers = req && req.headers
+  if (!headers) return false
+  return Object.keys(headers).some((name) => {
+    const key = name.toLowerCase()
+    return FORWARDING_HEADER_NAMES.includes(key)
+      || FORWARDING_HEADER_PREFIXES.some((prefix) => key.startsWith(prefix))
+  })
+}
+
+export function isNonLocalRequest(req) {
+  const host = req && req.headers && typeof req.headers.host === 'string' ? req.headers.host.trim() : ''
+  return isForwardedRequest(req) || !TRUSTED_LOCAL_AUTHORITY.test(host)
+}
+
+/** Same-origin with the Origin header REQUIRED (missing Origin => false). */
+export function hasMatchingOrigin(req) {
+  return typeof req.headers.origin === 'string' && isSameOrigin(req)
 }
 
 export function isSameOrigin(req) {
@@ -845,11 +873,23 @@ export const plugin = {
       return url.toString()
     }
 
+    // Spec 027: owner-only self-update of this linked checkout.
+    const selfUpdater = options.selfUpdate === false ? null : (() => {
+      const root = options.selfUpdateRoot ?? defaultRepoRoot()
+      return createSelfUpdater({ git: options.selfUpdateGit ?? createGitRunner({ cwd: root }),
+        dshVersion: resolveDshRuntimeVersion(), npmCi: createNpmCi({ cwd: root }) })
+    })()
+
     const handler = async (req, res) => {
       try {
         // FR5: every request, read or write, comes from this machine. The
         // plugin itself never opens a listener, but the Host web server may
         // be bound wider; a remote device must not reach these routes.
+        if (isNonLocalRequest(req)) {
+          sendJson(res, 403, { error: 'forbidden', message: isForwardedRequest(req)
+            ? 'devices API is not reachable through a proxy' : 'devices API is loopback-only' })
+          return
+        }
         if (!isLoopback(req)) {
           sendJson(res, 403, { error: 'forbidden', message: 'devices API is loopback-only' })
           return
@@ -932,6 +972,12 @@ export const plugin = {
           sendJson(res, 404, { error: 'not-found' })
           return
         }
+        if (selfUpdater && parts[0] === 'devices' && parts[1] === 'self-update'
+          && req.method !== 'GET' && req.method !== 'HEAD' && !hasMatchingOrigin(req)) {
+          sendJson(res, 403, { error: 'forbidden', message: 'self-update requires a same-origin Origin header' })
+          return
+        }
+        if (selfUpdater && await handleSelfUpdateRoute(selfUpdater, parts, req, readBody, (s, v) => sendJson(res, s, v))) return
         if (parts[0] !== 'devices' || parts[1] !== 'remotes') { sendJson(res, 404, { error: 'not-found' }); return }
         const id = parts[2]
         const action = parts[3]

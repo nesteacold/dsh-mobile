@@ -87,7 +87,13 @@ repo's `AGENTS.md` / `CLAUDE.md` and the role briefs.
 
 ## Standing rules
 - Spec Kit is the work process: every feature gets `specs/<###-slug>/` before code.
-- Pin DSH upstream to `dsh-v0.2.2-rc.1` until the owner bumps it. Every plugin declares `engines.dsh`.
+- DSH support (owner 2026-11-13): every plugin declares `engines.dsh` as a bounded range within the
+  current minor line (tested on 0.2.2-rc.3), not one exact version. Code that reaches DSH internals
+  gates on a structural self-test, not on a version equality. `tools/ops/dsh-compat-check.mjs` checks
+  each new DSH release before its upper bound is widened.
+- A1.1 review trigger (owner 2026-11-13): a reviewer pass on the wrapper is required when the
+  structural self-test reports a mismatch, when an upgrade guide names a wrapped surface, or when the
+  range's upper bound is raised.
 - Network installs may hang on this machine; prefer offline copies and report hangs.
 - Evidence over assertion: build/test results are reported with the literal command and output;
   claims about DSH internals are labelled (a) measured/run, (b) read from source, (c) inferred.

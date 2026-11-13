@@ -28,6 +28,7 @@
     "test:webrtc": "node --test test/webrtc/*.test.mjs",
     "test:security-real": "node test/run-security-real.mjs",
     "test:package": "node --test test/package-install.test.mjs",
+    "compat:dsh": "node ../../tools/ops/dsh-compat-check.mjs",
     "test:webrtc:stress": "node test/webrtc/stress.mjs"
   },
   "exports": {
@@ -56,7 +57,7 @@
     "react-test-renderer": "18.3.1"
   },
   "engines": {
-    "dsh": "0.2.2-rc.1",
+    "dsh": ">=0.2.2-rc.3 <0.3.0-0",
     "node": ">=24.9"
   }
 }

@@ -312,8 +312,14 @@ window.__ModuleLoader__.load({
         hostDoorDescription: 'Sessions and approvals on this machine',
         devicesDoorDescription: 'Pairing, consent and browser control for this machine',
         hostDoorGone: 'This machine is no longer paired. Add it again on the Devices page.',
-      },
-      vi: {
+        // --- spec 027: self-update ---
+        updTitle: 'Plugin updates', updCheck: 'Check for updates', updChecking: 'Checking…',
+        updCurrent: 'Current', updLatest: 'Latest release', updUpToDate: 'Up to date.', updNoTags: 'No release published yet.',
+        updNotes: 'Changes', updUpdate: 'Update', updUpdating: 'Updating…', updRemote: 'Source',
+        updConfirm: 'Update the plugins to {tag}? Only a fast-forward merge is applied; DSH is not restarted.',
+        updDone: 'Restart DSH to load {tag}.', updRollback: 'To roll back, the previous commit was {head}.',
+        updBlocked: 'Update not possible', updSignature: 'Signature', updEngines: 'DSH compatibility',
+      },      vi: {
         title: 'Thiết bị',
         subtitle: 'Kết nối tới một DSH Host trên máy khác, hoặc cho máy khác kết nối vào máy này.',
         thisDevice: 'Máy này',
@@ -585,8 +591,13 @@ window.__ModuleLoader__.load({
         hostDoorDescription: 'Phiên và phê duyệt trên máy này',
         devicesDoorDescription: 'Ghép đôi, cấp quyền và điều khiển trình duyệt cho máy này',
         hostDoorGone: 'Máy này không còn ghép đôi. Hãy thêm lại trong trang Thiết bị.',
-      },
-    }
+        updTitle: 'Cập nhật plugin', updCheck: 'Kiểm tra cập nhật', updChecking: 'Đang kiểm tra…',
+        updCurrent: 'Hiện tại', updLatest: 'Bản phát hành mới nhất', updUpToDate: 'Đã là bản mới nhất.', updNoTags: 'Chưa có bản phát hành nào.',
+        updNotes: 'Thay đổi', updUpdate: 'Cập nhật', updUpdating: 'Đang cập nhật…', updRemote: 'Nguồn',
+        updConfirm: 'Cập nhật plugin lên {tag}? Chỉ áp dụng merge fast-forward; DSH không tự khởi động lại.',
+        updDone: 'Khởi động lại DSH để nạp {tag}.', updRollback: 'Để quay lại, commit trước đó là {head}.',
+        updBlocked: 'Không thể cập nhật', updSignature: 'Chữ ký', updEngines: 'Tương thích DSH',
+      },    }
     let hostLanguage = ''
     const listeners = new Set()
     const currentLang = () => (/^vi/i.test(hostLanguage || (typeof navigator !== 'undefined' ? navigator.language : '') || '') ? 'vi' : 'en')
@@ -2836,6 +2847,48 @@ window.__ModuleLoader__.load({
     }
 
 
+    // --------------------------------------------------- spec 027: self-update
+    function SelfUpdate() {
+      useLang()
+      const [info, setInfo] = React.useState(null)
+      const [busy, setBusy] = React.useState('')
+      const [error, setError] = React.useState('')
+      const [done, setDone] = React.useState(null)
+      const fill = (key, vars) => Object.entries(vars).reduce((t, [k, v]) => t.replace('{' + k + '}', v), tr(key))
+      async function check() {
+        setBusy('check'); setError(''); setDone(null)
+        try { setInfo(await post('/devices/self-update/check', {})) } catch (e) { setError(e?.message || String(e)) } finally { setBusy('') }
+      }
+      async function update() {
+        const tag = info?.latest?.tag
+        if (!tag || !window.confirm(fill('updConfirm', { tag }))) return
+        setBusy('update'); setError('')
+        try { setDone(await post('/devices/self-update/update', { tag })) } catch (e) { setError(tr('updBlocked') + ': ' + (e?.message || String(e))) } finally { setBusy('') }
+      }
+      const latest = info?.latest
+      return h('div', { 'data-testid': 'self-update' },
+        h('div', { className: 'dshdev-sect' },
+          h('h3', { className: 'dshdev-grow' }, tr('updTitle')),
+          h('button', { type: 'button', className: 'dshdev-btn', disabled: !!busy, onClick: check, 'data-testid': 'self-update-check' },
+            busy === 'check' ? tr('updChecking') : tr('updCheck'))),
+        error ? h('div', { className: 'dshdev-err', role: 'alert' }, error) : null,
+        info ? h('div', { className: 'dshdev-card' },
+          h('div', null, tr('updRemote') + ': ' + info.remote),
+          h('div', null, tr('updCurrent') + ': ' + Object.values(info.current || {}).filter(Boolean).join(' / ') + ' (' + info.branch + ' ' + String(info.head).slice(0, 8) + ')'),
+          !latest ? h('div', null, tr('updNoTags')) : h('div', null,
+            h('div', null, tr('updLatest') + ': ' + latest.tag + ' · ' + tr('updSignature') + ': ' + latest.signature),
+            h('div', null, tr('updEngines') + ': ' + latest.plugins.map((p) => p.dir.split('/').pop() + ' ' + (p.enginesDsh || '?') + (p.accepts === false ? ' ✗' : p.accepts ? ' ✓' : '')).join(', ')),
+            info.upToDate ? h('div', null, tr('updUpToDate')) : h('div', null,
+              h('div', null, tr('updNotes') + ':'),
+              h('pre', { style: { whiteSpace: 'pre-wrap', margin: '4px 0' } }, latest.notes.join('\n')),
+              done ? null : h('button', { type: 'button', className: 'dshdev-btn primary', disabled: !!busy, onClick: update, 'data-testid': 'self-update-apply' },
+                busy === 'update' ? tr('updUpdating') : tr('updUpdate'))))) : null,
+        done && done.updated ? h('div', { className: 'dshdev-card', role: 'status' },
+          h('strong', null, fill('updDone', { tag: done.tag })),
+          h('div', null, fill('updRollback', { head: done.previousHead })),
+          (done.npm || []).map((n) => h('pre', { key: n.dir, style: { whiteSpace: 'pre-wrap' } }, n.dir + ': ' + n.tail))) : null)
+    }
+
     // -------------------------------------------------------------- page
     function DevicesPage() {
       useLang()
@@ -2847,7 +2900,8 @@ window.__ModuleLoader__.load({
           h('p', { className: 'dshdev-sub', 'data-testid': 'page-subtitle' }, tr('subtitle'))),
         h('div', { className: 'dshdev-tabs', role: 'tablist' }, tabs.map(([id, label]) =>
           h('button', { key: id, type: 'button', role: 'tab', 'aria-selected': tab === id, className: 'dshdev-tab dshdev-seg-btn', onClick: () => setTab(id) }, label))),
-        tab === 'allow' ? h(AllowTab) : h(ConnectTab))
+        tab === 'allow' ? h(AllowTab) : h(ConnectTab),
+        h(SelfUpdate))
     }
 
     // The left sidebar row and the main panel it opens. One id, one page: the

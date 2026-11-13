@@ -641,12 +641,19 @@ test('a self-test mismatch wraps nothing and reports the reason for the Devices 
   // The pinned version is part of the self-test: a different or unknown running
   // DSH means no wrap at all (A1.1), never a guess.
   const { connection, record } = hostConnection({ native })
-  for (const [dshVersion, reason] of [[undefined, 'dsh-version-unknown'], ['0.2.3-rc.1', 'dsh-version-mismatch']]) {
+  for (const [dshVersion, reason] of [[undefined, 'dsh-version-unknown'], ['0.3.0-rc.1', 'dsh-version-out-of-range'], ['0.2.1', 'dsh-version-out-of-range']]) {
     const uploads = createUploadRoute({ connection, connect: noDial, tmpDir: root, dshVersion, log: () => {} })
     const status = uploads.install()
     assert.equal(status.wrapped, false)
     assert.equal(status.reason, reason)
     assert.equal(record.fetch, native, `DSH ${dshVersion}: the route stays the native handler`)
+  }
+  // A later 0.2.x patch with the same live route shape is wrapped (layer 2).
+  {
+    const later = hostConnection({ native })
+    const status = createUploadRoute({ connection: later.connection, connect: noDial, tmpDir: root, dshVersion: '0.2.5', log: () => {} }).install()
+    assert.equal(status.wrapped, true)
+    assert.equal(status.dshVersion, '0.2.5')
   }
 })
 
@@ -657,7 +664,7 @@ test('status notices a route record that was replaced under us', async (t) => {
   const uploads = route({ connection, connect: noDial, tmpDir: root })
   uploads.install()
   assert.deepEqual(uploads.status(), {
-    route: UPLOAD_PATH, wrapped: true, reason: null, dshVersion: PINNED, pinned: PINNED,
+    route: UPLOAD_PATH, wrapped: true, reason: null, dshVersion: PINNED, pinned: PINNED, range: '>=0.2.2-rc.3 <0.3.0-0',
   })
   // A reload of the file-upload plugin registers a fresh record; ours is dropped.
   record.fetch = native
@@ -683,7 +690,7 @@ test('the applied plugin wraps the live route and reports it in the Devices stat
     assert.notEqual(record.fetch, native, 'the live route record is wrapped')
     const response = await mounted.call('GET', '/devices/remotes')
     assert.equal(response.status, 200)
-    assert.deepEqual(response.json.uploads, { route: UPLOAD_PATH, wrapped: true, reason: null, dshVersion: PINNED, pinned: PINNED })
+    assert.deepEqual(response.json.uploads, { route: UPLOAD_PATH, wrapped: true, reason: null, dshVersion: PINNED, pinned: PINNED, range: '>=0.2.2-rc.3 <0.3.0-0' })
     assert.equal(mounted.instance.uploads.status().wrapped, true, 'also reachable through the internals seam')
   } finally {
     mounted.close()
@@ -702,7 +709,7 @@ test('a Host that composes no connection service reports the reason instead of w
     const response = await mounted.call('GET', '/devices/remotes')
     // A1.1: the failure mode is on the page, not in a log line only.
     assert.deepEqual(response.json.uploads, {
-      route: UPLOAD_PATH, wrapped: false, reason: 'no-connection', dshVersion: PINNED, pinned: PINNED,
+      route: UPLOAD_PATH, wrapped: false, reason: 'no-connection', dshVersion: PINNED, pinned: PINNED, range: '>=0.2.2-rc.3 <0.3.0-0',
     })
   } finally {
     mounted.close()

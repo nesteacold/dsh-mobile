@@ -63,7 +63,7 @@ async function startGateway() {
       // The remote bridge forwards a device's `sessions:read`/`harness:remote` calls
       // through this carrier, exactly as e2e.test.mjs sets it up: the merged list a
       // controller sees is this answer, renamed.
-      async dispatchRpc(endpoint) {
+      async dispatchRpc(endpoint, payload, signal, peer) { // eslint-disable-line no-unused-vars
         if (endpoint === 'session/list') return { ok: true, value: { items: SESSIONS } }
         return { ok: true, value: {} }
       },
