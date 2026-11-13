@@ -53,3 +53,15 @@ tsnet:box.tailnet.ts.net
 
 # Placeholder tailnet name in spec 010 (moved from dsh-ext).
 tsnet:tailXXXXXX.ts.net
+
+# Test fixtures for pair-QR MagicDNS parsing and tailnet DNS vetting (2026-11-14); not real hosts.
+tsnet:Node.Tail.ts.net
+tsnet:node.tail.ts.net
+tailscale_ip:100.101.102.103
+# RFC 6761 reserved .invalid contact for the VAPID subject; not a mailbox.
+email:web-push@dsh.invalid
+# One-letter placeholder hosts in pair-QR / pair-link tests (2026-11-14).
+tsnet:n.ts.net
+tsnet:n.t.ts.net
+tailscale_ip:100.64.0.2
+email:p@x.example

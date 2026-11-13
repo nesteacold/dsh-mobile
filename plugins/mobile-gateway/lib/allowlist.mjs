@@ -265,11 +265,10 @@ export function isRemoteUploadType(type) {
 }
 
 /**
- * Spec 021: the PWA's own re-lock frame (contract §14.2). `packages/mobile-protocol` names the
- * four ceremony frames only, so the literal lives here beside the gateway code that receives it
- * and beside the app constant that sends it (`apps/mobile-companion/src/core/web-lock.ts`).
+ * Spec 021: the PWA's own re-lock frame (contract §14.2). Re-exported from the contract
+ * (`packages/mobile-protocol` `PASSKEY_LOCK_TYPE`); not one of the four ceremony frames.
  */
-export const PASSKEY_LOCK_TYPE = 'passkey-lock'
+export const PASSKEY_LOCK_TYPE = contract.PASSKEY_LOCK_TYPE
 
 /**
  * Whether `type` is one of the spec 021 web passkey frames (scoped by `web:unlock`).

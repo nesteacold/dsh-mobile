@@ -205,6 +205,8 @@ export const PASSKEY_REGISTER_OPTIONS_TYPE: 'passkey-register-options'
 export const PASSKEY_REGISTER_TYPE: 'passkey-register'
 export const PASSKEY_ASSERT_OPTIONS_TYPE: 'passkey-assert-options'
 export const PASSKEY_ASSERT_TYPE: 'passkey-assert'
+/** The PWA's own re-lock frame (contract §14.2); not one of the four ceremony frames. */
+export const PASSKEY_LOCK_TYPE: 'passkey-lock'
 export const PASSKEY_CLIENT_TYPES: readonly PasskeyType[]
 
 /** The scope that gates the passkey frames and arms the server-side lock (`web:unlock`). */
@@ -236,6 +238,11 @@ export type PasskeyErrorCode =
   | 'passkey/challenge-expired'
   | 'passkey/verification-failed'
   | 'passkey/rate-limited'
+export const PASSKEY_NOT_REGISTERED: 'passkey/not-registered'
+export const PASSKEY_ALREADY_REGISTERED: 'passkey/already-registered'
+export const PASSKEY_CHALLENGE_EXPIRED: 'passkey/challenge-expired'
+export const PASSKEY_VERIFICATION_FAILED: 'passkey/verification-failed'
+export const PASSKEY_RATE_LIMITED: 'passkey/rate-limited'
 export const PASSKEY_ERROR_CODES: readonly PasskeyErrorCode[]
 /** Server frame announcing that the owner approved replacing this device's passkey. */
 export const PASSKEY_APPROVAL_KIND: 'passkey-approval'
@@ -632,6 +639,8 @@ export type Capability = 'sessions-read' | 'prompt' | 'cancel' | 'approval-v1'
 export type OptionalCapability = 'push-v1' | 'browser-agent:1' | 'session-rename' | 'session-archive'
   /** Spec 019: advertised only for a device holding `permission:lower`. */
   | 'permission-lower'
+  /** Spec 026 (revision 15): advertised only while the owner has web push enabled. */
+  | 'webPush'
 
 export const CAPABILITIES: readonly Capability[]
 export const OPTIONAL_CAPABILITIES: readonly OptionalCapability[]
@@ -879,6 +888,76 @@ export interface PushRemoveFrame {
   requestId: string
 }
 
+/**
+ * Revision 15 (spec 026): a device stores its OWN browser `PushSubscription`. Not a §4 op and
+ * not scope-gated, like `push-register`. `keys` is `PushSubscription.toJSON().keys`, unpadded
+ * base64url: `p256dh` is the 65-byte P-256 point, `auth` the 16-byte RFC 8291 secret.
+ */
+export interface PushSubscribeFrame {
+  type: 'push-subscribe'
+  requestId: string
+  /** An `https:` URL whose host matches `WEB_PUSH_ENDPOINT_HOSTS`; anything else is refused. */
+  endpoint: string
+  keys: { p256dh: string; auth: string }
+}
+
+/** Revision 15: the answer to `push-subscribe`. */
+export interface PushSubscribedFrame {
+  kind: 'push-subscribed'
+  requestId: string
+  accepted: true
+}
+
+/** Revision 15: an omitted `endpoint` drops every subscription of this device. */
+export interface PushUnsubscribeFrame {
+  type: 'push-unsubscribe'
+  requestId: string
+  endpoint?: string
+}
+
+/** Revision 15: the answer to `push-unsubscribe`. */
+export interface PushUnsubscribedFrame {
+  kind: 'push-unsubscribed'
+  requestId: string
+  accepted: true
+}
+
+/**
+ * Revision 15: the decrypted body of a Web Push message. Ids and the event kind only — never
+ * prompt text, tool name, arguments, path or title (spec 026 R5).
+ */
+export interface WebPushPayload {
+  v: 1
+  kind: WebPushEventKind
+  sessionId: string
+  /** Present only when the Host already had one for that event (`approval`, `question`). */
+  requestId?: string
+}
+
+export type WebPushEventKind = 'approval' | 'question' | 'session-finished'
+
+export const WEB_PUSH_CAPABILITY: 'webPush'
+export const WEB_PUSH_CLIENT_TYPES: readonly ['push-subscribe', 'push-unsubscribe']
+export const WEB_PUSH_SUBSCRIBE_TYPE: 'push-subscribe'
+export const WEB_PUSH_UNSUBSCRIBE_TYPE: 'push-unsubscribe'
+export const WEB_PUSH_RESPONSE_KINDS: Readonly<{ 'push-subscribe': 'push-subscribed'; 'push-unsubscribe': 'push-unsubscribed' }>
+export const WEB_PUSH_EVENT_KINDS: readonly WebPushEventKind[]
+export const WEB_PUSH_PAYLOAD_VERSION: 1
+/** Every field a payload may carry: `v`, `kind`, `sessionId`, `requestId?` — nothing else. */
+export const WEB_PUSH_PAYLOAD_FIELDS: readonly ['v', 'kind', 'sessionId', 'requestId']
+export const WEB_PUSH_TTL_SECONDS: 600
+export const WEB_PUSH_HIGH_URGENCY_KINDS: readonly WebPushEventKind[]
+export const WEB_PUSH_RATE_LIMIT_PER_HOUR: 30
+export const WEB_PUSH_TIMEOUT_MS: 10000
+/** The push services a subscription endpoint may name; `*.` entries match subdomains only. */
+export const WEB_PUSH_ENDPOINT_HOSTS: readonly string[]
+export function isWebPushEndpointAllowed(endpoint: unknown): boolean
+export function validatePushSubscribe(frame: unknown): BrowserValidation<{
+  endpoint: string
+  keys: { p256dh: string; auth: string }
+}>
+export function validatePushUnsubscribe(frame: unknown): BrowserValidation<{ endpoint?: string }>
+
 export type ClientFrame =
   | ClientHelloFrame
   | PingFrame
@@ -894,6 +973,8 @@ export type ClientFrame =
   | DeviceForgetFrame
   | PushRegisterFrame
   | PushRemoveFrame
+  | PushSubscribeFrame
+  | PushUnsubscribeFrame
 
 /** Every request carries a `type` from OPS and a `requestId`. */
 export interface ClientRequestFrameBase {
@@ -914,6 +995,14 @@ export interface HelloFrame {
   certSha256?: string
   /** Spec 021: present only for a device holding `web:unlock`; see `WebLockState`. */
   webLock?: WebLockState
+  /** Spec 026 (revision 15): present only while `webPush` is advertised and the socket is unlocked. */
+  webPush?: WebPushHello
+}
+
+/** Spec 026 (revision 15): `hello.webPush`. `vapidPublicKey` is an unpadded base64url P-256 point. */
+export interface WebPushHello {
+  enabled: true
+  vapidPublicKey: string
 }
 
 export interface PairedFrame {

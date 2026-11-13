@@ -21,9 +21,6 @@
     "test": "node --test test/*.test.mjs"
   },
   "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    },
     "client": {
       "platform": "web"
     }

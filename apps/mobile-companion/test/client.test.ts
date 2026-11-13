@@ -17,6 +17,7 @@ import {
   CompanionClient,
   DEFAULT_HANDSHAKE_TIMEOUT_MS,
 } from '../src/core/client';
+import { decideCompat } from '../src/core/compat';
 import { CoreError } from '../src/core/errors';
 import { Reconnector } from '../src/core/reconnect';
 import { TransportEmitter, type Transport, type TransportListener } from '../src/core/transport';
@@ -1142,6 +1143,34 @@ describe('CompanionClient close + handshake deadline over the production PinnedT
     assert.equal(updated.state, 'update-required');
     updated.close(1000, 'teardown');
     assert.equal(updated.state, 'update-required');
+  });
+
+  it('spec 029: hello survives requireUpdate; a hello missing companionProtocol classifies as malformed, not v-1', () => {
+    // Major mismatch: hello is kept so the UI can classify it.
+    const t1 = new ScriptedTransport();
+    const c1 = scriptedClient(t1, { counter: { value: 0 } });
+    c1.connect({ url: 'wss://127.0.0.1:1/ws', certSha256: PIN, token: 'tok-auth', ...TARGET });
+    t1.fireOpen();
+    t1.deliver({ ...HELLO, companionProtocol: 2, minClientVersion: 2 });
+    assert.equal(c1.state, 'update-required');
+    assert.notEqual(c1.hello, null);
+    assert.equal(decideCompat(c1.hello).kind, 'incompatible');
+
+    // Missing field: normalized to -1 by the client, must read as malformed.
+    const t2 = new ScriptedTransport();
+    const c2 = scriptedClient(t2, { counter: { value: 0 } });
+    const updates: Array<{ hostCompanionProtocol?: number; minClientVersion?: number }> = [];
+    c2.on('updateRequired', (u) => updates.push(u));
+    c2.connect({ url: 'wss://127.0.0.1:1/ws', certSha256: PIN, token: 'tok-auth', ...TARGET });
+    t2.fireOpen();
+    const { companionProtocol: _cp, minClientVersion: _mv, ...noVersion } = HELLO;
+    t2.deliver(noVersion);
+    assert.equal(c2.hello?.companionProtocol, -1);
+    assert.deepEqual(decideCompat(c2.hello), { kind: 'malformed' });
+    assert.equal(c2.state, 'update-required');
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0]?.hostCompanionProtocol, undefined, 'never surfaces -1 as a version');
+    assert.equal(updates[0]?.minClientVersion, undefined);
   });
 
   it('ignores frames delivered after a local close (no pushes from a dead socket)', () => {

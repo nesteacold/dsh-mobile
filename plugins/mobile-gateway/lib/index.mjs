@@ -187,6 +187,14 @@ import {
 // Spec 019 Wave 3: read + lower-only permission control, through the in-process
 // `permissionPresets` cordis service (never a command string).
 import { createPermissionLower } from './permission-lower.mjs'
+// Spec 026 (revision 15): Web Push for the PWA — the VAPID identity, RFC 8291 bodies, the
+// per-device subscription store and the outbound sender. Off unless the owner enables it.
+import {
+  createWebPushService, webPushPayload,
+} from './web-push/service.mjs'
+import {
+  createWebPushStore, loadOrCreateVapidKeys, loadWebPushSubscriptions, WEB_PUSH_SUBSCRIPTION_FILE,
+} from './web-push/store.mjs'
 import { createPairingRequests, otpProof, verificationCode } from './pairing-requests.mjs'
 import { pairingSourceKey } from './pairing-source-limiter.mjs'
 import { planScopeUpdate } from './device-scope-update.mjs'
@@ -210,7 +218,10 @@ import { DEVICE_KINDS, SCOPES, REMOTE_CLIENT_TYPES, DESKTOP_DEFAULT_SCOPES, NEVE
   QUESTION_RESPONSE_SCOPE, SESSION_EDIT_CAPABILITY_SCOPE,
   // Spec 021 (revision 14): the web passkey unlock frames, codes and `hello.webLock`.
   PASSKEY_APPROVAL_KIND, PASSKEY_ASSERT_OPTIONS_TYPE, PASSKEY_ASSERT_TYPE, PASSKEY_CLIENT_TYPES,
-  PASSKEY_REGISTER_OPTIONS_TYPE, PASSKEY_REGISTER_TYPE, WEB_LOCK_ERROR } from './vendor/mobile-protocol.mjs'
+  PASSKEY_REGISTER_OPTIONS_TYPE, PASSKEY_REGISTER_TYPE, WEB_LOCK_ERROR,
+  // Spec 026 (revision 15): the web push frames, capability and validators.
+  WEB_PUSH_CAPABILITY, WEB_PUSH_CLIENT_TYPES, WEB_PUSH_RESPONSE_KINDS,
+  validatePushSubscribe, validatePushUnsubscribe } from './vendor/mobile-protocol.mjs'
 import QRCode from 'qrcode'
 
 const { createRegistry, clampPairingTtlMs, MAX_PAIRING_TTL_MS } = devicesModule
@@ -389,6 +400,19 @@ const Config = Schema.object({
   }).default({}),
   publicUrl: Schema.string().default(''),
   deviceFile: Schema.string().default(''),
+  // Spec 026 (R1–R5): Web Push for the PWA. OFF by default, and off means the gateway makes NO
+  // outbound request at all — enabling it contacts browser push services, which is a new egress
+  // surface the owner has to choose. `webPush.enabled` is that owner switch; each `events` key
+  // toggles one kind on top of it. The VAPID key pair is generated on first enable and stored
+  // with the gateway's other secrets; its private half is never logged and never leaves the Host.
+  webPush: Schema.object({
+    enabled: Schema.boolean().default(false),
+    events: Schema.object({
+      approval: Schema.boolean().default(true),
+      question: Schema.boolean().default(true),
+      'session-finished': Schema.boolean().default(true),
+    }).default({}),
+  }).default({}),
   // Contract §2: `expiresAt` is at most five minutes ahead, so the config cannot
   // ask for a longer offer (the registry clamps again for callers that bypass
   // schema validation).
@@ -3448,6 +3472,65 @@ const plugin = {
         ? { idleMs: options.testWebUnlockIdleMs } : {}),
     })
 
+    // Spec 026 (revision 15): Web Push for the PWA. The owner switch is read LIVE on every send
+    // (never cached), so turning it off stops the next push even if a subscription still exists.
+    // The VAPID key pair is generated only when the feature is first enabled — an install that
+    // never turns web push on writes no key file at all. The subscription store lives next to the
+    // device store, like every other gateway secret.
+    const webPushOptions = options.webPush && typeof options.webPush === 'object' ? options.webPush : {}
+    const webPushEnabled = () => webPushOptions.enabled === true && remoteControlEnabled() && gatewayEnabled
+    // Lazily created so a disabled gateway never generates a key, never touches the file and
+    // therefore can never send: this is what "off means zero outbound requests" rests on.
+    let webPushParts
+    const webPush = () => {
+      if (webPushParts !== undefined) return webPushParts
+      const directory = path.dirname(deviceFile)
+      const keys = loadOrCreateVapidKeys(directory, log)
+      const loaded = loadWebPushSubscriptions(directory)
+      if (loaded.problem !== undefined) {
+        log(`web push subscription store unusable (${loaded.problem}); every device counts as unsubscribed`)
+      }
+      const store = createWebPushStore({ byDevice: loaded.byDevice, file: loaded.file, log })
+      // A device revoked while no store existed (or before a crash) must not keep a subscription.
+      store.pruneDevices(registry.list().map((device) => device.id))
+      const service = createWebPushService({
+        vapid: keys.vapid,
+        store,
+        enabled: webPushEnabled,
+        eventKinds: webPushOptions.events,
+        log,
+        // Test-only transport (never part of `Config`): lets the suite point the same code at a
+        // local fake push service instead of a real one. The bundle never sets it.
+        ...(typeof options.testWebPushTransport === 'function' ? { transport: options.testWebPushTransport } : {}),
+      })
+      webPushParts = { keys, store, service }
+      return webPushParts
+    }
+    // The gate in front of every event site. It is deliberately cheap and synchronous so a
+    // disabled gateway pays nothing: no store, no key file, no payload, no socket.
+    // Spec 026 R2: a revoked / forgotten / re-paired device loses its subscriptions, even while
+    // web push is switched off. Never creates the VAPID key; touches disk only when a store exists.
+    const forgetWebPushDevice = (deviceId) => {
+      try {
+        if (!deviceId) return
+        if (webPushParts) { webPushParts.store.forgetDevice(deviceId); return }
+        const directory = path.dirname(deviceFile)
+        if (!fs.existsSync(path.join(directory, WEB_PUSH_SUBSCRIPTION_FILE))) return
+        const loaded = loadWebPushSubscriptions(directory)
+        if (loaded.problem !== undefined || !loaded.byDevice.has(deviceId)) return
+        createWebPushStore({ byDevice: loaded.byDevice, file: loaded.file, log }).forgetDevice(deviceId)
+      } catch (error) {
+        log(`web push subscription cleanup failed: ${error && error.code ? String(error.code) : 'unknown'}`)
+      }
+    }
+    const pushWebPush = (event) => {
+      if (!webPushEnabled()) return
+      // `void`: a push must never delay or fail the frame/event that produced it.
+      void webPush().service.notify(event).catch((error) => {
+        log(`web push failed: ${error && error.message ? String(error.message).slice(0, 200) : 'unknown'}`)
+      })
+    }
+
     // T016 (R1): the Host certificate. Created on first use in the plugin data
     // directory; replaced only by the owner's explicit regenerate action.
     const tlsDirectory = options.tlsCertificateDir || path.join(path.dirname(deviceFile), 'mobile-gateway-tls')
@@ -5126,6 +5209,7 @@ const plugin = {
             if (claimed.repaired) {
               rtc?.closeDevice(device.id)
               void deviceAccess.revoke(device.id)
+              forgetWebPushDevice(device.id)
               for (const client of clients) {
                 if (client.deviceId === device.id) client.close(CLOSE_REVOKED, 'credential re-paired')
               }
@@ -5190,6 +5274,7 @@ const plugin = {
               // Spec 021 §5: revoking the device deletes its passkey record and closes its sockets
               // (4401 — the credential is gone, so the PWA must wipe its stored passkey too).
               passkeyService.revoke(id)
+              forgetWebPushDevice(id)
               for (const client of clients) {
                 // Contract §3/§6: close code 4401 tells the phone its credential
                 // is gone and it must wipe it (4003 would mean "re-authenticate").
@@ -6097,6 +6182,7 @@ const plugin = {
             deviceClientMessages.delete(deviceId)
             // Spec 021 §5: a device that forgets itself drops its passkey record with its credential.
             passkeyService.revoke(deviceId)
+            forgetWebPushDevice(deviceId)
             for (const client of clients) if (client.deviceId === deviceId) client.close(CLOSE_REVOKED, 'device forgot itself')
             log(`device removed itself: ${deviceId}`)
           }
@@ -6109,6 +6195,46 @@ const plugin = {
           sendFrame({ kind: 'error', code: OP_FORBIDDEN, requestType: msg.type,
             ...(typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}),
             message: 'push-v1 is not advertised by this gateway' })
+        } else if (WEB_PUSH_CLIENT_TYPES.includes(msg.type)) {
+          // Spec 026 (revision 15): the PWA stores or drops its OWN browser subscription. Like
+          // `push-register` these are not §4 ops and carry no scope, but unlike it they are
+          // actually served — while the owner has web push on. Off means `op/forbidden`, exactly
+          // as `push-register` answers above, so a client never believes it subscribed.
+          const echo = requestIdEcho(msg)
+          if (msg.type === 'push-subscribe' && deviceTokenCaller === false) {
+            sendFrame({ kind: 'error', code: 'auth/required', requestType: msg.type, ...echo,
+              message: 'a paired device credential is required' })
+            return
+          }
+          if (!webPushEnabled()) {
+            sendFrame({ kind: 'error', code: OP_FORBIDDEN, requestType: msg.type, ...echo,
+              message: `${WEB_PUSH_CAPABILITY} is not advertised by this gateway` })
+            return
+          }
+          if (refuseIfWebLocked(ws, msg)) return
+          // A subscription belongs to a `mobile` device (the PWA is one): a desktop record has no
+          // push service behind it, and accepting one would be a promise nothing can keep.
+          if (scopedDevice?.kind !== 'mobile') {
+            sendFrame({ kind: 'error', code: 'auth/forbidden-scope', requestType: msg.type, ...echo,
+              message: 'web push subscriptions belong to a mobile (web) device' })
+            return
+          }
+          const validated = msg.type === 'push-subscribe' ? validatePushSubscribe(msg) : validatePushUnsubscribe(msg)
+          if (validated.ok !== true) {
+            sendFrame({ kind: 'error', code: validated.code, requestType: msg.type, ...echo,
+              message: validated.message })
+            log(`web push frame refused: type=${msg.type} device=${ws.deviceId} reason=bad-request`)
+            return
+          }
+          const store = webPush().store
+          if (msg.type === 'push-subscribe') {
+            const count = store.subscribe(ws.deviceId, validated.value)
+            log(`web push frame: type=push-subscribe device=${ws.deviceId} subscriptions=${count}`)
+          } else {
+            const removed = store.unsubscribe(ws.deviceId, validated.value.endpoint)
+            log(`web push frame: type=push-unsubscribe device=${ws.deviceId} removed=${removed}`)
+          }
+          sendFrame({ kind: WEB_PUSH_RESPONSE_KINDS[msg.type], ...echo, accepted: true })
         } else if (msg.type === 'ping') {
           const requestId = typeof msg.requestId === 'string' && msg.requestId.length > 0 && msg.requestId.length <= 128
             ? { requestId: msg.requestId } : {}
@@ -6678,6 +6804,7 @@ const plugin = {
           if (paired.repaired) {
             rtc?.closeDevice(device.id)
             void deviceAccess.revoke(device.id)
+            forgetWebPushDevice(device.id)
             for (const client of clients) {
               if (client.deviceId === device.id) client.close(CLOSE_REVOKED, 'credential re-paired')
             }

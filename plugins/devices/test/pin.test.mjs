@@ -113,15 +113,15 @@ await check('a pin that is not 64 hex chars, an expired code and wrong versions 
 
 await check('address must match the pairing string; public addresses are refused by default (FR2)', async () => {
   const payload = decodePairingString(pairingString('wss://203.0.113.9:3081/ws/mobile', pinOf(served.cert)))
-  assert.throws(() => resolveDialUrl('10.0.0.5:3081', payload), /does not match/)
-  assert.throws(() => resolveDialUrl('203.0.113.9:3081', payload), /private-network/)
-  assert.equal(resolveDialUrl('203.0.113.9:3081', payload, { allowPublic: true }), 'wss://203.0.113.9:3081/ws/mobile')
-  assert.throws(() => resolveDialUrl('', payload), /required/)
-  assert.throws(() => resolveDialUrl('user:pw@203.0.113.9:3081', payload), /look like/)
-  for (const host of ['127.0.0.1', '10.1.2.3', '192.168.0.9', '172.16.5.5', '100.64.0.1', '169.254.1.1', 'fd00::1', 'fe80::1', '::1', 'nas.local']) {
+  await assert.rejects(() => resolveDialUrl('10.0.0.5:3081', payload), /does not match/)
+  await assert.rejects(() => resolveDialUrl('203.0.113.9:3081', payload), /private-network/)
+  assert.equal(await resolveDialUrl('203.0.113.9:3081', payload, { allowPublic: true }), 'wss://203.0.113.9:3081/ws/mobile')
+  await assert.rejects(() => resolveDialUrl('', payload), /required/)
+  await assert.rejects(() => resolveDialUrl('user:pw@203.0.113.9:3081', payload), /look like/)
+  for (const host of ['127.0.0.1', '10.1.2.3', '192.168.0.9', '172.16.5.5', '100.64.0.1', '169.254.1.1', 'fd00::1', 'fe80::1', '::1']) {
     assert.equal(isPrivateAddress(host), true, host)
   }
-  for (const host of ['8.8.8.8', '172.32.0.1', '100.128.0.1', '203.0.113.9', '2001:db8::1', 'example.com']) {
+  for (const host of ['8.8.8.8', '172.32.0.1', '100.128.0.1', '203.0.113.9', '2001:db8::1', 'example.com', 'nas.local']) {
     assert.equal(isPrivateAddress(host), false, host)
   }
 })

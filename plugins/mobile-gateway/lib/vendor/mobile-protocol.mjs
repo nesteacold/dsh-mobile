@@ -9,7 +9,7 @@
  * Source:     packages/mobile-protocol/src/index.mjs
  * Regenerate: node scripts/sync-mobile-protocol.mjs   (npm run sync:protocol)
  * Verify:     node scripts/sync-mobile-protocol.mjs --check   (npm run check:protocol)
- * Source sha256: 5b5a33ff482a61f7b2fd7aa9c6c3edbeaea8253b302764d1fe68eb4837a8b404
+ * Source sha256: 95d2c087faf22e43b0481ada36ec192a906691b27a02939722b4a913434f7a57
  *
  * Everything below this header is the source file unchanged (byte for byte, LF):
  * the contract logic is never forked, only copied.
@@ -779,6 +779,13 @@ export const PASSKEY_REGISTER_TYPE = 'passkey-register'
 export const PASSKEY_ASSERT_OPTIONS_TYPE = 'passkey-assert-options'
 export const PASSKEY_ASSERT_TYPE = 'passkey-assert'
 
+/**
+ * The PWA's own re-lock frame (contract §14.2): `{type:PASSKEY_LOCK_TYPE}` ->
+ * `{kind:PASSKEY_LOCK_TYPE, locked:true}`. Scoped by `web:unlock` and accepted in any lock state;
+ * deliberately NOT in {@link PASSKEY_CLIENT_TYPES} (the four ceremony frames).
+ */
+export const PASSKEY_LOCK_TYPE = 'passkey-lock'
+
 /** The four spec 021 client frames, in the order the PWA uses them. */
 export const PASSKEY_CLIENT_TYPES = Object.freeze([
   PASSKEY_REGISTER_OPTIONS_TYPE,
@@ -831,12 +838,17 @@ export const WEB_UNLOCK_IDLE_MS = 15 * 60_000
  * device already has a passkey: replacing it needs the owner's approval on the Host, and the
  * client re-sends `passkey-register` once `passkey-approval` reports the approval.
  */
+export const PASSKEY_NOT_REGISTERED = 'passkey/not-registered'
+export const PASSKEY_ALREADY_REGISTERED = 'passkey/already-registered'
+export const PASSKEY_CHALLENGE_EXPIRED = 'passkey/challenge-expired'
+export const PASSKEY_VERIFICATION_FAILED = 'passkey/verification-failed'
+export const PASSKEY_RATE_LIMITED = 'passkey/rate-limited'
 export const PASSKEY_ERROR_CODES = Object.freeze([
-  'passkey/not-registered',
-  'passkey/already-registered',
-  'passkey/challenge-expired',
-  'passkey/verification-failed',
-  'passkey/rate-limited',
+  PASSKEY_NOT_REGISTERED,
+  PASSKEY_ALREADY_REGISTERED,
+  PASSKEY_CHALLENGE_EXPIRED,
+  PASSKEY_VERIFICATION_FAILED,
+  PASSKEY_RATE_LIMITED,
 ])
 
 /** Server frame announcing that the owner approved replacing this device's passkey. */
@@ -970,6 +982,172 @@ export const PERMISSION_LOWER_MESSAGES = Object.freeze({
 })
 
 // ---------------------------------------------------------------------------
+// Spec 026 — Web Push for the PWA (revision 15, additive)
+//
+// Two client frames, NOT contract §4 operations (`OPS` is unchanged) and NOT scope-gated: a
+// device manages its OWN subscription, exactly as `push-register`/`push-remove` do for native
+// push. They are served only while the owner has web push enabled, which is what the `webPush`
+// capability in `hello` says, and they are the frames the PWA uses after it obtains a
+// `PushSubscription` from the browser:
+//
+//   push-subscribe   { type, requestId, endpoint, keys: { p256dh, auth } }
+//     -> { kind: 'push-subscribed',   requestId, accepted: true }
+//   push-unsubscribe { type, requestId, endpoint? }        (omitted endpoint = every one of this device)
+//     -> { kind: 'push-unsubscribed', requestId, accepted: true }
+//
+// `p256dh` and `auth` are the subscription's own key material as **unpadded base64url**: the
+// 65-byte uncompressed P-256 point and the 16-byte shared auth secret (RFC 8291 §3.2). The
+// gateway refuses an endpoint outside its allowlist (§15.3) — https only, a known push service,
+// no credentials in the URL, no redirects, 10 s deadline — so this surface is never an SSRF
+// primitive. The payload a device later receives is a Web Push body encrypted per RFC 8291 and
+// carries ids only; nothing about it travels on this link.
+// ---------------------------------------------------------------------------
+
+/** Capability the gateway advertises in `hello` while the owner has enabled web push. */
+export const WEB_PUSH_CAPABILITY = 'webPush'
+
+/** Client → server frames of this revision (they use `type`, like every client frame). */
+export const WEB_PUSH_CLIENT_TYPES = Object.freeze(['push-subscribe', 'push-unsubscribe'])
+
+/** The client frame that stores (or replaces) this device's subscription. */
+export const WEB_PUSH_SUBSCRIBE_TYPE = 'push-subscribe'
+
+/** The client frame that drops one subscription, or every one of this device when `endpoint` is omitted. */
+export const WEB_PUSH_UNSUBSCRIBE_TYPE = 'push-unsubscribe'
+
+/** Server → client `kind` per frame (`OP_RESPONSES` is the §4 table and stays untouched). */
+export const WEB_PUSH_RESPONSE_KINDS = Object.freeze({
+  'push-subscribe': 'push-subscribed',
+  'push-unsubscribe': 'push-unsubscribed',
+})
+
+/**
+ * The only `kind` values a web push payload may carry (spec 026 R5). The owner toggles each one
+ * on the Host; the payload itself never says more than which of these happened.
+ */
+export const WEB_PUSH_EVENT_KINDS = Object.freeze(['approval', 'question', 'session-finished'])
+
+/** Version of the push payload shape. A client that does not know it shows nothing. */
+export const WEB_PUSH_PAYLOAD_VERSION = 1
+
+/**
+ * The complete field set of a web push payload: `{ v, kind, sessionId, requestId? }` and nothing
+ * else. No prompt text, no tool name, no arguments, no path, no session title — the notification
+ * is rendered from a fixed localized string plus these ids (spec 026 R5, constitution).
+ */
+export const WEB_PUSH_PAYLOAD_FIELDS = Object.freeze(['v', 'kind', 'sessionId', 'requestId'])
+
+/** Lifetime the gateway asks a push service to keep a message (RFC 8030 `TTL`), in seconds. */
+export const WEB_PUSH_TTL_SECONDS = 600
+
+/** RFC 8030 `Urgency` for the kinds that wait for a decision; everything else is left at `normal`. */
+export const WEB_PUSH_HIGH_URGENCY_KINDS = Object.freeze(['approval'])
+
+/** Pushes one device may receive per rolling hour, all kinds together. */
+export const WEB_PUSH_RATE_LIMIT_PER_HOUR = 30
+
+/** Deadline of one request to a push service. A slow service is abandoned, never queued forever. */
+export const WEB_PUSH_TIMEOUT_MS = 10_000
+
+/**
+ * The push services a subscription endpoint may name (spec 026 R3). An entry starting with `*.`
+ * matches any subdomain, never the bare apex; every other entry is an exact host match. Nothing
+ * outside this list is contacted, whatever a device sends.
+ */
+export const WEB_PUSH_ENDPOINT_HOSTS = Object.freeze([
+  'fcm.googleapis.com',
+  '*.push.services.mozilla.com',
+  '*.notify.windows.com',
+  '*.push.apple.com',
+])
+
+/** Unpadded base64url, the encoding of `keys.p256dh` and `keys.auth`. */
+const WEB_PUSH_BASE64URL = /^[A-Za-z0-9_-]+$/
+
+/**
+ * Decoded byte count of an unpadded base64url string, or `-1` when it cannot be one. The length
+ * alone is enough because this package also runs on the phone (Hermes): it must not depend on
+ * `Buffer`, and the contents are never inspected here.
+ */
+function base64urlBytes(value) {
+  if (typeof value !== 'string' || value.length === 0 || !WEB_PUSH_BASE64URL.test(value)) return -1
+  // A base64 quantum is 4 chars; unpadded input can only lack 1 or 2 of them.
+  if (value.length % 4 === 1) return -1
+  return Math.floor((value.length * 3) / 4)
+}
+
+/**
+ * Whether `endpoint` may be contacted at all: an `https:` URL, no credentials in it, and a host
+ * on {@link WEB_PUSH_ENDPOINT_HOSTS}. Purely syntactic — it never resolves or touches the URL.
+ *
+ * This is the SSRF guard of spec 026 R3. It is exported so the Host and the app agree on the
+ * list, and so a test can pin the refusals without a network.
+ *
+ * @param {unknown} endpoint
+ * @returns {boolean}
+ */
+export function isWebPushEndpointAllowed(endpoint) {
+  if (typeof endpoint !== 'string' || endpoint.length === 0 || endpoint.length > 2048) return false
+  let url
+  try {
+    url = new URL(endpoint)
+  } catch {
+    return false
+  }
+  // `https:` only — a plaintext push service would leak the subscription to the path.
+  if (url.protocol !== 'https:') return false
+  // `https://user:pass@host/…` is never a push service and must not be parsed as one.
+  if (url.username !== '' || url.password !== '') return false
+  if (url.port !== '') return false
+  const host = url.hostname.toLowerCase()
+  if (host === '') return false
+  return WEB_PUSH_ENDPOINT_HOSTS.some((pattern) => (pattern.startsWith('*.')
+    ? host.endsWith(pattern.slice(1)) && host.length > pattern.length - 1
+    : host === pattern))
+}
+
+/**
+ * Validate one `push-subscribe`: `{ type, requestId, endpoint, keys: { p256dh, auth } }`, or
+ * `{ ok: false, code: 'bad-request', message }`. Never throws, and never touches the network: the
+ * allowlist is a pure syntactic check ({@link isWebPushEndpointAllowed}).
+ *
+ * The key lengths are checked, not their contents: 65 bytes of `p256dh` is an uncompressed P-256
+ * point and 16 bytes of `auth` is the RFC 8291 auth secret. A subscription that carries anything
+ * else could never decrypt a message, so it is refused here instead of failing at delivery time.
+ *
+ * @param {unknown} frame
+ */
+export function validatePushSubscribe(frame) {
+  if (!isRecord(frame)) return badRequest('a push-subscribe must be an object')
+  if (frame.type !== WEB_PUSH_SUBSCRIBE_TYPE) return badRequest('type must be "push-subscribe"')
+  if (!isWebPushEndpointAllowed(frame.endpoint)) {
+    return badRequest('endpoint must be an https URL of a known push service')
+  }
+  if (!isRecord(frame.keys)) return badRequest('keys must be an object')
+  const { p256dh, auth } = frame.keys
+  if (base64urlBytes(p256dh) !== 65) return badRequest('keys.p256dh must be a 65-byte P-256 point')
+  if (base64urlBytes(auth) !== 16) return badRequest('keys.auth must be a 16-byte secret')
+  return { ok: true, value: { endpoint: frame.endpoint, keys: { p256dh, auth } } }
+}
+
+/**
+ * Validate one `push-unsubscribe`: `{ type, requestId, endpoint? }`. An omitted endpoint drops
+ * every subscription of this device; a present one must still pass the allowlist, so a device
+ * cannot use this frame to make the Host parse an arbitrary URL.
+ *
+ * @param {unknown} frame
+ */
+export function validatePushUnsubscribe(frame) {
+  if (!isRecord(frame)) return badRequest('a push-unsubscribe must be an object')
+  if (frame.type !== WEB_PUSH_UNSUBSCRIBE_TYPE) return badRequest('type must be "push-unsubscribe"')
+  if (frame.endpoint === undefined) return { ok: true, value: {} }
+  if (!isWebPushEndpointAllowed(frame.endpoint)) {
+    return badRequest('endpoint must be an https URL of a known push service')
+  }
+  return { ok: true, value: { endpoint: frame.endpoint } }
+}
+
+// ---------------------------------------------------------------------------
 // §3.5 / §6 Capabilities, close codes, errors
 // ---------------------------------------------------------------------------
 
@@ -990,6 +1168,10 @@ export const OPTIONAL_CAPABILITIES = Object.freeze([
   // Spec 019 Wave 3: the app may show its permission chip. Advertised PER DEVICE and
   // only for a device holding `permission:lower` (see SESSION_EDIT_CAPABILITY_SCOPE).
   'permission-lower',
+  // Spec 026 (revision 15): the host accepts `push-subscribe`/`push-unsubscribe` and may
+  // send Web Push messages. Advertised only while the owner has web push enabled — the
+  // switch is off by default, and off means zero outbound requests.
+  'webPush',
 ])
 
 /**
@@ -1212,6 +1394,63 @@ export const PING_INTERVAL_MS = 25_000
  * @property {string} gatewayId
  * @property {string} [dshVersion] DSH runtime version, e.g. `0.2.2-rc.1`.
  * @property {string} [certSha256] Hex SHA-256 of the pinned TLS leaf certificate.
+ * @property {{ enabled: boolean, vapidPublicKey: string }} [webPush] Revision 15: present only
+ *   while `webPush` is in `capabilities` and the socket is not locked.
+ */
+
+/**
+ * Server → client `hello.webPush` (revision 15, contract §15.1). `vapidPublicKey` is the Host's
+ * VAPID P-256 public key as an unpadded base64url uncompressed point (65 bytes); the private key
+ * never leaves the Host.
+ * @typedef {Object} WebPushHello
+ * @property {true} enabled
+ * @property {string} vapidPublicKey
+ */
+
+/**
+ * Client → server `push-subscribe` (revision 15, contract §15.2). Not a §4 op and not scoped:
+ * a device stores its OWN browser subscription. `keys` is the `PushSubscription.toJSON()` pair:
+ * `p256dh` (65-byte P-256 point) and `auth` (16-byte secret), both unpadded base64url.
+ * @typedef {Object} PushSubscribeFrame
+ * @property {'push-subscribe'} type
+ * @property {string} requestId
+ * @property {string} endpoint An `https:` URL of a host in {@link WEB_PUSH_ENDPOINT_HOSTS}.
+ * @property {{ p256dh: string, auth: string }} keys
+ */
+
+/**
+ * Server answer to `push-subscribe` (revision 15).
+ * @typedef {Object} PushSubscribedFrame
+ * @property {'push-subscribed'} kind
+ * @property {string} requestId
+ * @property {true} accepted
+ */
+
+/**
+ * Client → server `push-unsubscribe` (revision 15, contract §15.2). An omitted `endpoint` drops
+ * every subscription of this device.
+ * @typedef {Object} PushUnsubscribeFrame
+ * @property {'push-unsubscribe'} type
+ * @property {string} requestId
+ * @property {string} [endpoint] The subscription to drop; absent means all of them.
+ */
+
+/**
+ * Server answer to `push-unsubscribe` (revision 15).
+ * @typedef {Object} PushUnsubscribedFrame
+ * @property {'push-unsubscribed'} kind
+ * @property {string} requestId
+ * @property {true} accepted
+ */
+
+/**
+ * The decrypted body of a web push message (revision 15, contract §15.4). It carries ids and the
+ * event kind only: no prompt text, no tool name, no arguments, no path, no title.
+ * @typedef {Object} WebPushPayload
+ * @property {1} v {@link WEB_PUSH_PAYLOAD_VERSION}
+ * @property {'approval'|'question'|'session-finished'} kind
+ * @property {string} sessionId
+ * @property {string} [requestId] Present only when the Host already has one (approval, question).
  */
 
 /**

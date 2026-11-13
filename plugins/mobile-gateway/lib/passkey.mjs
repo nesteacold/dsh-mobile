@@ -29,7 +29,14 @@ import path from 'node:path'
 // `node_modules/@dsh-ext/mobile-protocol` (see `scripts/sync-mobile-protocol.mjs`), and a bare
 // import here failed `npm run test:package` for exactly that reason.
 import {
+  PASSKEY_ALREADY_REGISTERED,
+  PASSKEY_ASSERT_OPTIONS_TYPE,
+  PASSKEY_CHALLENGE_EXPIRED,
   PASSKEY_CHALLENGE_TTL_MS,
+  PASSKEY_NOT_REGISTERED,
+  PASSKEY_RATE_LIMITED,
+  PASSKEY_REGISTER_OPTIONS_TYPE,
+  PASSKEY_VERIFICATION_FAILED,
   PASSKEY_RATE_LIMITS,
   WEB_UNLOCK_IDLE_MS,
 } from './vendor/mobile-protocol.mjs'
@@ -50,11 +57,11 @@ const PUBLIC_KEY_PATTERN = /^[A-Za-z0-9_-]{1,3072}$/
 
 /** Wire codes (contract §6). */
 export const PASSKEY_CODES = Object.freeze({
-  notRegistered: 'passkey/not-registered',
-  alreadyRegistered: 'passkey/already-registered',
-  challengeExpired: 'passkey/challenge-expired',
-  verificationFailed: 'passkey/verification-failed',
-  rateLimited: 'passkey/rate-limited',
+  notRegistered: PASSKEY_NOT_REGISTERED,
+  alreadyRegistered: PASSKEY_ALREADY_REGISTERED,
+  challengeExpired: PASSKEY_CHALLENGE_EXPIRED,
+  verificationFailed: PASSKEY_VERIFICATION_FAILED,
+  rateLimited: PASSKEY_RATE_LIMITED,
   badRequest: 'bad-request',
 })
 
@@ -274,7 +281,7 @@ export function createPasskeyService(options) {
     // A fresh challenge every time an option is issued: an old answer can no longer verify.
     const challenge = issueChallenge(socket)
     return {
-      kind: 'passkey-register-options',
+      kind: PASSKEY_REGISTER_OPTIONS_TYPE,
       challenge,
       rp: { id: site.rpId, name: options.gatewayName },
       user: {
@@ -298,7 +305,7 @@ export function createPasskeyService(options) {
     if (stored === undefined) refuse(PASSKEY_CODES.notRegistered)
     const challenge = issueChallenge(socket)
     return {
-      kind: 'passkey-assert-options',
+      kind: PASSKEY_ASSERT_OPTIONS_TYPE,
       challenge,
       rpId: site.rpId,
       allowCredentials: [{ type: 'public-key', id: stored.credentialId }],

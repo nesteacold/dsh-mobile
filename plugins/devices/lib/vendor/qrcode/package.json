@@ -1,0 +1,6 @@
+{
+  "name": "devices-vendor-qrcode",
+  "private": true,
+  "type": "commonjs",
+  "description": "Vendored Kazuhiko Arase QRCode for JavaScript (MIT), copied from the qrcode-terminal@0.12.0 encoder core. CommonJS marker inside the ESM plugin package."
+}

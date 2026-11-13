@@ -206,6 +206,9 @@ window.__ModuleLoader__.load({
         otpHelp: 'Type this code on the other device together with this address. It works once, for 10 minutes, and you will still have to approve the request here.',
         otpNew: 'Generate pairing code',
         otpClose: 'Close',
+        otpQrAlt: 'Pairing QR code',
+        otpQrHelp: 'Scan with the phone camera: it opens the app with the address and code filled in. You still confirm on the phone and approve here.',
+        otpQrTextHelp: 'Scan to read the address and code as text.',
         pendingTitle: 'Pending requests',
         pendingNone: 'No device is asking to connect.',
         pendingHelp: 'Check that the code below is the same one shown on the other device before you approve.',
@@ -492,6 +495,9 @@ window.__ModuleLoader__.load({
         otpHelp: 'Nhập mã này trên thiết bị kia cùng với địa chỉ này. Chỉ dùng một lần, trong 10 phút, và bạn vẫn phải phê duyệt yêu cầu tại đây.',
         otpNew: 'Tạo mã ghép đôi',
         otpClose: 'Đóng',
+        otpQrAlt: 'Mã QR ghép đôi',
+        otpQrHelp: 'Quét bằng camera điện thoại: ứng dụng mở ra với địa chỉ và mã đã điền sẵn. Bạn vẫn xác nhận trên điện thoại và phê duyệt tại đây.',
+        otpQrTextHelp: 'Quét để đọc địa chỉ và mã dạng văn bản.',
         pendingTitle: 'Yêu cầu đang chờ',
         pendingNone: 'Không có thiết bị nào đang xin kết nối.',
         pendingHelp: 'Hãy kiểm tra mã bên dưới trùng với mã hiển thị trên thiết bị kia trước khi phê duyệt.',
@@ -997,17 +1003,33 @@ window.__ModuleLoader__.load({
     const groupOtp = (otp) => String(otp || '').replace(/^(\d{4})(\d{4})$/, '$1 $2')
 
     // Window 1: the one-time code, its countdown and the addresses to type.
-    function OtpDialog({ offer, addresses, onClose }) {
+    // The QR (lib/pair-qr.mjs, rendered locally on this Host) encodes
+    // https://<pwa>/pair#a=<address>&c=<code>: the fragment never reaches a server.
+    // `qr.address` is the address a phone can reach (behind `tailscale serve` the
+    // listener's own loopback port is not), so it replaces the listener's list.
+    function OtpDialog({ offer, addresses, lanHost, onClose }) {
       useLang()
+      const [qr, setQr] = React.useState(null)
+      React.useEffect(() => {
+        let live = true
+        post('/devices/pair-qr', { otp: String(offer.otp), lanHost: lanHost || '', fallbackAddress: addresses[0] || '' })
+          .then((reply) => { if (live && reply && typeof reply.svg === 'string') setQr(reply) })
+          .catch(() => { /* the code and address still show; the QR is an extra */ })
+        return () => { live = false }
+      }, [offer.otp])
+      const shown = qr && qr.address ? [qr.address] : addresses
       return h(Dialog, { title: tr('otpTitle'), onClose },
+        qr ? h('div', { 'data-testid': 'otp-qr', style: { display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: 8 } },
+          h('img', { alt: tr('otpQrAlt'), width: 200, height: 200, src: 'data:image/svg+xml;utf8,' + encodeURIComponent(qr.svg) }),
+          h('div', { className: 'dshdev-muted' }, tr(qr.link ? 'otpQrHelp' : 'otpQrTextHelp'))) : null,
         h('div', { className: 'dshdev-otp', 'data-testid': 'otp-code' }, groupOtp(offer.otp)),
         h('div', { className: 'dshdev-row', style: { justifyContent: 'center', marginBottom: 8 } },
           h(Countdown, { expiresAt: offer.pairing.expiresAt }),
           h(CopyButton, { text: String(offer.otp) })),
         h('div', { className: 'dshdev-muted', style: { marginBottom: 10 } }, tr('otpHelp')),
         h('h3', null, tr('address')),
-        addresses.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('noAddress'))
-          : h('div', { className: 'dshdev-row' }, addresses.map((address) =>
+        shown.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('noAddress'))
+          : h('div', { className: 'dshdev-row', 'data-testid': 'otp-addresses' }, shown.map((address) =>
             h('span', { key: address, className: 'dshdev-chip' }, address, h(CopyButton, { text: address })))))
     }
 
@@ -1568,7 +1590,7 @@ window.__ModuleLoader__.load({
             h('h3', { className: 'dshdev-grow' }, tr('pairingCode')),
             h('button', { type: 'button', className: 'dshdev-btn primary', disabled: busy || !on, onClick: generateOtp }, tr('generate'))),
           !on ? h('div', { className: 'dshdev-muted' }, tr('enableFirst')) : null),
-        otpOffer ? h(OtpDialog, { offer: otpOffer, addresses, onClose: () => setOtpOffer(null) }) : null,
+        otpOffer ? h(OtpDialog, { offer: otpOffer, addresses, lanHost: status && status.lan ? status.lan.host : '', onClose: () => setOtpOffer(null) }) : null,
         h(PendingRequests, { active: on }),
         pairing && !editing ? h(PairingBox, { pairing, onClose: () => setPairing(null) }) : null,
         h('div', { className: 'dshdev-card' },
@@ -2945,6 +2967,10 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'dshdev-panel', 'data-testid': 'devices-panel' }, h(DevicesPage))
     }
 
+    // The bundle that carries this plugin (spec 028) and its rows' packages.
+    const MOBILE_BUNDLE = '@dsh-mobile/bundle'
+    const isMobileBundleSubject = (subject) => !!subject && subject.kind === 'bundle' && !!subject.pkg && subject.pkg.name === MOBILE_BUNDLE
+
     const inject = ['slots', 'locale']
     function apply(ctx) {
       ctx.effect(() => {
@@ -2979,6 +3005,14 @@ window.__ModuleLoader__.load({
         { name: 'sidebar.panellist', id: PANEL_ID, order: PANEL_ORDER, label: () => tr('title') },
         DevicesPanelIcon))
       seat('main', () => ctx.slots.register({ name: 'main', key: PANEL_ID }, () => h(DevicesPanel)))
+      // Spec 028: the same spec-027 updater on the dsh-mobile bundle's page in Plugins, through the
+      // page's public `plugins.detail.section` list slot (dsh-client-ui-plugin-manager README,
+      // "Detail page extension points"). Plugins offers no native Update for a `link:` bundle, so this
+      // is the updater that applies; it lives with this row, so it is absent while Devices is off.
+      seat('plugins.detail.section', () => ctx.slots.register(
+        { name: 'plugins.detail.section', id: 'dsh-mobile-self-update', order: 10 },
+        (props) => (isMobileBundleSubject(props && props.subject)
+          ? h('div', { className: 'dshdev', 'data-testid': 'bundle-self-update' }, h(SelfUpdate)) : null)))
       // Spec 008 P2b. Gated on the client context's own capability (`ctx.inject` is
       // how a browser plugin waits for optional services): without it there is no
       // way to reach the workspace/session actions, so nothing is installed and the
@@ -3002,6 +3036,8 @@ window.__ModuleLoader__.load({
       RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText, hostLinkOf,
       // spec 016 Phase 3
       BrowserAgentTab, agentKindOf,
+      // spec 028
+      SelfUpdate, isMobileBundleSubject, MOBILE_BUNDLE,
       // spec 016 Phase 1: the per-machine Start-page doorways, their numbers and the
       // card each one opens, so a test can prove the entries without a browser.
       HostDoorTab, HostDoorIcon, hostDoorEntries, hostDoorId, HOST_DOORWAYS,

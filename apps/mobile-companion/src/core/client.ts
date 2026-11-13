@@ -63,6 +63,7 @@ import {
   PING_INTERVAL_MS,
   PROTOCOL_SUBPROTOCOL,
   WEB_LOCK_STATES,
+  WEB_PUSH_CLIENT_TYPES,
   authSubprotocols,
   createClientNonce,
   pairingSubprotocols,
@@ -73,6 +74,7 @@ import {
   type Op,
   type PairedFrame,
   type WebLockState,
+  PASSKEY_APPROVAL_KIND as PASSKEY_APPROVAL_FRAME_KIND,
 } from '@dsh-ext/mobile-protocol';
 
 import { CoreError, normaliseErrorCode, type CoreErrorCode } from './errors';
@@ -357,9 +359,12 @@ export function classifyProtocolUnsupported(
   errorFrame: { minClientVersion?: number } | null,
   clientVersion: number = COMPANION_PROTOCOL_VERSION,
 ): UpdateRequired {
-  const hostCompanionProtocol = hello?.companionProtocol;
-  const minClientVersion = errorFrame?.minClientVersion ?? hello?.minClientVersion;
-  const appTooOld = typeof minClientVersion === 'number' ? minClientVersion > clientVersion : hello !== null;
+  // -1 is the normalization of an absent field: never surface it as a version.
+  const known = (v: number | undefined): number | undefined => (typeof v === 'number' && v >= 0 ? v : undefined);
+  const hostCompanionProtocol = known(hello?.companionProtocol);
+  const minClientVersion = known(errorFrame?.minClientVersion) ?? known(hello?.minClientVersion);
+  const rawMin = errorFrame?.minClientVersion ?? hello?.minClientVersion;
+  const appTooOld = typeof rawMin === 'number' ? rawMin > clientVersion : hello !== null;
   if (appTooOld) {
     return {
       side: 'app',
@@ -549,6 +554,8 @@ export class CompanionClient {
   private _adoptedPin: string | null = null;
   /** Spec 021: `hello.webLock` of the current connection (see `get webLock`). */
   private _webLock: WebLockState | null = null;
+  /** Spec 026: hello.webPush of the current connection (web devices, unlocked only). */
+  private _webPush: { enabled: boolean; vapidPublicKey: string } | null = null;
   /**
    * True once the end of the current connection was reported. The first terminal report wins
    * (local close, transport close or the handshake deadline), so listeners see exactly one
@@ -615,6 +622,11 @@ export class CompanionClient {
    * a device holding `web:unlock`; `null` means "this device is not locked" (native, or a Host that
    * does not speak revision 14 yet).
    */
+  /** Spec 026 (contract §15.1): hello.webPush, or null when absent/unreadable. */
+  get webPush(): { enabled: boolean; vapidPublicKey: string } | null {
+    return this._webPush;
+  }
+
   get webLock(): WebLockState | null {
     return this._webLock;
   }
@@ -716,6 +728,7 @@ export class CompanionClient {
     this._hello = null;
     // Spec 021: every new connection starts from the Host's own statement, never the old socket's.
     this._webLock = null;
+    this._webPush = null;
     this._device = null;
     this._pairedToken = null;
     this.revokedFired = false;
@@ -907,6 +920,20 @@ export class CompanionClient {
   ): Promise<Record<string, unknown>> {
     if (!(PASSKEY_CLIENT_TYPES as readonly string[]).includes(type)) {
       return Promise.reject(new CoreError({ code: 'op/forbidden', message: `${type} is not a passkey frame` }));
+    }
+    return this.request(type as Op, params, { allowNonOpType: true });
+  }
+
+  /**
+   * Spec 026 (contract §15.2): send push-subscribe/push-unsubscribe. Not §4 ops; this is the
+   * narrow typed opt-in for exactly those two frames.
+   */
+  webPushRequest(
+    type: (typeof WEB_PUSH_CLIENT_TYPES)[number],
+    params: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown>> {
+    if (!(WEB_PUSH_CLIENT_TYPES as readonly string[]).includes(type)) {
+      return Promise.reject(new CoreError({ code: 'op/forbidden', message: `${type} is not a web push frame` }));
     }
     return this.request(type as Op, params, { allowNonOpType: true });
   }
@@ -1215,7 +1242,7 @@ export class CompanionClient {
       // Spec 021 (contract §14.3): the owner's decision on replacing this device's passkey. It is a
       // push for the asking socket only: a `reject` answers nothing, and either way it must never be
       // mistaken for the `passkey-register` answer (that one is matched by requestId below).
-      case 'passkey-approval': {
+      case PASSKEY_APPROVAL_FRAME_KIND: {
         const approvalId = typeof f.approvalId === 'string' ? f.approvalId : '';
         const action = f.action;
         if (approvalId === '' || (action !== 'approve' && action !== 'reject')) return;
@@ -1561,6 +1588,13 @@ export class CompanionClient {
       : (WEB_LOCK_STATES as readonly unknown[]).includes(f.webLock)
         ? (f.webLock as WebLockState)
         : 'locked';
+    {
+      const wp = f.webPush as { enabled?: unknown; vapidPublicKey?: unknown } | null | undefined;
+      this._webPush = wp && typeof wp === 'object' && typeof wp.enabled === 'boolean'
+        && typeof wp.vapidPublicKey === 'string' && /^[A-Za-z0-9_-]+$/.test(wp.vapidPublicKey)
+        ? { enabled: wp.enabled, vapidPublicKey: wp.vapidPublicKey }
+        : null;
+    }
     this._device = parseDevice(f.device) ?? this._device;
     const incompatible =
       hello.companionProtocol !== COMPANION_PROTOCOL_VERSION ||

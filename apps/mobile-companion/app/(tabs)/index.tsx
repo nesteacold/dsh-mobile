@@ -46,6 +46,8 @@ import {
 import { grantState, newSessionAvailability, type LoadState } from '../../src/ui/components/authoring';
 import { elevation, hit, radius, space, useTheme } from '../../src/ui/theme';
 import { useApp } from '../_layout';
+import type { CompatDecision } from '../../src/core/compat';
+import { compatBannerView } from '../../src/ui/compat-banner';
 import { t, type MessageKey } from '../../i18n';
 
 /** One row of the flat list: a collapsible section header, or a session. */
@@ -314,6 +316,14 @@ export default function ListScreen() {
           list is where a user notices a dead link, so the reason must be visible here, not just in
           the conversation screen. */}
       <Banner banner={banner} warn={bannerWarn} />
+
+      {/* Spec 029: a capability/version mismatch is surfaced, never silent. */}
+      <CompatBanner
+        compat={snapshot.compat ?? null}
+        dismissed={snapshot.dismissedCompat ?? []}
+        onDismiss={(key) => controller.dismissCompat(key)}
+        tr={tr}
+      />
 
       {/* Title search (reference: SessionSearch). Locale-independent testID for maestro. */}
       {snapshot.activeHost === null ? null : (
@@ -835,6 +845,41 @@ function Banner(props: { banner: string | null; warn: boolean }) {
       accessibilityLabel={banner}
     >
       <Text style={[type.caption, { color: warn ? colors.warning : colors.accent }]}>{banner}</Text>
+    </View>
+  );
+}
+
+function CompatBanner(props: {
+  compat: CompatDecision | null;
+  dismissed: readonly string[];
+  onDismiss: (key: string) => void;
+  tr: ReturnType<typeof useApp>['tr'];
+}) {
+  const { compat, dismissed, onDismiss, tr } = props;
+  const { colors, type } = useTheme();
+  const view = compatBannerView(compat, new Set(dismissed));
+  if (view === null) return null;
+  const text = tr(view.key, view.params);
+  return (
+    <View
+      style={[styles.banner, { backgroundColor: view.blocking ? colors.surfaceRaised : colors.surface, flexDirection: 'row', gap: space.sm }]}
+      testID="compat-banner"
+      accessibilityLabel={text}
+    >
+      <Text style={[type.caption, { color: view.tone === 'info' ? colors.accent : colors.warning, flex: 1 }]}>{text}</Text>
+      {view.dismissKey === null ? null : (
+        <Pressable
+          testID="compat-banner-dismiss"
+          accessibilityRole="button"
+          accessibilityLabel={tr('compat.dismiss')}
+          onPress={() => {
+            onDismiss(view.dismissKey as string);
+          }}
+          style={{ minHeight: hit, justifyContent: 'center' }}
+        >
+          <Text style={[type.caption, { color: colors.accent }]}>{tr('compat.dismiss')}</Text>
+        </Pressable>
+      )}
     </View>
   );
 }

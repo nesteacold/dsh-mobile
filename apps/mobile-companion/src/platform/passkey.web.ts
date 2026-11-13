@@ -23,7 +23,7 @@
 // decision is reported through `watchPasskeyApproval`; on `approve` the caller registers again
 // (a fresh options challenge, per §14.3).
 
-import { PASSKEY_REGISTER_TYPE } from '@dsh-ext/mobile-protocol';
+import { PASSKEY_ASSERT_OPTIONS_TYPE, PASSKEY_ASSERT_TYPE, PASSKEY_REGISTER_OPTIONS_TYPE, PASSKEY_REGISTER_TYPE } from '@dsh-ext/mobile-protocol';
 
 import { CoreError } from '../core/errors';
 import type { CompanionClient } from '../core/client';
@@ -144,7 +144,7 @@ export async function getPasskeyAssertion(request: PasskeyAssertionRequest): Pro
  * `code` is the contract code (`passkey/already-registered` included).
  */
 export async function registerPasskey(client: CompanionClient): Promise<{ ok: true }> {
-  const options = await client.passkeyRequest('passkey-register-options');
+  const options = await client.passkeyRequest(PASSKEY_REGISTER_OPTIONS_TYPE);
   const request = registrationRequestFrom(options);
   const attestation = await createPasskey(request);
   const answer = await client.passkeyRequest(PASSKEY_REGISTER_TYPE, { attestation });
@@ -154,10 +154,10 @@ export async function registerPasskey(client: CompanionClient): Promise<{ ok: tr
 
 /** Assert the passkey on THIS socket: the Host's verification is what unlocks it (contract §14.1). */
 export async function assertPasskey(client: CompanionClient): Promise<{ ok: true }> {
-  const options = await client.passkeyRequest('passkey-assert-options');
+  const options = await client.passkeyRequest(PASSKEY_ASSERT_OPTIONS_TYPE);
   const request = assertionRequestFrom(options);
   const assertion = await getPasskeyAssertion(request);
-  const answer = await client.passkeyRequest('passkey-assert', { assertion });
+  const answer = await client.passkeyRequest(PASSKEY_ASSERT_TYPE, { assertion });
   if (answer.unlocked !== true) throw new CoreError({ code: 'client/bad-message', message: 'The computer did not unlock this device' });
   return { ok: true };
 }

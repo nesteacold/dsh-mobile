@@ -121,7 +121,7 @@ against a build served on port 18443 in a fresh Chrome profile (raw CDP, not a s
 | 1 | Build succeeds | `npm run build:web` prints `injected 4/4 PWA tags` and `wrote precache.json (N entries)` |
 | 2 | Manifest is installable | DevTools → Manifest: name, icons, `start_url`, `display: standalone`; no errors. **Measured**: `GET /manifest.json` → 200, `application/json`, 644 B, correct body |
 | 3 | Service worker is active | DevTools → Service Workers: `/sw.js` activated; `navigator.serviceWorker.controller` non-null. **Measured**: registration scope `/`, state `activated` |
-| 4 | The shell is precached on the FIRST visit | `caches.open('dsh-shell-v4')` contains the HTML shell, the hashed bundles and the icons. **Measured**: 19 entries including `/`, from a single first visit — do not rely on a second load to fill it |
+| 4 | The shell is precached on the FIRST visit | `caches.open('dsh-shell-v5')` contains the HTML shell, the hashed bundles and the icons. **Measured**: 19 entries including `/`, from a single first visit — do not rely on a second load to fill it |
 | 5 | Offline shows the shell | Stop the server (verify with a raw TCP connect, not a guess), then reload: the shell renders and the main document response reports `fromServiceWorker: true`. **Measured**: TCP refused, `{"status":200,"fromServiceWorker":true}`, no network failures, full unlock screen rendered |
 | 6 | Non-shell traffic is never cached | DevTools → Application → Cache Storage: only shell/hashed assets; no `/api`, `/pair`, `/auth` entries |
 | 7 | The gate stays LOCKED before pairing | Fresh profile: the unlock screen appears and no credential is read |

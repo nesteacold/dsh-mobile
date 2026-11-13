@@ -14,6 +14,7 @@
 //    error message or a log line.
 //  - No `Origin` header is sent (the gateway refuses foreign origins by default).
 import crypto from 'node:crypto'
+import { promises as dns } from 'node:dns'
 import { EventEmitter, once } from 'node:events'
 import { createRequire } from 'node:module'
 import net from 'node:net'
@@ -110,10 +111,17 @@ export function normalizeHost(host) {
   return value
 }
 
-/** Loopback, RFC1918, link-local, Tailscale CGNAT (100.64/10), ULA/link-local v6, `.local`. */
+export const PUBLIC_ADDRESS_ERROR = 'only private-network or Tailscale (*.ts.net) addresses are allowed; to allow public addresses set the devices plugin option allowPublicRemotes: true'
+
+/**
+ * IP rules only: loopback, RFC1918, link-local, Tailscale CGNAT (100.64/10), ULA
+ * (incl. Tailscale fd7a:115c:a1e0::/48) and link-local v6. A NAME is never private by
+ * itself (a `*.ts.net` Funnel name resolves to public IPs): names are vetted by
+ * `vetDialHost`, which resolves them and judges every address.
+ */
 export function isPrivateAddress(host) {
   const value = normalizeHost(host)
-  if (value === 'localhost' || value === '::1' || value.endsWith('.local')) return true
+  if (value === '::1') return true
   const octets = value.split('.').map((part) => Number(part))
   if (octets.length === 4 && octets.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) {
     return octets[0] === 10 || octets[0] === 127 ||
@@ -125,12 +133,43 @@ export function isPrivateAddress(host) {
   return net.isIPv6(value) && /^(?:f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:)/i.test(value)
 }
 
+const defaultLookup = (host) => dns.lookup(host, { all: true, verbatim: true })
+
+/**
+ * Decide where a dial may actually go. An IP literal is judged as written; a name is
+ * resolved (`lookup`, injectable for tests) and EVERY address must be private, else
+ * the dial is refused — a failed lookup is refused too. Returns the vetted IP to
+ * connect to plus the original name for SNI/Host, so a later re-resolution (DNS
+ * rebinding) can never move the connection. `allowPublic` skips the check (the owner's
+ * `allowPublicRemotes`), but still dials one resolved address.
+ */
+export async function vetDialHost(host, { allowPublic = false, lookup = defaultLookup } = {}) {
+  const name = normalizeHost(host).replace(/\.$/, '')
+  if (!name) throw new RemoteInputError('an address (ip:port) is required')
+  if (net.isIP(name)) {
+    if (!allowPublic && !isPrivateAddress(name)) throw new RemoteInputError(PUBLIC_ADDRESS_ERROR, 403, 'forbidden')
+    return { address: name, servername: undefined }
+  }
+  let records
+  try { records = await lookup(name) } catch { records = null }
+  const addresses = (Array.isArray(records) ? records : records ? [records] : [])
+    .map((record) => normalizeHost(typeof record === 'string' ? record : record?.address))
+    .filter((address) => net.isIP(address))
+  if (addresses.length === 0) {
+    throw new RemoteInputError(`the address ${name} could not be resolved`, allowPublic ? 502 : 403, allowPublic ? 'unreachable' : 'forbidden')
+  }
+  if (!allowPublic && !addresses.every((address) => isPrivateAddress(address))) {
+    throw new RemoteInputError(PUBLIC_ADDRESS_ERROR, 403, 'forbidden')
+  }
+  return { address: addresses[0], servername: name }
+}
+
 /**
  * Parse the address the user typed (`ip:port`, `[v6]:port`, or `wss://host:port[/path]`)
  * and require it to name the same listener as the pairing payload. Returns the
  * URL to dial (always from the payload, never from free text).
  */
-export function resolveDialUrl(address, payload, { allowPublic = false } = {}) {
+export async function resolveDialUrl(address, payload, { allowPublic = false, lookup } = {}) {
   const typed = String(address ?? '').trim()
   if (!typed) throw new RemoteInputError('an address (ip:port) is required')
   let host
@@ -149,21 +188,23 @@ export function resolveDialUrl(address, payload, { allowPublic = false } = {}) {
     .filter(Boolean)
   const match = candidates.find((url) => normalizeHost(url.hostname) === host && (url.port || '443') === port)
   if (!match) throw new RemoteInputError('the address does not match any endpoint in the pairing string')
-  if (!allowPublic && !isPrivateAddress(host)) {
-    throw new RemoteInputError('only private-network addresses are allowed (public addresses are disabled by default)', 403, 'forbidden')
-  }
+  // Resolve now so a refused name is a 403 before anything is dialled; every dial
+  // re-vets (openPinnedSocket/probeCertificate) and connects to the vetted IP.
+  if (!allowPublic) await vetDialHost(host, { lookup })
   return match.toString()
 }
 
-function dialTarget(url) {
+/** Vet the URL's host at dial time and return the IP to connect to + the SNI name. */
+async function dialTarget(url, { allowPublic = false, lookup } = {}) {
   const target = new URL(url)
-  return { host: target.hostname.replace(/^\[|\]$/g, ''), port: Number(target.port) || 443 }
+  const { address, servername } = await vetDialHost(target.hostname, { allowPublic, lookup })
+  return { host: address, servername, port: Number(target.port) || 443 }
 }
 
 /** Read the leaf certificate a listener presents, sending no application data. */
-export async function probeCertificate(url, { timeoutMs = 8000 } = {}) {
-  const { host, port } = dialTarget(url)
-  const socket = tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, rejectUnauthorized: false })
+export async function probeCertificate(url, { timeoutMs = 8000, allowPublic, lookup } = {}) {
+  const { host, servername, port } = await dialTarget(url, { allowPublic, lookup })
+  const socket = tls.connect({ host, port, servername, rejectUnauthorized: false })
   const timer = setTimeout(() => socket.destroy(new Error('TLS probe timed out')), timeoutMs)
   try {
     await once(socket, 'secureConnect')
@@ -189,11 +230,13 @@ export async function probeCertificate(url, { timeoutMs = 8000 } = {}) {
  * UNABLE_TO_VERIFY_LEAF_SIGNATURE and Node then skips `checkServerIdentity`, so
  * the pin was never compared and every dial ended as "unreachable".
  */
-async function openPinnedTlsSocket({ url, expected, timeoutMs, signal }) {
-  const { host, port } = dialTarget(url)
+async function openPinnedTlsSocket({ url, expected, timeoutMs, signal, allowPublic, lookup }) {
+  const { host, servername, port } = await dialTarget(url, { allowPublic, lookup })
+  if (signal?.aborted) throw dialCancelled()
   // The hash comparison below is the trust decision: the gateway's certificate
   // is self-signed by design, so the platform's chain verdict is not consulted.
-  const socket = tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, rejectUnauthorized: false })
+  // `host` is the vetted IP; `servername` keeps the original name for SNI.
+  const socket = tls.connect({ host, port, servername, rejectUnauthorized: false })
   const timer = setTimeout(() => socket.destroy(new Error('TLS handshake timed out')), timeoutMs)
   // A dial the caller stopped must not wait for the peer. A listener that accepts TCP
   // and then says nothing (or a handshake stalled in the middle) would otherwise hold
@@ -250,11 +293,12 @@ async function openPinnedTlsSocket({ url, expected, timeoutMs, signal }) {
  * pending socket before its credential exists.
  * @returns {Promise<import('ws').WebSocket>} the ws client, not yet open
  */
-export async function openPinnedSocket({ url, protocols, headers, certSha256, timeoutMs = 8000, signal, WebSocketImpl = getWebSocket() }) {
+export async function openPinnedSocket({ url, protocols, headers, certSha256, timeoutMs = 8000, signal, WebSocketImpl = getWebSocket(),
+  allowPublic = false, lookup }) {
   const expected = String(certSha256).toLowerCase()
   if (!HEX64.test(expected)) throw new RemoteInputError('invalid certificate pin')
   if (signal?.aborted) throw dialCancelled()
-  const socket = await openPinnedTlsSocket({ url, expected, timeoutMs, signal })
+  const socket = await openPinnedTlsSocket({ url, expected, timeoutMs, signal, allowPublic, lookup })
   if (signal?.aborted) {
     socket.destroy()
     throw dialCancelled()
@@ -547,8 +591,11 @@ export class RemoteConnection extends EventEmitter {
   // The `ws` implementation is not defaulted here on purpose: constructing a
   // connection must never resolve (and fail on) it — `openPinnedSocket` does at
   // dial time, so the missing dependency is reported by name, not at apply time.
-  constructor({ remote, readToken, log = () => {}, requestTimeoutMs = 10_000, WebSocketImpl, browserConsent, browserAgent }) {
+  constructor({ remote, readToken, log = () => {}, requestTimeoutMs = 10_000, WebSocketImpl, browserConsent, browserAgent,
+    allowPublic = false, lookup }) {
     super()
+    this.allowPublic = allowPublic === true
+    this.lookup = lookup
     this.remote = remote
     this.readToken = readToken
     this.log = log
@@ -625,6 +672,8 @@ export class RemoteConnection extends EventEmitter {
         headers: { Authorization: `Bearer ${token}`, 'X-DSH-Device-ID': this.remote.clientDeviceId },
         certSha256: this.remote.certSha256,
         signal: controller.signal,
+        allowPublic: this.allowPublic,
+        lookup: this.lookup,
       })
     } catch (error) {
       // Our own stop, already reported as offline with no detail by close(): never a
@@ -1055,7 +1104,7 @@ export function normalizeOtp(value) {
 export const formatVerificationCode = (code) => String(code).replace(/^(\d{3})(\d{3})$/, '$1 $2')
 
 /** Address typed by the user (`ip:port`) -> the gateway's wss URL. Private ranges only by default. */
-export function otpDialUrl(address, { allowPublic = false, path = '/ws/mobile' } = {}) {
+export async function otpDialUrl(address, { allowPublic = false, path = '/ws/mobile', lookup } = {}) {
   const typed = String(address ?? '').trim()
   if (!typed) throw new RemoteInputError('an address (ip:port) is required')
   let url
@@ -1063,16 +1112,14 @@ export function otpDialUrl(address, { allowPublic = false, path = '/ws/mobile' }
     url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(typed) ? typed : `wss://${typed}`)
     if (url.protocol !== 'wss:' || url.username || url.password || url.search || url.hash) throw new Error('parts')
   } catch { throw new RemoteInputError('the address must look like 192.168.1.20:3081') }
-  if (!allowPublic && !isPrivateAddress(url.hostname)) {
-    throw new RemoteInputError('only private-network addresses are allowed (public addresses are disabled by default)', 403, 'forbidden')
-  }
+  if (!allowPublic) await vetDialHost(url.hostname, { lookup })
   if (url.pathname === '/' || url.pathname === '') url.pathname = path
   return url.toString()
 }
 
 /** TLS pin the listener presents now (trust on first use): read before any secret is sent. */
-export async function readCertificatePin(url, { timeoutMs } = {}) {
-  return sha256Hex(await probeCertificate(url, { timeoutMs }))
+export async function readCertificatePin(url, { timeoutMs, allowPublic, lookup } = {}) {
+  return sha256Hex(await probeCertificate(url, { timeoutMs, allowPublic, lookup }))
 }
 
 /** 6-digit code both screens show; same derivation as the gateway (pairing-requests.mjs). */
@@ -1099,9 +1146,9 @@ export function verificationCode(certSha256, clientNonce, serverNonce) {
  * Resolves `{ token, device, hello, certSha256, gatewayId, gatewayName }`.
  */
 export async function claimWithOtp({ url, otp, clientDeviceId, deviceName, onPending, signal, timeoutMs = 10_000,
-  waitMs = 5 * 60_000 + 15_000, WebSocketImpl = getWebSocket() }) {
+  waitMs = 5 * 60_000 + 15_000, WebSocketImpl = getWebSocket(), allowPublic = false, lookup }) {
   const code = normalizeOtp(otp)
-  const certSha256 = await readCertificatePin(url, { timeoutMs })
+  const certSha256 = await readCertificatePin(url, { timeoutMs, allowPublic, lookup })
   if (signal?.aborted) throw new RemoteInputError('pairing cancelled', 499, 'cancelled')
   const ws = await openPinnedSocket({
     url,
@@ -1179,7 +1226,7 @@ export async function claimWithOtp({ url, otp, clientDeviceId, deviceName, onPen
  * `{ token, device, hello }`. The code is sent only after the pin matched.
  */
 export async function claimPairing({ url, payload, clientDeviceId, deviceName, onPending, signal, timeoutMs = 10_000,
-  waitMs = 5 * 60_000 + 15_000, WebSocketImpl = getWebSocket() }) {
+  waitMs = 5 * 60_000 + 15_000, WebSocketImpl = getWebSocket(), allowPublic = false, lookup }) {
   const ws = await openPinnedSocket({
     url,
     protocols: [PROTOCOL, `dsh-pair.${payload.pairingCode}`],
@@ -1189,7 +1236,7 @@ export async function claimPairing({ url, payload, clientDeviceId, deviceName, o
     },
     certSha256: payload.certSha256,
     timeoutMs,
-    WebSocketImpl,
+    WebSocketImpl, allowPublic, lookup,
   })
   return new Promise((resolve, reject) => {
     let paired = null

@@ -60,11 +60,14 @@ QR/manual text = **unpadded base64url** of UTF-8 JSON (same encoding as upstream
   "gatewayId": "...", "dshVersion": "0.2.2-rc.1", "certSha256": "<hex>" }
 ```
    `capabilities` on the companion channel are exactly the package `CAPABILITIES` the gateway supports;
-   `push-v1` is added only when remote push is configured; `session-rename` and `session-archive` are
+   `push-v1` is added only when remote push is configured; `webPush` is added only while the owner has
+   web push enabled (revision 15); `session-rename` and `session-archive` are
    added only when the device holds `sessions:author` (revision 11); `permission-lower` is added only
    when the device holds `permission:lower` (revision 13). Revision 14 adds `webLock` **only** when the
    device holds `web:unlock`: `"unregistered"` (no passkey on this device yet), `"locked"` (a passkey
-   exists, this socket has not asserted yet) or `"unlocked"` (§14).
+   exists, this socket has not asserted yet) or `"unlocked"` (§14). Revision 15 adds
+   `hello.webPush: { enabled, vapidPublicKey }` only while `webPush` is listed and the socket is not
+   locked (§15.1).
 6. Client sends `{ "type": "client-hello", "requestId": "...", "companionProtocol": 1, "appVersion": "x.y.z", "platform": "ios|android" }`.
    Server answers `{ "kind": "client-hello", "requestId": "...", "accepted": true }` or an error
    `protocol/unsupported` (with `minClientVersion`) and closes.
@@ -772,3 +775,70 @@ for the request path) until the window passes. Failures are logged as codes only
 Revoking the device on the Host deletes its passkey record and closes its sockets with `4401` (the
 credential is gone, as §3 says). Re-pairing the same installation with a new grant clears the old
 records with them.
+
+## Revision 15 (spec 026 web push, additive)
+
+Web Push for the PWA (`specs/026-web-push/spec.md`). Additive — `OPS` (§4) does not change, no type gains a
+scope, the wire protocol stays v1, and a host with web push off behaves exactly as before it: the owner
+switch is **off by default** and a disabled gateway makes **zero** outbound requests.
+
+### 15.1 Capability and `hello`
+
+`hello.capabilities` lists **`webPush`** only while the owner has web push enabled. While it is listed,
+`hello` also carries, for a `mobile` device on an **unlocked** socket only:
+
+```json
+{ "kind": "hello", "webPush": { "enabled": true, "vapidPublicKey": "<unpadded base64url, 65 bytes>" } }
+```
+
+`vapidPublicKey` is the Host's VAPID P-256 public key (an uncompressed EC point, §15.5). The private key
+never leaves the Host and is never logged. A locked web device receives neither the capability nor
+`hello.webPush` (§14.2 already withholds everything about the Host from a locked socket).
+
+### 15.2 Frames
+
+Two client frames, **not** §4 operations and **not** scoped: a device manages its own subscription, like
+`push-register`/`push-remove`. They are served only when `webPush` is advertised and only to a `mobile`
+device; each is answered with exactly one frame echoing its `requestId`.
+
+```json
+{ "type": "push-subscribe", "requestId": "r-1",
+  "endpoint": "https://fcm.googleapis.com/fcm/send/abc", "keys": { "p256dh": "<base64url>", "auth": "<base64url>" } }
+{ "kind": "push-subscribed", "requestId": "r-1", "accepted": true }
+{ "type": "push-unsubscribe", "requestId": "r-2", "endpoint": "https://fcm.googleapis.com/fcm/send/abc" }
+{ "kind": "push-unsubscribed", "requestId": "r-2", "accepted": true }
+```
+
+`keys.p256dh` and `keys.auth` are the subscription's own key material, **unpadded base64url**: the
+65-byte P-256 point (`p256dh`) and the 16-byte shared auth secret (`auth`). `push-unsubscribe` may omit
+`endpoint` to drop every subscription of that device. A refused subscription is an error frame
+(`bad-request` for a malformed frame, `op/forbidden` when `webPush` is not advertised, `auth/locked`
+while the socket is locked) — never a silent success.
+
+Subscriptions are stored **per device** and removed when the device unsubscribes, when the device is
+revoked or forgets itself, and when the push service answers `404` or `410` to a delivery.
+
+### 15.3 Endpoint allowlist (SSRF guard)
+
+`endpoint` must be an **`https:`** URL whose host is one of the known push services —
+`fcm.googleapis.com`, `*.push.services.mozilla.com`, `*.notify.windows.com`, `*.push.apple.com` — with
+no credentials in the URL. Anything else is refused `bad-request` before any request exists. A gateway
+**never follows a redirect** and every request has a **10 s** deadline. These hosts are the only
+outbound destinations the gateway may reach for web push.
+
+### 15.4 Payload, TTL, rate limit
+
+The push body is exactly `{ "v": 1, "kind": "<kind>", "sessionId": "<id>", "requestId": "<id>"? }` —
+nothing else, ever: no prompt text, no tool name, no arguments, no paths, no titles. `kind` is one of
+`approval`, `question`, `session-finished`. `requestId` is present only when the Host already has one
+for that event (`approval`/`question`).
+
+Every push asks for **TTL 600** seconds; `approval` is sent with urgency **`high`**. A device receives at
+most **30 pushes per hour** (a rolling window) and pushes for the same `sessionId` collapse: a newer
+push for a session still sitting in the outbound queue replaces the older one.
+
+### 15.5 Encryption
+
+Body encryption is **RFC 8291** (`aes128gcm`, content coding `aes128gcm`) and authorization is **RFC
+8292 VAPID** (ES256 JWT), both built on `node:crypto` only — no new dependency (R4). The application
+server keypair is generated on first enable and stored with the Host's other owner-only secrets.

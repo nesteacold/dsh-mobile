@@ -448,6 +448,38 @@ test('a remote result whose id already names a host namespace is refused: remote
   }
 })
 
+test('a pseudo-tagged callId on ANY remote frame is refused: remote/id-leak', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B', {
+    replies: { 'session/page': { sessionId: 's1', items: [{ part: { callId: 'h:hostA:c1' } }] } },
+  })
+  const harness = createHarness({ remotes: [hostB] })
+  const answer = await harness.gateway.dispatchRpc('session/page', { args: { sessionId: 'h:hostB:s1' } }, undefined, {})
+  assert.equal(answer.ok, false)
+  assert.equal(answer.error.code, 'remote/id-leak')
+  assert.ok(harness.logs.some((line) => line.includes('remote/id-leak')))
+  // An ordinary callId still passes verbatim.
+  const clean = createFakeRemote('hostB', 'Host B', { replies: { 'session/page': { items: [{ callId: 'c1' }] } } })
+  const ok = await createHarness({ remotes: [clean] }).gateway.dispatchRpc('session/page', { args: { sessionId: 'h:hostB:s1' } }, undefined, {})
+  assert.equal(ok.ok, true)
+  assert.equal(ok.value.items[0].callId, 'c1')
+})
+
+test('remote browser handles (targetId/tabId/frameId) are tagged and route back without a sessionId or hint', async () => {
+  // Follow-up browser calls are not guaranteed to carry a sessionId/__dshHost
+  // (e.g. `close {tabId}`), so the handle itself must name the host.
+  const hostB = createFakeRemote('hostB', 'Host B', {
+    replies: { 'browser/open': { tabId: 't2', targetId: 't2', frameId: 'f1' }, 'browser/close': { closed: true, tabId: 't2' } },
+  })
+  const harness = createHarness({ remotes: [hostB] })
+  const opened = await harness.gateway.dispatchRpc('browser/open', { args: { __dshHost: 'hostB' } }, undefined, {})
+  assert.equal(opened.ok, true)
+  assert.deepEqual(opened.value, { tabId: 'h:hostB:t2', targetId: 'h:hostB:t2', frameId: 'h:hostB:f1' })
+  const closed = await harness.gateway.dispatchRpc('browser/close', { args: { tabId: opened.value.tabId } }, undefined, {})
+  assert.equal(closed.ok, true)
+  assert.equal(hostB.calls.length, 2, 'the untagged-session follow-up reached hostB, not Local')
+  assert.equal(JSON.stringify(hostB.calls[1]).includes('h:hostB:'), false, 'the tag is stripped before the Host sees it')
+})
+
 test('anything a remote sends is wrapped in ITS namespace, never passed through', async () => {
   // Not hostile, just an id that happens to look tagged in a way that resolves to
   // no host: it is still wrapped in the authenticated source's namespace.

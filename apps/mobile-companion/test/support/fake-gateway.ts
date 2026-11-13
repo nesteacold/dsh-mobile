@@ -227,7 +227,8 @@ const DEFAULT_SESSIONS: FakeSession[] = [
 /** Session row shaped like the upstream list projection (title under projections.values). */
 export function sessionRow(session: FakeSession): Record<string, unknown> {
   return {
-    id: session.id,
+    // Keyed like the real gateway's forwarded Host row (`sessionId`, no `id`).
+    sessionId: session.id,
     state: session.state,
     updatedAt: session.updatedAt,
     projections: { values: { title: session.title } },
@@ -1123,7 +1124,9 @@ export class FakeGateway {
           this.seq += 1;
           this.promptsByClientMsgId.set(clientMsgId, { seq: this.seq, sessionId, text: String(frame.text ?? '') });
         }
-        return send({ kind: 'sent', sessionId, clientMsgId });
+        // Like the real gateway (lib/index.mjs:812-822): no clientMsgId echo; the app
+        // correlates by requestId.
+        return send({ kind: 'sent', sessionId });
       }
       case 'session-cancel': {
         const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId : '';

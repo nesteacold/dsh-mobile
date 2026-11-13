@@ -17,7 +17,9 @@ additive; **revision 11** adds the `session-rename` and `session-archive` ops on
 `web:unlock` scopes, with `auth/locked` and the close code `4412`; **revision 13** adds the spec 019
 `permission:lower` scope and its two frames; **revision 14** replaces the spec 020 DeepSeek-account
 attestation with the spec 021 web PASSKEY unlock — the `passkey-*` frames on the same `web:unlock`
-scope, `hello.webLock`, the `passkey/…` error codes; `account-attestation` is withdrawn), and a
+scope, `hello.webLock`, the `passkey/…` error codes; `account-attestation` is withdrawn), and
+**revision 15** adds the spec 026 web push surface (capability `webPush`, the `push-subscribe` /
+`push-unsubscribe` frames and their answers, the endpoint allowlist, the id-only payload shape), and a
 breaking change requires a new major version of this package.
 
 - Runtime: `src/index.mjs` — pure ESM, no dependencies, frozen constant tables.
@@ -50,6 +52,7 @@ breaking change requires a new major version of this package.
 | `permission:lower` (scope), `PERMISSION_LOWER_CLIENT_TYPES`, `PERMISSION_LOWER_TYPES`, `PERMISSION_LOWER_SCOPE`, `PERMISSION_LOWER_REASONS`, `PERMISSION_LOWER_MESSAGES` | spec 019 (revision 13, additive) |
 | `auth/locked` (error, `null` status), `CLOSE_CODES.locked` (4412), the five `passkey/…` codes | §6, §3 (revision 14) |
 | `QUESTION_RESPONSE_TYPES`, `QUESTION_RESPONSE_SCOPE`, `QUESTION_CUSTOM_MAX_LENGTH` (2000) | spec 018 item 4; `approval:respond`, no new scope |
+| `webPush` (capability), `WEB_PUSH_CAPABILITY`, `WEB_PUSH_CLIENT_TYPES`, `WEB_PUSH_SUBSCRIBE_TYPE`, `WEB_PUSH_UNSUBSCRIBE_TYPE`, `WEB_PUSH_RESPONSE_KINDS`, `WEB_PUSH_EVENT_KINDS`, `WEB_PUSH_PAYLOAD_VERSION`, `WEB_PUSH_PAYLOAD_FIELDS`, `WEB_PUSH_TTL_SECONDS`, `WEB_PUSH_HIGH_URGENCY_KINDS`, `WEB_PUSH_RATE_LIMIT_PER_HOUR`, `WEB_PUSH_TIMEOUT_MS`, `WEB_PUSH_ENDPOINT_HOSTS`, `isWebPushEndpointAllowed()`, `validatePushSubscribe()`, `validatePushUnsubscribe()` | spec 026 (revision 15, additive; `push-subscribe`/`push-unsubscribe`, not §4 ops and not scoped) |
 
 The spec 008 scopes (`harness:remote` and the six above) are **desktop-only and explicit-only**: none
 is in `DESKTOP_DEFAULT_SCOPES`, and a `mobile` or pre-005 record never holds one.
@@ -72,6 +75,16 @@ LOCKED on every connection and may only send `client-hello`, `ping` and the four
 until a `passkey-assert` verifies on that socket; `hello.webLock` says `unregistered`, `locked` or
 `unlocked`. Registration is refused `passkey/already-registered` once the device has a passkey:
 replacing it needs the owner's approval on the Host.
+
+Revision 15 is **off by default**: the gateway advertises `webPush` (and `hello.webPush` with its VAPID
+public key) only while the owner enables web push, and while it is off the gateway makes **zero**
+outbound requests. `push-subscribe` / `push-unsubscribe` are not §4 ops and carry no scope — a device
+manages its own browser subscription, exactly as `push-register` does for native push. The endpoint
+must be `https` on a known push service (`WEB_PUSH_ENDPOINT_HOSTS`): anything else is refused
+`bad-request` before a request exists (SSRF guard), no redirect is followed and every request has a
+10 s deadline. The push body is `{ v: 1, kind, sessionId, requestId? }` and nothing else — no prompt
+text, tool name, arguments, path or title — with TTL 600, urgency `high` for approvals, at most 30
+pushes per hour per device and one queued push per `sessionId`.
 
 ## Tests
 

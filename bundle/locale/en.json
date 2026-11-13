@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-mobile",
+    "description": "Control this Host from your phone and other computers: the mobile gateway (pinned TLS, per-device pairing and scopes, loopback by default), the Devices page (pair and drive other DSH Hosts), and agent tools for the sidebar Browser tab. Each part keeps its own switch below. Check for updates updates the linked dsh-mobile checkout to its latest release tag."
+  }
+}

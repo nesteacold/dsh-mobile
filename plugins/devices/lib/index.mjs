@@ -14,7 +14,7 @@ import path from 'node:path'
 
 import {
   CLOSE_REVOKED, PinMismatchError, RemoteConnection, RemoteInputError,
-  claimPairing, claimWithOtp, decodePairingString, formatVerificationCode, isPrivateAddress, normalizeOtp,
+  claimPairing, claimWithOtp, decodePairingString, formatVerificationCode, vetDialHost, normalizeOtp,
   otpDialUrl, resolveDialUrl,
 } from './remote-client.mjs'
 import { assertCleanCard, createHostRouter } from './host-router.mjs'
@@ -22,6 +22,7 @@ import { createAgentBrowserPool } from './agent-browser.mjs'
 import { resolveDshRuntimeVersion } from './dsh-runtime-version.mjs'
 import { createSessionCache } from './session-cache.mjs'
 import { createUploadRoute } from './upload-route.mjs'
+import { advertisedPairAddress, pairQrPayload, qrSvg, resolvePwaOrigin, tailscaleDnsName } from './pair-qr.mjs'
 import { createGitRunner, createNpmCi, createSelfUpdater, defaultRepoRoot, handleSelfUpdateRoute } from './self-update.mjs'
 import {
   ensureOwnerOnlyDirectory, restrictToOwnerSync, setSecureFileLogger, writeSecretFile,
@@ -407,6 +408,8 @@ export const plugin = {
       cancelRedial(entry)
     }
 
+    // Dial-time address policy (every dial resolves and vets the host; see vetDialHost).
+    const dialPolicy = { allowPublic: options.allowPublicRemotes === true, lookup: options.dnsLookup }
     const attach = (remote) => {
       let entry = live.get(remote.id)
       if (entry) return entry
@@ -415,6 +418,7 @@ export const plugin = {
         readToken: () => store.readToken(remote.id),
         log,
         WebSocketImpl: options.WebSocketImpl,
+        ...dialPolicy,
         requestTimeoutMs: options.requestTimeoutMs,
         // Spec 016 Phase 3: the owner's setting is read per dial (it decides whether
         // the hello advertises `browser-agent:1`) and per command (a change applies
@@ -733,7 +737,7 @@ export const plugin = {
       }
     }
 
-    const startPairing = (body) => {
+    const startPairing = async (body) => {
       prunePairings()
       if (store.list().length >= MAX_REMOTES) throw new RemoteInputError('too many remote devices', 409, 'limit')
       if ([...pairings.values()].filter((s) => s.state === 'connecting' || s.state === 'pending').length >= MAX_PAIRINGS) {
@@ -746,15 +750,15 @@ export const plugin = {
       let run
       let url
       if (hasOtp) {
-        url = otpDialUrl(body.address, { allowPublic: options.allowPublicRemotes === true })
+        url = await otpDialUrl(body.address, { allowPublic: options.allowPublicRemotes === true, lookup: options.dnsLookup })
         // Validated here, not inside the async run, so a typo is a 400 and nothing is dialled.
         const otp = normalizeOtp(body.otp)
-        run = (hooks) => claimWithOtp({ url, otp, clientDeviceId: store.clientDeviceId, deviceName: options.deviceName || os.hostname(),
+        run = (hooks) => claimWithOtp({ url, otp, clientDeviceId: store.clientDeviceId, deviceName: options.deviceName || os.hostname(), ...dialPolicy,
           WebSocketImpl: options.WebSocketImpl, ...hooks }).then((claimed) => ({ claimed, certSha256: claimed.certSha256, payload: {} }))
       } else {
         const payload = decodePairingString(body.pairingString)
-        url = resolveDialUrl(body.address, payload, { allowPublic: options.allowPublicRemotes === true })
-        run = (hooks) => claimPairing({ url, payload, clientDeviceId: store.clientDeviceId, deviceName: options.deviceName || os.hostname(),
+        url = await resolveDialUrl(body.address, payload, { allowPublic: options.allowPublicRemotes === true, lookup: options.dnsLookup })
+        run = (hooks) => claimPairing({ url, payload, clientDeviceId: store.clientDeviceId, deviceName: options.deviceName || os.hostname(), ...dialPolicy,
           WebSocketImpl: options.WebSocketImpl, ...hooks }).then((claimed) => ({ claimed, certSha256: payload.certSha256, payload }))
       }
       const session = { id: crypto.randomUUID(), state: 'connecting', verificationCode: null, error: null, code: null, remoteId: null,
@@ -806,7 +810,7 @@ export const plugin = {
     const addRemote = async (body) => {
       if (store.list().length >= MAX_REMOTES) throw new RemoteInputError('too many remote devices', 409, 'limit')
       const payload = decodePairingString(body.pairingString)
-      const url = resolveDialUrl(body.address, payload, { allowPublic: options.allowPublicRemotes === true })
+      const url = await resolveDialUrl(body.address, payload, { allowPublic: options.allowPublicRemotes === true, lookup: options.dnsLookup })
       const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 80)
         : String(payload.gatewayName || 'Remote host').slice(0, 80)
       // Same installation + same gateway = re-pair in place (the gateway closes the old sockets).
@@ -814,7 +818,7 @@ export const plugin = {
       let claimed
       try {
         claimed = await claimPairing({
-          url, payload, clientDeviceId: store.clientDeviceId, deviceName: options.deviceName || os.hostname(),
+          url, payload, clientDeviceId: store.clientDeviceId, deviceName: options.deviceName || os.hostname(), ...dialPolicy,
           WebSocketImpl: options.WebSocketImpl,
         })
       } catch (error) {
@@ -849,7 +853,7 @@ export const plugin = {
      * the port is exactly what a Tailscale move changes. A bare `host:port` keeps the
      * pairing's own path, so a custom gateway path is not silently reset to `/ws/mobile`.
      */
-    const editDialUrl = (value, remote) => {
+    const editDialUrl = async (value, remote) => {
       const typed = typeof value === 'string' ? value.trim() : ''
       if (!typed) throw new RemoteInputError('an address (ip:port) is required')
       let url
@@ -864,9 +868,7 @@ export const plugin = {
       if (!/^(?:\[[^\]]*\]|[^:[\]]*):\d+$/.test(authority)) {
         throw new RemoteInputError('the address must include a port')
       }
-      if (!options.allowPublicRemotes && !isPrivateAddress(url.hostname)) {
-        throw new RemoteInputError('only private-network addresses are allowed (public addresses are disabled by default)', 403, 'forbidden')
-      }
+      if (!options.allowPublicRemotes) await vetDialHost(url.hostname, { lookup: options.dnsLookup })
       if (url.pathname === '/' || url.pathname === '') {
         try { url.pathname = new URL(remote.publicUrl).pathname } catch { /* keep the default path */ }
       }
@@ -916,7 +918,7 @@ export const plugin = {
         // GET polls it, DELETE cancels it. Same loopback + same-origin guards as above.
         if (parts[0] === 'devices' && parts[1] === 'pairings') {
           if (parts.length === 2 && req.method === 'POST') {
-            sendJson(res, 201, { pairing: pairingView(startPairing(await readBody(req))) })
+            sendJson(res, 201, { pairing: pairingView(await startPairing(await readBody(req))) })
             return
           }
           const session = parts.length === 3 && /^[a-f0-9-]{36}$/.test(parts[2]) ? pairings.get(parts[2]) : undefined
@@ -931,6 +933,21 @@ export const plugin = {
             return
           }
           sendJson(res, 404, { error: 'not-found' })
+          return
+        }
+        // Pairing-code QR (lib/pair-qr.mjs): the dialog posts the code it already shows and the
+        // listener's bind host; the reply is a locally rendered SVG plus the reachable address.
+        // Same loopback + same-origin guards; nothing here is logged.
+        if (parts[0] === 'devices' && parts[1] === 'pair-qr' && parts.length === 2 && req.method === 'POST') {
+          const body = await readBody(req)
+          const otp = String(body?.otp ?? '').replace(/\D/g, '')
+          if (!/^\d{8}$/.test(otp)) throw new RemoteInputError('otp must be 8 digits')
+          const dnsName = await (options.tailscaleDnsName ?? tailscaleDnsName)()
+          const pwaOrigin = resolvePwaOrigin({ pwaUrl: options.pwaUrl, dnsName })
+          const address = advertisedPairAddress({ advertisedAddress: options.advertisedAddress, pwaOrigin, lanHost: body?.lanHost })
+            ?? (typeof body?.fallbackAddress === 'string' && body.fallbackAddress ? body.fallbackAddress : null)
+          const payload = pairQrPayload({ pwaOrigin, address, otp })
+          sendJson(res, 200, { svg: qrSvg(payload), address, link: pwaOrigin !== null, pwaOrigin })
           return
         }
         // Spec 016 Phase 3: the "Browser (agent)" tab. `frame` is the screencast the
@@ -1003,7 +1020,7 @@ export const plugin = {
           if (req.method === 'PATCH') {
             const remote = requireRemote(id)
             const body = await readBody(req)
-            const publicUrl = editDialUrl(body.url, remote)
+            const publicUrl = await editDialUrl(body.url, remote)
             // The pin is what the pairing proved; an address edit must never re-pin
             // (a different certificate then fails the dial as `pin-mismatch`).
             if (body.certSha256 !== undefined && String(body.certSha256).toLowerCase() !== String(remote.certSha256).toLowerCase()) {

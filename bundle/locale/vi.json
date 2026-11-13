@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-mobile",
+    "description": "Điều khiển Host này từ điện thoại và máy tính khác: cổng mobile (TLS ghim chứng chỉ, ghép đôi và phạm vi quyền theo từng thiết bị, mặc định chỉ loopback), trang Thiết bị (ghép đôi và điều khiển Host DSH khác), và công cụ cho tab Trình duyệt ở thanh bên. Mỗi phần có công tắc riêng bên dưới. Kiểm tra cập nhật sẽ cập nhật bản checkout dsh-mobile đã liên kết lên thẻ phát hành mới nhất."
+  }
+}

@@ -76,6 +76,16 @@ export type MessageKey =
   | 'settings.pairAnother'
   // Spec 021 (web only): send `passkey-lock` and show the lock screen again.
   | 'settings.lockNow'
+  // Spec 026 (web only): web push toggle.
+  | 'notify.title'
+  | 'notify.enable'
+  | 'notify.disable'
+  | 'notify.enabled'
+  | 'notify.denied'
+  | 'notify.forbidden'
+  | 'notify.unsupported'
+  | 'notify.error'
+  | 'notify.iosNote'
   | 'settings.fontSize'
   | 'settings.fontSizeHint'
   // Session authoring: workspace picker, new session, model/mode row (spec 011 revision 7).
@@ -143,6 +153,10 @@ export type MessageKey =
   // An 8-digit code cannot carry the computer's certificate, and a phone cannot pin an unpinned
   // socket — so the code flow is refused here, before any connection, with the alternative.
   | 'pair.error.otpNative'
+  // A phone camera scanned the pairing-code LINK (the desktop dialog's QR): same rule as above.
+  | 'pair.error.otpLinkNative'
+  // The PWA opened from that link: the form is filled in, the user still confirms.
+  | 'pair.linkPrefilled'
   // The Host's own identity could not be trusted: it stated none, or it claimed another known one.
   | 'pair.error.noHostId'
   | 'pair.error.hostConflict'
@@ -305,6 +319,12 @@ export type MessageKey =
   | 'banner.reauth'
   | 'banner.cleanupFailed'
   | 'banner.pinnedTransportMissing'
+  // spec 029 capability / version mismatch
+  | 'compat.incompatible'
+  | 'compat.newer'
+  | 'compat.missing'
+  | 'compat.malformed'
+  | 'compat.dismiss'
   // protocol update (N7)
   | 'update.appTitle'
   | 'update.appBody'
@@ -428,6 +448,15 @@ const en = {
   'settings.paired': 'Paired',
   'settings.pairAnother': 'Pair another computer',
   'settings.lockNow': 'Lock now',
+  'notify.title': 'Notifications',
+  'notify.enable': 'Turn on notifications',
+  'notify.disable': 'Turn off notifications',
+  'notify.enabled': 'Notifications are on. They never show message content.',
+  'notify.denied': 'Notifications are blocked in this browser.',
+  'notify.forbidden': 'Notifications are turned off on your computer.',
+  'notify.unsupported': 'This browser cannot receive notifications.',
+  'notify.error': 'Could not change notifications. Try again.',
+  'notify.iosNote': 'On iPhone and iPad, notifications work only after adding this app to the Home Screen.',
   'settings.fontSize': 'Text size',
   'settings.fontSizeHint': 'Applies to this app only.',
   // While the socket is not `ready` the app must say so — never diagnose a permission problem it
@@ -494,6 +523,8 @@ const en = {
   'pair.error.otpBadLength': 'The pairing code is 8 digits. Check it on your computer and type it again.',
   'pair.error.badAddress': 'Type your computer’s address, for example 192.168.1.20:3081.',
   'pair.error.pinMismatch': 'That computer is not the one the code belongs to. Nothing was sent. If its certificate changed, pair again with a fresh code.',
+  'pair.error.otpLinkNative': 'This QR is the pairing-code link for the web app. The phone app cannot pair with an 8-digit code: it carries no certificate for the phone to verify the computer against. Pair with the computer\'s pairing QR (QR or code) instead.',
+  'pair.linkPrefilled': 'Address and code filled in from the QR. Check them, then tap Pair, and approve the request on your computer.',
   'pair.error.otpNative': 'On a phone, use the QR code or the long pairing string instead of the 8-digit code: a code carries no certificate for the phone to verify the computer against. Tap “QR or code” above.',
   'pair.error.noHostId': 'This computer did not identify itself, so this phone cannot remember it. Show a new code on your computer and try again.',
   'pair.error.hostConflict': 'This phone already has a different computer saved under that identity, so the pairing was refused. Forget that computer first if it really was replaced.',
@@ -646,6 +677,12 @@ const en = {
   'banner.gatewayOff': 'Remote control is off on your computer. Auto-reconnect is paused.',
   'banner.revoked': 'This device was removed from the computer. Pair again to continue.',
   'banner.reauth': 'The computer asks to re-authenticate. Reconnecting…',
+  'compat.incompatible':
+    "This app and the computer's gateway are incompatible (app v{app}, gateway v{gateway}). Update the older one.",
+  'compat.newer': "The computer's gateway is newer than this app; some features may not appear here. ({caps})",
+  'compat.missing': "The computer's gateway is older and lacks: {caps}. Those features are unavailable.",
+  'compat.malformed': "The computer's gateway sent a greeting this app cannot read. Update the older one.",
+  'compat.dismiss': 'Dismiss',
   'banner.cleanupFailed':
     'This phone could not finish deleting the stored credential. This device stays unpaired and the credential will not be used — restart the app and forget the computer again.',
   'banner.pinnedTransportMissing':
@@ -755,6 +792,15 @@ const vi = {
   'settings.paired': 'Đã ghép đôi',
   'settings.pairAnother': 'Ghép đôi máy tính khác',
   'settings.lockNow': 'Khoá ngay',
+  'notify.title': 'Thông báo',
+  'notify.enable': 'Bật thông báo',
+  'notify.disable': 'Tắt thông báo',
+  'notify.enabled': 'Đã bật thông báo. Thông báo không bao giờ chứa nội dung.',
+  'notify.denied': 'Trình duyệt này đang chặn thông báo.',
+  'notify.forbidden': 'Thông báo đang bị tắt trên máy tính của bạn.',
+  'notify.unsupported': 'Trình duyệt này không nhận được thông báo.',
+  'notify.error': 'Không đổi được thông báo. Hãy thử lại.',
+  'notify.iosNote': 'Trên iPhone và iPad, thông báo chỉ hoạt động sau khi thêm ứng dụng vào Màn hình chính.',
   'settings.fontSize': 'Cỡ chữ',
   'settings.fontSizeHint': 'Chỉ áp dụng cho ứng dụng này.',
   'authoring.connecting': 'Đang kết nối tới máy tính…',
@@ -818,6 +864,8 @@ const vi = {
   'pair.error.otpBadLength': 'Mã ghép đôi gồm 8 chữ số. Hãy kiểm tra lại trên máy tính và nhập lại.',
   'pair.error.badAddress': 'Hãy nhập địa chỉ máy tính, ví dụ 192.168.1.20:3081.',
   'pair.error.pinMismatch': 'Máy tính này không khớp với mã. Không có dữ liệu nào được gửi. Nếu chứng chỉ vừa đổi, hãy ghép đôi lại bằng mã mới.',
+  'pair.error.otpLinkNative': 'Mã QR này là liên kết mã ghép đôi cho ứng dụng web. Ứng dụng điện thoại không ghép đôi bằng mã 8 số: mã này không mang chứng chỉ để điện thoại xác minh máy tính. Hãy dùng mã QR ghép đôi của máy tính (QR hoặc mã chuỗi).',
+  'pair.linkPrefilled': 'Đã điền sẵn địa chỉ và mã từ QR. Kiểm tra lại rồi nhấn Ghép đôi, và phê duyệt yêu cầu trên máy tính.',
   'pair.error.otpNative': 'Trên điện thoại, hãy dùng mã QR hoặc chuỗi ghép đôi dài thay cho mã 8 số: mã này không mang chứng chỉ để điện thoại xác minh máy tính. Nhấn “Mã QR hoặc mã chuỗi” ở trên.',
   'pair.error.noHostId': 'Máy tính này không cho biết danh tính nên điện thoại không thể ghi nhớ. Hãy hiển thị mã mới trên máy tính và thử lại.',
   'pair.error.hostConflict': 'Điện thoại đã lưu một máy tính khác dưới cùng danh tính đó, nên lần ghép đôi này bị từ chối. Nếu máy tính thật sự đã được thay, hãy xoá máy tính cũ trước.',
@@ -967,6 +1015,12 @@ const vi = {
   'banner.gatewayOff': 'Điều khiển từ xa đang tắt trên máy tính. Tự kết nối lại đã tạm dừng.',
   'banner.revoked': 'Thiết bị này đã bị xoá khỏi máy tính. Hãy ghép đôi lại để tiếp tục.',
   'banner.reauth': 'Máy tính yêu cầu xác thực lại. Đang kết nối lại…',
+  'compat.incompatible':
+    'Ứng dụng này và cổng kết nối trên máy tính không tương thích (ứng dụng v{app}, cổng v{gateway}). Hãy cập nhật bên cũ hơn.',
+  'compat.newer': 'Cổng kết nối trên máy tính mới hơn ứng dụng; một số tính năng có thể không hiển thị ở đây. ({caps})',
+  'compat.missing': 'Cổng kết nối trên máy tính cũ hơn và thiếu: {caps}. Các tính năng đó không dùng được.',
+  'compat.malformed': 'Cổng kết nối trên máy tính gửi lời chào mà ứng dụng không đọc được. Hãy cập nhật bên cũ hơn.',
+  'compat.dismiss': 'Ẩn',
   'banner.cleanupFailed':
     'Điện thoại chưa xoá xong thông tin đăng nhập đã lưu. Thiết bị này vẫn ở trạng thái chưa ghép đôi và thông tin đó sẽ không được dùng — hãy khởi động lại ứng dụng và xoá máy tính một lần nữa.',
   'banner.pinnedTransportMissing':

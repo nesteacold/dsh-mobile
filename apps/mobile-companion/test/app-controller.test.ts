@@ -465,6 +465,8 @@ describe('AppController connection lifecycle (M5 / M6)', () => {
         // Spec 011 P2 item 4: the snapshot now also carries the Host's capability statement. Nothing
         // completed a handshake here, so the list is empty — an empty list, not `undefined`.
         capabilities: [],
+        compat: null,
+        dismissedCompat: [],
         banner: 'reauth',
         loading: true,
         sessions: [],
@@ -886,6 +888,29 @@ describe('AppController pairing lifecycle (M9)', () => {
     } finally {
       controller.stop();
       await gateway.close();
+    }
+  });
+
+  it('spec 029: a major mismatch is never silent (update prompt + incompatible compat, dismiss state in controller)', async () => {
+    const code = pairCode('W');
+    const futureHost = await FakeGateway.create({ pairingCodes: [code], companionProtocol: 2, minClientVersion: 2 });
+    const controller = new AppController({ locale: () => 'en', transport: nodeTransport });
+    try {
+      await controller.start();
+      await controller.unlock();
+      await controller.pair(pairingPayload(futureHost, code));
+      await waitFor(() => controller.snapshot().updateRequired !== null, { label: 'update prompt' });
+      const snap = controller.snapshot();
+      assert.equal(snap.updateRequired?.side, 'app');
+      assert.equal(snap.compat?.kind, 'incompatible', 'hello survived requireUpdate');
+      // Even after the full-screen prompt is dismissed, the banner still says so.
+      controller.dismissUpdateRequired();
+      assert.equal(controller.snapshot().compat?.kind, 'incompatible');
+      controller.dismissCompat('k1');
+      assert.deepEqual(controller.snapshot().dismissedCompat, ['k1']);
+    } finally {
+      controller.stop();
+      await futureHost.close();
     }
   });
 

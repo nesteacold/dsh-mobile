@@ -1,0 +1,33 @@
+{
+  "name": "@dsh-mobile/bundle",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "dsh-mobile: Devices (control other DSH Hosts), the mobile gateway for the phone app, and the agent's sidebar Browser tools, as one bundle. Spec 028.",
+  "exports": {
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "scripts",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "scripts": {
+    "sync": "node scripts/sync-patch.mjs",
+    "test": "node scripts/sync-patch.mjs --check && node --test --test-isolation=none test/bundle.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.2.2-rc.3 <0.3.0-0",
+    "node": ">=24.9"
+  }
+}

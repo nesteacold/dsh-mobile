@@ -42,3 +42,9 @@
         # server is refused by default; the frame route also records the Host it is
         # served from, so the running app blocks itself without configuration).
         agentBrowserBlockedOrigins: []
+        # Pairing-code QR (lib/pair-qr.mjs). `pwaUrl`: the externally served PWA
+        # (https only); empty = https://<this node's MagicDNS name>:30443 when known.
+        # `advertisedAddress`: host:port shown in the Pairing code dialog; empty =
+        # the PWA host:30443 when the gateway is loopback-bound behind tailscale serve.
+        pwaUrl: ''
+        advertisedAddress: ''

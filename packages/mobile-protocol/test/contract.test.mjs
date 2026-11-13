@@ -276,7 +276,9 @@ test('CAPABILITIES / OPTIONAL_CAPABILITIES match the prose of §3.5', () => {
   // Revision 11 adds the two session-edit capabilities, only for `sessions:author`; revision
   // 13 adds `permission-lower`, only for `permission:lower`.
   assert.deepEqual([...OPTIONAL_CAPABILITIES],
-    ['push-v1', 'browser-agent:1', 'session-rename', 'session-archive', ...SPEC_019_CAPABILITIES])
+    ['push-v1', 'browser-agent:1', 'session-rename', 'session-archive', ...SPEC_019_CAPABILITIES,
+      // Spec 026 (revision 15): web push, advertised only while the owner enabled it.
+      protocol.WEB_PUSH_CAPABILITY])
   // Revision 13 reflowed the tail of this list (it now feeds `permission-lower`), so the
   // rename/archive condition dropped its closing period; the two facts asserted above
   // still pin its names and the scope it names, so a scope change cannot pass silently.
@@ -405,6 +407,9 @@ test('every export is frozen where it is a constant table', () => {
     // Spec 019 Wave 3 (revision 13).
     'PERMISSION_LOWER_CLIENT_TYPES', 'PERMISSION_LOWER_TYPES', 'PERMISSION_LOWER_REASONS',
     'PERMISSION_LOWER_MESSAGES', 'SANDBOX_MODE_ORDER', 'APPROVAL_POLICY_ORDER',
+    // Spec 026 (revision 15).
+    'WEB_PUSH_CLIENT_TYPES', 'WEB_PUSH_RESPONSE_KINDS', 'WEB_PUSH_EVENT_KINDS', 'WEB_PUSH_PAYLOAD_FIELDS',
+    'WEB_PUSH_HIGH_URGENCY_KINDS', 'WEB_PUSH_ENDPOINT_HOSTS',
   ]) {
     assert.equal(Object.isFrozen(protocol[name]), true, `${name} must be frozen`)
   }
@@ -1029,4 +1034,140 @@ test('revision 14: the d.ts declares the passkey surface and the withdrawn spec 
   // Spec 020's account attestation is withdrawn: no surface may still declare it.
   assert.equal(declaration.includes('ACCOUNT_ATTESTATION_TYPE'), false, 'the spec 020 frame name must not remain')
   assert.equal(declaration.includes('host-signed-out'), false, 'the spec 020 lock reasons must not remain')
+})
+
+// ---------------------------------------------------------------------------
+// Spec 026 — Web Push for the PWA (revision 15, additive)
+// ---------------------------------------------------------------------------
+
+/** A syntactically valid subscription: 65-byte P-256 point and 16-byte auth secret. */
+const WEB_PUSH_KEYS = Object.freeze({
+  p256dh: Buffer.alloc(65, 7).toString('base64url'),
+  auth: Buffer.alloc(16, 9).toString('base64url'),
+})
+const WEB_PUSH_ENDPOINT = 'https://abc123.push.services.mozilla.com/wpush/v2/gAAAA'
+
+test('revision 15: the two push frames are additive, unscoped, and answered by their own kinds', () => {
+  assert.deepEqual([...protocol.WEB_PUSH_CLIENT_TYPES], ['push-subscribe', 'push-unsubscribe'])
+  assert.equal(protocol.WEB_PUSH_SUBSCRIBE_TYPE, 'push-subscribe')
+  assert.equal(protocol.WEB_PUSH_UNSUBSCRIBE_TYPE, 'push-unsubscribe')
+  assert.deepEqual({ ...protocol.WEB_PUSH_RESPONSE_KINDS },
+    { 'push-subscribe': 'push-subscribed', 'push-unsubscribe': 'push-unsubscribed' })
+  // Additive: `OPS` is exactly the §4 table, and neither frame joins it or the scope map.
+  assert.equal(OPS.length, contractOps.length)
+  for (const type of protocol.WEB_PUSH_CLIENT_TYPES) {
+    assert.equal(contractOps.includes(type), false, `${type} must not appear in the §4 table`)
+    assert.equal(OPS.includes(type), false, `${type} must not join the §4 OPS`)
+    assert.equal(protocol.SCOPE_BY_TYPE[type], undefined, `${type} manages the device's own subscription, never a scoped capability`)
+    assert.ok(contract.includes(`"type": "${type}"`), `${type} must be named as a client frame in the contract document`)
+  }
+  // The answer kinds are the contract's own names, not a restatement here.
+  for (const kind of Object.values(protocol.WEB_PUSH_RESPONSE_KINDS)) {
+    assert.ok(contract.includes(`"kind": "${kind}"`), `${kind} must appear in the contract document`)
+  }
+})
+
+test('revision 15: webPush is an optional capability, never a required one', () => {
+  assert.equal(protocol.WEB_PUSH_CAPABILITY, 'webPush')
+  assert.ok(OPTIONAL_CAPABILITIES.includes(protocol.WEB_PUSH_CAPABILITY), 'webPush must be optional')
+  assert.equal(CAPABILITIES.includes(protocol.WEB_PUSH_CAPABILITY), false, 'webPush is never required')
+  // Off by default is the whole point of spec 026: nothing else may turn it on.
+  assert.equal(Object.values(protocol.SESSION_EDIT_CAPABILITY_SCOPE).includes(protocol.WEB_PUSH_CAPABILITY), false)
+  // The document states the same condition the constant encodes.
+  assert.ok(contract.includes('`webPush` is added only while the owner has\n   web push enabled (revision 15);'),
+    'revision 15 must say what `webPush` is gated on')
+  assert.match(contract, /## Revision 15 \(spec 026 web push, additive\)/)
+})
+
+test('revision 15: the payload carries ids only, TTL 600, urgency high for approvals', () => {
+  assert.equal(protocol.WEB_PUSH_PAYLOAD_VERSION, 1)
+  assert.deepEqual([...protocol.WEB_PUSH_EVENT_KINDS], ['approval', 'question', 'session-finished'])
+  // The allowlist of fields IS the privacy guarantee: no prompt text, tool name, args or title.
+  assert.deepEqual([...protocol.WEB_PUSH_PAYLOAD_FIELDS], ['v', 'kind', 'sessionId', 'requestId'])
+  assert.equal(protocol.WEB_PUSH_TTL_SECONDS, 600)
+  assert.deepEqual([...protocol.WEB_PUSH_HIGH_URGENCY_KINDS], ['approval'])
+  assert.equal(protocol.WEB_PUSH_RATE_LIMIT_PER_HOUR, 30)
+  assert.equal(protocol.WEB_PUSH_TIMEOUT_MS, 10_000)
+  // The document pins the same numbers and the same field set.
+  assert.match(contract, /TTL 600/)
+  assert.match(contract, /urgency \*\*`high`\*\*/)
+  assert.match(contract, /at\nmost \*\*30 pushes per hour\*\*/)
+  assert.match(contract, /every request has a \*\*10 s\*\* deadline/)
+  assert.ok(contract.includes('{ "v": 1, "kind": "<kind>", "sessionId": "<id>", "requestId": "<id>"? }'),
+    'the contract must spell the payload shape')
+  for (const kind of protocol.WEB_PUSH_EVENT_KINDS) assert.ok(contract.includes(`\`${kind}\``), `${kind} must appear`)
+})
+
+test('revision 15: the endpoint allowlist refuses everything a push service is not', () => {
+  assert.deepEqual([...protocol.WEB_PUSH_ENDPOINT_HOSTS],
+    ['fcm.googleapis.com', '*.push.services.mozilla.com', '*.notify.windows.com', '*.push.apple.com'])
+  for (const host of protocol.WEB_PUSH_ENDPOINT_HOSTS) assert.ok(contract.includes(host), `${host} must appear in the contract`)
+  // Accepted: one exact host and one subdomain of each wildcard entry.
+  for (const endpoint of [
+    'https://fcm.googleapis.com/fcm/send/abc',
+    'https://updates.push.services.mozilla.com/wpush/v2/x',
+    'https://wns2-par02p.notify.windows.com/w/?token=b',
+    'https://web.push.apple.com/QGx',
+  ]) {
+    assert.equal(protocol.isWebPushEndpointAllowed(endpoint), true, endpoint)
+  }
+  // Refused: plaintext, a foreign host, a bare apex of a wildcard entry, credentials, a port,
+  // a look-alike suffix, and everything that is not a URL at all.
+  for (const endpoint of [
+    'http://fcm.googleapis.com/fcm/send/abc',
+    'https://evil.example.com/fcm/send/abc',
+    'https://push.services.mozilla.com/wpush/v2/x',
+    'https://notify.windows.com/w/',
+    'https://push.apple.com/QGx',
+    'https://user:pass@fcm.googleapis.com/fcm/send/abc',
+    'https://fcm.googleapis.com:8443/fcm/send/abc',
+    'https://fcm.googleapis.com.evil.example/fcm/send/abc',
+    'https://evilfcm.googleapis.com/fcm/send/abc',
+    'ftp://fcm.googleapis.com/x',
+    'fcm.googleapis.com/fcm/send/abc',
+    '',
+    null,
+    42,
+  ]) {
+    assert.equal(protocol.isWebPushEndpointAllowed(endpoint), false, String(endpoint))
+  }
+  // The validators report a refusal instead of throwing, and never touch the network.
+  const refused = protocol.validatePushSubscribe({ type: 'push-subscribe', endpoint: 'https://evil.example/x', keys: WEB_PUSH_KEYS })
+  assert.equal(refused.ok, false)
+  assert.equal(refused.code, 'bad-request')
+  const accepted = protocol.validatePushSubscribe({ type: 'push-subscribe', endpoint: WEB_PUSH_ENDPOINT, keys: WEB_PUSH_KEYS })
+  assert.deepEqual(accepted, { ok: true, value: { endpoint: WEB_PUSH_ENDPOINT, keys: { ...WEB_PUSH_KEYS } } })
+  // A subscription whose keys could never decrypt is refused at the door.
+  for (const keys of [{ p256dh: 'AAAA', auth: WEB_PUSH_KEYS.auth }, { p256dh: WEB_PUSH_KEYS.p256dh, auth: 'AAAA' },
+    { p256dh: WEB_PUSH_KEYS.p256dh }, {}, undefined]) {
+    const bad = protocol.validatePushSubscribe({ type: 'push-subscribe', endpoint: WEB_PUSH_ENDPOINT, keys })
+    assert.equal(typeof bad.code, 'string', `keys ${JSON.stringify(keys)} must be refused`)
+  }
+  // `push-unsubscribe` may omit the endpoint (= all of them) and refuses a foreign one.
+  assert.deepEqual(protocol.validatePushUnsubscribe({ type: 'push-unsubscribe' }), { ok: true, value: {} })
+  assert.deepEqual(protocol.validatePushUnsubscribe({ type: 'push-unsubscribe', endpoint: WEB_PUSH_ENDPOINT }),
+    { ok: true, value: { endpoint: WEB_PUSH_ENDPOINT } })
+  assert.equal(protocol.validatePushUnsubscribe({ type: 'push-unsubscribe', endpoint: 'https://evil.example/x' }).ok, false)
+})
+
+test('revision 15: the d.ts declares the web push surface', () => {
+  const declaration = fs.readFileSync(new URL('../index.d.ts', import.meta.url), 'utf8')
+  for (const name of ['WEB_PUSH_CAPABILITY', 'WEB_PUSH_CLIENT_TYPES', 'WEB_PUSH_SUBSCRIBE_TYPE',
+    'WEB_PUSH_UNSUBSCRIBE_TYPE', 'WEB_PUSH_RESPONSE_KINDS', 'WEB_PUSH_EVENT_KINDS', 'WEB_PUSH_PAYLOAD_VERSION',
+    'WEB_PUSH_PAYLOAD_FIELDS', 'WEB_PUSH_TTL_SECONDS', 'WEB_PUSH_HIGH_URGENCY_KINDS',
+    'WEB_PUSH_RATE_LIMIT_PER_HOUR', 'WEB_PUSH_TIMEOUT_MS', 'WEB_PUSH_ENDPOINT_HOSTS']) {
+    assert.ok(declaration.includes(`export const ${name}`), `${name} must be declared`)
+  }
+  for (const name of ['WebPushEventKind', 'WebPushPayload', 'WebPushHello', 'PushSubscribeFrame',
+    'PushSubscribedFrame', 'PushUnsubscribeFrame', 'PushUnsubscribedFrame']) {
+    assert.match(declaration, new RegExp(`export (interface|type) ${name}\\b`), `${name} must be declared`)
+  }
+  for (const fn of ['isWebPushEndpointAllowed', 'validatePushSubscribe', 'validatePushUnsubscribe']) {
+    assert.ok(declaration.includes(`export function ${fn}(`), `${fn} must be declared`)
+  }
+  // `hello` carries the VAPID key only under the conditions the contract states.
+  const hello = declaration.match(/export interface HelloFrame \{[\s\S]*?\n\}/)?.[0]
+  assert.ok(hello, 'HelloFrame not found')
+  assert.match(hello, /^\s*webPush\?: WebPushHello$/m)
+  assert.ok(declaration.includes(`| 'webPush'`), 'webPush must be declared as an OptionalCapability')
 })

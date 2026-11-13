@@ -163,6 +163,8 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     // them (client-ui-sidebar children table, client-ui-layout root children table).
     'sidebar.panellist': 'list',
     'main': 'keyed',
+    // client-ui-plugin-manager README "Detail page extension points": a list slot keyed by id.
+    'plugins.detail.section': 'list',
   }
   const occupants = new Map(Object.keys(SLOT_KINDS).map((slot) => [slot, []]))
   occupants.get('sidebar.workspaces').push({ meta: { name: 'sidebar.workspaces', priority: 0, registrant: 'tk' } })
@@ -279,12 +281,24 @@ await check('registers settings.section and settings.section.icon for the same i
   const ui = load()
   assert.equal(ui.api.id, '@dsh-ext/devices')
   assert.deepEqual([...ui.api.inject], ['slots', 'locale'])
-  assert.deepEqual(ui.injects, ['settings.section', 'settings.section.icon', 'sidebar.panellist', 'main'])
+  assert.deepEqual(ui.injects, ['settings.section', 'settings.section.icon', 'sidebar.panellist', 'main', 'plugins.detail.section'])
   const [section, icon] = ui.registered
   // JSON round trip: the objects were created inside the vm realm.
   assert.deepEqual(JSON.parse(JSON.stringify(section.meta)), { name: 'settings.section', id: 'dsh-ext.devices', order: 80, label: 'Devices' })
   assert.deepEqual(JSON.parse(JSON.stringify(icon.meta)), { name: 'settings.section.icon', id: 'dsh-ext.devices', order: 80, label: 'Devices' })
   assert.equal(typeof section.component, 'function')
+})
+
+await check('spec 028: the self-update section renders on the dsh-mobile bundle page only (public plugins.detail.section)', () => {
+  const ui = load()
+  const entry = ui.registered.find((e) => e.meta.name === 'plugins.detail.section')
+  assert.ok(entry, 'registered')
+  assert.equal(entry.meta.id, 'dsh-mobile-self-update')
+  const bundle = { kind: 'bundle', pkg: { name: '@dsh-mobile/bundle' } }
+  assert.notEqual(entry.component({ subject: bundle }), null)
+  assert.equal(entry.component({ subject: { kind: 'bundle', pkg: { name: '@dsh-ext/dsh-wiki' } } }), null)
+  assert.equal(entry.component({ subject: { kind: 'row', pkg: { name: '@dsh-mobile/bundle' }, row: {} } }), null)
+  assert.equal(entry.component({}), null)
 })
 
 await check('sidebar row: a `sidebar.panellist` entry directly below Repo Wiki, labelled in both languages', async () => {

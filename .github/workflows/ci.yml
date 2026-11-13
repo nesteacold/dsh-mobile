@@ -36,6 +36,9 @@ jobs:
       # Tree completeness: every relative import resolves, every test named by `npm test` exists.
       - name: verify-publish
         run: node tools/verify-publish.mjs
+      # Every test file under plugins/devices/test and plugins/mobile-gateway/test is run by npm test (or opted out with a reason).
+      - name: check-test-wiring
+        run: node tools/check-test-wiring.mjs
       # PII / secret scan over every tracked file (the same gate the pre-push hook runs).
       - name: scan-pii
         run: node tools/scan-pii.mjs --all

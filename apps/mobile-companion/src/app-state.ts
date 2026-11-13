@@ -19,6 +19,8 @@
 
 import { AppState, type AppStateStatus } from 'react-native';
 
+import { decideCompat, type CompatDecision } from './core/compat';
+
 import {
   ApprovalCards,
   CompanionClient,
@@ -71,6 +73,7 @@ import {
   type ApprovalNotification,
   type PinnedTransport,
 } from '../src/platform';
+import { dropLocalWebPush } from './platform/web-push';
 import { createPinnedTransport, type CreatePinnedTransportOptions } from '../src/platform/pinned-transport';
 import { readAgentTeam, readSubagents, type TeamRead, type AgentTeamProjection, type SubagentCatalogEntry } from './core/team';
 import {
@@ -357,6 +360,10 @@ export interface AppStateSnapshot {
    * statement — it is never merged with client guesses.
    */
   capabilities: string[];
+  /** Spec 029: version/capability comparison of the last `hello`, or `null` before one. */
+  compat: CompatDecision | null;
+  /** Spec 029: compat dismiss keys the user hid this run. */
+  dismissedCompat: string[];
   banner: BannerKind;
   /** True while no session list is known yet (first load). */
   loading: boolean;
@@ -1223,6 +1230,28 @@ export class AppController {
   }
 
   /**
+   * Spec 026: `hello.webPush` of the live, unlocked socket (null: not offered — native, locked,
+   * an older Host, or no socket). `enabled: false` means the owner has web push turned off.
+   */
+  get webPush(): { enabled: boolean; vapidPublicKey: string } | null {
+    const client = this.client;
+    if (client === null || client.state !== 'ready' || this.webLocked) return null;
+    return client.webPush;
+  }
+
+  /** Spec 026: send `push-subscribe`/`push-unsubscribe` on the live socket. */
+  webPushSend = (
+    type: 'push-subscribe' | 'push-unsubscribe',
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> => {
+    const client = this.client;
+    if (client === null || client.state !== 'ready' || this.webLocked) {
+      return Promise.reject(Object.assign(new Error('not connected'), { code: 'client/disconnected' }));
+    }
+    return client.webPushRequest(type, params);
+  };
+
+  /**
    * Read the lock state `hello` reported for this (current) client, and keep it while the socket
    * lives. Called from `onReady`, before any resync request: a locked socket may only use the
    * channel-neutral frames and the passkey ones (§14.2), so nothing else may be asked of it.
@@ -1529,9 +1558,11 @@ export class AppController {
         );
       });
       pairingClient.on('gatewayDisabled', () => reject(new CoreError({ code: 'remote/disabled', message: 'remote control off' })));
-      pairingClient.on('updateRequired', (update) =>
-        reject(new CoreError({ code: update.side === 'app' ? 'client/update-app-required' : 'client/update-host-required', message: update.message })),
-      );
+      pairingClient.on('updateRequired', (update) => {
+        // Spec 029: keep the refused hello so compat stays visible after this client is dropped.
+        this.mismatchHello = pairingClient.hello;
+        reject(new CoreError({ code: update.side === 'app' ? 'client/update-app-required' : 'client/update-host-required', message: update.message }));
+      });
       pairingClient.on('revoked', () => reject(new CoreError({ code: 'auth/revoked', message: 'revoked' })));
       pairingClient.on('error', (error) => {
         if (error.code === 'client/bad-message' || error.code === 'client/disconnected') return;
@@ -1852,6 +1883,7 @@ export class AppController {
     } catch {
       // Best effort: the device is already unpaired; the wipe outcome is reported separately.
     }
+    await dropLocalWebPush();
     // M5: the deletes above were awaited; a newer pairing/lock may own the UI now.
     if (!this.isCurrent(generation)) return;
     if (cleanupFailed) {
@@ -2557,6 +2589,7 @@ export class AppController {
     client.on('updateRequired', (update) => {
       if (!current()) return;
       this.updateRequired = update;
+      this.mismatchHello = client.hello;
       // A version mismatch is terminal for this connection: stop the loop (N7 screen retries).
       this.reconnector?.stop();
       this.bump();
@@ -3154,6 +3187,7 @@ export class AppController {
     } catch {
       // Best effort: the device is already unpaired; the wipe outcome is reported separately.
     }
+    await dropLocalWebPush();
     if (!this.isCurrent(generation)) return;
     this.bump();
   }
@@ -3271,9 +3305,22 @@ export class AppController {
     if (!this.unlocked) return;
     const host = this.host;
     this.updateRequired = null;
+    this.mismatchHello = null;
     this.banner = 'none';
     this.bump();
     if (host !== null) await this.connectHost(host);
+  }
+
+  /** Spec 029: dismissed "gateway is newer" keys (gateway id + revision + unknown set); per app run. */
+  private readonly dismissedCompat = new Set<string>();
+  /** Spec 029: the last hello refused by a major mismatch; cleared on retry/dismiss. */
+  private mismatchHello: unknown = null;
+
+  /** Spec 029: hide the non-blocking "gateway is newer" banner for this exact key. */
+  dismissCompat(key: string): void {
+    if (this.dismissedCompat.has(key)) return;
+    this.dismissedCompat.add(key);
+    this.bump();
   }
 
   /** N7: the user chose "pair a different computer" instead of retrying the mismatch. */
@@ -3668,6 +3715,12 @@ export class AppController {
       activeHost: this.host,
       connection: this.client?.state ?? 'idle',
       capabilities: this.client?.hello?.capabilities ?? [],
+      compat: this.client?.hello
+        ? decideCompat(this.client.hello)
+        : this.mismatchHello
+          ? decideCompat(this.mismatchHello)
+          : null,
+      dismissedCompat: [...this.dismissedCompat],
       banner: this.banner,
       loading: this.loading,
       sessions: this.sessions.snapshot().items,

@@ -93,7 +93,9 @@ const inside = (root, target) => {
  */
 const resolveFile = (root, pathname) => {
   // Root and a bare '/' both mean the single page app's entry.
-  const rel = pathname === '/' || pathname === '' ? 'index.html' : pathname.replace(/^\/+/, '');
+  // `/pair` is the pairing-code link's entry (`/pair#a=…&c=…`, the fragment never reaches here):
+  // the single page app serves it, as it serves `/`.
+  const rel = pathname === '/' || pathname === '' || pathname === '/pair' || pathname === '/pair/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const segments = rel.split(/[\\/]/);
   for (const segment of segments) {
     if (segment === '' || segment === '.' || segment === '..') return null;

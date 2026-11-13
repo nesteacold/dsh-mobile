@@ -17,7 +17,19 @@
 //   2. `credential.id` is the base64url of `rawId`. The Host matches the stored credential by
 //      `rawId`, so both are sent and both must describe the same credential; a mismatch is refused.
 
-import type { WebLockReason, WebLockState } from '@dsh-ext/mobile-protocol';
+import {
+  PASSKEY_ALREADY_REGISTERED,
+  PASSKEY_ASSERT_OPTIONS_TYPE,
+  PASSKEY_CHALLENGE_EXPIRED,
+  PASSKEY_LOCK_TYPE as CONTRACT_PASSKEY_LOCK_TYPE,
+  PASSKEY_NOT_REGISTERED,
+  PASSKEY_RATE_LIMITED,
+  PASSKEY_REGISTER_OPTIONS_TYPE,
+  PASSKEY_VERIFICATION_FAILED,
+  WEB_LOCK_ERROR,
+  type WebLockReason,
+  type WebLockState,
+} from '@dsh-ext/mobile-protocol';
 
 import { CoreError } from './errors';
 import { decodeBase64Url, encodeBase64Url } from './base64url';
@@ -107,10 +119,10 @@ export const PASSKEY_NOT_ALLOWED = 'client/passkey-not-allowed';
 
 /**
  * The PWA's own "lock now" frame (contract §14.2: `{type:"passkey-lock"}` -> `{kind:"passkey-lock",
- * locked:true}`). `packages/mobile-protocol` revision 14 does not export a constant for it yet, so
- * the name is kept here, beside the code that sends it, and the gateway spells the same literal.
+ * locked:true}`). Re-exported from the contract (`packages/mobile-protocol`),
+ * which the gateway also imports.
  */
-export const PASSKEY_LOCK_TYPE = 'passkey-lock';
+export const PASSKEY_LOCK_TYPE = CONTRACT_PASSKEY_LOCK_TYPE;
 
 /** The `code` of a thrown value (a `CoreError` from the client always carries one). */
 export function errorCodeOf(error: unknown): string | null {
@@ -129,22 +141,22 @@ export function errorCodeOf(error: unknown): string | null {
  */
 export function lockReasonFor(error: unknown): LockReason {
   const code = errorCodeOf(error);
-  if (code === 'auth/locked') {
+  if (code === WEB_LOCK_ERROR) {
     // The Host's request-path refusal (contract §14.2): its `reason` is the whole story.
     const reason = (error as { reason?: unknown }).reason;
     if (reason === 'unregistered' || reason === 'locked' || reason === 'rate-limited') return reason;
     return 'locked';
   }
   switch (code) {
-    case 'passkey/not-registered':
+    case PASSKEY_NOT_REGISTERED:
       return 'not-registered';
-    case 'passkey/already-registered':
+    case PASSKEY_ALREADY_REGISTERED:
       return 'already-registered';
-    case 'passkey/challenge-expired':
+    case PASSKEY_CHALLENGE_EXPIRED:
       return 'challenge-expired';
-    case 'passkey/verification-failed':
+    case PASSKEY_VERIFICATION_FAILED:
       return 'verification-failed';
-    case 'passkey/rate-limited':
+    case PASSKEY_RATE_LIMITED:
       return 'rate-limited';
     case 'client/passkey-not-allowed':
     case 'client/timeout':
@@ -214,7 +226,7 @@ function timeoutOf(value: unknown): number {
  * takes. Structural only: the Host does the security checks (§14.1) on the way back.
  */
 export function registrationRequestFrom(answer: Record<string, unknown>): PasskeyRegistrationRequest {
-  if (answer.kind !== 'passkey-register-options') throw invalid('the Host did not answer passkey-register-options');
+  if (answer.kind !== PASSKEY_REGISTER_OPTIONS_TYPE) throw invalid('the Host did not answer passkey-register-options');
   const challenge = binaryField(answer.challenge, 'challenge');
   const rp = answer.rp as { id?: unknown; name?: unknown } | undefined;
   if (typeof rp?.id !== 'string' || rp.id === '') throw invalid('rp.id must be a non-empty string');
@@ -251,7 +263,7 @@ export function registrationRequestFrom(answer: Record<string, unknown>): Passke
  * resident credential, and the HOST still checks it against the stored one.
  */
 export function assertionRequestFrom(answer: Record<string, unknown>): PasskeyAssertionRequest {
-  if (answer.kind !== 'passkey-assert-options') throw invalid('the Host did not answer passkey-assert-options');
+  if (answer.kind !== PASSKEY_ASSERT_OPTIONS_TYPE) throw invalid('the Host did not answer passkey-assert-options');
   const challenge = binaryField(answer.challenge, 'challenge');
   if (typeof answer.rpId !== 'string' || answer.rpId === '') throw invalid('rpId must be a non-empty string');
   return {

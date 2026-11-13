@@ -124,6 +124,13 @@ export const ID_FIELDS = Object.freeze({
   // answered `workspace/not-found` — the drag simply did nothing.
   beforeWorkspaceId: 'id',
   beforeSessionId: 'id',
+  // Remote agent-browser handles. A follow-up browser call (`close {tabId}`, a
+  // frame-scoped op …) need not carry a sessionId or `__dshHost`, so `#route`
+  // could only send it to the right Host if the handle itself is tagged. Without
+  // these entries an untagged `{tabId}` fell through to Local.
+  targetId: 'id',
+  tabId: 'id',
+  frameId: 'id',
   sessionIds: 'ids',
   archivedSessionIds: 'ids',
   pinnedSessionIds: 'ids',
@@ -578,6 +585,23 @@ export function taggedIdsIn(value) {
 }
 
 /**
+ * True when any `callId` (at any depth) already starts with the host prefix.
+ * `callId` is opaque to the rename table, so the table walk cannot see it; it must
+ * still never impersonate a tag this controller minted, on ANY remote frame.
+ */
+export function hasPseudoTaggedCallId(value, seen = new Set(), depth = 0) {
+  if (value === null || typeof value !== 'object' || depth > MAX_ID_DEPTH || seen.has(value)) return false
+  seen.add(value)
+  if (Array.isArray(value)) return value.some((item) => hasPseudoTaggedCallId(item, seen, depth + 1))
+  if (!isPlainObject(value)) return false
+  for (const [key, item] of Object.entries(value)) {
+    if (key === 'callId' && typeof item === 'string' && item.startsWith(HOST_PREFIX)) return true
+    if (hasPseudoTaggedCallId(item, seen, depth + 1)) return true
+  }
+  return false
+}
+
+/**
  * Refuse an interaction card whose ids are not opaque (spec 008 review fix).
  *
  * A card is remote data like every other frame, but it is the ONE payload this
@@ -598,9 +622,7 @@ export function taggedIdsIn(value) {
  * @returns {unknown} the same frame, when every id on it is opaque
  */
 export function assertCleanCard(hostId, frame) {
-  const callId = isPlainObject(frame) ? frame.callId : undefined
-  const pseudoTag = typeof callId === 'string' && callId.startsWith(HOST_PREFIX)
-  if (taggedIdsIn(frame).size === 0 && !pseudoTag) return frame
+  if (taggedIdsIn(frame).size === 0 && !hasPseudoTaggedCallId(frame)) return frame
   throw new HostRouterError('remote/id-leak',
     'an interaction card carried an id that already names a host namespace; the card was refused',
     { hostId })
@@ -1254,7 +1276,7 @@ export class HostRouter {
    * @returns {unknown} the same value, when it is clean
    */
   #refuseTagged(hostId, value, what) {
-    if (taggedIdsIn(value).size === 0) return value
+    if (taggedIdsIn(value).size === 0 && !hasPseudoTaggedCallId(value)) return value
     this.#log(`${what} from ${hostId} refused: remote/id-leak`)
     throw new HostRouterError('remote/id-leak',
       `${what} from ${hostId} carried an id that already names a host namespace; the payload was refused`,

@@ -59,7 +59,7 @@ describe('service worker precache list', () => {
 
   it('the worker reads that list at install and bumps the cache name when the strategy changes', () => {
     assert.match(SW, /fetch\('\/precache\.json'/, 'install must read the build-generated list');
-    assert.match(SW, /const CACHE = 'dsh-shell-v4'/, 'strategy changed => cache name bumped (see the note in sw.js)');
+    assert.match(SW, /const CACHE = 'dsh-shell-v5'/, 'strategy changed => cache name bumped (see the note in sw.js)');
     // Never-cache stays in force at install, not only in the fetch handler.
     assert.match(SW, /NEVER_CACHE\.some\(\(prefix\) => path\.startsWith\(prefix\)\)\) continue/);
   });

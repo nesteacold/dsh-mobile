@@ -13,7 +13,7 @@
 // Keeping the allowlist positive (only these paths are cacheable) is what makes the guarantee
 // auditable: an endpoint added later is NOT cached unless someone edits this list.
 
-const CACHE = 'dsh-shell-v4';
+const CACHE = 'dsh-shell-v5';
 
 /** Static shell assets: content-hashed by the bundler, so cache-first is safe. */
 const SHELL_ASSET_PATHS = ['/_expo/static/', '/assets/', '/icon.svg', '/icon-maskable.svg', '/manifest.json'];
@@ -144,5 +144,75 @@ self.addEventListener('fetch', (event) => {
     const response = await fetch(request);
     if (response.ok) await cache.put(request, response.clone());
     return response;
+  })());
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 026 — Web Push (R6). The payload is `{ v: 1, kind, sessionId, requestId? }`: ids only. The
+// notification text is FIXED per kind and localized here from the browser language; nothing from
+// the payload except the kind ever reaches the title/body, and the session id is used only to build
+// the URL a click opens. A locked PWA still shows it (it carries no content); opening the session
+// goes through the app, which demands the passkey first.
+
+const PUSH_TEXT = {
+  en: {
+    approval: { title: 'DSH: approval needed', body: 'A session is waiting for your decision.' },
+    question: { title: 'DSH: question waiting', body: 'A session is waiting for your answer.' },
+    'session-finished': { title: 'DSH: session finished', body: 'A session has finished.' },
+  },
+  vi: {
+    approval: { title: 'DSH: cần duyệt', body: 'Một phiên đang chờ bạn quyết định.' },
+    question: { title: 'DSH: có câu hỏi', body: 'Một phiên đang chờ bạn trả lời.' },
+    'session-finished': { title: 'DSH: phiên đã xong', body: 'Một phiên đã kết thúc.' },
+  },
+};
+
+const PUSH_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/** Parse a push body into `{ kind, sessionId }`, or null. Unknown version/kind/extra shape → null. */
+function parsePushPayload(data) {
+  let value;
+  try {
+    value = data ? data.json() : null;
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== 'object' || value.v !== 1) return null;
+  if (!Object.prototype.hasOwnProperty.call(PUSH_TEXT.en, value.kind)) return null;
+  if (typeof value.sessionId !== 'string' || !PUSH_ID.test(value.sessionId)) return null;
+  return { kind: value.kind, sessionId: value.sessionId };
+}
+
+function pushLanguage() {
+  const lang = (self.navigator && self.navigator.language) || 'en';
+  return lang.toLowerCase().startsWith('vi') ? 'vi' : 'en';
+}
+
+self.addEventListener('push', (event) => {
+  const payload = parsePushPayload(event.data);
+  // Unknown version: show nothing (contract §15.4).
+  if (payload === null) return;
+  const text = PUSH_TEXT[pushLanguage()][payload.kind];
+  event.waitUntil(self.registration.showNotification(text.title, {
+    body: text.body,
+    tag: `dsh-${payload.sessionId}`,
+    icon: '/icon.svg',
+    data: { url: `/session/${encodeURIComponent(payload.sessionId)}` },
+  }));
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const raw = event.notification.data && event.notification.data.url;
+  const target = typeof raw === 'string' && /^\/session\/[^/?#]+$/.test(raw) ? raw : '/';
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    for (const client of windows) {
+      if (new URL(client.url).origin !== self.location.origin) continue;
+      await client.focus();
+      if ('navigate' in client) await client.navigate(target);
+      return;
+    }
+    await self.clients.openWindow(target);
   })());
 });

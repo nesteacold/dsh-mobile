@@ -10,7 +10,7 @@
 //   language switch (the locale feeds AppController's lifecycle; changing it at runtime is a
 //   controller change, not a UI change — P2), storage/logs/plugins/tailscale/about.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Alert, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useRouter } from 'expo-router';
 
@@ -18,6 +18,8 @@ import { useApp } from './_layout';
 import { Card, Divider, Screen, SectionLabel, StatusDot } from '../src/ui/components/ui';
 import { FONT_SCALES, space, useTheme } from '../src/ui/theme';
 import { saveFontScale } from '../src/ui/font-scale-store';
+import { disableWebPush, enableWebPush, isWebPushSubscribed, isWebPushSupported } from '../src/platform/web-push';
+import type { WebPushOutcome } from '../src/core/web-push';
 
 export default function SettingsScreen() {
   const { controller, snapshot, tr } = useApp();
@@ -38,6 +40,39 @@ export default function SettingsScreen() {
    * never locked — draws no row for it, and the button is never dead.
    */
   const webLock = snapshot.webLock;
+
+  /**
+   * Spec 026 (R6/R7): web push toggle. Drawn only on web where the browser supports push and the Host
+   * offers hello.webPush (absent while locked / native / older Host). Permission is requested only
+   * inside the press handler (a user gesture). A native build draws nothing (isWebPushSupported).
+   */
+  const webPush = controller.webPush;
+  const [pushOn, setPushOn] = useState(false);
+  const [pushStatus, setPushStatus] = useState<WebPushOutcome | null>(null);
+  const [pushBusy, setPushBusy] = useState(false);
+  const showPush = Platform.OS === 'web' && isWebPushSupported() && webPush !== null;
+  useEffect(() => {
+    if (!showPush) return;
+    let live = true;
+    void isWebPushSubscribed().then((on) => { if (live) setPushOn(on); });
+    return () => { live = false; };
+  }, [showPush]);
+  const togglePush = (): void => {
+    if (webPush === null || pushBusy) return;
+    setPushBusy(true);
+    const run = pushOn ? disableWebPush(controller.webPushSend) : enableWebPush(webPush.vapidPublicKey, controller.webPushSend);
+    void run.then((outcome) => {
+      setPushStatus(outcome);
+      setPushOn(outcome === 'enabled');
+    }).catch(() => setPushStatus('error')).finally(() => setPushBusy(false));
+  };
+  const pushMessage = !showPush ? null
+    : webPush !== null && !webPush.enabled ? tr('notify.forbidden')
+    : pushStatus === 'denied' ? tr('notify.denied')
+    : pushStatus === 'forbidden' ? tr('notify.forbidden')
+    : pushStatus === 'unsupported' ? tr('notify.unsupported')
+    : pushStatus === 'error' ? tr('notify.error')
+    : pushOn ? tr('notify.enabled') : null;
 
   const forget = (): void => {
     Alert.alert(tr('sessions.forget'), tr('sessions.forgetConfirm'), [
@@ -148,9 +183,39 @@ export default function SettingsScreen() {
         )}
       </View>
 
+      {showPush ? (
+        <View style={styles.group}>
+          <SectionLabel style={{ paddingHorizontal: space.xl }}>{tr('notify.title')}</SectionLabel>
+          <View style={{ paddingHorizontal: space.xl, paddingTop: space.sm }}>
+            <Card>
+              <Pressable
+                testID="settings-web-push"
+                accessibilityRole="switch"
+                accessibilityState={{ checked: pushOn, disabled: pushBusy || (webPush !== null && !webPush.enabled && !pushOn) }}
+                accessibilityLabel={pushOn ? tr('notify.disable') : tr('notify.enable')}
+                disabled={pushBusy || (webPush !== null && !webPush.enabled && !pushOn)}
+                onPress={togglePush}
+                style={({ pressed }) => [styles.row, (pressed || pushBusy) && styles.pressed]}
+              >
+                <Text style={[settingsType.item, { color: colors.accent }]}>
+                  {pushOn ? tr('notify.disable') : tr('notify.enable')}
+                </Text>
+              </Pressable>
+              {pushMessage !== null ? (
+                <Text style={[settingsType.description, { color: colors.textMuted, paddingHorizontal: space.md, paddingBottom: space.sm }]}>
+                  {pushMessage}
+                </Text>
+              ) : null}
+              <Text style={[settingsType.description, { color: colors.textMuted, paddingHorizontal: space.md, paddingBottom: space.sm }]}>
+                {tr('notify.iosNote')}
+              </Text>
+            </Card>
+          </View>
+        </View>
+      ) : null}
+
       <View style={styles.group}>
-        <SectionLabel style={{ paddingHorizontal: space.xl }}>{tr('storage.title')}</SectionLabel>
-        <View style={{ paddingHorizontal: space.xl, paddingTop: space.sm }}>
+        <SectionLabel style={{ paddingHorizontal: space.xl }}>{tr('storage.title')}</SectionLabel>        <View style={{ paddingHorizontal: space.xl, paddingTop: space.sm }}>
           <Card>
             <Pressable
               testID="settings-storage"

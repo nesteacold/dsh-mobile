@@ -876,7 +876,7 @@ class FixtureGateway {
         if (!this.evidence.prompts.some((item) => item.clientMsgId === clientMsgId)) {
           this.evidence.prompts.push({ clientMsgId, sessionId, text: String(frame.text ?? ''), at: Date.now() })
         }
-        return send({ kind: 'sent', sessionId, clientMsgId })
+        return send({ kind: 'sent', sessionId })
       }
 
       case 'session-cancel': {

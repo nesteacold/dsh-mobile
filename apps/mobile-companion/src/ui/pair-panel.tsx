@@ -23,6 +23,8 @@ import type { AppController, AppStateSnapshot } from '../app-state';
 import { GATEWAY_WS_PATH, sameOriginGatewayUrl } from '../core/gateway-address';
 import { normalizeOtp, OTP_DIGITS } from '../core/pairing-otp';
 import { readWebLocation } from '../platform/web-location';
+import { consumePairHash } from '../platform/pair-hash';
+import { parsePairLinkUrl, type PairLink } from '../core/pair-link';
 import { pairErrorFromCode, pairErrorFromQr, type Interpolate, type MessageKey } from '../../i18n';
 // UI ported from Clarklevis1995/dsh-mobile androidApp/.../ui/GatewayAuthenticationUi.kt (MIT).
 import { useTheme } from './theme';
@@ -65,9 +67,34 @@ export function PairPanel(props: {
   // make the hint depend on a global this component does not own.
   const webGatewayUrl = useMemo(() => (Platform.OS === 'web' ? sameOriginGatewayUrl(readWebLocation()) : null), []);
 
+  // The pairing-code link (`/pair#a=…&c=…`, the desktop dialog's QR). Read once on mount; the web
+  // adapter strips the fragment from the address bar before anything else sees it. The form is only
+  // PRE-FILLED: nothing is dialled until the user taps Pair, and the Host still approves.
+  const [prefilled, setPrefilled] = useState(false);
+  const applyPairLink = useCallback((link: PairLink) => {
+    setMode('otp');
+    setOtpAddress(link.address);
+    setOtpCode(link.otp);
+    setFailure(null);
+    setPrefilled(true);
+  }, []);
+  useEffect(() => {
+    const link = consumePairHash();
+    if (link !== null) applyPairLink(link);
+  }, [applyPairLink]);
+
   const submit = useCallback(
     async (raw: string) => {
       if (busy || raw.trim() === '') return;
+      // A scanned/pasted pairing-code link is not a pairing string. The web pre-fills the code form;
+      // a phone app keeps its rule (no OTP on native: a code carries no pin) and says so plainly.
+      const link = parsePairLinkUrl(raw);
+      if (link !== null) {
+        setScanLocked(false);
+        if (Platform.OS === 'web') applyPairLink(link);
+        else setFailure('pair.error.otpLinkNative');
+        return;
+      }
       setBusy(true);
       setFailure(null);
       const parsed = controller.parsePairPayload(raw);
@@ -88,7 +115,7 @@ export function PairPanel(props: {
       setFailure(errorKey(pairErrorFromCode(result.code)));
       setScanLocked(false);
     },
-    [busy, controller, onPaired],
+    [busy, controller, onPaired, applyPairLink],
   );
 
   /**
@@ -194,6 +221,9 @@ export function PairPanel(props: {
 
       {mode === 'otp' ? (
         <>
+          {prefilled ? (
+            <Text style={styles.addressHint}>{tr('pair.linkPrefilled')}</Text>
+          ) : null}
           <Text style={styles.section}>{tr('pair.otpAddress')}</Text>
           <TextInput
             style={styles.input}

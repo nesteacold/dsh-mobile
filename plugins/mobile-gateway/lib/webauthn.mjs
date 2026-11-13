@@ -17,6 +17,7 @@
  * never a reason about which check failed, and never the offending value.
  */
 import crypto from 'node:crypto'
+import { PASSKEY_VERIFICATION_FAILED } from './vendor/mobile-protocol.mjs'
 import { CborDecodeError, CborMap, decodeCbor as decodeCborBytes } from './cbor.mjs'
 
 /** The only attestation format accepted (no attestation trust is needed: the device is paired). */
@@ -56,7 +57,7 @@ export class PasskeyVerificationError extends Error {
   constructor() {
     super('the passkey proof did not verify')
     this.name = 'PasskeyVerificationError'
-    this.code = 'passkey/verification-failed'
+    this.code = PASSKEY_VERIFICATION_FAILED
   }
 }
 
