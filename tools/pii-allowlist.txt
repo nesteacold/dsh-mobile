@@ -49,3 +49,4 @@ email:pass@host.example.test
 
 # Placeholder tailnet name (RFC 2606 'example' label) in the same-origin gateway-address tests.
 tsnet:example.ts.net
+tsnet:box.tailnet.ts.net
