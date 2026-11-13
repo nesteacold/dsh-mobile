@@ -1,0 +1,8 @@
+{
+  "name": "@local/dsh-roles",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared DSH role presets (coder, beastcore, scout, reviewer) for every workspace; project-specific rules live in the workspace instruction chain (AGENTS.md / CLAUDE.md) and the role brief (.claude/agents/<role>.md)",
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

@@ -1,0 +1,22 @@
+# @dsh-ext/sidebar-browser bundle patch (spec 014).
+# Inserts one loader row. The plugin registers the model-facing `internal_browser_*`
+# tools plus the two bridge routes the app window polls; it opens no listener of its
+# own and speaks to the sidebar Browser tab through the window (C5).
+- insert:
+    - id: sidebar-browser
+      name: '@dsh-ext/sidebar-browser'
+      config:
+        # No master switch (C2a): the session's permission preset is the switch. Under
+        # Full access the tools run like any other tool; in every other preset a mutating
+        # tool or eval asks for one-shot approval through DSH's own approval seam.
+        # Where screenshots are written. Empty = <DSH_HOME>/sidebar-browser.
+        # A tool's savePath is confined to this directory (C7); absolute paths and `..`
+        # that resolve outside it are refused before anything runs.
+        dataDir: ''
+        # C6: a session whose origin cannot be determined is treated as remote and needs
+        # the `browser:control` scope. DSH 0.2.2-rc.1 exposes no such signal to a plugin,
+        # so a local owner states it here. Remote devices get the scope from the gateway
+        # (`remoteSessionScope` service; see README).
+        grantedScopes: []
+        # Optional sidebar tab to pin by URL or title fragment; empty = the visible tab.
+        tab: ''

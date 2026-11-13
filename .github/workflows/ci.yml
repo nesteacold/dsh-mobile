@@ -125,6 +125,20 @@ jobs:
         run: npm test
         working-directory: plugins/devices
 
+  sidebar-browser:
+    name: sidebar-browser (plugins/sidebar-browser)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # No dependencies: node built-ins only.
+      - name: npm test
+        run: npm test
+        working-directory: plugins/sidebar-browser
+
   app:
     name: app (apps/mobile-companion)
     runs-on: ubuntu-latest

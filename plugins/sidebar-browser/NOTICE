@@ -1,0 +1,74 @@
+@dsh-ext/sidebar-browser — third-party notices
+===============================================
+
+This package is a hardened fork of the `plugin/` folder of
+
+  dsh-sidebar-browser  (package `dsh-sidebar-browser-cdp` 0.3.0)
+  https://github.com/alesha-pro/dsh-sidebar-browser
+  reference clone commit 65eca4f6
+
+Upstream copyright and licence
+------------------------------
+
+MIT License
+
+Copyright (c) 2026 Alexey Fateev
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+What was derived from upstream
+------------------------------
+
+- `lib/client.js` — the window transport (webview methods, dock tabs, the
+  `sidebarRight` service calls) is upstream's, with the bridge secret and the DOM
+  hook report added by spec 014.
+- `lib/index.js` — the in-page DOM snippets (`SNAPSHOT_JS`, `SCROLL_INFO_JS`,
+  `RENDER_SHOT_JS`, the key table) and the tool descriptions are upstream's.
+  The CDP transport and the three cookie tools were removed (spec 014 C3/C5);
+  the advance-approval gate, the bridge secret, the untrusted-content wrapping and
+  the savePath confinement are new.
+
+Not derived from upstream: `lib/remote-scope.js`, the tests, this NOTICE, the
+`cordis.patch.yml` row.
+
+Vendored library
+----------------
+
+  modern-screenshot 4.7.0  (lib/vendor/modern-screenshot.js,
+                            lib/vendor/modern-screenshot.VERSION)
+
+The MIT License (MIT)
+
+Copyright (c) 2021-present wxm
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+The vendored file is loaded into the page at screenshot time and is never
+executed by the Host.
+
+DeepSeek Harness
+----------------
+
+This plugin is an extension for DeepSeek Harness and is not a fork of it. It
+registers tools and two HTTP routes through the Host's public Cordis services
+and does not patch, fork or ship any DSH code.

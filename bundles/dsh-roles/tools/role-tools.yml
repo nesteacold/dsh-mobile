@@ -1,0 +1,30 @@
+# Fixed-route role tools inserted into the `delegation` group of the lead presets
+# (standard, cordis/Creator) by sync-presets.cjs. Models: owner 2026-11-08; change only on the owner's word.
+- id: tool-coder
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: coder
+    agentPreset: coder
+    agentOptions: { provider: r9-fallback, model: ds41-cmc-ccsonnet }
+- id: tool-beastcore
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: beastcore
+    agentPreset: beastcore
+    agentOptions: { provider: r9-commandcode, model: cc/claude-opus-5-5 }
+- id: tool-scout
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: scout
+    agentPreset: scout
+    agentOptions: { provider: r9-commandcode, model: cc/claude-haiku-5-5 }
+- id: tool-reviewer
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: reviewer
+    agentPreset: reviewer
+    agentOptions: { provider: r9-fallback, model: sol61-opus55 }

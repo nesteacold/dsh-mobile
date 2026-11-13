@@ -13,8 +13,10 @@ Read this file first, then `CLAUDE.md` (standing rules, role split, hard rules).
 |---|---|---|
 | `plugins/mobile-gateway/` | The Host-side gateway: TLS listener, pairing, per-device credentials and scopes, the WS protocol, remote bridge | `@dsh-ext/mobile-gateway` |
 | `plugins/devices/` | The desktop "Remote" product: control another DSH Host's sessions from this window (runtime id `devices`) | `@dsh-ext/devices` |
+| `plugins/sidebar-browser/` | Agent tools for DSH's built-in side-panel Browser tab (moved from dsh-ext 2026-11-13) | `@dsh-ext/sidebar-browser` |
 | `apps/mobile-companion/` | The phone client: React Native + Expo (SDK 58), Expo Router, native `pinned-ws` module (Kotlin/Swift), i18n vi/en, a web (PWA) target | private app |
 | `packages/mobile-protocol/` | The **versioned contract** shared by gateway and app: wire constants, types, the contract test | `@dsh-ext/mobile-protocol` |
+| `bundles/dsh-roles/` | The shared role bundle (coder/beastcore/scout/reviewer presets and lead tools), linked into the DSH profile (moved from dsh-ext 2026-11-13) | `@local/dsh-roles` |
 | `specs/<###-slug>/` | Spec Kit features (001–020, the mobile/remote set) | — |
 | `docs/arch-notes/` | Architecture notes about the mobile product, the gateway, and the agent permission/preset surface | — |
 | `tools/` | Repository gates: `scan-pii.mjs` (PII/secret scan), `verify-publish.mjs` (tree completeness) | — |
@@ -31,6 +33,7 @@ itself is **not** vendored: every plugin declares `engines.dsh`, as a bounded ra
 | `packages/mobile-protocol` | `npm test` (contract test; also checks the gateway's vendored copy is in sync) |
 | `plugins/mobile-gateway` | `npm test` · `npm run check:protocol` · `npm run test:package` |
 | `plugins/devices` | `npm test` |
+| `plugins/sidebar-browser` | `npm test` |
 | `apps/mobile-companion` | `npm run typecheck` · `npm run check:core` · `node e2e/check-flows.mjs` · `node --import tsx --import ./test/support/resolve.ts --import ./test/support/stub-platform.ts --test "test/*.test.ts"` |
 | Repository | `node tools/verify-publish.mjs` · `node tools/scan-pii.mjs` (must be clean before any push) |
 

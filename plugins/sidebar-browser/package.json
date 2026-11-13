@@ -1,0 +1,60 @@
+{
+  "name": "@dsh-ext/sidebar-browser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Let the agent use DSH's built-in side-panel Browser tab (the sidebar webview) over the app-window bridge. The session's permission preset decides approval (spec 014 C2a); page content comes back as untrusted data. Hardened fork of dsh-sidebar-browser-cdp.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.2-rc.3 <0.3.0-0",
+    "node": ">=24.9"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.0 || ^3.19.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "browser",
+    "webview",
+    "sidebar"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "the repository owner"
+  },
+  "contributors": [
+    {
+      "name": "Alexey Fateev",
+      "url": "https://github.com/alesha-pro"
+    }
+  ]
+}

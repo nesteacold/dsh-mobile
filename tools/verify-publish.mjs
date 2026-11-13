@@ -22,7 +22,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, extname, join, resolve } from 'node:path'
 
 const ROOT = resolve(import.meta.dirname, '..')
-const PACKAGES = ['plugins/mobile-gateway', 'plugins/devices', 'packages/mobile-protocol']
+const PACKAGES = ['plugins/mobile-gateway', 'plugins/devices', 'plugins/sidebar-browser', 'packages/mobile-protocol']
 const SOURCE_EXTENSIONS = new Set(['.mjs', '.cjs', '.js', '.ts', '.tsx'])
 const SPECIFIER = /(?:from\s+|import\s*\(\s*|require\s*\(\s*)['"](\.[^'"]+)['"]/g
 
@@ -71,11 +71,18 @@ for (const { file, specifier } of broken) {
 }
 
 const missingTests = []
-for (const pkg of ['plugins/mobile-gateway', 'plugins/devices']) {
+for (const pkg of ['plugins/mobile-gateway', 'plugins/devices', 'plugins/sidebar-browser']) {
   const manifest = join(ROOT, pkg, 'package.json')
   if (!existsSync(manifest)) continue
   const script = JSON.parse(readFileSync(manifest, 'utf8')).scripts?.test ?? ''
   for (const token of script.split(/\s+/)) {
+    if (/^test\/\*\.test\.(mjs|cjs)$/.test(token)) {
+      // A glob (node --test test/*.test.mjs): it must match at least one file.
+      const ext = token.slice(token.lastIndexOf('.'))
+      const dir = join(ROOT, pkg, 'test')
+      if (!existsSync(dir) || !readdirSync(dir).some((name) => name.endsWith(`.test${ext}`))) missingTests.push(`${pkg}/${token}`)
+      continue
+    }
     if (/^test\/.+\.(mjs|cjs)$/.test(token) && !existsSync(join(ROOT, pkg, token))) {
       missingTests.push(`${pkg}/${token}`)
     }
