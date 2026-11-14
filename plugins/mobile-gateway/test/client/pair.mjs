@@ -136,32 +136,46 @@ export function pinnedTlsOptions(pairingPayload) {
   }
 }
 
+/** The error a waiter settles with once its socket has closed. */
+function closedError(code) {
+  return new Error(`socket closed (${code}) before the expected frame`)
+}
+
 function waitForFrame(ws, predicate, timeoutMs = 5_000) {
-  return new Promise((resolve, reject) => {
+  // A waiter that settles before its promise is awaited would otherwise reject with
+  // no handler the moment it settles; `once(ws, 'open')` rejects on an earlier
+  // 'error', which is how `pair()`/`connect()` leave their frame waiters unawaited.
+  // The main promise still rejects for whoever awaits it; only the no-handler copy
+  // is swallowed.
+  let settled
+  const promise = new Promise((resolve, reject) => {
     const timeout = new Error('timed out waiting for a frame')
-    const timer = setTimeout(() => { cleanup(); reject(timeout) }, timeoutMs)
+    const timer = setTimeout(() => { cleanup(); settled.reject(timeout) }, timeoutMs)
     const onMessage = (data) => {
       let frame
       try { frame = JSON.parse(data.toString()) } catch { return }
       if (!predicate(frame)) return
       cleanup()
-      resolve(frame)
+      settled.resolve(frame)
     }
     const onClose = (code) => {
       cleanup()
-      reject(new Error(`socket closed (${code}) before the expected frame`, { cause: timeout }))
+      settled.reject(new Error(`socket closed (${code}) before the expected frame`, { cause: timeout }))
     }
-    const onError = (error) => { cleanup(); reject(error) }
+    const onError = (error) => { cleanup(); settled.reject(error) }
     function cleanup() {
       clearTimeout(timer)
       ws.off('message', onMessage)
       ws.off('close', onClose)
       ws.off('error', onError)
     }
+    settled = { resolve, reject }
     ws.on('message', onMessage)
     ws.on('close', onClose)
     ws.on('error', onError)
   })
+  promise.catch(() => {})
+  return promise
 }
 
 function assertPairingPayload(payload) {
@@ -291,17 +305,48 @@ export async function connect(options) {
   const next = (predicate, timeoutMs = 5_000) => {
     const buffered = pending.findIndex(predicate)
     if (buffered >= 0) return Promise.resolve(pending.splice(buffered, 1)[0])
+    // Every settlement path (frame, close, error, timeout) goes through one `settle`
+    // that clears the timer, drops the waiter and resolves/rejects exactly once — no
+    // timer outlives its waiter, and a settled waiter never fires twice.
     return new Promise((resolve, reject) => {
-      const waiter = { predicate, resolve }
-      waiters.push(waiter)
-      setTimeout(() => {
+      const waiter = { predicate }
+      let done = false
+      let timer
+      const settle = (error, frame) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
         const index = waiters.indexOf(waiter)
-        if (index < 0) return
-        waiters.splice(index, 1)
-        reject(new Error('timed out waiting for a frame'))
-      }, timeoutMs).unref?.()
+        if (index >= 0) waiters.splice(index, 1)
+        if (error) reject(error)
+        else resolve(frame)
+      }
+      timer = setTimeout(() => settle(new Error('timed out waiting for a frame')), timeoutMs)
+      timer.unref?.()
+      waiter.resolve = (frame) => settle(null, frame)
+      waiter.reject = (error) => settle(error)
+      waiters.push(waiter)
     })
   }
+  // `next()` is also used as a never-matching frame buffer (allowlist.test.mjs keeps
+  // one for the life of a connection and never awaits it). The promise is returned
+  // as-is, so a caller that awaits it still sees the rejection; this guard only
+  // silences the no-handler copy for the waiters nobody awaits.
+  const guardedNext = (predicate, timeoutMs) => {
+    const promise = next(predicate, timeoutMs)
+    promise.catch(() => {})
+    return promise
+  }
+  // A closed socket can never deliver another frame: settle the waiters now, which
+  // clears their timers instead of leaving them to fire after the test has moved on.
+  ws.on('close', (code) => {
+    for (const waiter of waiters.splice(0)) waiter.reject?.(closedError(code))
+  })
+  // A socket error also ends every outstanding waiter through the same settle path
+  // (clearing its timer); listening here also keeps the error from going unhandled.
+  ws.on('error', (error) => {
+    for (const waiter of waiters.splice(0)) waiter.reject?.(error)
+  })
   const request = async (frame, timeoutMs) => {
     // Register the waiter before sending: the answer can arrive inside send().
     const answer = next((reply) => reply.requestId === frame.requestId, timeoutMs)
@@ -323,7 +368,7 @@ export async function connect(options) {
     ws,
     hello: helloFrame,
     request,
-    next,
+    next: guardedNext,
     close() { try { ws.close() } catch { /* already closed */ } },
   }
 }

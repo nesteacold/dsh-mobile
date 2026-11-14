@@ -403,6 +403,18 @@ function deviceless(pluginContext) {
 }
 
 
+/**
+ * The refusal for `default-model` / `save-default-model` when this Host loads no
+ * `agentDefaultModel` service. One stable code and one visible sentence, so the app
+ * can name the cause instead of reporting an internal error; the gateway reads the
+ * service lazily (it must not inject it — see `resolveAgentDefaultModel` in
+ * index.mjs), which makes absence a normal state rather than a failure.
+ */
+function defaultModelUnavailable(requestType) {
+  return { kind: 'error', code: 'default-model-unavailable', requestType,
+    message: 'this Host has no default-model service (agentDefaultModel is not loaded)' }
+}
+
 // Dispatch one mobile query frame; returns the wire frame to send back.
 async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
   if (PLUGIN_REQUEST_TYPES.has(msg.type)) return handlePluginQuery(api, msg, pluginContext)
@@ -532,7 +544,14 @@ async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
   if (msg.type === 'host') {
     return proxyQuery(api, 'host', api.host.describe.bind(api.host), {})
   }
+  // The service is read lazily (`resolveAgentDefaultModel` in index.mjs), so a Host
+  // that does not load `agentDefaultModel` reaches here with `undefined`. The
+  // gateway no longer injects it (a model change used to reload the whole plugin
+  // and close every device's sockets), so absence is a possible state, not a bug:
+  // each op validates its own request first, then answers `DEFAULT_MODEL_UNAVAILABLE`.
+  // Every other op in this file is unaffected.
   if (msg.type === 'default-model') {
+    if (!agentDefaultModel) return defaultModelUnavailable(msg.type)
     try {
       const selection = agentDefaultModel.currentSelection()
       log(`default-model queried: ${selection.provider}/${selection.model}`)
@@ -548,6 +567,7 @@ async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
     if (!provider || !model) {
       return { kind: 'error', code: 'bad-request', message: 'save-default-model requires provider and model', requestType: 'save-default-model' }
     }
+    if (!agentDefaultModel) return defaultModelUnavailable(msg.type)
     const selection = { provider, model }
     if (typeof msg.reasoningEffort === 'string' && msg.reasoningEffort.trim() !== '') selection.reasoningEffort = msg.reasoningEffort.trim()
     try {

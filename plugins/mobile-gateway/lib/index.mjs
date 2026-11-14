@@ -928,6 +928,39 @@ function resolveHostGateway(ctx) {
   return undefined
 }
 
+/**
+ * The Host's `agentDefaultModel`, resolved late and without a hard dependency.
+ *
+ * Cordis reloads every plugin whose `inject` names a service when that service's
+ * fiber is reconfigured, and DSH reconfigures this one on every model change
+ * (`agentDefaultModel.saveSelection` → `configEditor.edit`). Injecting it meant
+ * one model change took this gateway (and every paired device's sockets) down;
+ * `ctx.get(name, false)` reads the same service the way `resolveHostGateway`
+ * and `devicesPluginActive` already do, at the moment a default-model op needs
+ * it. Absence is a normal answer here: the caller degrades the two ops and every
+ * other op is unaffected.
+ * @param {object} ctx the plugin context
+ * @returns {object|undefined} the service, or undefined when this Host has none
+ */
+function resolveAgentDefaultModel(ctx) {
+  // Property first, like `resolveHostGateway`: a harness (and a Host that mixes
+  // the service onto the context) is authoritative for this call. Cordis' proxy
+  // THROWS for a property it cannot resolve without `inject` (reflect.ts:152-177),
+  // so this read is guarded — an absent service is `undefined`, never an error.
+  try {
+    const property = ctx?.agentDefaultModel
+    if (property) return property
+  } catch { /* a strict context refuses a non-injected property; fall through */ }
+  if (typeof ctx?.get !== 'function') return undefined
+  try {
+    const service = ctx.get('agentDefaultModel', false)
+    if (service) return service
+  } catch { /* this context only knows the single-argument form */ }
+  try {
+    return ctx.get('agentDefaultModel')
+  } catch { return undefined }
+}
+
 // The plugin package whose Settings → Devices page drives the same `/mgw/*`
 // admin routes as this plugin's own "Mobile Devices" section.
 const DEVICES_PLUGIN_PACKAGE = '@dsh-ext/devices'
@@ -1090,7 +1123,18 @@ const plugin = {
   // T022a: `remoteAccess` is a hard dependency too — a paired device runs as a
   // non-owner Peer and DSH must be able to evaluate the policy. Without it the
   // plugin does not activate (fail closed), it never falls back to owner Peers.
-  inject: ['webServer', 'typertGateway', 'connection', 'agentDefaultModel', 'remoteAccess'],
+  //
+  // `agentDefaultModel` is deliberately NOT here (measured 2026-11-14). A model
+  // change, local or remote, is `agentDefaultModel.saveSelection()`, which a
+  // `configEditor` row implements as a profile write plus a reconcile of that
+  // row; Cordis then reloads EVERY plugin whose `inject` names the service —
+  // `{ required: false }` does not exempt one (it only drops the activation
+  // gate, `fiber.inject` keeps the name). In `inject`, every model change tore
+  // this gateway down and closed every paired device's sockets. It is read
+  // lazily per call instead (`resolveAgentDefaultModel`), so a Host without the
+  // service still serves every other op and the two default-model ops answer a
+  // `default-model-unavailable` frame instead of a crash.
+  inject: ['webServer', 'typertGateway', 'connection', 'remoteAccess'],
   // exported for local tests; Cordis ignores unknown plugin fields
   // The owner switch resolver: precedence of `remoteControl.enabled` over the
   // legacy `gatewayEnabled` alias lives in lib/remote-control.mjs; exported here
@@ -1272,7 +1316,9 @@ const plugin = {
       if (!visibleSessionIds.includes(id)) visibleSessionIds = [...visibleSessionIds, id]
       deviceAccess.invalidate()
     }
-    const agentDefaultModel = ctx.agentDefaultModel
+    // Read per request, never captured at apply: the service is not injected (see
+    // the `inject` comment above), so it may be absent, or arrive after this fiber.
+    const agentDefaultModel = () => resolveAgentDefaultModel(ctx)
     const options = {
       path: DEFAULT_WS_PATH,
       gatewayEnabled: false,
@@ -4351,7 +4397,7 @@ const plugin = {
           const requestId = typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}
           // T022a: a device token reads and cancels through its own non-owner Peer.
           const queryApi = adminCaller ? api : connApi
-          trackInFlight(ws, msg, handleQuery(queryApi, queryApi, agentDefaultModel, msg, { workspaceGroupFieldsFor, aggregateFrameFor, deviceId: ws.deviceId, client: ws })).then((frame) => {
+          trackInFlight(ws, msg, handleQuery(queryApi, queryApi, agentDefaultModel(), msg, { workspaceGroupFieldsFor, aggregateFrameFor, deviceId: ws.deviceId, client: ws })).then((frame) => {
             sendFrame(frame
               ? { ...frame, ...requestId }
               : { kind: 'error', code: 'bad-request', requestType: msg.type, ...requestId, message: `${msg.type} could not be served` })
@@ -4363,7 +4409,7 @@ const plugin = {
           // `admitAuthoring` adds only the argument rules the desktop bridge already
           // enforces (FR-005). Contract §1: the receipt echoes this request's id.
           const authorIdentity = requestIdEcho(msg)
-          trackInFlight(ws, msg, admitAuthoring(connApi, connApi, agentDefaultModel, msg, scopedDevice,
+          trackInFlight(ws, msg, admitAuthoring(connApi, connApi, agentDefaultModel(), msg, scopedDevice,
             () => refreshWorkspaceIds(host), workspaceGroupFieldsFor, aggregateFrameFor, ws)).then((frame) => {
             // Spec 011: the creating device can address the new session on its NEXT
             // request (an app opens it immediately and asks for its models), so the
@@ -4396,7 +4442,7 @@ const plugin = {
           || msg.type === 'goal-pause' || msg.type === 'goal-resume' || msg.type === 'goal-clear')) {
           // Admin channel only (owner on the DSH loopback listener): the upstream
           // management surface. A device token never reaches this branch (T022).
-          handleQuery(api, host, agentDefaultModel, msg, {
+          handleQuery(api, host, agentDefaultModel(), msg, {
             workspaceGroupFieldsFor,
             onInstallStart: (requestId) => pluginInstallOwners.set(requestId, ws),
             onInstallEnd: (requestId) => pluginInstallOwners.delete(requestId),

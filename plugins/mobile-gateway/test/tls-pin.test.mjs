@@ -243,7 +243,15 @@ async function scenario2(instance, payload) {
   assert.equal(viaSubprotocol.hello.authenticated, true)
   const subprotocolInfo = await viaSubprotocol.request({ type: 'device-info', requestId: 'info-2' })
   assert.equal(subprotocolInfo.requestId, 'info-2', JSON.stringify(subprotocolInfo))
+  // review-gateway-waiters: a `next()` waiter settles exactly once and its timeout timer
+  // is cleared at settlement. This asserts the CLOSE path, which needs no frame: a waiter
+  // left outstanding past a 300 s timeout (far longer than this scenario) must be rejected
+  // by the socket closing, not left scheduled to fire long after the test moved on. The
+  // waiter is awaited, so the rejection is observed rather than swallowed: `next()` returns
+  // the original promise and only silences the no-handler copy.
+  const orphan = viaSubprotocol.next(() => false, 300_000)
   viaSubprotocol.close()
+  await assert.rejects(orphan, /socket closed/, 'a close settles the waiter by rejecting it, not by a silent timeout')
   passed('token connection over WSS is served hello and allowlisted operations')
   return { session, paired, deviceId }
 }

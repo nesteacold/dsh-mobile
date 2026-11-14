@@ -168,6 +168,89 @@ test('HTTP guards: forwarded request and POST without Origin are 403', async () 
   } finally { mounted.close() }
 })
 
+// The desktop shell serves the page as `dsh-app://app` and forwards its requests to
+// the Host after deleting `origin` (and `sec-fetch-site`), so the Host sees no Origin
+// at all. Spec 027 therefore lets the two self-update POSTs through only when the
+// client's own marker and a JSON body travel with them, and keeps every present
+// Origin on the original same-origin rule.
+const MARKER = { 'x-dsh-devices-request': 'self-update' }
+const JSON_TYPE = 'application/json'
+
+test('absent Origin is accepted for the two self-update POSTs only with the client marker + JSON', async () => {
+  const { mountPlugin } = await import('./helpers.mjs')
+  const { git, calls } = fakeGit()
+  const mounted = await mountPlugin({ selfUpdateGit: git })
+  try {
+    // The exact request lib/client.js makes: no Origin, our marker, a JSON body.
+    // What proves the guard let it through is that the ROUTE answered: `check` says
+    // 200, and `update` answers with one of its own verdicts (its fake checkout is
+    // dirty / cannot name the running DSH), never the guard's 403 `forbidden`.
+    const check = await mounted.call('POST', '/devices/self-update/check', { body: {}, headers: { ...MARKER, 'content-type': JSON_TYPE } })
+    assert.equal(check.status, 200, check.text)
+    const update = await mounted.call('POST', '/devices/self-update/update', { body: {}, headers: { ...MARKER, 'content-type': JSON_TYPE } })
+    assert.notEqual(update.status, 403, `update: ${update.text}`)
+    assert.notEqual(update.json.error, 'forbidden', `update: ${update.text}`)
+    // The update reached the updater's own gates: a check ran.
+    assert.ok(calls.some((c) => c[0] === 'fetch'), 'the route ran a check')
+    // Without the marker, with the wrong value, or with a non-JSON body: 403, and
+    // nothing was run.
+    const before = calls.length
+    for (const [u, headers] of [
+      ['/devices/self-update/check', { 'content-type': JSON_TYPE }],
+      ['/devices/self-update/update', { 'content-type': JSON_TYPE }],
+      ['/devices/self-update/check', { ...MARKER, 'x-dsh-devices-request': 'other', 'content-type': JSON_TYPE }],
+      ['/devices/self-update/update', { ...MARKER, 'x-dsh-devices-request': 'other', 'content-type': JSON_TYPE }],
+      ['/devices/self-update/check', { ...MARKER, 'content-type': 'text/plain' }],
+      ['/devices/self-update/update', { ...MARKER, 'content-type': 'text/plain' }],
+      ['/devices/self-update/check', { ...MARKER }],
+      ['/devices/self-update/update', { ...MARKER }],
+    ]) {
+      const a = await mounted.call('POST', u, { body: {}, headers })
+      assert.equal(a.status, 403, `${u} ${JSON.stringify(headers)}: ${a.text}`)
+      assert.match(a.json.message, /Origin/)
+    }
+    assert.equal(calls.length, before, 'a refused request ran no git')
+    // A present Origin is judged exactly as before — cross-site, `null` and a
+    // mismatched authority stay refused even with the marker and a JSON body.
+    for (const origin of ['https://evil.example', 'null', 'http://127.0.0.1:9999', 'http://localhost:3080', '::bad']) {
+      for (const u of ['/devices/self-update/check', '/devices/self-update/update']) {
+        const a = await mounted.call('POST', u, { body: {}, headers: { origin, ...MARKER, 'content-type': JSON_TYPE } })
+        assert.equal(a.status, 403, `${origin} ${u}: ${a.text}`)
+      }
+    }
+    // The marker opens nothing else. The other /devices routes keep their own
+    // rule unchanged: an absent Origin is same-origin there (only these two writes
+    // ever demanded one), while a cross-site `null` is still refused with the marker.
+    const nulled = await mounted.call('POST', '/devices/remotes', { body: {}, headers: { origin: 'null', ...MARKER, 'content-type': JSON_TYPE } })
+    assert.equal(nulled.status, 403, `POST /devices/remotes origin null: ${nulled.text}`)
+    assert.match(nulled.json.message, /cross-origin/)
+    // The read stays as it was: a GET needs no Origin (that rule is unchanged).
+    assert.equal((await mounted.call('GET', '/devices/self-update')).status, 200)
+  } finally { mounted.close() }
+})
+
+test('a cross-site origin never gets a permissive CORS answer, and OPTIONS is not granted', async () => {
+  const { mountPlugin } = await import('./helpers.mjs')
+  const { git } = fakeGit()
+  const mounted = await mountPlugin({ selfUpdateGit: git })
+  try {
+    for (const [method, url] of [['OPTIONS', '/devices/self-update/check'], ['OPTIONS', '/devices/self-update/update'],
+      ['OPTIONS', '/devices/self-update'], ['POST', '/devices/self-update/check'], ['POST', '/devices/self-update/update']]) {
+      const a = await mounted.call(method, url, { method, body: {}, headers: { origin: 'https://evil.example',
+        'access-control-request-method': 'POST' } })
+      assert.equal(a.status, 403, `${method} ${url}: ${a.text}`)
+      // A preflight is answered only by a 2xx with `Access-Control-Allow-*`; a 403
+      // without them fails the preflight and the browser never sends the POST.
+      assert.ok(!Object.keys(a.headers ?? {}).some((name) => name.toLowerCase().startsWith('access-control-')),
+        `${method} ${url} answered ${JSON.stringify(a.headers)}`)
+    }
+    // Even the answer a same-origin request gets carries no CORS grant.
+    const same = await mounted.call('POST', '/devices/self-update/check', { body: {}, headers: { origin: 'http://127.0.0.1:3080' } })
+    assert.equal(same.status, 200)
+    assert.ok(!Object.keys(same.headers).some((name) => name.toLowerCase().startsWith('access-control-')))
+  } finally { mounted.close() }
+})
+
 test('route ignores other paths', async () => {
   const u = createSelfUpdater({ git: fakeGit().git })
   assert.equal(await handleSelfUpdateRoute(u, ['devices', 'remotes'], { method: 'GET' }, null, null), false)

@@ -141,6 +141,30 @@ single object field the right seam. The whole implementation is `lib/upload-rout
 read it yet (it is outside this change's scope), so the reason is currently visible only in this
 response and in the plugin log line `remote attachments: active|off (…)`.
 
+## Plugin self-update (spec 027)
+
+**Check for updates** on the dsh-mobile bundle page (`lib/client.js` `SelfUpdate`, the
+`plugins.detail.section` entry this plugin declares) reads the linked checkout — branch, HEAD,
+`git fetch --tags origin` — and shows the highest `v*` release, its notes and each plugin's
+`engines.dsh` at that tag. **Update** asks first, then applies `git merge --ff-only <tag>` plus
+`npm ci --ignore-scripts` only when a lockfile changed; it never resets, stashes, checks out or
+restarts DSH. Dirty tree, non-fast-forward, a rejecting `engines.dsh` and a stale tag are refused
+with their own codes. `GET /devices/self-update` reports `{ busy, lastCheck, previousHead }`.
+
+- **Same-origin, with one shell-shaped exception.** The writes sit behind the loopback + same-origin
+  guards every `/devices` route uses. A **present** `Origin` must be this Host's — cross-site,
+  `null` and a mismatched port are 403. An **absent** `Origin` is accepted for
+  `/devices/self-update/check` and `/update` **only** with `X-DSH-Devices-Request: self-update` and
+  `Content-Type: application/json`; anything else stays 403. This is what makes the writes work in
+  the installed desktop app: its shell serves this page as `dsh-app://app` and forwards each
+  request to the Host after deleting `origin`, `sec-fetch-site`, `host` and `cookie` (DSH desktop
+  `lib/main.js` `forwardWebRequest`, its `headers.delete` list), keeping every other header. A
+  browser cannot add that marker or a JSON content type to a cross-site POST without a CORS
+  preflight, and this plugin answers no preflight and sends no `Access-Control-Allow-*` header
+  (`test/self-update.test.mjs` asserts both). The page never sets `Origin` itself.
+- **Reviewer pass.** Network + code-execution surface: a reviewer pass is required before changing
+  this route (the spec's own rule).
+
 ## Browser the host may drive (spec 016 Phase 3, contract revision 10)
 
 A paired host's agent can ask **this** machine to open a headless browser. Two independent

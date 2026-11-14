@@ -3057,15 +3057,29 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState('')
       const [done, setDone] = React.useState(null)
       const fill = (key, vars) => Object.entries(vars).reduce((t, [k, v]) => t.replace('{' + k + '}', v), tr(key))
+      // The desktop shell serves this page as `dsh-app://app` and forwards the request
+      // to the Host after DELETING `Origin` (and `Sec-Fetch-Site`), so a route that
+      // demands Origin would refuse every write from that shell while still believing
+      // the request is same-origin. Spec 027's rule: a present Origin must be
+      // same-origin, and an absent one is accepted only for these two POSTs when this
+      // marker rides along — the shell keeps every other header. `Origin` is never
+      // set here: the browser owns it, and a page that could fake it could fake the
+      // rule.
+      const SELF_UPDATE_HEADER = 'X-DSH-Devices-Request'
+      const postSelfUpdate = (path, body) => request(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', [SELF_UPDATE_HEADER]: 'self-update' },
+        body: JSON.stringify(body ?? {}),
+      })
       async function check() {
         setBusy('check'); setError(''); setDone(null)
-        try { setInfo(await post('/devices/self-update/check', {})) } catch (e) { setError(e?.message || String(e)) } finally { setBusy('') }
+        try { setInfo(await postSelfUpdate('/devices/self-update/check', {})) } catch (e) { setError(e?.message || String(e)) } finally { setBusy('') }
       }
       async function update() {
         const tag = info?.latest?.tag
         if (!tag || !window.confirm(fill('updConfirm', { tag }))) return
         setBusy('update'); setError('')
-        try { setDone(await post('/devices/self-update/update', { tag })) } catch (e) { setError(tr('updBlocked') + ': ' + (e?.message || String(e))) } finally { setBusy('') }
+        try { setDone(await postSelfUpdate('/devices/self-update/update', { tag })) } catch (e) { setError(tr('updBlocked') + ': ' + (e?.message || String(e))) } finally { setBusy('') }
       }
       const latest = info?.latest
       return h('div', { 'data-testid': 'self-update' },

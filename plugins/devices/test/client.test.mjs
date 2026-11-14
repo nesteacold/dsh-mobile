@@ -51,7 +51,7 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     const target = new URL(url)
     const route = target.pathname + target.search
     const body = options.body ? JSON.parse(options.body) : undefined
-    calls.push({ method: options.method ?? 'GET', route, body, origin: target.origin, credentials: options.credentials })
+    calls.push({ method: options.method ?? 'GET', route, body, origin: target.origin, credentials: options.credentials, headers: options.headers })
     const reply = (data, ok = true, status = ok ? 200 : 400) => ({ ok, status, json: async () => data })
     if (fail[route]) return reply({ message: fail[route] }, false)
     if (route === '/mgw/status') return reply(state.status)
@@ -120,6 +120,13 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
       return reply({ remotes: state.remotes, uploads: state.uploads })
     }
     if (route === '/devices/remotes' && options.method === 'POST') return reply({ remote: { id: 'r-new' } })
+    // Spec 027: the self-update route, with the segment the dialog is on (a newer
+    // tag). The calls themselves are asserted by the test.
+    if (route === '/devices/self-update/check' && options.method === 'POST') {
+      return reply({ remote: 'https://github.com/nesteacold/dsh-mobile.git', branch: 'main', head: 'b'.repeat(40),
+        current: {}, latest: { tag: 'v0.3.0', signature: 'unsigned', plugins: [], notes: ['feat: x'] }, upToDate: false })
+    }
+    if (route === '/devices/self-update/update' && options.method === 'POST') return reply({ updated: true, tag: 'v0.3.0' })
     if (/^\/devices\/remotes\/[^/]+\/connect$/.test(route) && options.method === 'POST') {
       if (state.connectGate) await state.connectGate
       if (state.connectFailure) {
@@ -304,6 +311,29 @@ await check('spec 028: the self-update section renders on the dsh-mobile bundle 
   assert.equal(entry.component({ subject: { kind: 'bundle', pkg: { name: '@dsh-ext/dsh-wiki' } } }), null)
   assert.equal(entry.component({ subject: { kind: 'row', pkg: { name: '@dsh-mobile/bundle' }, row: {} } }), null)
   assert.equal(entry.component({}), null)
+})
+
+await check('spec 027: both self-update POSTs carry the client marker and JSON, and set no Origin', async () => {
+  const ui = load()
+  const { SelfUpdate, DICT } = ui.api.testing
+  const page = await mount(React.createElement(SelfUpdate))
+  await click(button(page, DICT.en.updCheck))
+  await flush()
+  // The desktop shell forwards the request without Origin, so the Host accepts these
+  // two writes only with the client's own marker; `Origin` is the browser's and the
+  // page must never set one (the string "Origin" is not even a header key here).
+  await click(button(page, DICT.en.updUpdate))
+  await flush()
+  const posts = ui.calls.filter((call) => call.route.startsWith('/devices/self-update/'))
+  assert.deepEqual(posts.map((call) => call.route), ['/devices/self-update/check', '/devices/self-update/update'])
+  for (const call of posts) {
+    assert.equal(call.method, 'POST')
+    assert.equal(call.headers['X-DSH-Devices-Request'], 'self-update', call.route)
+    assert.equal(call.headers['Content-Type'], 'application/json', call.route)
+    assert.ok(!Object.keys(call.headers).some((name) => name.toLowerCase() === 'origin'), `${call.route} sets no Origin`)
+  }
+  // The update asks the route for the tag it was shown.
+  assert.deepEqual(posts[1].body, { tag: 'v0.3.0' })
 })
 
 await check('sidebar row: a `sidebar.panellist` entry directly below Repo Wiki, labelled in both languages', async () => {

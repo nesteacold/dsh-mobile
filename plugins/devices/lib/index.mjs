@@ -79,6 +79,33 @@ export function hasMatchingOrigin(req) {
   return typeof req.headers.origin === 'string' && isSameOrigin(req)
 }
 
+// Spec 027: the client half always sends this marker on its two self-update POSTs
+// (lib/client.js `postSelfUpdate`). It is what lets a request WITHOUT `Origin` still
+// prove it came from this plugin's own page: the desktop shell serves that page as
+// `dsh-app://app` and forwards each request to the Host after deleting `origin`,
+// `sec-fetch-site`, `host` and `cookie` (DSH desktop `lib/main.js` forwardWebRequest,
+// the `headers.delete` list) — it keeps every other header, including this one. A
+// cross-site page cannot add it without a CORS preflight, and this plugin answers no
+// preflight and sends no `Access-Control-Allow-*` header, so a browser never lets one
+// through; a request without it (curl, a redirect-shaped form POST) is still refused.
+const SELF_UPDATE_HEADER = 'x-dsh-devices-request'
+const SELF_UPDATE_JSON = /^application\/json(?:[;,]|$)/
+
+/**
+ * The self-update write guard. A PRESENT Origin is judged exactly as before: it must
+ * be same-origin (cross-site, `null` and a mismatched port stay refused). Only when
+ * Origin is ABSENT — which a browser never does for a cross-site POST, so this is not
+ * a general bypass — may the two POSTs pass, and only together with the marker above
+ * and a JSON content type. Anything else is 403.
+ */
+export function isSelfUpdateWriteAllowed(req) {
+  const origin = req.headers.origin
+  if (origin !== undefined) return hasMatchingOrigin(req)
+  if (req.headers[SELF_UPDATE_HEADER] !== 'self-update') return false
+  const contentType = req.headers['content-type']
+  return typeof contentType === 'string' && SELF_UPDATE_JSON.test(contentType.trim().toLowerCase())
+}
+
 export function isSameOrigin(req) {
   const origin = req.headers.origin
   if (origin === undefined) return true
@@ -1022,9 +1049,13 @@ export const plugin = {
           sendJson(res, 404, { error: 'not-found' })
           return
         }
+        // Spec 027: a self-update write must be same-origin. The desktop shell forwards
+        // it without Origin (see `isSelfUpdateWriteAllowed`), so an absent Origin is
+        // accepted for these two POSTs only with the client's own marker and a JSON
+        // body; a present Origin keeps the original rule.
         if (selfUpdater && parts[0] === 'devices' && parts[1] === 'self-update'
-          && req.method !== 'GET' && req.method !== 'HEAD' && !hasMatchingOrigin(req)) {
-          sendJson(res, 403, { error: 'forbidden', message: 'self-update requires a same-origin Origin header' })
+          && req.method !== 'GET' && req.method !== 'HEAD' && !isSelfUpdateWriteAllowed(req)) {
+          sendJson(res, 403, { error: 'forbidden', message: 'self-update requires a same-origin Origin header, or the client request marker' })
           return
         }
         if (selfUpdater && await handleSelfUpdateRoute(selfUpdater, parts, req, readBody, (s, v) => sendJson(res, s, v))) return
