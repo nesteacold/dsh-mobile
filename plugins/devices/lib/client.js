@@ -149,6 +149,7 @@ window.__ModuleLoader__.load({
         // Spec 013: `uploads` on GET /devices/remotes. A remote row must name a
         // broken attachment bridge instead of letting every upload 404.
         'uploadsOff': 'Remote attachments are off: this Host does not take file uploads for a remote session.',
+        'uploadsWaiting': 'Waiting for the upload service…',
         'uploadsBroken': 'Remote attachments will fail: the upload route this plugin wraps is not in place',
         presetStandard: 'Standard',
         presetFull: 'Full control',
@@ -447,6 +448,7 @@ window.__ModuleLoader__.load({
         'risk.web:unlock': 'Có thể chứng thực việc mở khóa ứng dụng web cho tài khoản này.',
         'risk.permission:lower': 'Chỉ có thể đặt phiên chặt hơn; không bao giờ nới lỏng quyền.',
         'uploadsOff': 'Đính kèm từ xa đang tắt: Host này không nhận tệp tải lên cho phiên từ xa.',
+        'uploadsWaiting': 'Đang chờ dịch vụ tải lên…',
         'uploadsBroken': 'Đính kèm từ xa sẽ lỗi: tuyến tải lên mà plugin này bọc không còn ở đó',
         presetStandard: 'Tiêu chuẩn',
         presetFull: 'Toàn quyền',
@@ -1963,13 +1965,27 @@ window.__ModuleLoader__.load({
     // measured by the Host on every read, so a route that was replaced after load
     // shows up here instead of as a native 404 on the first tagged upload (A1.1).
     // A Host that reports no `uploads` at all is an older one: claim nothing.
-    const uploadsNote = (uploads) => {
+    //
+    // `not-installed` is the one reason that is NOT yet a failure: it means the
+    // install fiber is still waiting for the `connection` or `fileUploads`
+    // service, which on a real Host start is normal for a few seconds (the
+    // connection provider awaits BrowserAuth.create). It is shown as neutral
+    // status, and only after the tab's own poll has read it this many times
+    // (4 s apart, so ~1 min) does it become an alert: a service that never
+    // appears is a broken Host, and hiding that forever would be the A1.1
+    // failure mode this note exists to prevent.
+    const UPLOAD_WAIT_POLLS = 15
+    const uploadsNote = (uploads, waitPolls = 0) => {
       if (!uploads || typeof uploads !== 'object') return null
       if (uploads.wrapped === true) return null
       const reason = typeof uploads.reason === 'string' && uploads.reason !== '' ? uploads.reason : 'unknown'
       if (reason === 'disabled') {
         return h('div', { key: 'uploads', className: 'dshdev-muted', 'data-testid': 'remote-uploads', 'data-reason': reason, role: 'status' },
           tr('uploadsOff'))
+      }
+      if (reason === 'not-installed' && waitPolls < UPLOAD_WAIT_POLLS) {
+        return h('div', { key: 'uploads', className: 'dshdev-muted', 'data-testid': 'remote-uploads', 'data-reason': reason, role: 'status' },
+          tr('uploadsWaiting'))
       }
       return h('div', { key: 'uploads', className: 'dshdev-err', 'data-testid': 'remote-uploads', 'data-reason': reason, role: 'alert' },
         `${tr('uploadsBroken')} (${reason})`)
@@ -2089,6 +2105,8 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = React.useState(null)
       // Spec 013: the Host's own attachment bridge rides the same read.
       const [uploads, setUploads] = React.useState(null)
+      // Consecutive polls the bridge spent `not-installed` (see `uploadsNote`).
+      const [uploadWait, setUploadWait] = React.useState(0)
       const [openId, setOpenId] = React.useState('')
       const [error, setError] = React.useState('')
       const [connecting, setConnecting] = React.useState('')
@@ -2107,6 +2125,11 @@ window.__ModuleLoader__.load({
           ])
           if (!mounted.current) return
           setRemotes(data.remotes || [])
+          // A bridge still waiting for its services is a transient startup state,
+          // not a failure: count consecutive polls so the note can stay neutral
+          // briefly and turn into an alert if the wait never ends.
+          const waiting = data.uploads?.wrapped === false && data.uploads?.reason === 'not-installed'
+          setUploadWait((count) => (waiting ? count + 1 : 0))
           setUploads(data.uploads ?? null)
           setStatus(mgw)
         } catch (cause) { if (mounted.current) setError(cause.message) }
@@ -2183,7 +2206,7 @@ window.__ModuleLoader__.load({
             : null,
           // Spec 013: the attachment bridge is this Host's, not the remote's, so the
           // note lands on every row and explains why a send would 404.
-          uploadsNote(uploads),
+          uploadsNote(uploads, uploadWait),
         ].filter(Boolean)
         return h('div', { key: remote.id, className: 'dshdev-item', 'data-testid': 'remote-item' },
           h('div', { className: `dshdev-tile${remote.status === 'online' ? ' ok' : remote.status === 'revoked' || remote.status === 'error' ? ' bad' : ''}` },

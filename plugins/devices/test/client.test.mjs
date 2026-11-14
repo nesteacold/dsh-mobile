@@ -971,6 +971,39 @@ await check('connect tab: the Host\'s attachment bridge is on the remote row —
   assert.equal(noteIn(off, offPage)[0].children.join(''), off.api.testing.DICT.vi.uploadsOff)
   offPage.unmount()
 
+  // Waiting for the services is NOT a failure: during normal startup the Host's
+  // install fiber has not run yet (`not-installed`), and a red "will fail" alert
+  // there would be a false alarm on every launch.
+  const waiting = load({ remotes, uploads: { route: '/api/session/uploadFileBinary', wrapped: false, reason: 'not-installed' } })
+  const waitingPage = await mount(React.createElement(waiting.api.testing.ConnectTab))
+  await flush()
+  const waitDict = waiting.api.testing.DICT
+  const waitingNote = noteIn(waiting, waitingPage)
+  assert.equal(waitingNote.length, 1)
+  assert.equal(waitingNote[0].props.role, 'status', 'waiting is news, not an alarm')
+  assert.equal(waitingNote[0].props['data-reason'], 'not-installed', 'the reason still rides the note')
+  assert.equal(waitingNote[0].children.join(''), waitDict.en.uploadsWaiting, 'a neutral waiting sentence')
+  assert.notEqual(waitDict.vi.uploadsWaiting, waitDict.en.uploadsWaiting, 'a real translation, not a copy')
+  await act(async () => { waiting.setLocale('vi') })
+  assert.equal(noteIn(waiting, waitingPage)[0].children.join(''), waitDict.vi.uploadsWaiting, 'the Vietnamese sentence renders too')
+  await act(async () => { waiting.setLocale('en') })
+  // A wait that never ends IS a broken Host: after ~1 minute of 4 s polls the same
+  // reason becomes the alert, so a permanently missing service is never hidden.
+  const pump = async (times) => {
+    for (let i = 0; i < times; i += 1) {
+      await act(async () => { for (const tick of [...waiting.intervals.values()]) await tick() })
+      await flush()
+    }
+  }
+  await pump(13) // mount poll + these = 14: still inside the bound
+  assert.equal(noteIn(waiting, waitingPage)[0].props.role, 'status', 'still waiting, not yet a failure')
+  await pump(2) // 15 and 16: past the bound
+  const escalated = noteIn(waiting, waitingPage)[0]
+  assert.equal(escalated.props.role, 'alert', 'an unending wait is reported as the failure it is')
+  assert.ok(escalated.children.join('').includes(waitDict.en.uploadsBroken))
+  assert.ok(escalated.children.join('').includes('not-installed'))
+  waitingPage.unmount()
+
   // Healthy: `wrapped` measured true — no noise at all.
   const healthy = load({ remotes, uploads: { route: '/api/session/uploadFileBinary', wrapped: true, reason: null, dshVersion: '0.2.2-rc.1', pinned: '0.2.2-rc.1' } })
   const healthyPage = await mount(React.createElement(healthy.api.testing.ConnectTab))

@@ -1507,6 +1507,35 @@ test('remoteSessions:false leaves the carrier alone and reports why', async () =
   mounted.close()
 })
 
+// Owner defect (DSH desktop, profile `desktop`, `remotes: []`): "New session" in a Workspace left
+// the composer's Workspace chip on "Choose workspace" and minted no Session. With no remote paired
+// every authoring call belongs to Local, so the wrapper must be a pure pass-through for
+// `session/create`: the request goes to the ROOT DSH carrier byte-for-byte (an untagged Local
+// `workspaceId` is never stripped, tagged, or refused) and the Host's `{sessionId}` reply reaches the
+// UI unwrapped, which is what lets the native `startSession` open the new Session.
+// Source: `dsh-api-session-controller` `session/create { workspaceId?, cwd?, sessionId?, agentPreset? }
+// → { sessionId, agentPreset? }`; `dsh-client-ui-workspace` opens the returned id directly.
+test('session/create with no remote host reaches Local unchanged and its sessionId is not rewritten', async () => {
+  const verdict = { ok: true, value: { sessionId: 'session-566b825c-3954-4fd4-9f45-690c3273e315', agentPreset: 'standard' } }
+  const harness = createHarness({ remotes: [], dispatchRpc: () => verdict })
+  assert.equal(harness.status.remote, true, 'the wrapper is installed even with zero hosts')
+
+  const payload = { args: { workspaceId: 'ea6ef60e-f343-4517-a00b-7b9a1cbc879a' } }
+  const answer = await harness.gateway.dispatchRpc('session/create', payload, undefined, {})
+  assert.deepEqual(harness.localCalls.at(-1), { endpoint: 'session/create', payload },
+    'the Local call keeps the exact payload: no hint, no strip, no tag')
+  assert.deepEqual(answer, verdict, 'the {sessionId} reply is returned untouched')
+
+  // The same rule for the two workspaces the owner reported, one on another volume.
+  for (const workspaceId of ['ea6ef60e-f343-4517-a00b-7b9a1cbc879a', '7df03885-fb65-43a1-bbe4-fdf2b65dac01']) {
+    await harness.gateway.dispatchRpc('session/create', { args: { workspaceId } }, undefined, {})
+    assert.deepEqual(harness.localCalls.at(-1).payload, { args: { workspaceId } },
+      `${workspaceId}: the id is forwarded as the UI sent it`)
+  }
+  assert.equal([...hostIdsIn(harness.localCalls.at(-1).payload)].length, 0, 'nothing is namespaced')
+  assert.deepEqual(harness.remotes.length, 0, 'no remote was asked')
+})
+
 test('RemoteConnection.call stops waiting when the caller cancels', async () => {
   const sent = []
   const connection = new RemoteConnection({ remote: { publicUrl: 'wss://127.0.0.1:9' }, readToken: () => 'token' })

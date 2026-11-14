@@ -115,16 +115,24 @@ single object field the right seam. The whole implementation is `lib/upload-rout
   carrier wrapper (`0.2.2-rc.3`): the `connection` service must exist, `fetchRoutes` must be a `Map`,
   the record must exist with `POST` in `methods`, `requestBody === 'streaming'`, a callable `fetch`, and
   the version must equal the pin.
+- **The install waits for the services, it does not read them at apply time.** On rc.3 the
+  `connection` service is provided later than this plugin (its provider awaits `BrowserAuth.create`),
+  so a one-shot read at apply time is always empty. The install runs in a child context that requires
+  **both** `connection` and `fileUploads` (the service that registers the route): Cordis starts it once
+  both are live, re-starts it when a provider is replaced, and unloads it — restoring exactly — when
+  one withdraws. `not-installed` is the reason while that fiber has not started yet.
 - **Failure mode.** Any mismatch means **no wrap at all**, the record is untouched, and the reason
-  (`no-connection`, `fetchRoutes-missing`, `route-missing`, `route-methods`, `route-request-body`,
-  `route-fetch`, `dsh-version-unknown`, `dsh-version-mismatch`) is returned by
+  (`no-connection`, `not-installed`, `fetchRoutes-missing`, `route-missing`, `route-methods`,
+  `route-request-body`, `route-fetch`, `dsh-version-unknown`, `dsh-version-mismatch`) is returned by
   `GET /devices/remotes` as `uploads.reason`. Tagged uploads then fall through to the native handler
   and are refused there (`session/not-found`) instead of reaching the remote.
 - **Exact restore.** `dispose` puts the original `fetch` back, and only if the record still carries
   the one this plugin installed. A stacked wrapper finds the TRUE native handler through
-  `Symbol.for('@dsh-ext/devices.uploadRouteOriginal')`, and `uploads.wrapped` is measured live, so a
-  reload of the file-upload plugin that replaced the record under us reports `route-replaced` instead
-  of failing silently.
+  `Symbol.for('@dsh-ext/devices.uploadRouteOriginal')`, and `uploads.wrapped` is measured live on BOTH
+  facts: the map entry at `fetchRoutes.get(<path>)` must still be the record we wrapped, and that
+  record must still carry our wrapper. A reload of the file-upload plugin that replaced the entry
+  reports `route-replaced`, one the provider deleted (`registerFetchRoute`'s cleanup) reports
+  `route-missing`, and either way the stale wrapper hands requests to the native handler unread.
 - **No new surface.** No listener, route or port is added; the wrap changes one field of a record that
   already existed and only for the duration of the plugin.
 

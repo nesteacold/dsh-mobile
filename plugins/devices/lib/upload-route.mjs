@@ -222,16 +222,27 @@ export function splitTaggedSessionId(value) {
   return { hostId, sessionId }
 }
 
+/** Whether a service `ctx.get()` answered is a live object (Cordis tracing proxy included). */
+const isService = (value) => value !== null && (typeof value === 'object' || typeof value === 'function')
+
 /**
  * The remote attachment bridge for one applied plugin.
  *
  * `deps.connect(hostId)` resolves the paired remote as
  * `{connection, name}` (dialling it the same way every other remote route does)
  * and throws when the host cannot be reached.
+ *
+ * `deps.service(name)` resolves the SAME live instance the wrap is meant for —
+ * always `undefined` on a `mock` context, which carries no Cordis service store
+ * (lib/index.mjs). The wrap is installed inside a child context that reads
+ * `connection` (lib/index.mjs), so the record comes from that child after Cordis
+ * provided the service, never from a service read at apply time.
  */
 export class UploadRoute {
   #connection
   #connect
+  #service
+  #mock
   #dshVersion
   #log
   #tmpDir
@@ -246,15 +257,63 @@ export class UploadRoute {
   #installed = false
   /** Why the wrap was refused (A1.1): shown by the Devices page while it is off. */
   #reason = null
+  /** Whether `install()` has run at least once, i.e. whether `#reason` means anything yet. */
+  #attempted = false
+  /** The last stand-down reason a request observed, so a transition is logged once, not per request. */
+  #standDown = null
 
   constructor(deps = {}) {
     this.#connection = deps.connection
     this.#connect = typeof deps.connect === 'function' ? deps.connect : null
+    // `mock` is the test-only seam of lib/index.mjs: a context with no service
+    // store. Only there does the constructor's `connection` stay authoritative.
+    this.#service = typeof deps.service === 'function' ? deps.service : undefined
+    this.#mock = typeof deps.mock === 'function' ? deps.mock() === true : false
     this.#dshVersion = typeof deps.dshVersion === 'string' ? deps.dshVersion : undefined
     this.#log = typeof deps.log === 'function' ? deps.log : () => {}
     this.#tmpDir = typeof deps.tmpDir === 'string' && deps.tmpDir !== '' ? deps.tmpDir : os.tmpdir()
     this.#maxSpoolBytes = Number.isSafeInteger(deps.maxSpoolBytes) && deps.maxSpoolBytes > 0
       ? deps.maxSpoolBytes : MAX_SPOOL_BYTES
+  }
+
+  /**
+   * The live `connection` service every request is judged against. On a real
+   * Host it is read through the child context on every call, so a service that
+   * withdrew (and the provider's deletion of its routes) is seen at once instead
+   * of being answered from a stale record (see `#fetch`).
+   */
+  get #liveConnection() {
+    if (this.#service === undefined) return this.#connection
+    const service = this.#service('connection')
+    return isService(service) ? service : undefined
+  }
+
+  /** Why the wrap is not in force right now, or null when it really is; `status()` and `#fetch` share it. */
+  #measured() {
+    // `null` is reserved for "measured live": anything else is a reason the Devices
+    // page shows (A1.1). A refused install keeps the reason it recorded; otherwise
+    // name the real cause, because the constructor's `#reason` is still `null` and
+    // `status()` would read that as `wrapped: true` before any install was tried.
+    if (!this.#installed || this.#record === null) {
+      if (this.#attempted && this.#reason !== null) return this.#reason
+      // No `connection` at all is `no-connection`; a live service we simply have
+      // not wrapped yet (the fiber is still waiting for `fileUploads`) is not.
+      return this.#liveConnection === undefined ? 'no-connection' : 'not-installed'
+    }
+    const connection = this.#liveConnection
+    if (connection === undefined) return 'no-connection'
+    // BOTH halves are measured now, the same two facts the dispatcher needs: the
+    // map entry must still BE the record we wrapped (a withdrawal deletes it,
+    // connection lib/index.js:850-852; a reload replaces it) and that record must
+    // still carry our wrapper. The record alone is not enough: once the map entry
+    // is gone or replaced, nothing routes to this record, so a request that still
+    // reaches our wrapper has no owner check in front of it (see `#fetch`).
+    const routes = connection.fetchRoutes
+    if (!(routes instanceof Map) || typeof routes.get !== 'function') return 'fetchRoutes-missing'
+    const live = routes.get(UPLOAD_PATH)
+    if (live === undefined) return 'route-missing'
+    if (live !== this.#record || this.#record.fetch !== this.#wrapped) return 'route-replaced'
+    return null
   }
 
   /**
@@ -265,13 +324,17 @@ export class UploadRoute {
    */
   install() {
     if (this.#installed) return this.status()
-    const reason = uploadSelfTest(this.#connection, { dshVersion: this.#dshVersion })
+    this.#attempted = true
+    // A real Host is waited for by the child context (lib/index.mjs), so a missing
+    // service here is not final; a `mock` context never has one.
+    const connection = this.#mock ? this.#connection : this.#liveConnection
+    const reason = uploadSelfTest(connection, { dshVersion: this.#dshVersion })
     if (reason !== null) {
       this.#reason = reason
       this.#log(`remote attachments disabled: ${reason} (running DSH ${this.#dshVersion ?? 'unknown'}, declared ${DSH_ENGINES_RANGE}, last tested ${PINNED_DSH_VERSION})`)
       return this.status()
     }
-    const route = this.#connection.fetchRoutes.get(UPLOAD_PATH)
+    const route = connection.fetchRoutes.get(UPLOAD_PATH)
     // Restore target: exactly what was there before us (another wrapper, on a
     // reload). Local requests target the ROOT native handler instead, so a
     // stacked wrapper can never route a local upload back into us.
@@ -291,6 +354,7 @@ export class UploadRoute {
     route.fetch = wrapped
     this.#installed = true
     this.#reason = null
+    this.#standDown = null
     this.#log(`remote attachments active on POST ${UPLOAD_PATH}`)
     return this.status()
   }
@@ -304,6 +368,7 @@ export class UploadRoute {
     const route = this.#record
     const wrapped = this.#wrapped
     this.#installed = false
+    this.#standDown = null
     if (route === null || wrapped === null) return
     if (route.fetch === wrapped) route.fetch = this.#originals.fetch
     else this.#log('the upload route is no longer ours; left in place')
@@ -323,32 +388,70 @@ export class UploadRoute {
    *   pinned: string, range: string}}
    */
   status() {
-    const route = this.#connection?.fetchRoutes?.get?.(UPLOAD_PATH)
-    const live = this.#installed && typeof route?.fetch === 'function' && route.fetch === this.#wrapped
-    const reason = this.#installed ? (live ? null : 'route-replaced') : this.#reason
-    return { route: UPLOAD_PATH, wrapped: live, reason, dshVersion: this.#dshVersion, pinned: PINNED_DSH_VERSION, range: DSH_ENGINES_RANGE }
+    // One measurement for both fields, so `wrapped` and `reason` can never disagree.
+    const reason = this.#measured()
+    return { route: UPLOAD_PATH, wrapped: reason === null, reason,
+      dshVersion: this.#dshVersion, pinned: PINNED_DSH_VERSION, range: DSH_ENGINES_RANGE }
   }
 
   /**
    * The intercepted route. An untagged (or unparseable) request is handed to the
    * native handler as the SAME object, with its body untouched, so the local
    * upload path is exactly what it was before this plugin.
+   *
+   * The gate is re-measured here, not trusted from `install()`. The one thing this
+   * method must never get wrong is an authorization decision: our wrapper carries
+   * no owner check of its own, while the native route reaches the upload service
+   * only after the Connection dispatcher's `peer.principal.kind === 'owner'`
+   * refusal (dsh-client-connection lib/index.js:829-831). Once the `connection`
+   * service is gone the provider deletes its routes (connection:849-852), so a
+   * record could still hold our wrapper with NO authorization in front of it,
+   * and `mock` contexts (lib/index.mjs) carry no service store at all. Therefore:
+   * no live `connection` service, or the record no longer carrying our wrapper
+   * (nothing validates the request in front of us any more), hands the request
+   * to the native handler unread and leaves the stale wrapper inert.
    */
   async #fetch(request) {
+    // `#bodyUnread` hands the request to the root native handler whenever the wrap
+    // is not in force. Inert, never answered from a record whose authorization
+    // passed earlier: the body is untouched, exactly like an untagged local upload.
+    if (this.#assertLive()) return this.#bodyUnread(request)
     const original = this.#root?.fetch
     if (typeof original !== 'function') {
       return this.#failureResponse(failure('gateway/internal', 'the host upload handler is unavailable'))
     }
     let url
     try { url = new URL(request.url) } catch {
-      return Reflect.apply(original, this.#record, [request])
+      return this.#bodyUnread(request)
     }
     const rawSessionId = url.searchParams.get('sessionId')
     // No sessionId is not a host-tagged request: the native handler's own 400 is
     // the right answer and it runs before it ever reads the body.
     const tagged = rawSessionId === null || rawSessionId === '' ? null : splitTaggedSessionId(rawSessionId)
-    if (tagged === null) return Reflect.apply(original, this.#record, [request])
+    if (tagged === null) return this.#bodyUnread(request)
     return this.#upload(request, url, tagged)
+  }
+
+  /** The request, unread, to the native handler under any number of our wrappers. */
+  #bodyUnread(request) {
+    const original = this.#root?.fetch
+    if (typeof original !== 'function') {
+      return this.#failureResponse(failure('gateway/internal', 'the host upload handler is unavailable'))
+    }
+    // The native closure ignores `this`, but after `uninstall` there is no record
+    // left to pass, so the arity-1 call the dispatcher makes is the honest one.
+    return Reflect.apply(original, this.#record, [request])
+  }
+
+  /** Why `#fetch` must stand down right now, or null; logs a transition so the page's `status()` has a record. */
+  #assertLive() {
+    const reason = this.#measured()
+    if (reason === null) return null
+    if (reason !== this.#standDown) {
+      this.#standDown = reason
+      this.#log(`remote attachments off: ${reason}; every upload goes to the native handler unread`)
+    }
+    return reason
   }
 
   /** One host-tagged upload: the revision-8 frame sequence, answered as the route does. */

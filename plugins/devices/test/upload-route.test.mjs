@@ -115,6 +115,18 @@ function scratch(t) {
 const noDial = () => { throw new Error('the local path must not dial a remote host') }
 const route = (deps) => createUploadRoute({ dshVersion: PINNED, log: () => {}, ...deps })
 
+/**
+ * `createUploadRoute` exactly as lib/index.mjs builds it: the constructor carries
+ * no `connection` at all (that is what a one-shot `ctx.get` answers before the
+ * Host provides the service), and the record is read through `service()`. Returning
+ * `null` replays the provider deleting its routes when it withdraws
+ * (dsh-client-connection lib/index.js:849-852).
+ * @param {{native?: Function, service?: () => object|null}} options
+ */
+function wired({ native, service = () => null } = {}) {
+  return route({ service, connect: noDial })
+}
+
 test('an untagged sessionId reaches the native handler as the same request, its body untouched', async (t) => {
   const root = scratch(t)
   const seen = []
@@ -127,7 +139,11 @@ test('an untagged sessionId reaches the native handler as the same request, its 
   }
   const { connection, record } = hostConnection({ native })
   const uploads = route({ connection, connect: noDial, tmpDir: root })
+  // Before install there is nothing of ours on the record: `status()` measures the
+  // route, so "not wrapped" means the native handler is still the one in place.
   assert.equal(uploads.status().wrapped, false)
+  assert.equal(record.fetch, native)
+  assert.equal(uploads.status().reason, 'not-installed', 'nothing has been attempted yet, so nothing is wrapped')
   uploads.install()
   assert.notEqual(record.fetch, native, 'the route is wrapped once installed')
 
@@ -609,11 +625,16 @@ test('dispose restores the exact function, and never clobbers a later wrapper', 
   // A wrapper installed after us by someone else is left alone.
   const foreign = async () => json(200, { ok: true })
   const third = route({ connection, connect: noDial, tmpDir: root })
-  third.install()
+  const thirdStatus = third.install()
+  assert.equal(thirdStatus.wrapped, true, 'PRE: the wrap is on the record before it is stolen')
   record.fetch = foreign
+  assert.equal(third.status().wrapped, false, 'status() sees the stolen record, not a remembered one')
+  assert.equal(third.status().reason, 'route-replaced')
   third.uninstall()
   assert.equal(record.fetch, foreign, 'a route that is no longer ours is never clobbered')
+  // Disposed: nothing of ours is on any record, and that is stated as a reason.
   assert.equal(third.status().wrapped, false)
+  assert.equal(third.status().reason, 'not-installed')
 })
 
 test('a self-test mismatch wraps nothing and reports the reason for the Devices page', async (t) => {
@@ -680,9 +701,13 @@ test('the applied plugin wraps the live route and reports it in the Devices stat
   const native = async () => json(200, { ok: true, value: { native: true } })
   const record = { methods: new Set(['POST']), requestBody: 'streaming', fetch: native }
   const connection = { fetchRoutes: new Map([[UPLOAD_PATH, record]]) }
+  // Both services the install fiber waits for: `connection` owns the record and
+  // `fileUploads` is the service that registered it (FileUploads `static inject`
+  // lists `connection`, dsh-client-file-upload lib/index.js:163-184), so waiting on
+  // `connection` alone would install onto nothing.
   const mounted = await mountPlugin({
     dataDir: tempDir('dsh-devices-upload-int-'),
-    services: { connection },
+    services: { connection, fileUploads: { staged: () => undefined } },
     testDshVersion: PINNED,
     autoReconnect: false,
   })
@@ -715,3 +740,354 @@ test('a Host that composes no connection service reports the reason instead of w
     mounted.close()
   }
 })
+
+// The rc.3 timeline the fix exists for: this plugin applies BEFORE the connection
+// service exists (its provider awaits BrowserAuth.create first,
+// dsh-client-connection lib/index.js:1033-1034), so a `ctx.get` at apply time is
+// `undefined` and no route record exists yet. The install must wait, not give up.
+test('a connection service that appears after apply still gets the wrap installed', async (t) => {
+  const { mountPlugin, tempDir } = await import('./helpers.mjs')
+  const native = async () => json(200, { ok: true, value: { native: true } })
+  const record = { methods: new Set(['POST']), requestBody: 'streaming', fetch: native }
+  const mounted = await mountPlugin({
+    dataDir: tempDir('dsh-devices-upload-int-'),
+    testDshVersion: PINNED,
+    autoReconnect: false,
+  })
+  try {
+    // PRE: nothing to wrap yet, and the page says so rather than claiming a wrap.
+    assert.equal(mounted.instance.uploads.status().wrapped, false)
+    assert.equal(record.fetch, native)
+
+    // rc.3 order: `fileUploads` registers the route first (its `static inject`
+    // lists `connection`, dsh-client-file-upload lib/index.js:163-184), and the
+    // plugin installs only once BOTH services are live.
+    mounted.setService('fileUploads', { staged: () => undefined })
+    assert.equal(record.fetch, native, 'fileUploads alone is not enough: no connection yet')
+    mounted.setService('connection', { fetchRoutes: new Map([[UPLOAD_PATH, record]]) })
+
+    assert.notEqual(record.fetch, native, 'the late service is wrapped, not given up on')
+    assert.equal(mounted.instance.uploads.status().wrapped, true)
+    const response = await mounted.call('GET', '/devices/remotes')
+    assert.deepEqual(response.json.uploads, { route: UPLOAD_PATH, wrapped: true, reason: null, dshVersion: PINNED, pinned: PINNED, range: '>=0.2.2-rc.3 <0.3.0-0' })
+  } finally {
+    mounted.close()
+  }
+  assert.equal(record.fetch, native, 'teardown still restores the native handler')
+})
+
+test('a withdrawn connection service restores the exact handler it replaced', async (t) => {
+  const { mountPlugin, tempDir } = await import('./helpers.mjs')
+  const native = async () => json(200, { ok: true, value: { native: true } })
+  const record = { methods: new Set(['POST']), requestBody: 'streaming', fetch: native }
+  const connection = { fetchRoutes: new Map([[UPLOAD_PATH, record]]) }
+  const mounted = await mountPlugin({
+    dataDir: tempDir('dsh-devices-upload-int-'),
+    services: { connection, fileUploads: { staged: () => undefined } },
+    testDshVersion: PINNED,
+    autoReconnect: false,
+  })
+  try {
+    assert.notEqual(record.fetch, native, 'PRE: the live record is wrapped')
+
+    // The provider withdraws: Cordis unloads the fiber (its disposer restores),
+    // then `registerFetchRoute`'s cleanup deletes the route
+    // (dsh-client-connection lib/index.js:850-852).
+    connection.fetchRoutes.delete(UPLOAD_PATH)
+    mounted.setService('connection', undefined)
+
+    assert.equal(record.fetch, native, 'the function we replaced is back, exactly')
+    assert.equal(mounted.instance.uploads.status().wrapped, false)
+    assert.equal(mounted.instance.uploads.status().reason, 'no-connection', 'and the page shows why')
+  } finally {
+    mounted.close()
+  }
+  assert.equal(record.fetch, native, 'dispose after a withdrawal is still exact')
+})
+
+test('without the fileUploads service nothing is wrapped, even when connection is live', async (t) => {
+  const { mountPlugin, tempDir } = await import('./helpers.mjs')
+  const native = async () => json(200, { ok: true, value: { native: true } })
+  const record = { methods: new Set(['POST']), requestBody: 'streaming', fetch: native }
+  const connection = { fetchRoutes: new Map([[UPLOAD_PATH, record]]) }
+  // `fileUploads` is the service that registers this route (its constructor calls
+  // `ctx.connection.fetch.register`, dsh-client-file-upload lib/index.js:179-184).
+  // Waiting on `connection` alone would install onto a record nobody owns.
+  const mounted = await mountPlugin({
+    dataDir: tempDir('dsh-devices-upload-int-'),
+    services: { connection },
+    testDshVersion: PINNED,
+    autoReconnect: false,
+  })
+  try {
+    assert.equal(record.fetch, native, 'no wrap without the route owner')
+    const response = await mounted.call('GET', '/devices/remotes')
+    assert.equal(response.json.uploads.wrapped, false)
+    // `connection` IS live here, so the honest reason is "nothing was installed",
+    // not `no-connection`: the install fiber is still waiting for the route owner.
+    assert.equal(response.json.uploads.reason, 'not-installed', 'the fiber never started, so no wrap was attempted')
+  } finally {
+    mounted.close()
+  }
+  assert.equal(record.fetch, native)
+})
+
+test('a request is judged against the live service: a withdrawn provider hands it to the native handler unread', async (t) => {
+  // The authorization the wrapper relies on is the Connection dispatcher's
+  // owner-only check (dsh-client-connection lib/index.js:829-831), which sits in
+  // front of the record. When the provider withdraws it DELETES the routes
+  // (connection:849-852), so a stale record could reach our wrapper with no
+  // check in front of it. Measured here: the wrapper must not answer then.
+  const root = scratch(t)
+  const seen = []
+  const native = async (request) => { seen.push(request); return json(200, { ok: true, value: { native: true } }) }
+  const host = hostConnection({ native })
+  let live = host.connection
+  const uploads = route({ service: () => live, connect: async () => { throw new Error('a withdrawn service must not be dialled') }, tmpDir: root })
+  uploads.install()
+  assert.equal(host.connection.fetchRoutes.get(UPLOAD_PATH).fetch !== native, true)
+
+  live = null
+  assert.equal(uploads.status().wrapped, false, 'status() says the wrap is not in force')
+  assert.equal(uploads.status().reason, 'no-connection')
+  const request = uploadRequest({ sessionId: TAGGED, body: Buffer.from('bytes') })
+  const response = await host.record.fetch(request)
+  assert.equal(seen.length, 1, 'the native handler answered instead of the remote frames')
+  assert.equal(seen[0], request, 'the SAME request, body unread')
+  assert.deepEqual(fs.readdirSync(root), [], 'nothing was staged for a request the wrapper would not answer')
+})
+
+test('a replaced record leaves the stale wrapper inert, and hands the request over unread', async (t) => {
+  // `status()` measures the record, but the dispatcher reads whatever the record
+  // holds (`route.fetch(request)`, connection:831). A record another registration
+  // replaced is no longer fronted by that dispatcher, so even a request that still
+  // reaches OUR wrapper function is handed to the native handler untouched.
+  const root = scratch(t)
+  const seen = []
+  const native = async (request) => { seen.push(request); return json(200, { ok: true }) }
+  const host = hostConnection({ native })
+  const uploads = route({ service: () => host.connection, connect: noDial, tmpDir: root })
+  uploads.install()
+  const stale = host.record.fetch // the wrapper we installed
+  host.record.fetch = native // the file-upload plugin re-registered under us
+  const status = uploads.status()
+  assert.equal(status.wrapped, false)
+  assert.equal(status.reason, 'route-replaced')
+
+  const request = uploadRequest({ sessionId: TAGGED, body: Buffer.from('bytes') })
+  const response = await stale(request)
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0], request, 'the SAME request, body unread')
+  assert.deepEqual(await response.json(), { ok: true })
+  assert.deepEqual(fs.readdirSync(root), [], 'a stale wrapper stages nothing')
+})
+
+test('a map entry deleted under a live service is measured as gone: the stale wrapper hands the request over unread', async (t) => {
+  // The record is not the only fact that matters. A provider removes its route
+  // with `fetchRoutes.delete` (dsh-client-connection lib/index.js:850-852), and
+  // nothing routes to the record we wrapped after that: the stale wrapper has no
+  // owner check in front of it, so it must not answer. Measured on the MAP, not on
+  // the record: `record.fetch` is still our wrapper here, which is exactly why the
+  // record-only check reported `wrapped: true` for a route nobody could reach.
+  const root = scratch(t)
+  const seen = []
+  const native = async (request) => { seen.push(request); return json(200, { ok: true, value: { native: true } }) }
+  const host = hostConnection({ native })
+  const uploads = route({ service: () => host.connection, connect: noDial, tmpDir: root })
+  uploads.install()
+  const stale = host.record.fetch // the wrapper we installed
+  assert.equal(uploads.status().wrapped, true, 'PRE: installed and reachable')
+
+  host.connection.fetchRoutes.delete(UPLOAD_PATH)
+  assert.notEqual(host.record.fetch, native, 'PRE: the record itself still carries the wrapper')
+
+  const status = uploads.status()
+  assert.equal(status.wrapped, false, 'a deleted map entry is not a live wrap')
+  assert.equal(status.reason, 'route-missing', 'and the page says the route is gone')
+
+  const request = uploadRequest({ sessionId: TAGGED, body: Buffer.from('bytes') })
+  const response = await stale(request)
+  assert.equal(seen.length, 1, 'the native handler answered instead of the remote frames')
+  assert.equal(seen[0], request, 'the SAME request, body unread')
+  assert.deepEqual(await response.json(), { ok: true, value: { native: true } })
+  assert.deepEqual(fs.readdirSync(root), [], 'nothing was staged behind a route that is gone')
+})
+
+test('a map entry replaced under a live service is measured as replaced, even though the old record still carries our wrapper', async (t) => {
+  // A reload of the file-upload plugin registers a FRESH record at the same path.
+  // Our record keeps our wrapper, so a record-only check reported `wrapped: true`
+  // while every request went to the new record — and a request still holding OUR
+  // record reached our wrapper with no owner check in front of it.
+  const root = scratch(t)
+  const seen = []
+  const native = async (request) => { seen.push(request); return json(200, { ok: true, value: { native: true } }) }
+  const host = hostConnection({ native })
+  const uploads = route({ service: () => host.connection, connect: noDial, tmpDir: root })
+  uploads.install()
+  const stale = host.record.fetch
+  const oldRecord = host.record
+  assert.equal(uploads.status().wrapped, true, 'PRE: installed and reachable')
+
+  const replacement = { methods: new Set(['POST']), requestBody: 'streaming', fetch: native }
+  host.connection.fetchRoutes.set(UPLOAD_PATH, replacement)
+  assert.notEqual(oldRecord.fetch, native, 'PRE: the OLD record still carries our wrapper')
+
+  const status = uploads.status()
+  assert.equal(status.wrapped, false, 'the map entry is no longer the record we wrapped')
+  assert.equal(status.reason, 'route-replaced')
+
+  const request = uploadRequest({ sessionId: TAGGED, body: Buffer.from('bytes') })
+  const response = await stale(request)
+  assert.equal(seen.length, 1, 'the native handler answered instead of the remote frames')
+  assert.equal(seen[0], request, 'the SAME request, body unread')
+  assert.deepEqual(await response.json(), { ok: true, value: { native: true } })
+  assert.deepEqual(fs.readdirSync(root), [], 'nothing was staged for a request the wrapper would not answer')
+})
+
+test('replacing the connection provider restores the OLD record exactly and installs once on the NEW one', async (t) => {
+  // rc.3 replaces a provider by disposing the old one and composing the new one, so
+  // the dependent fiber is UNSETTLED in between: cordis folds each dependency's
+  // implementation uid into the fiber epoch (cordis lib/index.js:611-635), unloads
+  // on the change (:693-718) and only then reloads (:670-691). The install must
+  // therefore run twice over a replacement — one exact restore, one fresh wrap —
+  // never zero (a dead bridge) and never two (a stacked wrapper).
+  const { mountPlugin, tempDir } = await import('./helpers.mjs')
+  const nativeOf = (label) => async () => json(200, { ok: true, value: { native: label } })
+  const firstRecord = { methods: new Set(['POST']), requestBody: 'streaming', fetch: nativeOf('a') }
+  const firstNative = firstRecord.fetch
+  const connection = { fetchRoutes: new Map([[UPLOAD_PATH, firstRecord]]) }
+  const mounted = await mountPlugin({
+    dataDir: tempDir('dsh-devices-upload-int-'),
+    services: { connection, fileUploads: { staged: () => undefined } },
+    testDshVersion: PINNED,
+    autoReconnect: false,
+  })
+  const installs = () => mounted.logs.filter((line) => line.includes(`remote attachments active on POST ${UPLOAD_PATH}`)).length
+  try {
+    assert.equal(installs(), 1, 'PRE: one install on the first provider')
+    assert.notEqual(firstRecord.fetch, firstNative)
+
+    const secondRecord = { methods: new Set(['POST']), requestBody: 'streaming', fetch: nativeOf('b') }
+    const secondNative = secondRecord.fetch
+    mounted.setService('connection', { fetchRoutes: new Map([[UPLOAD_PATH, secondRecord]]) })
+
+    assert.equal(firstRecord.fetch, firstNative, 'the OLD record got its exact function back')
+    assert.notEqual(secondRecord.fetch, secondNative, 'the NEW record is wrapped')
+    assert.equal(secondRecord.fetch[Symbol.for('@dsh-ext/devices.uploadRouteOriginal')], secondNative,
+      'and it wraps the new record\'s own handler, not a chain')
+    assert.equal(installs(), 2, 'exactly one installation on the new record')
+    assert.equal(mounted.instance.uploads.status().wrapped, true)
+  } finally {
+    mounted.close()
+  }
+  assert.equal(firstRecord.fetch, firstNative, 'teardown did not disturb the old record')
+})
+
+test('replacing the fileUploads provider re-registers the route: exact restore on the old record, one install on the new', async (t) => {
+  // `fileUploads` owns the route record (its constructor registers it,
+  // dsh-client-file-upload lib/index.js:179-184). A reload of that plugin is a
+  // provider replacement like any other, and it comes with a FRESH record at the
+  // same path — the case where a fake that only tracked service presence would
+  // leave the wrapper on a record nobody routes to.
+  const { mountPlugin, tempDir } = await import('./helpers.mjs')
+  const nativeOf = (label) => async () => json(200, { ok: true, value: { native: label } })
+  const firstRecord = { methods: new Set(['POST']), requestBody: 'streaming', fetch: nativeOf('a') }
+  const firstNative = firstRecord.fetch
+  const connection = { fetchRoutes: new Map([[UPLOAD_PATH, firstRecord]]) }
+  const mounted = await mountPlugin({
+    dataDir: tempDir('dsh-devices-upload-int-'),
+    services: { connection, fileUploads: { staged: () => undefined } },
+    testDshVersion: PINNED,
+    autoReconnect: false,
+  })
+  const installs = () => mounted.logs.filter((line) => line.includes(`remote attachments active on POST ${UPLOAD_PATH}`)).length
+  try {
+    assert.equal(installs(), 1, 'PRE: one install')
+
+    // The reloading plugin's new instance registers its record, then the provider
+    // implementation is swapped: the dependent fiber unloads first (restoring the
+    // OLD record it still holds) and reloads onto the record now in the map.
+    const secondRecord = { methods: new Set(['POST']), requestBody: 'streaming', fetch: nativeOf('b') }
+    const secondNative = secondRecord.fetch
+    connection.fetchRoutes.set(UPLOAD_PATH, secondRecord)
+    mounted.setService('fileUploads', { staged: () => undefined })
+
+    assert.equal(firstRecord.fetch, firstNative, 'the record we had wrapped is no longer ours')
+    assert.notEqual(secondRecord.fetch, secondNative, 'the record now in the map is wrapped')
+    assert.equal(installs(), 2, 'exactly one installation on the new record')
+    assert.equal(mounted.instance.uploads.status().wrapped, true)
+  } finally {
+    mounted.close()
+  }
+  assert.equal(firstRecord.fetch, firstNative, 'teardown left the detached record exactly as it found it')
+})
+
+test('real rc.3 Cordis: a provider replacement restarts the install fiber (exact restore, one install)', async (t) => {
+  // The fake above models the epoch rule; this one MEASURES it against the installed
+  // @deepseek-ai/cordis, so a change in how rc.x folds provider identities into a
+  // fiber's epoch fails here rather than silently leaving the wrap on a dead record.
+  // Opt-in like the gateway's *-official tests: DSH_INSTALL_ROOT holds the installed
+  // @deepseek-ai/dsh package root, and importing cordis is read-only.
+  const installRoot = process.env.DSH_INSTALL_ROOT
+  if (!installRoot) {
+    t.skip('DSH_INSTALL_ROOT is not set: no installed @deepseek-ai/cordis to measure against')
+    return
+  }
+  const { createRequire } = await import('node:module')
+  const { pathToFileURL } = await import('node:url')
+  const require = createRequire(path.join(installRoot, 'package.json'))
+  const { Context } = await import(pathToFileURL(require.resolve('@deepseek-ai/cordis')).href)
+  const root = scratch(t)
+  const app = new Context()
+  const installs = []
+  const providerFor = (label) => {
+    const native = async () => json(200, { ok: true, value: { native: label } })
+    const record = { methods: new Set(['POST']), requestBody: 'streaming', fetch: native }
+    const connection = { label, fetchRoutes: new Map([[UPLOAD_PATH, record]]) }
+    const fiber = app.plugin({ name: `connection-provider-${label}`, apply(ctx) {
+      ctx.provide('connection', connection)
+      ctx.provide('fileUploads', { staged: () => undefined })
+    } })
+    return { record, connection, fiber, native }
+  }
+  let uploads
+  app.plugin({ name: 'devices-upload-fixture', apply(ctx) {
+    // Exactly lib/index.mjs's shape: the install is the fiber body, so Cordis owns
+    // when it runs, and its returned disposer is the exact restore.
+    ctx.inject(['connection', 'fileUploads'], (sub) => {
+      uploads = route({ service: (name) => sub.get(name), connect: noDial, tmpDir: root })
+      installs.push(uploads.install().wrapped)
+      return () => uploads.uninstall()
+    })
+  } })
+  const settle = async () => { for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setTimeout(resolve, 5)) }
+
+  const first = providerFor('a')
+  await settle()
+  assert.deepEqual(installs, [true], 'the fiber started once both services were live')
+  assert.notEqual(first.record.fetch, first.native, 'the live record carries our wrapper')
+
+  await first.fiber.dispose()
+  await settle()
+  assert.equal(first.record.fetch, first.native, 'withdrawing the provider restored the record exactly')
+  assert.equal(uploads.status().reason, 'no-connection')
+
+  const second = providerFor('b')
+  await settle()
+  assert.deepEqual(installs, [true, true], 'exactly one more install, on the replacing provider')
+  assert.notEqual(second.record.fetch, second.native, 'the new record is wrapped, the old function is not chained in')
+  assert.equal(uploads.status().wrapped, true)
+})
+
+test('a mock context is a no-op: it reports the reason instead of throwing', async (t) => {
+  // Cordis owns WHEN the fiber starts (it waits for `connection` and `fileUploads`,
+  // lib/index.mjs); a `mock` context (no Cordis service store) can never start one,
+  // so the route must stay an explicit no-op with a reason rather than pretend.
+  const root = scratch(t)
+  const uploads = route({ service: () => undefined, mock: () => true, connect: noDial, tmpDir: root })
+  const status = uploads.install()
+  assert.equal(status.wrapped, false)
+  assert.equal(status.reason, 'no-connection')
+})
+
+

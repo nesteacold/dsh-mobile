@@ -700,9 +700,18 @@ export const plugin = {
     // `dispatchRpc`, so the carrier wrapper cannot see them. This one wraps that
     // route's live record on the `connection` service — nothing else — and only a
     // host-tagged `sessionId` leaves the local Host.
+    //
+    // Installing it at apply time cannot work: `connection` is provided LATER than
+    // this plugin (its plugin awaits BrowserAuth.create first, dsh-client-connection
+    // lib/index.js:1034), and a one-shot `ctx.get` answers `undefined` before
+    // anything notifies it. So the install waits in a CHILD context whose required
+    // service is `connection`: Cordis starts that fiber once the service is
+    // available, re-starts it when the provider is replaced, and unloads it when
+    // the service withdraws — each leg is an install or an exact restore.
+    // `fileUploads` is the owner of that route: without it the route record never
+    // exists, so waiting for `connection` alone would install onto nothing.
     const uploadRoute = options.remoteSessions === false ? null : createUploadRoute({
-      connection: typeof ctx.get === 'function' ? ctx.get('connection', false) : undefined,
-      // The same guarded dial every other remote route uses: an unpaired, revoked
+      // The guarded dial every other remote route uses: an unpaired, revoked
       // or unreachable host throws, and the upload answers in the route's own
       // envelope instead of waiting for bytes that will never go.
       connect: async (hostId) => {
@@ -711,11 +720,35 @@ export const plugin = {
         const entry = await connected(remote)
         return { connection: entry.connection, name: remote.name }
       },
+      // Read through the install fiber, never from `apply`'s time.
+      service: (name) => (typeof ctx.get === 'function' ? ctx.get(name) : undefined),
+      mock: () => typeof ctx.get !== 'function',
       dshVersion,
       log,
     })
-    uploadRoute?.install()
-    if (uploadRoute) log(`remote attachments: ${uploadRoute.status().wrapped ? 'active' : `off (${uploadRoute.status().reason})`}`)
+    if (uploadRoute) {
+      // The page reads the route through `internalsFor(ctx)`, which `apply`
+      // publishes only at its very end. Both paths write into the CURRENT record,
+      // so whichever runs last wins without erasing what the other holds.
+      const waitForUploadRoute = () => internals.set(ctx, { ...internals.get(ctx), uploads: uploadRoute })
+      waitForUploadRoute()
+      ctx.inject(['connection', 'fileUploads'], (uploadCtx) => {
+        // Runs when Cordis starts this fiber (both services live). A later
+        // provider replacement unloads the previous fiber (restoring exactly what
+        // it wrapped) before this one starts, so the re-entry installs onto the
+        // fresh record.
+        uploadRoute.install()
+        const status = uploadRoute.status()
+        log(`remote attachments: ${status.wrapped ? 'active' : `off (${status.reason})`}`)
+        waitForUploadRoute()
+        // The fiber's own cleanup: the exact restore, on withdrawal or plugin teardown.
+        return () => {
+          uploadRoute.uninstall()
+          log('remote attachments: off (the connection or file-upload service withdrew)')
+          waitForUploadRoute()
+        }
+      })
+    }
 
     for (const remote of store.list()) if (!remote.revoked) attach(remote)
 
