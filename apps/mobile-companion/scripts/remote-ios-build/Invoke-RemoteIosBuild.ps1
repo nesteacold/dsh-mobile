@@ -421,37 +421,32 @@ function Resolve-RemoteHome {
     return $remoteHome
 }
 
-# Stage mac/ios-build.sh at <remote $HOME>/.dsh-ios-build/ios-build.sh and prove the bytes
-# arrived intact. Returns the absolute remote path, or '' when staging failed (caller exits 2).
-# The staged copy is overwritten on every run; it is the only file the pipeline leaves behind.
-function Install-MacScript {
+# Stage one local file at <remote $HOME>/.dsh-ios-build/<remoteName> and prove the bytes arrived
+# intact. Returns the absolute remote path, or '' when staging failed (caller exits 2). The staged
+# copy is overwritten on every run.
+function Install-MacFile {
     param(
         [string]$LocalPath,
+        [string]$RemoteName,
         [string]$RemoteHome,
         [string]$SshExe,
         [string[]]$SshOptions,
         [string[]]$ScpOptions,
-        [string]$Target
+        [string]$Target,
+        [string]$ShaMismatchHint
     )
 
-    $stageRoot = $RemoteHome + '/.dsh-ios-build'
-    $stagedPath = $stageRoot + '/ios-build.sh'
+    $stagedPath = $RemoteHome + '/.dsh-ios-build/' + $RemoteName
 
     Out-Line ('  stage     : {0} (sha256-verified before use)' -f $stagedPath)
-    $mk = & $SshExe @SshOptions $Target ('mkdir -p ' + $stageRoot + ' && chmod 700 ' + $stageRoot) 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Out-Line ('ERROR preflight: cannot create the remote staging directory {0}: {1}' -f $stageRoot, (($mk | Select-Object -First 3) -join ' '))
-        return ''
-    }
-
     & $ScpExe @ScpOptions $LocalPath ($Target + ':' + $stagedPath) 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Out-Line ('ERROR preflight: cannot stage the orchestrator at {0} (scp failed)' -f $stagedPath)
+        Out-Line ('ERROR preflight: cannot stage {0} (scp failed)' -f $stagedPath)
         return ''
     }
     $chmod = & $SshExe @SshOptions $Target ('chmod 700 ' + $stagedPath) 2>&1
     if ($LASTEXITCODE -ne 0) {
-        Out-Line ('ERROR preflight: cannot chmod 700 the staged orchestrator: {0}' -f (($chmod | Select-Object -First 3) -join ' '))
+        Out-Line ('ERROR preflight: cannot chmod 700 {0}: {1}' -f $stagedPath, (($chmod | Select-Object -First 3) -join ' '))
         return ''
     }
 
@@ -465,10 +460,50 @@ function Install-MacScript {
     if ($remoteHash.Length -ne 64 -or $remoteHash -ne $localHash) {
         $shown = '<unreadable>'
         if ($remoteHash.Length -eq 64) { $shown = $remoteHash }
-        Out-Line ('ERROR preflight: staged orchestrator sha256 mismatch (local {0}, remote {1}); nothing was built' -f $localHash, $shown)
+        Out-Line ('ERROR preflight: staged {0} sha256 mismatch (local {1}, remote {2}); {3}' -f $RemoteName, $localHash, $shown, $ShaMismatchHint)
         return ''
     }
     Out-Line ('  sha256    : {0} (local == remote)' -f $localHash)
+    return $stagedPath
+}
+
+# Stage mac/ios-build.sh (the orchestrator) plus mac/cleanup-after-build.sh (the post-run
+# reclaimer it calls from its own cleanup trap). Both live in ~/.dsh-ios-build/ and are
+# overwritten on every run; nothing else of ours is written to the Mac.
+function Install-MacScript {
+    param(
+        [string]$LocalPath,
+        [string]$RemoteHome,
+        [string]$SshExe,
+        [string[]]$SshOptions,
+        [string[]]$ScpOptions,
+        [string]$Target
+    )
+
+    $stageRoot = $RemoteHome + '/.dsh-ios-build'
+    $mk = & $SshExe @SshOptions $Target ('mkdir -p ' + $stageRoot + ' && chmod 700 ' + $stageRoot) 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Out-Line ('ERROR preflight: cannot create the remote staging directory {0}: {1}' -f $stageRoot, (($mk | Select-Object -First 3) -join ' '))
+        return ''
+    }
+
+    $stagedPath = Install-MacFile -LocalPath $LocalPath -RemoteName 'ios-build.sh' -RemoteHome $RemoteHome `
+        -SshExe $SshExe -SshOptions $SshOptions -ScpOptions $ScpOptions -Target $Target `
+        -ShaMismatchHint 'nothing was built'
+    if ([string]::IsNullOrEmpty($stagedPath)) { return '' }
+
+    $cleanupLocal = Join-Path (Split-Path -Parent $LocalPath) 'cleanup-after-build.sh'
+    if (Test-Path -LiteralPath $cleanupLocal) {
+        $stagedCleanup = Install-MacFile -LocalPath $cleanupLocal -RemoteName 'cleanup-after-build.sh' -RemoteHome $RemoteHome `
+            -SshExe $SshExe -SshOptions $SshOptions -ScpOptions $ScpOptions -Target $Target `
+            -ShaMismatchHint 'the build can continue, but the post-run disk cleanup will be skipped'
+        if ([string]::IsNullOrEmpty($stagedCleanup)) {
+            Out-Line 'WARN preflight: the cleanup helper could not be staged; this run leaves its usual tail on the Mac'
+        }
+    } else {
+        Out-Line ('WARN preflight: {0} is missing; the post-run disk cleanup will be skipped' -f $cleanupLocal)
+    }
+
     return $stagedPath
 }
 
@@ -585,6 +620,7 @@ function Show-Plan {
     Out-Line ('  idle requirement : {0} s of no user input, -Force overrides' -f $Idle)
     Out-Line ('  remote staging   : {0}' -f $remoteStage)
     Out-Line '  staged script    : <mac $HOME>/.dsh-ios-build/ios-build.sh (sha256-verified, overwritten each run)'
+    Out-Line '  staged cleanup   : <mac $HOME>/.dsh-ios-build/cleanup-after-build.sh (same checks; used by the cleanup step)'
     if ($WaitForHost -gt 0) {
         Out-Line ('  unreachable Mac  : poll every 15 s for up to {0} min, then start the build' -f [int]($WaitForHost / 60))
     } else {
@@ -592,10 +628,12 @@ function Show-Plan {
     }
     Out-Line ''
     Out-Line '  Remote steps:'
-    Out-Line '   0 stage: scp mac/ios-build.sh -> <mac $HOME>/.dsh-ios-build/ios-build.sh, chmod 700,'
-    Out-Line '            then sha256 compare (Get-FileHash locally vs shasum -a 256 on the Mac);'
-    Out-Line '            a mismatch aborts with exit 2. The script runs FROM THAT FILE, never'
-    Out-Line '            `bash -s`, so the tar keeps stdin to itself (FR-018)'
+    Out-Line '   0 stage: scp mac/ios-build.sh -> <mac $HOME>/.dsh-ios-build/ios-build.sh,'
+    Out-Line '            chmod 700, then sha256 compare (Get-FileHash locally vs shasum -a 256 on'
+    Out-Line '            the Mac); a mismatch aborts with exit 2. mac/cleanup-after-build.sh is'
+    Out-Line '            staged the same way (a failure there is a WARNING, it never aborts a'
+    Out-Line '            build). The script runs FROM THAT FILE, never `bash -s`, so the tar keeps'
+    Out-Line '            stdin to itself (FR-018)'
     Out-Line '   1 self-test: the staged file parses itself (bash -n "$0"), then macOS/Xcode/pods/'
     Out-Line '               altool/disk/idle/lock report; a failure aborts here with exit 2'
     Out-Line '   2 preflight: uname / xcode-select -p / xcodebuild -version / free space floor / idle / lock'
@@ -623,7 +661,9 @@ function Show-Plan {
     }
     Out-Line '  14 cleanup: kill caffeinate, unmount, diskutil apfs deleteVolume, remove lock,'
     Out-Line '             assert free space is back within 1 GB of the baseline (else exit 6);'
-    Out-Line '             cleanup NEVER sleeps or shuts the Mac down'
+    Out-Line '             then run the staged cleanup-after-build.sh --auto --apply, which removes'
+    Out-Line '             stale stage dirs and this project''s DerivedData under the build $HOME'
+    Out-Line '             (it never touches this run''s .ipa); cleanup NEVER sleeps the Mac down'
     Out-Line '  15 power: DRIVER-owned, issued after retrieval + stage cleanup (never by this script)'
     Out-Line ''
     Out-Line '  Disk budget on the Mac (Apple Silicon, device-only):'

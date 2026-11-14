@@ -1,4 +1,4 @@
-// Service worker for the DSH Companion PWA (spec 020 requirement 4).
+// Service worker for the DSH Orbit PWA (spec 020 requirement 4).
 //
 // SCOPE, DELIBERATELY NARROW: this caches the app SHELL only — the HTML shell, the hashed
 // `_expo/static/**` bundles and the local icons/fonts they need — so a reload works offline and

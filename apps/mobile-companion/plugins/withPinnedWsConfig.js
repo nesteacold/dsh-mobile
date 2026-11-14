@@ -1,4 +1,4 @@
-// Config plugin for the DSH Companion app (A031).
+// Config plugin for the DSH Orbit app (A031).
 //
 // What it guarantees for `npx expo prebuild` (both platforms), derived from `app.json`:
 //
@@ -78,14 +78,14 @@ const NETWORK_SECURITY_CONFIG_XML = `<?xml version="1.0" encoding="utf-8"?>
 const DEFAULT_PERMISSION_STRINGS = {
   en: {
     NSCameraUsageDescription:
-      'Allow DSH Companion to scan the pairing QR code shown on your computer.',
+      'Allow DSH Orbit to scan the pairing QR code shown on your computer.',
     NSFaceIDUsageDescription:
-      'Allow DSH Companion to unlock with Face ID so your paired credential stays protected.',
+      'Allow DSH Orbit to unlock with Face ID so your paired credential stays protected.',
   },
   vi: {
-    NSCameraUsageDescription: 'DSH Companion dùng camera chỉ để quét mã QR ghép đôi hiển thị trên máy tính của bạn.',
+    NSCameraUsageDescription: 'DSH Orbit dùng camera chỉ để quét mã QR ghép đôi hiển thị trên máy tính của bạn.',
     NSFaceIDUsageDescription:
-      'DSH Companion dùng Face ID để mở khoá, giúp thông tin ghép đôi trên máy được bảo vệ.',
+      'DSH Orbit dùng Face ID để mở khoá, giúp thông tin ghép đôi trên máy được bảo vệ.',
   },
 };
 

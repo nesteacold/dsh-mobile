@@ -9,9 +9,10 @@ credential in this repo.
 
 **Scope** — the scripts under [`../scripts/remote-ios-build/`](../scripts/remote-ios-build/):
 `Invoke-RemoteIosBuild.ps1` (Windows driver, PowerShell 5.1), `mac/ios-build.sh` (remote
-orchestrator), `mac/bootstrap-mac.sh` (one-time checks), `ios-build.conf.example` (config
-template), `test/dryrun.Tests.ps1` (contract test), `test/package.Tests.ps1` (FR-007 source
-package regression test).
+orchestrator), `mac/cleanup-after-build.sh` (post-run disk reclaimer, §4.8),
+`mac/bootstrap-mac.sh` (one-time checks), `ios-build.conf.example` (config template),
+`test/dryrun.Tests.ps1` (contract test), `test/package.Tests.ps1` (FR-007 source package
+regression test).
 
 **Non-goals (explicitly out of bounds here)**
 
@@ -368,11 +369,12 @@ still deleted the volume, and the staged `.ipa` remains until the 3-day prune.
 
 ### 4.7 What this pipeline leaves on the Mac
 
-Exactly two things, both under `~/.dsh-ios-build/` and both safe to delete:
+Everything it leaves on the Mac, all under `~/.dsh-ios-build/` and all safe to delete:
 
 | Path | What | Lifetime |
 |---|---|---|
 | `~/.dsh-ios-build/ios-build.sh` | the staged orchestrator (~35 KB, mode 700) | overwritten by the next run; delete it any time |
+| `~/.dsh-ios-build/cleanup-after-build.sh` | the staged post-run reclaimer (§4.8, ~19 KB, mode 700) | overwritten by the next run; delete it any time |
 | `~/.dsh-ios-build/artifacts/<run-id>/` | this run's `.ipa` + `ExportOptions.plist` | deleted by the driver after a successful retrieval; the 3-day prune is the safety net |
 | `~/.dsh-ios-build/lock/` | single-flight marker | removed by the cleanup trap; recover by hand only when the holder pid is gone (§8) |
 
@@ -380,6 +382,63 @@ The APFS build volume is always deleted (that is exit 6 if it survives), `caffei
 by the cleanup trap, and nothing is installed: no daemon, no launchd agent, no EAS project.
 `bash ~/.dsh-ios-build/ios-build.sh --self-test` still works after a run if you want to inspect
 the Mac, and `rm -rf ~/.dsh-ios-build` returns the Mac to its pre-pipeline state.
+
+### 4.8 Reclaiming the disk a build leaves behind (cleanup-after-build.sh)
+
+The pipeline already deletes its own APFS volume, so **one run leaves nothing outside it**. What
+still grows on a Mac used for other Xcode/Flutter work is the tail *between* runs: stale stage
+dirs, `<Project>-<hash>` DerivedData folders, the 1 GB pod cache, npm/Gradle caches, simulator
+runtimes and device support. `mac/cleanup-after-build.sh` reclaims exactly the part this project is
+responsible for, and reports the rest.
+
+**It is a dry run unless you pass `--apply`.** Running it with no flags prints what it would
+remove and how much, and changes nothing:
+
+```bash
+# on the Mac (or over ssh), staged copy from the last driver run:
+bash ~/.dsh-ios-build/cleanup-after-build.sh              # dry run
+bash ~/.dsh-ios-build/cleanup-after-build.sh --apply      # delete what it listed
+```
+
+| Flag | Effect |
+|---|---|
+| `--apply` | delete (default: print only) |
+| `--auto` | what the driver's own run calls: stale stage dirs + this project's DerivedData, nothing else |
+| `--keep-run-id=<id>` | never touch `~/.dsh-ios-build/artifacts/<id>` (this run's `.ipa`) |
+| `--min-age-hours=<n>` | skip stage runs / device support newer than n hours (default 24) |
+| `--derived-data-name=<x>` | project name to match in DerivedData (default `DSHCompanion`; a folder also matches when its `info.plist` `WorkspacePath` is under this app, so renaming the Expo app cannot make the match miss) |
+| `--all-derived-data` | every DerivedData folder, not just this project's (wide, opt-in) |
+| `--pod-cache` / `--npm-cache` | `pod cache clean --all` / `npm cache clean --force` |
+| `--device-support` | iOS DeviceSupport symbol folders (rebuilt on the next device connection) |
+| `--archives` | `.xcarchive` bundles — **signed builds may be needed** for upload/symbolication |
+| `--volumes` | leftover APFS volumes named `DSHIosBuild` (outside `$HOME`; needs `--apply` too) |
+| `--simulator-catalog-cache` | print the root-only command to drop the CoreSimulator dyld catalog |
+
+**Wired into the driver.** `Invoke-RemoteIosBuild.ps1` stages the helper next to the orchestrator
+(sha256-verified, same as `ios-build.sh`), and `ios-build.sh`'s cleanup trap calls it with
+`--auto --apply --keep-run-id=<run>` **after** the volume is deleted, the lock released and the
+disk assertion made. Consequences worth knowing:
+
+- it runs on **both** success and failure paths (it is in the same trap), which is the point: a
+  failed build is the one that leaves the most behind;
+- it **cannot change the build's exit code** — a failure is a `WARN cleanup:` line, never exit 6;
+- it never removes this run's `.ipa`: `--keep-run-id` protects the staged artifact until the
+  driver has scp'd it;
+- in `--auto` mode it only touches `$HOME` paths this project creates;
+- nothing written within `--min-age-hours` (24 h) is touched, in **either** mode — a DerivedData
+  folder from a build running in the Xcode GUI right now stays put.
+
+**Hard limits.** It refuses to run as root or with an empty/`/` `$HOME`; every path is asserted to
+be inside `$HOME` before it is planned *and* again before it is deleted; it never touches
+`/Users/<other>`, Archives, Downloads, Documents, keychains, or anything outside `$HOME` unless the
+matching explicit flag is given. Simulator deletion (`xcrun simctl delete unavailable`) happens in
+`--apply` mode only.
+
+Measured on the owner's Mac, 2026-11-14 (Xcode 26.0.1, `bash 3.2.57`): the default dry run found
+nothing to reclaim from this project (no stale stage dirs, no DerivedData of this app, no orphan
+volumes, no unavailable simulators) while `--all-derived-data --pod-cache --npm-cache
+--device-support --archives --volumes` offered ~1.8 GB — i.e. the pipeline itself was clean and the
+growth came from the other tooling on that disk.
 
 ## 5. Phases
 

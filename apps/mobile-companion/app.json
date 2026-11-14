@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "DSH Companion",
+    "name": "DSH Orbit",
     "slug": "dsh-mobile",
     "version": "0.1.0",
     "orientation": "portrait",
@@ -10,8 +10,8 @@
       "bundleIdentifier": "com.dshext.companion",
       "supportsTablet": false,
       "infoPlist": {
-        "NSCameraUsageDescription": "DSH Companion uses the camera only to scan the pairing QR code shown on your computer.",
-        "NSFaceIDUsageDescription": "DSH Companion uses Face ID to unlock so your paired credential stays protected.",
+        "NSCameraUsageDescription": "DSH Orbit uses the camera only to scan the pairing QR code shown on your computer.",
+        "NSFaceIDUsageDescription": "DSH Orbit uses Face ID to unlock so your paired credential stays protected.",
         "CFBundleDevelopmentRegion": "vi",
         "CFBundleLocalizations": [
           "vi",
@@ -45,13 +45,13 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "Allow DSH Companion to scan the pairing QR code shown on your computer."
+          "cameraPermission": "Allow DSH Orbit to scan the pairing QR code shown on your computer."
         }
       ],
       [
         "expo-local-authentication",
         {
-          "faceIDPermission": "Allow DSH Companion to unlock with Face ID so your paired credential stays protected."
+          "faceIDPermission": "Allow DSH Orbit to unlock with Face ID so your paired credential stays protected."
         }
       ],
       "expo-secure-store",

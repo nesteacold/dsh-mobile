@@ -361,7 +361,11 @@ export type MessageKey =
   | 'privacy.p3'
   | 'privacy.p4'
   | 'privacy.p5'
-  | 'privacy.p6';
+  | 'privacy.p6'
+  | 'privacy.p7'
+  | 'privacy.p8'
+  | 'privacy.p9'
+  | 'privacy.p10';
 
 type MessageFunction = (params: Record<string, string | number>) => string;
 export type Messages = Record<MessageKey, string | MessageFunction>;
@@ -383,9 +387,9 @@ export type Interpolate = (key: MessageKey, params?: Record<string, string | num
 // ---------------------------------------------------------------------------
 
 const en = {
-  'unlock.title': 'DSH Companion',
+  'unlock.title': 'DSH Orbit',
   'unlock.subtitle': 'Unlock to reach your paired computer.',
-  'unlock.prompt': 'Unlock DSH Companion',
+  'unlock.prompt': 'Unlock DSH Orbit',
   'unlock.button': 'Unlock',
   'unlock.cancelled': 'Unlock cancelled. Your credential stays locked.',
   'unlock.failed': 'Could not verify you. Try again.',
@@ -518,7 +522,7 @@ const en = {
   'pair.error.expired': 'This pairing code expired or was already used. Show a new one on your computer.',
   'pair.error.rejected': 'Your computer refused this pairing. Check the approval prompt on your computer and try again with a new code.',
   'pair.error.timeout': 'The approval window ran out before the pairing finished. Show a new code on your computer and try again.',
-  'pair.error.otpUnsupported': 'This computer asks for a one-time code, which this app version cannot enter. Update DSH Companion, or pair with the QR code instead.',
+  'pair.error.otpUnsupported': 'This computer asks for a one-time code, which this app version cannot enter. Update DSH Orbit, or pair with the QR code instead.',
   'pair.error.otpRequired': 'This computer is waiting for its 8-digit pairing code. Generate one on your computer and type it here.',
   'pair.error.otpBadLength': 'The pairing code is 8 digits. Check it on your computer and type it again.',
   'pair.error.badAddress': 'Type your computer’s address, for example 192.168.1.20:3081.',
@@ -530,7 +534,7 @@ const en = {
   'pair.error.hostConflict': 'This phone already has a different computer saved under that identity, so the pairing was refused. Forget that computer first if it really was replaced.',
   'pair.error.notReady': 'Pairing is not ready yet. Wait a moment, then tap pair again.',
   'pair.error.unavailable': 'Could not reach that computer. Check you are on the same network and the gateway is running.',
-  'pair.error.appUpdate': 'Your computer needs a newer DSH Companion. Update the app.',
+  'pair.error.appUpdate': 'Your computer needs a newer DSH Orbit. Update the app.',
   'pair.error.hostUpdate': 'Your computer runs an older protocol. Update DSH on the desktop.',
   'pair.error.generic': 'Pairing failed. Show a new code and try again.',
   'session.loading': 'Loading conversation…',
@@ -687,7 +691,7 @@ const en = {
     'This phone could not finish deleting the stored credential. This device stays unpaired and the credential will not be used — restart the app and forget the computer again.',
   'banner.pinnedTransportMissing':
     'This build has no pinned TLS transport (Expo Go / web). Install a dev build to connect; the app will not fall back to an unpinned socket.',
-  'update.appTitle': 'Update DSH Companion',
+  'update.appTitle': 'Update DSH Orbit',
   'update.appBody': 'Your computer needs a newer version of this app. Install the new build, then tap Retry.',
   'update.hostTitle': 'Update DSH on your computer',
   'update.hostBody': 'Your computer speaks an older protocol than this app. Update DSH on the desktop, then tap Retry.',
@@ -716,12 +720,16 @@ const en = {
   'storage.category.other': 'Other',
   'privacy.title': 'Privacy',
   'privacy.updated': 'Applies to this version of the app.',
-  'privacy.p1': 'DSH Companion talks only to a DeepSeek Harness computer that you pair yourself. There is no account, no sign-in and no vendor server, so there is nowhere else for your data to go.',
-  'privacy.p2': 'Everything that leaves this phone goes to that one computer, over the connection you set up. Session titles, messages and approvals travel between this phone and your own machine. Nobody else receives them.',
-  'privacy.p3': 'The pairing credential is kept in this device’s encrypted storage (Android Keystore). It is never written to a log, never put in a notification and never sent anywhere except to your computer.',
-  'privacy.p4': 'The app contains no analytics, no crash reporting and no advertising SDK. Nothing is collected about how you use it, and nothing is sold or shared.',
-  'privacy.p5': 'On this phone the app can store an optional debug log (only in builds that switch it on) and the cached files listed on the storage screen. You can delete both from Settings, and deleting them does not unpair the device.',
-  'privacy.p6': 'Pairing a computer, or revoking this device on the computer, adds or removes the credential. Notifications carry only short text and identifiers, never message bodies from other sessions.',
+  'privacy.p1': 'DSH Orbit talks only to a DeepSeek Harness computer that you pair yourself. There is no account and no sign-in. The app never sends anything to a server run by its developer, and it never runs Host code, Node, a terminal or your agent’s tools on this phone.',
+  'privacy.p2': 'Session content — titles, messages, prompts you send and approvals — plus the pairing credential and the install-scoped device id go to the one computer you paired, over the connection you set up. The optional exception is browser notifications on the web build (next paragraphs). Nothing is sent to a server run by the app’s developer.',
+  'privacy.p3': 'The pairing credential and the install-scoped device id are kept in the platform’s encrypted store (Android Keystore-backed, iOS Keychain; on iOS read-only while the device is unlocked). The unlock step protects how the credential is used: native connections only open after biometrics or your device passcode succeed, while the non-secret device id may be read at app startup. On iOS the Keychain entry can outlive an uninstall; on Android uninstalling removes it. They are never written to a log, never put in a notification and never sent anywhere except to your computer.',
+  'privacy.p4': 'This app contains no analytics, no crash reporting and no advertising SDK. Nothing is collected about how you use it, and nothing is sold or shared.',
+  'privacy.p5': 'On this phone the app can store an optional debug log and the files listed on the storage screen. You can delete both from Settings, and deleting them does not unpair the device.',
+  'privacy.p6': 'Revoking this device on your computer withdraws the authorization and removes the stored subscription, so the computer produces no further sends; the app then wipes the credential it holds. Forget this computer removes the Host record locally and then tries to delete the credential under the same key, and it reports a cleanup failure if that does not complete. Notifications on the phone are raised by the app and carry a short fixed line, the tool name and identifiers — never approval arguments, tool inputs or message bodies.',
+  'privacy.p7': 'The web build is weaker than the phone apps: a browser cannot pin the computer’s certificate, so the app only connects with wss:// to a *.ts.net (Tailscale) address and the browser’s own TLS checks validate the certificate; the pinned fingerprint is ignored. On web the credential is encrypted in the browser’s IndexedDB with a key stored in the same database, the paired-computer list is stored as plain data and the device id in localStorage; clearing site data is the guaranteed way to remove them.',
+  'privacy.p8': 'On the web build, if you turn notifications on, your computer sends an ENCRYPTED message containing only { v, kind, sessionId, requestId? } to your browser’s push service (a service run by Google, Apple, Mozilla, Microsoft or your browser vendor), which sees delivery metadata such as your computer’s push identity, the endpoint and the time, under its own policy. Turning notifications off asks your computer to forget the subscription and then tries to drop the browser subscription, and either step can fail. Revoking the device on your computer stops future sends; delivery a push service already queued can still arrive.',
+  'privacy.p9': 'The app is built with Expo’s cloud tooling and, if a store build is made, distributed through Apple’s App Store or Google Play; those providers apply their own policies to build and store diagnostics. In the app, use Settings → Storage to delete local files and the Forget or revoke actions to remove the pairing.',
+  'privacy.p10': 'Policy version 2, 2026-11-14. Questions or requests: developer@sunjin.vn.',
 } satisfies Messages;
 
 // ---------------------------------------------------------------------------
@@ -729,9 +737,9 @@ const en = {
 // ---------------------------------------------------------------------------
 
 const vi = {
-  'unlock.title': 'DSH Companion',
+  'unlock.title': 'DSH Orbit',
   'unlock.subtitle': 'Mở khoá để kết nối máy tính đã ghép đôi.',
-  'unlock.prompt': 'Mở khoá DSH Companion',
+  'unlock.prompt': 'Mở khoá DSH Orbit',
   'unlock.button': 'Mở khoá',
   'unlock.cancelled': 'Đã huỷ mở khoá. Thông tin đăng nhập vẫn được giữ kín.',
   'unlock.failed': 'Không xác minh được. Vui lòng thử lại.',
@@ -859,7 +867,7 @@ const vi = {
   'pair.error.expired': 'Mã ghép đôi đã hết hạn hoặc đã dùng. Hãy hiển thị mã mới trên máy tính.',
   'pair.error.rejected': 'Máy tính đã từ chối lần ghép đôi này. Hãy kiểm tra hộp thoại phê duyệt trên máy tính rồi thử lại bằng mã mới.',
   'pair.error.timeout': 'Hết thời gian chờ phê duyệt trước khi ghép đôi xong. Hãy hiển thị mã mới trên máy tính và thử lại.',
-  'pair.error.otpUnsupported': 'Máy tính yêu cầu mã dùng một lần, phiên bản ứng dụng này chưa nhập được. Hãy cập nhật DSH Companion, hoặc ghép đôi bằng mã QR.',
+  'pair.error.otpUnsupported': 'Máy tính yêu cầu mã dùng một lần, phiên bản ứng dụng này chưa nhập được. Hãy cập nhật DSH Orbit, hoặc ghép đôi bằng mã QR.',
   'pair.error.otpRequired': 'Máy tính đang chờ mã ghép đôi 8 số. Hãy tạo mã trên máy tính rồi nhập vào đây.',
   'pair.error.otpBadLength': 'Mã ghép đôi gồm 8 chữ số. Hãy kiểm tra lại trên máy tính và nhập lại.',
   'pair.error.badAddress': 'Hãy nhập địa chỉ máy tính, ví dụ 192.168.1.20:3081.',
@@ -871,7 +879,7 @@ const vi = {
   'pair.error.hostConflict': 'Điện thoại đã lưu một máy tính khác dưới cùng danh tính đó, nên lần ghép đôi này bị từ chối. Nếu máy tính thật sự đã được thay, hãy xoá máy tính cũ trước.',
   'pair.error.notReady': 'Ứng dụng vẫn đang khởi động. Hãy đợi một chút rồi nhấn ghép đôi lại.',
   'pair.error.unavailable': 'Không kết nối được máy tính. Kiểm tra cùng mạng và gateway đang chạy.',
-  'pair.error.appUpdate': 'Máy tính cần bản DSH Companion mới hơn. Hãy cập nhật ứng dụng.',
+  'pair.error.appUpdate': 'Máy tính cần bản DSH Orbit mới hơn. Hãy cập nhật ứng dụng.',
   'pair.error.hostUpdate': 'Máy tính dùng giao thức cũ hơn. Hãy cập nhật DSH trên máy tính.',
   'pair.error.generic': 'Ghép đôi thất bại. Hãy hiển thị mã mới và thử lại.',
   'session.loading': 'Đang tải hội thoại…',
@@ -1025,7 +1033,7 @@ const vi = {
     'Điện thoại chưa xoá xong thông tin đăng nhập đã lưu. Thiết bị này vẫn ở trạng thái chưa ghép đôi và thông tin đó sẽ không được dùng — hãy khởi động lại ứng dụng và xoá máy tính một lần nữa.',
   'banner.pinnedTransportMissing':
     'Bản này không có kênh TLS ghim chứng chỉ (Expo Go / web). Hãy cài bản dev build để kết nối; ứng dụng không bao giờ chuyển sang kết nối không ghim.',
-  'update.appTitle': 'Cập nhật DSH Companion',
+  'update.appTitle': 'Cập nhật DSH Orbit',
   'update.appBody': 'Máy tính cần bản ứng dụng mới hơn. Hãy cài bản mới rồi nhấn Thử lại.',
   'update.hostTitle': 'Cập nhật DSH trên máy tính',
   'update.hostBody': 'Máy tính dùng giao thức cũ hơn ứng dụng này. Hãy cập nhật DSH trên máy tính rồi nhấn Thử lại.',
@@ -1054,12 +1062,16 @@ const vi = {
   'storage.category.other': 'Khác',
   'privacy.title': 'Quyền riêng tư',
   'privacy.updated': 'Áp dụng cho phiên bản ứng dụng này.',
-  'privacy.p1': 'DSH Companion chỉ kết nối tới máy tính DeepSeek Harness do chính bạn ghép đôi. Không có tài khoản, không có đăng nhập, không có máy chủ của nhà phát triển, nên dữ liệu của bạn không có chỗ nào khác để đi.',
-  'privacy.p2': 'Mọi thứ rời khỏi điện thoại đều đi tới đúng máy tính đó, qua kết nối do bạn thiết lập. Tiêu đề phiên, tin nhắn và yêu cầu phê duyệt chỉ đi giữa điện thoại và máy của bạn. Không ai khác nhận được.',
-  'privacy.p3': 'Thông tin ghép đôi được lưu trong vùng mã hoá của thiết bị (Android Keystore). Nó không bao giờ bị ghi vào nhật ký, không đưa vào thông báo và không gửi đi đâu ngoài máy tính của bạn.',
-  'privacy.p4': 'Ứng dụng không có phân tích hành vi, không có báo cáo sự cố, không có SDK quảng cáo. Không thu thập gì về cách bạn dùng app, không bán và không chia sẻ cho bên thứ ba.',
-  'privacy.p5': 'Trên máy này ứng dụng có thể lưu một tệp nhật ký gỡ lỗi (chỉ bản build bật tính năng đó) và các tệp đệm liệt kê ở màn Bộ nhớ đệm. Bạn xoá được cả hai trong Cài đặt, và xoá không làm mất ghép đôi.',
-  'privacy.p6': 'Ghép đôi máy tính, hoặc thu hồi thiết bị này trên máy tính, sẽ thêm hoặc xoá thông tin truy cập. Thông báo chỉ mang văn bản ngắn và mã định danh, không mang nội dung tin nhắn của phiên khác.',
+  'privacy.p1': 'DSH Orbit chỉ kết nối tới máy tính DeepSeek Harness do chính bạn ghép đôi. Không có tài khoản và không có đăng nhập. Ứng dụng không bao giờ gửi gì tới máy chủ do nhà phát triển tự dựng, và không chạy mã của Host, Node, terminal hay công cụ của agent trên điện thoại này.',
+  'privacy.p2': 'Nội dung phiên — tiêu đề, tin nhắn, câu lệnh bạn gửi và phê duyệt — cùng thông tin ghép đôi và mã thiết bị theo lần cài đặt chỉ đi tới đúng máy tính bạn đã ghép, qua kết nối do bạn thiết lập. Ngoại lệ tuỳ chọn là thông báo trên trình duyệt ở bản web (các đoạn sau). Không có gì được gửi tới máy chủ do nhà phát triển ứng dụng tự dựng.',
+  'privacy.p3': 'Thông tin ghép đôi và mã thiết bị theo lần cài đặt được lưu trong vùng mã hoá của nền tảng (nền Keystore trên Android, Keychain trên iOS; trên iOS chỉ đọc được khi thiết bị đã mở khoá). Bước mở khoá bảo vệ cách thông tin truy cập được dùng: kết nối native chỉ mở sau khi sinh trắc học hoặc mật mã thiết bị thành công, còn mã thiết bị (không phải bí mật) có thể được đọc lúc ứng dụng khởi động. Trên iOS mục Keychain có thể tồn tại sau khi gỡ ứng dụng; trên Android gỡ ứng dụng là xoá. Chúng không bao giờ bị ghi vào nhật ký, không đưa vào thông báo và không gửi đi đâu ngoài máy tính của bạn.',
+  'privacy.p4': 'Ứng dụng này không có phân tích hành vi, không có báo cáo sự cố, không có SDK quảng cáo. Không thu thập gì về cách bạn dùng app, không bán và không chia sẻ cho bên thứ ba.',
+  'privacy.p5': 'Trên máy này ứng dụng có thể lưu một tệp nhật ký gỡ lỗi và các tệp liệt kê ở màn Bộ nhớ đệm. Bạn xoá được cả hai trong Cài đặt, và xoá không làm mất ghép đôi.',
+  'privacy.p6': 'Thu hồi thiết bị này trên máy tính sẽ gỡ quyền truy cập và xoá đăng ký đã lưu, nên máy tính không tạo thêm lần gửi nào; sau đó ứng dụng xoá thông tin truy cập đang giữ. Quên máy tính này xoá bản ghi Host tại máy rồi cố xoá thông tin truy cập theo đúng khoá đó, và báo lỗi dọn dẹp nếu không xoá xong. Thông báo được ứng dụng tạo trên điện thoại và chỉ mang một dòng cố định ngắn, tên công cụ và mã định danh — không mang tham số phê duyệt, đầu vào công cụ hay nội dung tin nhắn.',
+  'privacy.p7': 'Bản web yếu hơn bản điện thoại: trình duyệt không thể ghim chứng chỉ của máy tính, nên ứng dụng chỉ kết nối wss:// tới địa chỉ *.ts.net (Tailscale) và chính trình duyệt kiểm tra TLS chứng chỉ; vân tay đã ghim bị bỏ qua. Trên web, thông tin truy cập được mã hoá trong IndexedDB với khoá nằm cùng cơ sở dữ liệu, danh sách máy tính đã ghép lưu dạng dữ liệu thường và mã thiết bị trong localStorage; xoá dữ liệu trang là cách xoá chắc chắn.',
+  'privacy.p8': 'Trên bản web, nếu bạn bật thông báo, máy tính của bạn gửi một thông điệp ĐÃ MÃ HOÁ chỉ chứa { v, kind, sessionId, requestId? } tới dịch vụ đẩy của trình duyệt (dịch vụ do Google, Apple, Mozilla, Microsoft hoặc hãng trình duyệt bạn dùng vận hành); dịch vụ đó thấy siêu dữ liệu giao nhận như danh tính đẩy của máy tính, endpoint và thời điểm, theo chính sách của chính họ. Tắt thông báo sẽ báo máy tính quên đăng ký rồi cố huỷ đăng ký trong trình duyệt, và bước nào cũng có thể thất bại. Thu hồi thiết bị trên máy tính chặn các lần gửi về sau; thông báo dịch vụ đẩy đã xếp hàng vẫn có thể tới.',
+  'privacy.p9': 'Ứng dụng được build bằng công cụ đám mây của Expo và, nếu có bản build cho cửa hàng, phát hành qua App Store của Apple hoặc Google Play; các nhà cung cấp đó áp dụng chính sách của họ cho chẩn đoán build và cửa hàng. Trong ứng dụng, dùng Cài đặt → Bộ nhớ đệm để xoá tệp cục bộ và các thao tác Quên hoặc thu hồi để xoá ghép đôi.',
+  'privacy.p10': 'Phiên bản chính sách 2, 14-11-2026. Câu hỏi hoặc yêu cầu: developer@sunjin.vn.',
 } satisfies Messages;
 
 const TABLES: Record<Locale, Messages> = { en, vi };

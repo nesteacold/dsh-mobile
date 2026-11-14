@@ -21,7 +21,7 @@ appId: com.dshext.companion
       # Denied so the pair screen never mounts a live camera preview (deterministic screens).
       camera: deny
 
-- assertVisible: "DSH Companion"
+- assertVisible: "DSH Orbit"
 
 - runFlow: subflows/unlock.yaml
 

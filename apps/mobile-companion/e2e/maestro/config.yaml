@@ -1,4 +1,4 @@
-# Maestro workspace for the DSH Companion device-validation flows (A040 / A041).
+# Maestro workspace for the DSH Orbit device-validation flows (A040 / A041).
 #
 # Run everything (Android emulator with a dev build installed):
 #   maestro test e2e/maestro --env PAIR_QR=<paste-code>

@@ -43,7 +43,7 @@ import {
 
 /** Shown when the build has no native module (Expo Go, web): there is no safe fallback. */
 export const PINNED_TRANSPORT_MESSAGE =
-  'The pinned TLS transport is not in this build (Expo Go or web). Use a dev build to connect — DSH Companion will not fall back to an unpinned socket.';
+  'The pinned TLS transport is not in this build (Expo Go or web). Use a dev build to connect — DSH Orbit will not fall back to an unpinned socket.';
 
 /** Error codes the native module may report; anything else is treated as a generic failure. */
 const NATIVE_ERROR_CODES: ReadonlySet<string> = new Set<string>([

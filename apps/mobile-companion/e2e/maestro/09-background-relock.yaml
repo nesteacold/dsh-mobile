@@ -13,7 +13,7 @@
 #        no hook (one button, `unlock.button`), so it stays text-matched.
 #
 # EXIT CRITERIA:
-#   1. after backgrounding, the app is locked again (no session row hook, `DSH Companion` visible);
+#   1. after backgrounding, the app is locked again (no session row hook, `DSH Orbit` visible);
 #   2. re-unlock returns to the session list (the row hook is back);
 #   3. `GET /state` shows `openConnections === 1` and `peakOpenConnections <= 2` for the whole run
 #      (orchestrator assertion): the old socket was closed before the new one was opened.
@@ -31,7 +31,7 @@ appId: com.dshext.companion
     stopApp: false
 
 # The gate is back: the credential is no longer usable until re-authentication.
-- assertVisible: "DSH Companion"
+- assertVisible: "DSH Orbit"
 - assertNotVisible:
     id: "session-row-sess-alpha"
 - assertVisible: "^Unlock$|^Mở khoá$"

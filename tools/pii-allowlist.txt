@@ -65,3 +65,7 @@ tsnet:n.ts.net
 tsnet:n.t.ts.net
 tailscale_ip:100.64.0.2
 email:p@x.example
+# Store/legal contact the owner authorised for the DSH Orbit privacy policy (2026-11-14): a
+# public mailbox, not personal information. It appears only in the in-app privacy strings
+# (i18n/index.ts) and the two policy drafts (apps/mobile-companion/docs/privacy-policy-*.md).
+email:developer@sunjin.vn

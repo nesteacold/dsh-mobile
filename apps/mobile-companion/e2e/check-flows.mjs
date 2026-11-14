@@ -45,12 +45,12 @@ const VI_CHARS = /[ăâđêôơưàáảãạằắẳẵặầấẩẫậèé�
 
 /**
  * Strings that legitimately have no `vi` alternative:
- *   * brand names — identical in both message tables (`unlock.title` is "DSH Companion" in vi too);
+ *   * brand names — identical in both message tables (`unlock.title` is "DSH Orbit" in vi too);
  *   * fixture/user data — a session title, a history line or a prompt is whatever the host sent,
  *     not app copy, so localising it would be wrong.
  */
 const LOCALE_INDEPENDENT = [
-  'DSH Companion',
+  'DSH Orbit',
   // fixture session titles (e2e/harness/gateway.mjs BASE_SESSIONS)
   'Refactor gateway TLS',
   'Release notes draft',

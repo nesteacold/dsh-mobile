@@ -371,7 +371,7 @@ export function classifyProtocolUnsupported(
       code: 'protocol/unsupported',
       ...(hostCompanionProtocol === undefined ? {} : { hostCompanionProtocol }),
       ...(minClientVersion === undefined ? {} : { minClientVersion }),
-      message: 'This host needs a newer version of DSH Companion. Update the app.',
+      message: 'This host needs a newer version of DSH Orbit. Update the app.',
     };
   }
   return {

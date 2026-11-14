@@ -20,7 +20,7 @@
 
 appId: com.dshext.companion
 ---
-- assertVisible: "DSH Companion"
+- assertVisible: "DSH Orbit"
 
 # If the gate is showing its own retry button, the automatic attempt was cancelled / failed.
 - runFlow:

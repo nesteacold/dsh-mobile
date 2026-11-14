@@ -1,7 +1,7 @@
 # 14 — protocol mismatch is a terminal, actionable state (FR-004, N7/A050).
 #
 # `classifyProtocolUnsupported` (src/core/client.ts) splits the mismatch by *which side is older*:
-#   minClientVersion > COMPANION_PROTOCOL_VERSION  → side 'app'  → "Update DSH Companion"
+#   minClientVersion > COMPANION_PROTOCOL_VERSION  → side 'app'  → "Update DSH Orbit"
 #   otherwise (host speaks an older protocol)      → side 'host' → "Update DSH on your computer"
 # The app decides this from `hello` and **never sends `client-hello`** in the 'app' case, so the
 # orchestrator asserts `clientHellos === 0` there: proving the handshake stopped, not that some
@@ -37,7 +37,7 @@ env:
       true: ${EXPECTED_UPDATE_SIDE == "app"}
     commands:
       - extendedWaitUntil:
-          visible: ".*(Update DSH Companion|Cập nhật DSH Companion).*"
+          visible: ".*(Update DSH Orbit|Cập nhật DSH Orbit).*"
           timeout: 30000
       - assertVisible: ".*(Your computer needs a newer version of this app|Máy tính cần bản ứng dụng mới hơn).*"
       - assertVisible: ".*(Protocol version 2|Phiên bản giao thức 2).*"

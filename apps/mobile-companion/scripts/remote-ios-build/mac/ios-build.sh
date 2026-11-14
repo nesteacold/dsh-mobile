@@ -555,6 +555,35 @@ prune_staging() {
     log "cleanup: pruned staged runs older than 3 days under $STAGE_ROOT/artifacts"
 }
 
+# Reclaim the build output this run's siblings leave under the build user's $HOME. The volume is
+# already deleted (that is where 11 GB of DerivedData went), so what is left is the small,
+# regenerable tail the owner kept paying for between builds: stale stage dirs, and this app's
+# DerivedData from an earlier run (measured 2026-11-14: 1.7 GB of DerivedData in one week, none of
+# it tracked by the drift assertion below, because it accumulates *between* runs rather than
+# during one). The helper is dry-run by default; --apply here is scoped by its own --auto mode,
+# which refuses to touch anything this project did not create and skips anything written within
+# --min-age-hours (so a GUI Xcode build on the same Mac is never eaten). It is best effort: a
+# cleanup helper must never change the build's exit code, and the 3-day prune above stays the
+# safety net if it fails.
+run_home_cleanup() {
+    local helper="$STAGE_ROOT/cleanup-after-build.sh" out rc=0 keep=''
+    if [ ! -f "$helper" ]; then
+        log "cleanup: no home helper staged at $helper (nothing extra to reclaim)"
+        return 0
+    fi
+    # This run's .ipa must outlive the transfer: the driver scp's it after this script exits.
+    if [ -n "${RUN_ID:-}" ]; then
+        keep="--keep-run-id=$RUN_ID"
+    fi
+    # shellcheck disable=SC2086 # $keep is deliberately unquoted: it may be absent.
+    out=$(/bin/bash "$helper" --auto --apply $keep 2>&1) || rc=$?
+    printf '%s\n' "$out" | redact_stream
+    if [ "$rc" -ne 0 ]; then
+        log "WARN cleanup: the home cleanup reported a failure (exit $rc); the build result is unchanged"
+    fi
+    return 0
+}
+
 create_volume() {
     local i existing orphan dev
     # From here on the volume name is ours to assert on in cleanup.
@@ -1293,6 +1322,7 @@ cleanup() {
     fi
 
     prune_staging
+    run_home_cleanup
 
     emit_result "$rc"
     # Power-down is DRIVER-OWNED (FR-016): the driver still has to scp the artifact and

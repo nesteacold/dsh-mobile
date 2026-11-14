@@ -2,7 +2,7 @@
   "name": "@dsh-ext/mobile-companion",
   "version": "0.1.0",
   "private": true,
-  "description": "DSH Companion — phone-side controller for a DSH Host (pairs, watches sessions, answers approvals).",
+  "description": "DSH Orbit — phone-side controller for a DSH Host (pairs, watches sessions, answers approvals).",
   "license": "MIT",
   "engines": {
     "node": ">=24.9"

@@ -5,6 +5,12 @@
 // no analytics/telemetry SDK, it stores the pairing token in the device's encrypted store, and its only
 // local files are the opt-in debug trace and any cached data the storage screen lists.
 //
+// The NATIVE text and the WEB build differ in what protects the stored credential and how the
+// connection is trusted, so the statements are separated per platform rather than merged
+// (`privacy.p7` web store + `.ts.net` CA trust, `privacy.p8` web push metadata, `.p3` Keychain
+// reinstall behaviour). The full policy (EN/VI) lives in `docs/privacy-policy-en.md` /
+// `docs/privacy-policy-vi.md`; this screen is the in-app notice and must not claim more than it.
+//
 // Keep it true: if a dependency ever adds analytics, this page must change in the same commit.
 
 import { Pressable, StyleSheet, Text, View } from 'react-native';
@@ -14,7 +20,7 @@ import { useApp } from './_layout';
 import { Card, Screen } from '../src/ui/components/ui';
 import { space, useTheme } from '../src/ui/theme';
 
-/** One paragraph of the policy, in reading order. */
+/** One paragraph of the policy, in reading order (`.p10` is the version + contact line). */
 const PARAGRAPHS = [
   'privacy.p1',
   'privacy.p2',
@@ -22,6 +28,10 @@ const PARAGRAPHS = [
   'privacy.p4',
   'privacy.p5',
   'privacy.p6',
+  'privacy.p7',
+  'privacy.p8',
+  'privacy.p9',
+  'privacy.p10',
 ] as const;
 
 export default function PrivacyScreen() {
