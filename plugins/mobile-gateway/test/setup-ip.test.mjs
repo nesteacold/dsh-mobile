@@ -69,9 +69,17 @@ assert.equal(helperSyntax.status, 0, helperSyntax.stderr)
 const binPath = fileURLToPath(new URL('../bin/setup-ip.mjs', import.meta.url))
 const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-gateway-bin-'))
 const linkedBin = path.join(temporaryDirectory, 'dsh-plugin-mobile-gateway')
-fs.symlinkSync(binPath, linkedBin)
-assert.equal(isMainModule(linkedBin), true)
-const linkedInvocation = spawnSync(process.execPath, [linkedBin, '--help'], { encoding: 'utf8' })
+let symlinked = true
+try {
+  fs.symlinkSync(binPath, linkedBin)
+} catch (error) {
+  if (error?.code !== 'EPERM') throw error
+  symlinked = false
+  console.log('SKIP: symlink creation not permitted here (EPERM); skipping isMainModule(symlink) check, invoking bin directly')
+}
+if (symlinked) assert.equal(isMainModule(linkedBin), true)
+const invokedBin = symlinked ? linkedBin : binPath
+const linkedInvocation = spawnSync(process.execPath, [invokedBin, '--help'], { encoding: 'utf8' })
 assert.equal(linkedInvocation.status, 0, linkedInvocation.stderr)
 assert.match(linkedInvocation.stdout, /@dsh-ext\/mobile-gateway setup/)
 
@@ -84,7 +92,7 @@ assert.equal(PUBLIC_SETUP_DISABLED, true)
 assert.equal('bin' in packageManifest, false, 'package.json must not declare the removed setup executable as a bin')
 assert.match(linkedInvocation.stdout, /DISABLED in this release \(FR-011\/R9\)/)
 for (const command of ['setup', 'init', 'setup-helper', 'remove-helper', 'status', 'remove']) {
-  const invocation = spawnSync(process.execPath, [linkedBin, command], { encoding: 'utf8' })
+  const invocation = spawnSync(process.execPath, [invokedBin, command], { encoding: 'utf8' })
   assert.equal(invocation.status, 1, `${command} must exit non-zero`)
   assert.equal(invocation.stdout, '', `${command} must not print setup output`)
   assert.match(invocation.stderr, /disabled in this release \(FR-011\/R9\)/, command)

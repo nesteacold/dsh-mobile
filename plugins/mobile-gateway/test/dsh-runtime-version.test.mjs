@@ -5,7 +5,7 @@ import path from 'node:path'
 import { test } from 'node:test'
 import { resolveDshRuntimeVersion } from '../lib/dsh-runtime-version.mjs'
 
-test('报告宿主启动包实际版本，支持符号链接入口与版本升级', () => {
+test('报告宿主启动包实际版本，支持符号链接入口与版本升级', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-version-'))
   try {
     const entry = path.join(root, 'lib/bin.js')
@@ -16,9 +16,17 @@ test('报告宿主启动包实际版本，支持符号链接入口与版本升�
     const manifest = path.join(dir, 'package.json')
     const write = version => fs.writeFileSync(manifest, JSON.stringify({ name: '@deepseek-ai/dsh-app-boot', version }))
     const link = path.join(root, 'dsh')
-    fs.symlinkSync(entry, link)
+    let linked = true
+    try {
+      fs.symlinkSync(entry, link)
+    } catch (error) {
+      if (error?.code !== 'EPERM') throw error
+      linked = false
+      t.diagnostic('SKIP symlink-entry assertion: symlink creation not permitted here (EPERM)')
+    }
     write('0.2.1-rc.5')
-    assert.equal(resolveDshRuntimeVersion(link), '0.2.1-rc.5')
+    if (linked) assert.equal(resolveDshRuntimeVersion(link), '0.2.1-rc.5')
+    else assert.equal(resolveDshRuntimeVersion(entry), '0.2.1-rc.5')
     write('0.2.1-rc.6+build.1')
     assert.equal(resolveDshRuntimeVersion(entry), '0.2.1-rc.6+build.1')
     write('unknown')

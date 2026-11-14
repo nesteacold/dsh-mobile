@@ -152,7 +152,14 @@ fs.writeFileSync(path.join(fileDownloadDir, 'app-release.apk'), fileDownloadByte
 fs.writeFileSync(path.join(fileDownloadRoot, 'guide.pdf'), Buffer.from('%PDF-1.7\nmobile gateway\n'))
 fs.writeFileSync(path.join(fileDownloadRoot, '三亚 攻略.pdf'), Buffer.from('%PDF-1.7\nChinese name\n'))
 fs.writeFileSync(outsideFile, Buffer.from('outside workspace'))
-fs.symlinkSync(outsideFile, path.join(fileDownloadRoot, 'outside-link.bin'))
+let symlinkSupported = true
+try {
+  fs.symlinkSync(outsideFile, path.join(fileDownloadRoot, 'outside-link.bin'))
+} catch (error) {
+  if (error?.code !== 'EPERM') throw error
+  symlinkSupported = false
+  console.log('SKIP: symlink creation not permitted here (EPERM); skipping "file download rejects escaping symlink"')
+}
 
 const listeners = {}
 const presetSession = { agentPreset: 'standard', sessionListMetadata: { blank: true, lastPromptAt: null } }
@@ -1182,7 +1189,7 @@ function openCompanionSocket(extraHeaders = {}) {
     ['../outside.bin', 'bad-request'], [outsideFile, 'file-not-allowed'],
     ['outside-link.bin', 'file-not-allowed'], ['missing.pdf', 'file-not-found'],
     ['builds', 'file-not-regular'], ['', 'bad-request'], ['bad\0.pdf', 'bad-request'],
-  ]) {
+  ].filter(([inputPath]) => symlinkSupported || inputPath !== 'outside-link.bin')) {
     const requestId = `resolve-error-${expectedCode}-${inputPath}`
     ws.send(JSON.stringify(admin({ type: 'file-resolve', requestId, sessionId: 's1', path: inputPath })))
     assert.equal(await waitFor(() => got.some(frame => frame.requestId === requestId), 2000), true)
@@ -1226,9 +1233,11 @@ function openCompanionSocket(extraHeaders = {}) {
   const escapedPathReady = await waitFor(() => got.some((m) => m.kind === 'error' && m.requestType === 'file-download-open' && m.code === 'bad-request'), 2000)
   interactionResults.push(['file download rejects parent path', escapedPathReady])
 
-  ws.send(JSON.stringify(admin({ type: 'file-download-open', requestId: 'symlink-1', sessionId: 's1', path: 'outside-link.bin' })))
-  const symlinkPathReady = await waitFor(() => got.some((m) => m.kind === 'error' && m.requestType === 'file-download-open' && m.code === 'file-not-allowed'), 2000)
-  interactionResults.push(['file download rejects escaping symlink', symlinkPathReady])
+  if (symlinkSupported) {
+    ws.send(JSON.stringify(admin({ type: 'file-download-open', requestId: 'symlink-1', sessionId: 's1', path: 'outside-link.bin' })))
+    const symlinkPathReady = await waitFor(() => got.some((m) => m.kind === 'error' && m.requestType === 'file-download-open' && m.code === 'file-not-allowed'), 2000)
+    interactionResults.push(['file download rejects escaping symlink', symlinkPathReady])
+  }
 
   ws.send(JSON.stringify(admin({ type: 'question-cancel', rpcId: requestedTwo.rpcId, sessionId: 's2' })))
   const cancelReady = await waitFor(() => got.some((m) => m.kind === 'question-response' && m.rpcId === requestedTwo.rpcId), 2000)
