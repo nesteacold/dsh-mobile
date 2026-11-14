@@ -184,6 +184,12 @@ window.__ModuleLoader__.load({
         portBusyBody: 'Another program holds this port, or an outgoing connection already took the same port from the operating system dynamic range. That busy port is why the listener cannot bind.',
         // --- spec 008: the connection plan — bind the listener to one of this machine's own addresses ---
         planTitle: 'Connection plan',
+        // The select answers ONE question ("where does the gateway bind its socket"),
+        // because that is the only thing POST /mgw/listen can apply. How that bind is
+        // reached is a separate line below it, never an option.
+        planBindTitle: 'Gateway bind address',
+        planServeRoute: 'Reachable through a Tailscale serve front:',
+        planServeNote: 'The gateway itself is bound to',
         planHelp: 'Bind this machine\'s gateway to one of its own addresses. The Tailscale option uses this machine\'s tailnet address, so the devices on your tailnet can connect.',
         // The LAN option is the first private address the OS reports, in Node's
         // interface order — a VPN or virtual adapter can win over the physical LAN.
@@ -476,6 +482,9 @@ window.__ModuleLoader__.load({
         portBusyBody: 'Một chương trình khác đang giữ cổng này, hoặc một kết nối đi ra đã lấy đúng cổng đó từ dải động của hệ điều hành. Cổng bị chiếm là lý do listener không bind được.',
         // --- spec 008: kế hoạch kết nối — gắn listener vào một địa chỉ của chính máy này ---
         planTitle: 'Kế hoạch kết nối',
+        planBindTitle: 'Địa chỉ bind của gateway',
+        planServeRoute: 'Truy cập được qua lớp Tailscale serve:',
+        planServeNote: 'Gateway thực tế đang lắng nghe tại',
         planHelp: 'Gắn gateway của máy này vào một địa chỉ của chính nó. Tuỳ chọn Tailscale dùng địa chỉ tailnet của máy này, nên các thiết bị trong tailnet của bạn kết nối được.',
         planLanCaveat: 'LAN gắn vào địa chỉ riêng đầu tiên mà hệ điều hành báo cáo. Một adapter VPN hoặc mạng ảo có thể được chọn trước adapter LAN thật; nếu đó không phải địa chỉ bạn muốn, hãy dùng tuỳ chọn Tailscale hoặc đặt địa chỉ lắng nghe trong cấu hình gateway.',
         planBound: 'Đang lắng nghe tại',
@@ -1007,13 +1016,20 @@ window.__ModuleLoader__.load({
     // https://<pwa>/pair#a=<address>&c=<code>: the fragment never reaches a server.
     // `qr.address` is the address a phone can reach (behind `tailscale serve` the
     // listener's own loopback port is not), so it replaces the listener's list.
-    function OtpDialog({ offer, addresses, lanHost, onClose }) {
+    function OtpDialog({ offer, addresses, lanHost, onQr, onClose }) {
       useLang()
       const [qr, setQr] = React.useState(null)
       React.useEffect(() => {
         let live = true
         post('/devices/pair-qr', { otp: String(offer.otp), lanHost: lanHost || '', fallbackAddress: addresses[0] || '' })
-          .then((reply) => { if (live && reply && typeof reply.svg === 'string') setQr(reply) })
+          .then((reply) => {
+            if (!live || !reply) return
+            if (typeof reply.svg === 'string') setQr(reply)
+            // The Host's own served origin: handed up so the connection plan can state
+            // the route this machine is actually reached through (spec 029). It is the
+            // same `resolvePwaOrigin` answer the QR is built from.
+            if (onQr) onQr(reply)
+          })
           .catch(() => { /* the code and address still show; the QR is an extra */ })
         return () => { live = false }
       }, [offer.otp])
@@ -1337,6 +1353,37 @@ window.__ModuleLoader__.load({
       return isTailscaleHost(host, status.tailscale && status.tailscale.addresses) ? 'tailscale' : 'lan'
     }
 
+    // The route a loopback bind is REACHED through, when it is reached at all.
+    //
+    // `planOf` answers "where did the gateway bind its socket", and a loopback socket
+    // is `loopback` — even when the owner put `tailscale serve` (or another TLS
+    // front) in front of it so the tailnet and the phone app can reach this machine.
+    // The listen TARGET and the reachable ROUTE are two different facts, and the
+    // select must keep answering the first one (it is the only thing POST /mgw/listen
+    // can apply). So the serve route is reported beside it instead of being folded
+    // into the selection, and it is never a selectable option: /mgw/listen has no
+    // `serve` target, and an option that silently falls back would be a lie.
+    //
+    // Evidence only — never inferred from `tailscale.addresses`, which exist on any
+    // machine that joined a tailnet whether or not anything is served. The route is
+    // claimed only from the Host's own answer: `POST /devices/pair-qr` runs
+    // `resolvePwaOrigin` (configured `pwaUrl`, else the node's MagicDNS name on the
+    // serve port) and returns that origin as `pwaOrigin`, and that same function
+    // decides the reachable address. `null` therefore means "the Host reports no
+    // served origin", never "guess from the interface list".
+    const serveRouteOf = (qr, lan) => {
+      if (!qr || typeof qr.pwaOrigin !== 'string' || !qr.pwaOrigin) return null
+      if (qr.link === false) return null
+      const info = lan || {}
+      // A serve front only makes sense in front of a loopback socket that is up: a
+      // non-loopback bind is reached on its own address and needs no route line.
+      const host = typeof info.host === 'string' ? info.host : ''
+      if (!host || !isLoopbackHost(host)) return null
+      if (info.enabled === false || info.listening !== true) return null
+      const bind = listenerBind(info)
+      return { url: qr.pwaOrigin, subject: typeof qr.address === 'string' ? qr.address : '', bind }
+    }
+
     // POST /mgw/listen refuses with a machine-readable code AND an English sentence
     // (lib/index.mjs). On a page that is not in English the known reasons are named
     // in the Host language instead; anything else is shown verbatim, so a new reason
@@ -1355,7 +1402,7 @@ window.__ModuleLoader__.load({
     // The connection plan used to be static plugin config (`lanHost`), which meant
     // editing config and restarting to reach this machine over Tailscale. This is
     // the one write on the tab: POST /mgw/listen rebinds the live listener.
-    function ConnectionPlan({ status, onApplied }) {
+    function ConnectionPlan({ status, serveOrigin, onApplied }) {
       useLang()
       const [applying, setApplying] = React.useState('')
       const [error, setError] = React.useState('')
@@ -1374,6 +1421,16 @@ window.__ModuleLoader__.load({
       const bound = listenerBind(lan)
       const privateHost = boundHost && !isLoopbackHost(boundHost) &&
         !isTailscaleHost(boundHost, addresses)
+      // The reachable route, from the Host's own answer.
+      //
+      // `serveOrigin` is learned from `POST /devices/pair-qr`, the only route that runs
+      // `resolvePwaOrigin`, so it is the Host saying "this origin serves this gateway".
+      // It is NOT read on a poll: the existing tests pin that this block adds no
+      // request, and a POST every 3 s would also ask for a QR nobody shows. So the
+      // dialog's own reply is handed up when a code is generated, and with no such
+      // reply there is no evidence — hence no route line. `tailscale.addresses` alone
+      // never claim one: they only prove the machine joined a tailnet.
+      const plannedRoute = serveRouteOf(serveOrigin ? { pwaOrigin: serveOrigin, link: true } : null, lan)
       const choose = async (target) => {
         if (inFlight.current || !plan || !target) return
         inFlight.current = true
@@ -1392,12 +1449,17 @@ window.__ModuleLoader__.load({
       // disclosure (see AdvancedLimits), so the main page stays readable while the
       // control, its consent text and the bind it produced stay on the page.
       return h('div', { 'data-testid': 'connection-plan' },
+        // The section keeps its name ("Connection plan"); the SELECT inside it asks the
+        // narrower question ("Gateway bind address"). Two different facts, two labels:
+        // the select is the only thing POST /mgw/listen can apply, and the route line
+        // below it is how that bind is actually reached.
         h('h3', null, tr('planTitle')),
         h('div', { className: 'dshdev-muted', style: { marginBottom: 8 } }, tr('planHelp')),
         h('div', { className: 'dshdev-row' },
+          h('span', { className: 'dshdev-muted' }, tr('planBindTitle')),
           h('select', {
             className: 'dshdev-input', style: { maxWidth: 260 }, 'data-testid': 'plan-select',
-            'aria-label': tr('planTitle'), value: applying || plan, disabled: !plan || !!applying,
+            'aria-label': tr('planBindTitle'), value: applying || plan, disabled: !plan || !!applying,
             onChange: (event) => choose(event.target.value),
           },
             plan ? null : h('option', { value: '' }, tr('planUnknown')),
@@ -1405,6 +1467,14 @@ window.__ModuleLoader__.load({
               key: target, value: target, disabled: target === 'tailscale' && tailscaleOff,
             }, tr(`plan.${target}`)))),
           applying ? h('span', { className: 'dshdev-muted', 'data-testid': 'plan-applying' }, tr('planApplying')) : null),
+        // The route a loopback bind is reached through, stated as a FACT with its
+        // origin — never as an option, because /mgw/listen has no `serve` target.
+        plannedRoute ? h('div', { 'data-testid': 'plan-serve-route' },
+          h('div', { className: 'dshdev-row', style: { marginTop: 8 } },
+            h('span', { className: 'dshdev-muted' }, tr('planServeRoute')),
+            h('code', { className: 'dshdev-chip', title: plannedRoute.url }, plannedRoute.url),
+            h(CopyButton, { text: plannedRoute.url })),
+          h('div', { className: 'dshdev-muted' }, `${tr('planServeNote')} ${plannedRoute.bind}`)) : null,
         // Honest consent: what "LAN" means here, and the address it actually produced.
         h('div', { className: 'dshdev-muted', style: { marginTop: 6 }, 'data-testid': 'plan-lan-caveat' }, tr('planLanCaveat')),
         bound ? h('div', { className: 'dshdev-row', style: { marginTop: 6 }, 'data-testid': 'plan-bound' },
@@ -1474,6 +1544,11 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false)
       const [pairing, setPairing] = React.useState(null)
       const [otpOffer, setOtpOffer] = React.useState(null)
+      // The Host's own served origin, learned from the QR route the moment a pairing
+      // code is generated (see `OtpDialog.onQr`). `null` = the Host never said it serves
+      // anything, which is why no route line is drawn: that is the honest answer, and
+      // `tailscale.addresses` alone are never evidence of one (spec 029).
+      const [serveOrigin, setServeOrigin] = React.useState(null)
       const [editing, setEditing] = React.useState(null) // { device, scopes }
       const [permEditing, setPermEditing] = React.useState(null) // the device whose Permissions editor is open
       const mounted = React.useRef(true)
@@ -1590,7 +1665,18 @@ window.__ModuleLoader__.load({
             h('h3', { className: 'dshdev-grow' }, tr('pairingCode')),
             h('button', { type: 'button', className: 'dshdev-btn primary', disabled: busy || !on, onClick: generateOtp }, tr('generate'))),
           !on ? h('div', { className: 'dshdev-muted' }, tr('enableFirst')) : null),
-        otpOffer ? h(OtpDialog, { offer: otpOffer, addresses, lanHost: status && status.lan ? status.lan.host : '', onClose: () => setOtpOffer(null) }) : null,
+        otpOffer ? h(OtpDialog, { offer: otpOffer, addresses, lanHost: status && status.lan ? status.lan.host : '',
+          // Spec 029: the QR route's answer is the Host's own served origin, kept in the
+          // background so closing the dialog does not forget the route this machine
+          // is reachable through (the plan states it as a fact, never as a target).
+          // EVERY successful reply replaces the cache: `{pwaOrigin: null, link: false}`
+          // is the Host saying it no longer serves that origin, so keeping the old
+          // value would draw a route the Host has just disclaimed.
+          onQr: (reply) => {
+            const origin = reply && typeof reply.pwaOrigin === 'string' && reply.pwaOrigin ? reply.pwaOrigin : null
+            setServeOrigin(origin)
+          },
+          onClose: () => setOtpOffer(null) }) : null,
         h(PendingRequests, { active: on }),
         pairing && !editing ? h(PairingBox, { pairing, onClose: () => setPairing(null) }) : null,
         h('div', { className: 'dshdev-card' },
@@ -1647,7 +1733,7 @@ window.__ModuleLoader__.load({
         // changes it sits behind "Advanced" with the limits, so the page is quiet.
         h(ListeningOn, { lan: status && status.lan, tailscale: status && status.tailscale }),
         h(AdvancedLimits, { limits: status && status.remoteBridgeLimits },
-          h(ConnectionPlan, { status, onApplied: applyPlan })))
+          h(ConnectionPlan, { status, serveOrigin, onApplied: applyPlan })))
     }
 
     // --------------------------------------------------- tab 2: connect
@@ -2676,30 +2762,87 @@ window.__ModuleLoader__.load({
       let sessionsPending = false
       /** Ask the native catalog to pull `session/list` again (ClientSessions.refresh). */
       const refreshSessions = () => {
-        if (!sessions) { sessionsPending = true; return }
+        if (!sessions) { sessionsPending = true; return null }
         sessionsPending = false
         try {
           const pending = sessions.refresh()
-          if (pending && typeof pending.catch === 'function') pending.catch(() => { /* the native sidebar reports its own refusal */ })
-        } catch { /* a refused refresh must not take the surfaces down */ }
+          if (pending && typeof pending.catch === 'function') { pending.catch(() => { /* the native sidebar reports its own refusal */ }); return pending }
+          return null
+        } catch { return null /* a refused refresh must not take the surfaces down */ }
       }
       // `session/list` is answered by merging every connected Host (`host-router`),
       // but the client catalog only pulls it on connect — `ClientSessions.refresh`
       // → `manager.refreshList`, driven by `handleConnected`. A Host that connects
       // after startup would therefore never show its sessions until a reload, so the
       // connected-host set is compared here and the catalog is pulled again whenever
-      // it changes: connect, disconnect, and a reconnect (which leaves and re-enters
-      // the set).
+      // it changes.
+      //
+      // The key is the whole PICTURE, not just the id set. A remote whose own
+      // `session/list` call failed contributes no rows and its refusal is reported
+      // per host (`host-router` `#noteHostError`), so a pull that lands while it is
+      // still failing caches an EMPTY list — and with an id-set-only key that empty
+      // list was never re-read once the host recovered, which is the "connected,
+      // but no conversations" symptom. Each row therefore carries its state:
+      //   - the connection set, so connect/disconnect/reconnect still pull;
+      //   - the per-host error CODE, so a host that fails or recovers (or swaps one
+      //     refusal for another) is a change worth a pull and a silent success is not;
+      //   - the disconnected hosts and how many rows each still retains, because a
+      //     disconnect moves rows from `hosts` to `disconnected` and back.
+      // `refresh()` only publishes on an answer, so a failing poll leaves the key
+      // untouched and cannot pump the catalog.
       let hostKey = ''
       let hostKeyKnown = false
-      const refreshForHosts = (snapshot) => {
-        const next = snapshot.hosts.map((host) => host.hostId).sort().join(',')
-        if (hostKeyKnown && next === hostKey) return
-        const first = !hostKeyKnown
+      // A pull already in flight is not replaced — but a change that arrives WHILE one
+      // runs must not be lost either. `ClientSessions.refresh` coalesces its own calls,
+      // so stacking a second here would let an older answer land last; consuming the
+      // new key and returning would be worse still: the change would be recorded as
+      // handled and never pulled, which is exactly how a host that recovers mid-pull
+      // keeps its empty list forever. So the running pull owns no key: the key is only
+      // committed once a pull actually starts, and a change seen meanwhile sets
+      // `refreshQueued`, which re-checks the picture when the pull settles.
+      let refreshInFlight = false
+      let refreshQueued = false
+      const pictureKey = (snapshot) => JSON.stringify([
+        snapshot.hosts.map((host) => [host.hostId, host.error === null || host.error === undefined ? null : String(host.error)]).sort(),
+        (snapshot.disconnected || []).map((host) => [host.hostId, Number(host.retainedSessions) || 0]).sort(),
+      ])
+      // The newest picture seen, so a pull that settles can re-check against it.
+      let lastSnapshot = null
+      const pull = () => {
+        refreshInFlight = true
+        // `refreshSessions` swallows its own refusal; this only re-arms the guard.
+        // Both settle paths are here so a throw or a rejection cannot wedge it.
+        Promise.resolve(refreshSessions()).then(settlePull, settlePull)
+      }
+      const settlePull = () => {
+        refreshInFlight = false
+        if (!refreshQueued) return
+        // `consider` re-checks the picture and may start the next pull itself. The flag
+        // is only cleared when it does NOT queue again — clearing it up front would
+        // drop a change that arrives while the re-check runs.
+        if (lastSnapshot) consider(lastSnapshot)
+        if (!refreshInFlight) refreshQueued = false
+      }
+      const consider = (snapshot) => {
+        const next = pictureKey(snapshot)
+        if (hostKeyKnown && next === hostKey) {
+          // The picture returned to what the running pull already committed: nothing
+          // left to re-read.
+          refreshQueued = false
+          return
+        }
+        // Startup: the catalog pulled once on its own, so only the key is recorded.
+        if (!hostKeyKnown) { hostKey = next; hostKeyKnown = true; return }
+        if (refreshInFlight) { refreshQueued = true; return }
+        // Commit the key BEFORE dialing, so a poll that lands during the pull compares
+        // against what this pull is fetching rather than re-queueing the same change.
         hostKey = next
-        hostKeyKnown = true
-        // Startup already pulled the list once; only a later change needs the second pull.
-        if (!first) refreshSessions()
+        refreshQueued = false
+        pull()
+      }
+      const refreshForHosts = (snapshot) => {
+        lastSnapshot = snapshot
+        consider(snapshot)
       }
       // Spec 016 Phase 3: one registered tab type (and one keyed body) per paired
       // host, kept in step with the host list. A shell that refuses the seat leaves
@@ -2772,6 +2915,18 @@ window.__ModuleLoader__.load({
         // A1.1: the wrapper's own reason (e.g. `dsh-version-mismatch`) is shown, so a
         // refused wrap is never a silently missing feature.
         const routingOff = !(snapshot.routing && snapshot.routing.remote === true)
+        // A healthy wrapper with no connected host is NOT a failure: the seats are in
+        // and they fill the moment a host connects, so `grouped` stays true and `reason`
+        // stays null (spec 008 P2b pins both).
+        //
+        // The one case worth a word is a remote that IS PAIRED but whose rows are not
+        // in the merged list right now — the host is merely away. Its sessions are still
+        // retained (host-router `#retainedRows`), so the Devices page can say "away,
+        // coming back" instead of letting a bare empty sidebar look like a failure.
+        // No paired remote at all stays silent: nothing is pending and this Host simply
+        // has not paired an outbound machine yet.
+        const awayHost = !seatError && !routingOff && snapshot.hosts.length === 0 &&
+          (snapshot.disconnected || []).length > 0
         remoteUI.set({
           grouped: !seatError && !routingOff,
           hosts: snapshot.hosts.length,
@@ -2779,7 +2934,9 @@ window.__ModuleLoader__.load({
             ? seatError
             : routingOff
               ? `multi-host routing is off${snapshot.routing && snapshot.routing.reason ? `: ${snapshot.routing.reason}` : ''}`
-              : null,
+              : awayHost
+                ? 'no remote host is connected'
+                : null,
         })
       }
       if (typeof ctx.inject === 'function') {
@@ -3044,7 +3201,11 @@ window.__ModuleLoader__.load({
       HOST_DOOR_BASE, HOST_DOOR_STRIDE,
       // The sidebar row's two halves, so a test can prove the row sits below Repo
       // Wiki and that its panel hosts the same DevicesPage instead of a copy.
-      PANEL_ID, PANEL_ORDER, DevicesPanel, DevicesPanelIcon }
+      PANEL_ID, PANEL_ORDER, DevicesPanel, DevicesPanelIcon,
+      // Spec 029: the bind target and the reachable route are two facts, so the
+      // derivation of each is exported and asserted separately (a select that could
+      // show a route would offer a target /mgw/listen cannot apply).
+      planOf, serveRouteOf }
     return module.exports
   },
 })

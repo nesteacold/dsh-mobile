@@ -43,6 +43,9 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     uploads,
     // POST /mgw/devices/:id/scopes: one queued refusal, and the calls the page made.
     scopeFailure: null,
+    // POST /devices/pair-qr: the Host's own served origin (spec 029). A test sets it to
+    // the reply the route would give; `null` models a Host that serves nothing.
+    qrReply: { svg: '<svg/>', address: '', pwaOrigin: null, link: false },
   }
   const fetch = async (url, options = {}) => {
     const target = new URL(url)
@@ -52,6 +55,8 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     const reply = (data, ok = true, status = ok ? 200 : 400) => ({ ok, status, json: async () => data })
     if (fail[route]) return reply({ message: fail[route] }, false)
     if (route === '/mgw/status') return reply(state.status)
+    // Spec 029: the pairing dialog's QR reply carries the Host's served origin.
+    if (route === '/devices/pair-qr' && options.method === 'POST') return reply(state.qrReply)
     // Fresh row objects on every poll, the way JSON over HTTP really delivers them: React cannot
     // bail out of a re-render, so a test sees the rows the route persisted.
     if (route === '/mgw/devices') {
@@ -2274,6 +2279,329 @@ await check('start page: the machine card renders the paired host\'s own session
   assert.match(text(gone), /no longer paired/)
   gone.unmount()
   for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+// ------------------------------------------------- spec 029: refresh key + serve route
+// The native catalog pulls `session/list` only on a Host generation change
+// (`dsh-api-session-controller`: `connection.generation.subscribe(connected)`,
+// `handleConnected` -> `refreshList`). The router answers that pull for Local plus
+// every connected remote, but a remote that FAILED its own `session/list` fan-out
+// contributes no rows and reports only a per-host `error` (`host-router.mjs`
+// `#noteHostError`). A pull that happens while the host is still failing therefore
+// caches an empty list, and the only later trigger was the SET of connected ids — so
+// a host that recovers keeps its sessions off the sidebar until the page reloads.
+// This is the bug the owner reported as "connects, no conversations listed".
+
+/** A shell whose `/devices/remotes` answer the test can change between polls. */
+function loadFollow({ routing, sessions, locale = 'en-US' }) {
+  let api
+  const live = { routing: routing(), sessions: sessions() }
+  const fetch = async (url) => {
+    const route = new URL(String(url), 'http://127.0.0.1:3080/').pathname
+    if (route === '/devices/remotes') {
+      // A poll that fails the way the real route does: the fetch rejects.
+      if (live.routing === undefined) throw new Error('device route unreachable')
+      return { ok: true, status: 200, json: async () => ({ remotes: live.routing.remotes ?? [], routing: live.routing.routing }) }
+    }
+    return { ok: true, status: 200, json: async () => ({}) }
+  }
+  const window = {
+    __ModuleLoader__: { load: ({ factory }) => { api = factory(() => React) } },
+    setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {},
+  }
+  const document = { baseURI: 'http://127.0.0.1:3080/', head: { appendChild() {} }, createElement: () => ({ remove() {} }) }
+  vm.runInNewContext(source, { window, document, fetch, URL, console, setTimeout, clearTimeout, Date, navigator: { language: locale } })
+  const disposers = []
+  const ctx = {
+    locale: { getSnapshot: () => ({ active: locale }), subscribe: () => () => {} },
+    effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out); return () => { out?.() } },
+    inject(deps, fn) {
+      const scope = {}
+      for (const dep of deps) scope[dep] = { sessions: live.sessions, sidebarRight: { openTab() {} }, sidebarRightTabs: { register: () => () => {} }, contextMenus: { register: () => () => {} } }[dep]
+      const out = fn(scope)
+      if (typeof out === 'function') disposers.push(out)
+      return () => { out?.() }
+    },
+    slots: { inject() { return () => {} }, register(meta) { return { meta } } },
+  }
+  api.apply(ctx)
+  return { api, live, disposers, refresh: () => api.testing.hostsStore.refresh() }
+}
+
+const HOST_ROW = { hostId: 'r-a', hostName: 'Qoder-Sigma', online: true }
+const failingRouting = (error) => ({
+  remotes: [{ id: 'r-a', name: 'Qoder-Sigma', address: '10.0.0.40:3081', status: 'online', device: { kind: 'desktop', scopes: [] } }],
+  routing: { remote: true, reason: null, hosts: [{ ...HOST_ROW, ...(error ? { error } : {}) }], disconnected: [] },
+})
+
+await check('refresh key: a remote host that recovers from a failed pull pulls the catalog again, once', async () => {
+  let pulls = 0
+  const ui = loadFollow({
+    routing: () => ({ remotes: [], routing: { remote: true, reason: null, hosts: [], disconnected: [] } }),
+    sessions: () => ({ refresh() { pulls += 1 } }),
+  })
+  // Startup: the shared refresh runs before any link exists, and the catalog has
+  // already pulled once on its own — the plugin must not pull a second time.
+  await ui.refresh()
+  assert.equal(pulls, 0, 'startup never doubles the catalog\'s own first pull')
+  // The host connects and its own `session/list` already failed: the merged list is
+  // empty and the refusal rides on the row. This is the pull that caches nothing.
+  ui.live.routing = failingRouting('auth/forbidden-scope')
+  await ui.refresh()
+  assert.equal(pulls, 1, 'a newly connected host pulls the merged list')
+  // Same ids, same error: nothing new, no storm.
+  await ui.refresh()
+  assert.equal(pulls, 1, 'an unchanged picture never re-pulls')
+  // The host recovers: its `session/list` now answers with rows, so the error clears.
+  ui.live.routing = failingRouting(null)
+  await ui.refresh()
+  assert.equal(pulls, 2, 'the error clearing is a real change and re-pulls the catalog')
+  // A pull is not issued again while the host stays healthy.
+  await ui.refresh()
+  await ui.refresh()
+  assert.equal(pulls, 2, 'a healthy host stays quiet')
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('refresh key: a now-failing host re-pulls too, and a different code is a different state', async () => {
+  let pulls = 0
+  const ui = loadFollow({
+    routing: () => ({ remotes: [], routing: { remote: true, reason: null, hosts: [], disconnected: [] } }),
+    sessions: () => ({ refresh() { pulls += 1 } }),
+  })
+  await ui.refresh()
+  assert.equal(pulls, 0, 'startup stays quiet')
+  ui.live.routing = { ...failingRouting(null) }
+  await ui.refresh()
+  assert.equal(pulls, 1, 'connect pulls once')
+  ui.live.routing = failingRouting('remote/host-offline')
+  await ui.refresh()
+  assert.equal(pulls, 2, 'a host that starts failing re-pulls, so its retained rows are re-read')
+  ui.live.routing = failingRouting('auth/forbidden-scope')
+  await ui.refresh()
+  assert.equal(pulls, 3, 'a changed refusal code is a changed state, not the same one')
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('refresh key: disconnected hosts and their retained count count as the picture', async () => {
+  let pulls = 0
+  const disconnected = {
+    remotes: [{ id: 'r-a', name: 'Qoder-Sigma', address: '10.0.0.40:3081', status: 'online', device: { kind: 'desktop', scopes: [] } }],
+    routing: { remote: true, reason: null, hosts: [], disconnected: [{ hostId: 'r-a', hostName: 'Qoder-Sigma', online: false, retainedSessions: 3 }] },
+  }
+  const ui = loadFollow({ routing: () => ({ remotes: [], routing: { remote: true, reason: null, hosts: [], disconnected: [] } }), sessions: () => ({ refresh() { pulls += 1 } }) })
+  await ui.refresh()
+  assert.equal(pulls, 0, 'startup stays quiet')
+  ui.live.routing = disconnected
+  await ui.refresh()
+  assert.equal(pulls, 1, 'a host that links away is a change from the empty startup picture')
+  await ui.refresh()
+  assert.equal(pulls, 1, 'the same disconnected picture does not re-pull')
+  ui.live.routing = { ...disconnected, routing: { ...disconnected.routing, disconnected: [{ hostId: 'r-a', hostName: 'Qoder-Sigma', online: false, retainedSessions: 0 }] } }
+  await ui.refresh()
+  assert.equal(pulls, 2, 'retained rows appearing or disappearing is a change worth a pull')
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('refresh key: one pull in flight — a burst of changes never stacks catalog pulls', async () => {
+  let pulls = 0
+  let release
+  const ui = loadFollow({
+    routing: () => ({ remotes: [], routing: { remote: true, reason: null, hosts: [], disconnected: [] } }),
+    sessions: () => ({ refresh() { pulls += 1; return new Promise((resolve) => { release = resolve }) } }),
+  })
+  await ui.refresh()
+  ui.live.routing = failingRouting('auth/forbidden-scope')
+  await ui.refresh()
+  ui.live.routing = failingRouting(null)
+  await ui.refresh()
+  assert.equal(pulls, 1, 'the second change waited for the pull already running')
+  if (release) release()
+  await new Promise((resolve) => setImmediate(resolve))
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('refresh key: a change that arrives mid-pull is not swallowed — the recovery still lands', async () => {
+  let pulls = 0
+  const deferred = []
+  const ui = loadFollow({
+    routing: () => ({ remotes: [], routing: { remote: true, reason: null, hosts: [], disconnected: [] } }),
+    sessions: () => ({ refresh() { pulls += 1; return new Promise((resolve) => deferred.push(resolve)) } }),
+  })
+  await ui.refresh()
+  assert.equal(pulls, 0, 'startup stays quiet')
+  // The host connects while failing: pull #1 starts and does NOT settle.
+  ui.live.routing = failingRouting('auth/forbidden-scope')
+  await ui.refresh()
+  assert.equal(pulls, 1, 'the connect started a pull')
+  // The host RECOVERS while that pull is still in flight. This is the dangerous
+  // state: the key must not be consumed by the request that is already running, or
+  // the recovery would be recorded as "already handled" and never re-pulled.
+  ui.live.routing = failingRouting(null)
+  await ui.refresh()
+  assert.equal(pulls, 1, 'only one pull at a time')
+  // The in-flight pull settles late (it may well answer with the pre-recovery list):
+  // the pending change must now be pulled, or the empty list it cached is final.
+  deferred.shift()()
+  await new Promise((resolve) => setImmediate(resolve))
+  await ui.refresh()
+  assert.equal(pulls, 2, 'the change that arrived mid-pull is pulled once the pull finishes')
+  // And now the picture is stable: nothing more is queued.
+  await ui.refresh()
+  await ui.refresh()
+  assert.equal(pulls, 2, 'the queued change fires exactly once')
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('refresh key: a failing refresh() call is no storm — the key only moves on a real answer', async () => {
+  let pulls = 0
+  const ui = loadFollow({
+    routing: () => ({ remotes: [], routing: { remote: true, reason: null, hosts: [], disconnected: [] } }),
+    sessions: () => ({ refresh() { pulls += 1 } }),
+  })
+  await ui.refresh()
+  assert.equal(pulls, 0, 'startup stays quiet')
+  ui.live.routing = failingRouting(null)
+  await ui.refresh()
+  assert.equal(pulls, 1)
+  // The route starts failing: the store keeps its last snapshot, so the key is
+  // unchanged and the catalog is not asked to pull a list that never arrived.
+  ui.live.routing = undefined
+  for (let round = 0; round < 3; round += 1) await ui.refresh()
+  assert.equal(pulls, 1, 'a failing poll publishes nothing and pumps nothing')
+  for (const dispose of ui.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+// ------------------------------------------------- spec 029: bind target vs route
+// The owner's report: choosing Tailscale came back as "This machine only". The cause
+// is that the select answered the BIND (a serve-fronted gateway really is bound to
+// 127.0.0.1) while the owner meant the ROUTE they reach it through. These assertions
+// lock the split: `planOf` never mentions a route, and `serveRouteOf` claims one only
+// from the Host's own served origin — never from `tailscale.addresses`.
+await check('route vs bind: a serve-fronted loopback bind stays "loopback" for the select and reports its own route', async () => {
+  const { planOf, serveRouteOf } = load().api.testing
+  // The live shape of this machine: bound to loopback, tailnet joined, serve in front.
+  const serveStatus = {
+    lan: { enabled: true, listening: true, host: '127.0.0.1', port: 30081, urls: [] },
+    tailscale: { addresses: ['100.64.0.7', 'fd00:115c::ce31'], urls: [], dnsName: '' },
+  }
+  assert.equal(planOf(serveStatus), 'loopback', 'the bind is loopback — the select tells the truth about the bind')
+  // The Host's own served origin (what `POST /devices/pair-qr` answers with).
+  const served = serveRouteOf({ pwaOrigin: 'https://box.tailnet.ts.net:30443', link: true }, serveStatus.lan)
+  assert.equal(served.url, 'https://box.tailnet.ts.net:30443', 'the route names the served origin')
+  assert.equal(served.bind, '127.0.0.1:30081', 'and states the bind it fronts')
+  // No served origin: no route, even though the machine IS on a tailnet. This is the
+  // rule the owner set — `tailscale.addresses` alone prove nothing.
+  assert.equal(serveRouteOf(null, serveStatus.lan), null, 'addresses alone never claim a route')
+  assert.equal(serveRouteOf({ pwaOrigin: null, link: false }, serveStatus.lan), null)
+  // A DIRECT tailscale bind reaches its own address and needs no serve line.
+  const direct = { ...serveStatus, lan: { ...serveStatus.lan, host: '100.64.0.7', urls: ['wss://100.64.0.7:30081/ws/mobile'] } }
+  assert.equal(planOf(direct), 'tailscale', 'a direct tailnet bind still reads as tailscale')
+  assert.equal(serveRouteOf({ pwaOrigin: 'https://box.tailnet.ts.net:30443', link: true }, direct.lan), null,
+    'a direct bind needs no route line')
+  // A listener that is down, or LAN disabled, serves nothing either.
+  assert.equal(serveRouteOf({ pwaOrigin: 'https://box.tailnet.ts.net:30443', link: true }, { ...serveStatus.lan, listening: false }), null)
+  assert.equal(serveRouteOf({ pwaOrigin: 'https://box.tailnet.ts.net:30443', link: true }, { ...serveStatus.lan, enabled: false }), null)
+})
+
+await check('route vs bind: the route is never a selectable option — the options stay the three /mgw/listen targets', async () => {
+  const ui = load({ status: { remoteControl: { enabled: true, accepting: true }, lan: { enabled: true, listening: true, host: '127.0.0.1', port: 30081, urls: [] }, tailscale: { addresses: ['100.64.0.7'], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  await openAdvanced(page)
+  const options = find(page, (node) => node.type === 'option').map((node) => node.props.value)
+  assert.deepEqual([...options].sort(), ['lan', 'loopback', 'tailscale'], 'exactly the three bind targets, no "serve"')
+  // The select shows the bind, and the label says so instead of implying a route.
+  assert.equal(byTestId(page, 'plan-select')[0].props.value, 'loopback', 'the select shows the real bind')
+  assert.equal(byTestId(page, 'plan-select')[0].props['aria-label'], ui.api.testing.DICT.en.planBindTitle,
+    'the select is labelled as the bind address')
+  page.unmount()
+})
+
+await check('route vs bind: the two new strings exist in vi and en as real translations; key sets stay twins', async () => {
+  const { DICT } = load().api.testing
+  for (const key of ['planBindTitle', 'planServeRoute', 'planServeNote']) {
+    assert.equal(typeof DICT.en[key], 'string', `${key} (en)`)
+    assert.equal(typeof DICT.vi[key], 'string', `${key} (vi)`)
+    assert.notEqual(DICT.vi[key], DICT.en[key], `${key}: a real translation, not a copy`)
+  }
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
+})
+
+await check('diagnostics: a paired host that is only away is named; no paired remote at all stays silent', async () => {
+  // The case worth a word: paired, link down, rows retained — so the empty merged
+  // list is a temporary absence, and the page can say so.
+  const away = loadFollow({
+    routing: () => ({ remotes: [{ id: 'r-a', name: 'Qoder-Sigma', address: '10.0.0.40:3081', status: 'online', device: { kind: 'desktop', scopes: [] } }],
+      routing: { remote: true, reason: null, hosts: [], disconnected: [{ hostId: 'r-a', hostName: 'Qoder-Sigma', online: false, retainedSessions: 2 }] } }),
+    sessions: () => ({ refresh() {} }),
+  })
+  await away.refresh()
+  const snapshot = away.api.testing.remoteUI.getSnapshot()
+  // `grouped` stays true (the seats are in and fill on reconnect); only the reason is set.
+  assert.equal(snapshot.grouped, true, 'the seats are in; a quiet list is not a failure')
+  assert.equal(snapshot.reason, 'no remote host is connected', 'and a merely-away host is named')
+  assert.equal(away.api.testing.groupingReasonText(snapshot.reason), 'No remote host is connected.')
+  for (const dispose of away.disposers) { try { dispose() } catch { /* teardown */ } }
+
+  // No outbound remote at all: nothing is pending, so nothing is claimed.
+  const none = loadFollow({
+    routing: () => ({ remotes: [], routing: { remote: true, reason: null, hosts: [], disconnected: [] } }),
+    sessions: () => ({ refresh() {} }),
+  })
+  await none.refresh()
+  assert.equal(none.api.testing.remoteUI.getSnapshot().reason, null, 'an unpaired machine has nothing pending')
+  for (const dispose of none.disposers) { try { dispose() } catch { /* teardown */ } }
+
+  // A connected host: quiet, as before.
+  const held = loadFollow({ routing: () => failingRouting(null), sessions: () => ({ refresh() {} }) })
+  await held.refresh()
+  const withHost = held.api.testing.remoteUI.getSnapshot()
+  assert.equal(withHost.grouped, true, 'a connected host is the normal case')
+  assert.equal(withHost.reason, null, 'and it adds no notice')
+  for (const dispose of held.disposers) { try { dispose() } catch { /* teardown */ } }
+
+  // The wrapper off is still the more fundamental reason, not "no host".
+  const off = loadFollow({
+    routing: () => ({ remotes: [], routing: { remote: false, reason: 'dispatchRpc-missing', hosts: [], disconnected: [] } }),
+    sessions: () => ({ refresh() {} }),
+  })
+  await off.refresh()
+  assert.equal(off.api.testing.remoteUI.getSnapshot().reason, 'multi-host routing is off: dispatchRpc-missing',
+    'a refused wrap is named first')
+  for (const dispose of off.disposers) { try { dispose() } catch { /* teardown */ } }
+})
+
+await check('route vs bind: a later reply that serves nothing clears the stale route (AllowTab renders it)', async () => {
+  // The review's case: a valid origin is learned from one pairing code, then a LATER
+  // successful reply says the Host serves nothing ({pwaOrigin: null, link: false}).
+  // Keeping the old origin would draw a route the Host has just disclaimed.
+  const ui = load({
+    status: { remoteControl: { enabled: true, accepting: true }, lan: { enabled: true, listening: true, host: '127.0.0.1', port: 30081, urls: [] }, tailscale: { addresses: ['100.64.0.7'], urls: [] } },
+  })
+  ui.state.qrReply = { svg: '<svg/>', address: 'box.tailnet.ts.net:30443', pwaOrigin: 'https://box.tailnet.ts.net:30443', link: true }
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  await openAdvanced(page)
+  // First code: the Host reports a served origin, so the route line is drawn.
+  await click(button(page, 'Generate pairing code'))
+  await flush()
+  const shown = text(page)
+  assert.match(shown, /https:\/\/box\.tailnet\.ts\.net:30443/, 'the served origin is stated')
+  assert.match(shown, new RegExp(ui.api.testing.DICT.en.planServeRoute.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'as a route, next to the bind')
+  assert.equal(byTestId(page, 'plan-serve-route').length, 1)
+  // The select still shows the real BIND, and offers only the three bind targets.
+  assert.equal(byTestId(page, 'plan-select')[0].props.value, 'loopback')
+  assert.deepEqual(find(page, (node) => node.type === 'option').map((node) => node.props.value).sort(),
+    ['lan', 'loopback', 'tailscale'])
+  // Close the dialog, then generate a SECOND code whose reply disclaims serving.
+  await click(find(page, (node) => node.type === 'button' && node.props['aria-label'] === 'Close')[0])
+  ui.state.qrReply = { svg: '<svg/>', address: '', pwaOrigin: null, link: false }
+  await click(button(page, 'Generate pairing code'))
+  await flush()
+  assert.equal(byTestId(page, 'plan-serve-route').length, 0, 'the stale route is gone')
+  assert.doesNotMatch(text(page), /box\.tailnet\.ts\.net:30443/, 'and its origin is not left behind')
+  page.unmount()
 })
 
 await check('start page: the doorway strings exist in vi and en as real translations; vi/en key sets stay twins; the label follows the language', async () => {
