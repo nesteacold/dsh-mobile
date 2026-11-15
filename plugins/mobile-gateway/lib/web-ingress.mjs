@@ -23,30 +23,54 @@ export const WEB_WS_PATH = '/ws/mobile'
 const WEB_INGRESS_KEYS = Object.freeze(['enabled', 'port', 'origin'])
 
 /**
- * The one origin shape this ingress accepts: canonical `https://<label>.ts.net`, no port, no path.
- * Serve serves the PWA and `/ws/mobile` on the tailnet MagicDNS name over TLS; any other spelling
- * (http, a LAN address, an IP literal, a trailing dot, a userinfo, a port or a path) is refused
- * instead of normalised, so a typo can never silently fence a different origin out.
+ * The one origin shape this ingress accepts: canonical `https://<label>.ts.net`, optionally with an
+ * explicit port 1–65535 (`https://<label>.ts.net:30443`), never a path. Serve serves the PWA and
+ * `/ws/mobile` on the tailnet MagicDNS name over TLS; any other spelling (http, a LAN address, an
+ * IP literal, a trailing dot, a userinfo, a path) is refused instead of normalised, so a typo can
+ * never silently fence a different origin out.
+ *
+ * Amendment A1: the port is normalised by WHAT A BROWSER SENDS, not by `URL`'s default-port
+ * elision. `:443` is refused because the browser sends the portless form for it (the portless
+ * origin IS the 443 origin), and a leading zero or `0` is refused because a browser never sends
+ * them either — accepting one would fence an origin no browser can match.
  */
-// At least one label before `ts.net`: a bare `ts.net` is not a tailnet name.
-const WEB_ORIGIN_SHAPE = /^https:\/\/(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+ts\.net$/
+// At least one label before `ts.net`: a bare `ts.net` is not a tailnet name. The port group is
+// 1–65535 written canonically: no leading zero, no `0`.
+const WEB_ORIGIN_SHAPE = /^https:\/\/(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+ts\.net(?::([1-9][0-9]{0,4}))?$/
+
+/** A canonical port decimal: 1–65535 inclusively (a length-six group would already fail). */
+function canonicalPort(text) {
+  if (!Number.isSafeInteger(text) || text < 1 || text > WEB_INGRESS_MAX_PORT) return null
+  return text
+}
 
 /**
- * A configured web origin, or `null` when it is not exactly one canonical HTTPS `*.ts.net` origin.
+ * A configured web origin, or `null` when it is not exactly one canonical HTTPS `*.ts.net` origin
+ * with an optional canonical port (Amendment A1).
  * @param {unknown} value owner-configured origin
  * @returns {string|null}
  */
 export function normalizeWebOrigin(value) {
   if (typeof value !== 'string') return null
-  const trimmed = value.trim()
-  if (!WEB_ORIGIN_SHAPE.test(trimmed)) return null
+  // No trim: a browser sends the origin verbatim, and the fence is an exact whole-string compare,
+  // so a padded spelling is refused rather than silently stored in a form nobody sends.
+  const match = WEB_ORIGIN_SHAPE.exec(value)
+  if (!match) return null
+  const host = value.slice('https://'.length, match[1] === undefined ? value.length : value.lastIndexOf(':'))
+  // `URL` would accept a port, a path or credentials the regex cannot see, and `.origin` would
+  // then silently DROP a default port (`:443` becomes portless) or a trailing dot; the canonical
+  // form is plain, so compare the WHOLE hostname, the port and an empty path/query/fragment,
+  // never `.origin`.
   let url
-  try { url = new URL(trimmed) } catch { return null }
-  // `URL` would accept a port, a path or credentials the regex cannot see, and `.origin`
-  // would then silently drop them; the canonical form has none, so compare the WHOLE string.
-  if (url.origin !== trimmed || url.pathname !== '/' || url.search !== '' || url.hash !== '') return null
+  try { url = new URL(value) } catch { return null }
+  if (url.protocol !== 'https:') return null
+  if (url.hostname !== host || url.pathname !== '/' || url.search !== '' || url.hash !== '') return null
+  if (match[1] !== undefined && url.port !== match[1]) return null
   if (url.username !== '' || url.password !== '') return null
-  return url.origin
+  if (match[1] === undefined) return url.protocol + '//' + url.host
+  const port = canonicalPort(Number(match[1]))
+  if (port === null) return null
+  return `${url.protocol}//${url.hostname}:${port}`
 }
 
 /**
@@ -158,12 +182,14 @@ export function planWebIngress(input, current, directPort) {
     next.port = input.port
   }
   if (input.origin !== undefined) {
-    if (typeof input.origin !== 'string' || normalizeWebOrigin(input.origin) === null) {
-      const error = new Error('origin must be a canonical https://<label>.ts.net origin (no port, path or credentials)')
+    // `''` is the documented "not configured" value the disabled default and the config key use;
+    // any NON-empty spelling must be canonical (a padded/foreign one is refused, never repaired).
+    if (typeof input.origin !== 'string' || (input.origin !== '' && normalizeWebOrigin(input.origin) === null)) {
+      const error = new Error('origin must be a canonical https://<label>.ts.net origin with an optional explicit port 1-65535 (no path or credentials)')
       error.status = 400
       throw error
     }
-    next.origin = normalizeWebOrigin(input.origin)
+    next.origin = input.origin === '' ? '' : normalizeWebOrigin(input.origin)
   }
   // An enabled ingress must be reachable: an origin is required, and the port must be a real port
   // (0 would let the OS pick one Serve is not pointing at) that is not the direct listener's.

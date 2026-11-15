@@ -22,6 +22,11 @@ import {
   WEB_INGRESS_HOST, WEB_WS_PATH, ingressIdentity, listenerIngress, normalizeWebOrigin, planWebIngress, readWebIngress,
   webIngressLabel, webIngressStatus, webOriginAccepted,
 } from './web-ingress.mjs'
+// Spec 031 Amendment A2/A3: the built PWA as static files on the SAME web ingress listener (GET/HEAD
+// only). The path rules and headers live in that leaf module; this file only picks the root
+// (`DSH_MGW_WEB_ASSETS_DIR`, else this repository's built PWA) and answers the plain HTTP requests
+// the listener receives.
+import { ASSET_ROOT_DEFAULT, resolveAssetRoot, serveWebAsset, webAssetsStatus } from './web-assets.mjs'
 // @dsh-ext/mobile-gateway — persistent Host plugin.
 //
 // Two directions:
@@ -328,7 +333,8 @@ const Config = Schema.object({
     enabled: Schema.boolean().default(false),
     // 0 = ephemeral (tests only); a real ingress needs a fixed port Serve is pointed at.
     port: Schema.natural().min(0).max(65535).default(0),
-    // Canonical `https://<label>.ts.net`; empty means "not configured".
+    // Canonical `https://<label>.ts.net`, optionally with an explicit port 1-65535 (Amendment
+    // A1); empty means "not configured".
     origin: Schema.string().default(''),
   }).default({}),
   tlsCertificateDir: Schema.string().default(''),
@@ -1868,6 +1874,9 @@ const plugin = {
     // `beginWebAttempt`. A restoration over the same tuple moves only `webGeneration`, so the
     // tuple generation alone cannot tell a socket's listener from the one that replaced it.
     let webListenerIngress = null
+    // Spec 031 Amendment A2/A3: the built PWA `openWebListener` serves, resolved ONCE per listener
+    // attempt. `null` until a listener exists, so the report reads "not configured" before then.
+    let webAssets = null
     let webListening = false
     let webListenError = null
     let webBoundPort = 0
@@ -2922,6 +2931,10 @@ const plugin = {
                 // (and any passkey unlock), which no listener state can stand in for, so it is
                 // never reported here as `ready`.
                 active: webIngressActive(),
+                // Amendment A3: the static-file report travels WITH `webIngressStatus`'s fields
+                // (whose key set an existing test pins), as its own key, never folded into
+                // `listening`/`active`.
+                assets: webIngressReport().assets,
               },
               tls: {
                 fingerprint256: tlsIdentity?.fingerprint256 ?? null,
@@ -5278,6 +5291,8 @@ const plugin = {
 
     function openWebListener() {
       if (webIngressState.enabled !== true || gatewayEnabled !== true || webIngressServer) return null
+      // No assets root is NOT a reason to withhold the listener: the browser's `/ws/mobile` path
+      // must keep working, and a missing PWA is reported by `assets`, never claimed as listening.
       if (webIngressState.origin === '' || webIngressState.port === 0) {
         webListening = false
         const refused = beginWebAttempt()
@@ -5286,10 +5301,20 @@ const plugin = {
         return refused
       }
       const origin = webIngressState.origin
+      // Spec 031 Amendment A2: the ONE asset root this listener serves, resolved here (per listener
+      // attempt) so a link swapped under a served path after start cannot move the root. The root
+      // comes from `DSH_MGW_WEB_ASSETS_DIR` when the owner set it (an unusable value is reported by
+      // `assets`, never silently replaced by the default), else from this repository's built PWA.
+      // No usable root, no throw: the listener still comes up for `/ws/mobile` and answers a
+      // generic 404 for files.
+      webAssets = resolveAssetRoot(process.env.DSH_MGW_WEB_ASSETS_DIR, ASSET_ROOT_DEFAULT)
+      const assetsServed = webAssets
       const listener = https.createServer(tlsServerOptions(tlsIdentity), (req, res) => {
-        // No page, no static asset, no DSH route, no management surface on this port. A plain
-        // HTTP request (Serve should never forward one) learns only that a TLS listener is here.
-        sendJson(res, 404, { error: 'not-found' })
+        // This port serves the built PWA and nothing else: GET/HEAD from the asset SNAPSHOT taken
+        // above (405 for every other method), generic 404s. No DSH route, no management surface
+        // (`/mgw` included) is reachable here, and an upgrade never reaches this handler (see
+        // `on('upgrade')`).
+        serveWebAsset(req, res, assetsServed)
       })
       const attempt = beginWebAttempt()
       webIngressServer = listener
@@ -5402,10 +5427,13 @@ const plugin = {
       return outcome
     }
 
-    /** The state `webIngressStatus` reports; also used by the management status route. */
+    /** The state `webIngressStatus` reports; also used by the management status route. It also
+     *  carries Amendment A3's separate `assets` report: the root and its `index.html` never stand
+     *  in for `listening`/`active` (spec §7 readiness is an accepted client-hello, not a file). */
     const webIngressReport = () => ({
       enabled: webIngressState.enabled === true,
       origin: webIngressState.origin,
+      assets: webAssetsStatus(webAssets),
       listening: webListening === true,
       port: webListening ? webBoundPort : webIngressState.port,
       error: webListenError,

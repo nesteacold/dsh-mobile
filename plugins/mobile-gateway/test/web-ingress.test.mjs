@@ -27,12 +27,14 @@ import https from 'node:https'
 import os from 'node:os'
 import path from 'node:path'
 import tls from 'node:tls'
+import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
 import plugin from '../lib/index.mjs'
 import { createGatewayState } from '../lib/gateway-state.mjs'
 import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
 import { WEB_WS_PATH, normalizeWebOrigin, planWebIngress, readWebIngress, webIngressStatus, webOriginAccepted } from '../lib/web-ingress.mjs'
+import { ASSET_CSP, assetTypeFor, buildAssetSnapshot, resolveAssetRoot, spaFallback, webAssetsStatus } from '../lib/web-assets.mjs'
 import { PasskeyRefusal, createPasskeyService } from '../lib/passkey.mjs'
 import { otpProof } from '../lib/pairing-requests.mjs'
 
@@ -58,6 +60,22 @@ console.log = (message, ...rest) => {
 process.on('exit', (code) => {
   process.stdout.write(`  [summary] ${checks - failures.length}/${checks} checks passed, ${failures.length} failed (exit ${code})\n`)
 })
+
+/** Amendment A2: the asset root is an ENVIRONMENT choice (`DSH_MGW_WEB_ASSETS_DIR`), not a Config
+ *  key. The gateway reads it when it opens a listener, so a check sets it here, runs, and restores
+ *  the previous value (or its absence) whatever happened. */
+async function withAssetsEnv(dir, body) {
+  const had = Object.hasOwn(process.env, 'DSH_MGW_WEB_ASSETS_DIR')
+  const previous = process.env.DSH_MGW_WEB_ASSETS_DIR
+  if (dir === undefined) delete process.env.DSH_MGW_WEB_ASSETS_DIR
+  else process.env.DSH_MGW_WEB_ASSETS_DIR = dir
+  try {
+    return await body()
+  } finally {
+    if (had) process.env.DSH_MGW_WEB_ASSETS_DIR = previous
+    else delete process.env.DSH_MGW_WEB_ASSETS_DIR
+  }
+}
 
 /** A real listening port nobody else uses: bind 0, read it, close. The probe is TCP-only:
  *  a bare server never answers the helper's fetch probe, and `server.close()` would then wait on
@@ -85,6 +103,7 @@ async function startGateway(name, overrides = {}) {
   })
   await listenFetchSafe(server)
   const port = server.address().port
+  // A fresh copy per instance, so no check can leak a value into the next one.
   const config = {
     deviceFile: path.join(temp, `${name}-devices.json`),
     gatewayName: name,
@@ -104,6 +123,13 @@ async function startGateway(name, overrides = {}) {
     ...overrides,
   }
   const ctx = {
+    // The real service shape: the plugin's `webServer.register(...)` is bound to this fiber. The
+    // asset root is no longer a Config key, so `get('config')` deliberately answers nothing here:
+    // the gateway must not need it.
+    get(name, ...rest) {
+      if (name === 'config' && rest.length > 0) return config
+      return undefined
+    },
     webServer: {
       port,
       register(route) { management = route; return () => { management = undefined } },
@@ -421,6 +447,53 @@ async function ask(stream, frame) {
   return stream.next((reply) => reply.requestId === requestId)
 }
 
+/**
+ * A plain HTTP request on the TLS web-ingress port, answered as a whole response: `status`,
+ * lowercased headers and the raw body. Raw TLS (not fetch) so every method and a non-ASCII path
+ * are testable exactly as a browser or Serve would send them.
+ */
+function webHttpGet({ port, method = 'GET', pathName = '/', headers = {} }) {
+  return new Promise((resolve, reject) => {
+    const socket = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false })
+    const timer = setTimeout(() => { socket.destroy(); reject(Object.assign(new Error('timeout'), { timeout: true })) }, 4000)
+    let text = ''
+    socket.once('secureConnect', () => {
+      const lines = [`${method} ${pathName} HTTP/1.1`, 'Host: 127.0.0.1', 'Connection: close']
+      for (const [name, value] of Object.entries(headers)) lines.push(`${name}: ${value}`)
+      socket.write(`${lines.join('\r\n')}\r\n\r\n`)
+    })
+    socket.on('data', (chunk) => { text += chunk.toString('latin1') })
+    socket.once('error', (error) => { clearTimeout(timer); reject(error) })
+    socket.once('close', () => {
+      clearTimeout(timer)
+      const split = text.indexOf('\r\n\r\n')
+      if (split === -1) { reject(new Error('no complete response')); return }
+      const head = text.slice(0, split).split('\r\n')
+      const statusMatch = /^HTTP\/1\.1 (\d{3})/.exec(head[0] || '')
+      const responseHeaders = {}
+      for (const line of head.slice(1)) {
+        const at = line.indexOf(':')
+        if (at > 0) responseHeaders[line.slice(0, at).trim().toLowerCase()] = line.slice(at + 1).trim()
+      }
+      const rawBody = text.slice(split + 4)
+      // Strip chunked framing (`<hex>\r\n<chunk>\r\n…`) so HEAD (`0\r\n\r\n`) reads as an empty
+      // body; responses here are whole and small, so a single pass is enough.
+      let body = rawBody
+      if (/chunked/i.test(responseHeaders['transfer-encoding'] || '')) {
+        const parts = rawBody.split('\r\n')
+        const chunks = []
+        for (let index = 0; index + 1 < parts.length; index += 2) {
+          const size = Number.parseInt(parts[index], 16)
+          if (!Number.isFinite(size) || size === 0) break
+          chunks.push(parts[index + 1])
+        }
+        body = chunks.join('')
+      }
+      resolve({ status: statusMatch ? Number(statusMatch[1]) : 0, headers: responseHeaders, body })
+    })
+  })
+}
+
 /** The web ingress answers (fence + path passed) and asks for a credential: HTTP 401. A 403/404
  *  here would mean the origin or the path was refused instead. */
 async function expectServed(port) {
@@ -449,14 +522,33 @@ try {
   // ---------------------------------------------------------------------------------------
   // 1. Pure origin policy and the persisted tuple
   // ---------------------------------------------------------------------------------------
-  await check('origin: only one canonical https://<label>.ts.net spelling is accepted', () => {
-    for (const good of [ORIGIN, 'https://box.tailnet-1234.ts.net']) assert.equal(normalizeWebOrigin(good), good)
+  // Amendment A1 (owner-approved 2026-11-15): an explicit port 1-65535 is accepted; the fence
+  // stays an exact whole-string match, so `:443` is refused (the browser sends the portless origin)
+  // and so is every spelling a browser cannot produce (`:0`, a leading zero, a trailing dot, ...).
+  await check('origin A1: a canonical port 1-65535 is accepted, everything else is refused', () => {
+    for (const good of [ORIGIN, 'https://box.tailnet-1234.ts.net', 'https://box.tailnet-1234.ts.net:30443',
+      'https://box.tailnet-1234.ts.net:1', 'https://box.tailnet-1234.ts.net:65535', 'https://a-b.c.tailnet-9.ts.net:8443',
+      `${ORIGIN}:30443`]) assert.equal(normalizeWebOrigin(good), good, good)
     for (const bad of [
       'http://dsh-owner.tail1234.ts.net', 'https://dsh-owner.tail1234.ts.net/', 'https://dsh-owner.tail1234.ts.net:443',
       'https://dsh-owner.tail1234.ts.net:30443/ws/mobile', 'https://dsh-owner.tail1234.ts.net.', 'https://ts.net',
       'https://dsh-owner.tail1234.ts.net#x', 'https://user:pw@dsh-owner.tail1234.ts.net', 'https://100.64.1.2',
       'https://localhost', ' HTTPS://dsh-owner.tail1234.ts.net', 'Dsh-owner.tail1234.ts.net',
+      // Amendment A1 additions.
+      'https://dsh-owner.tail1234.ts.net:0', 'https://dsh-owner.tail1234.ts.net:030443',
+      'https://dsh-owner.tail1234.ts.net:03044', 'https://dsh-owner.tail1234.ts.net:30443/',
+      'https://dsh-owner.tail1234.ts.net:65536', 'https://dsh-owner.tail1234.ts.net:99999',
+      'https://dsh-owner.tail1234.ts.net:', 'https://dsh-owner.tail1234.ts.net:+30443',
+      'https://dsh-owner.tail1234.ts.net:-0', 'https://dsh-owner.tail1234.ts.net:30443.',
+      'https://dsh-owner.tail1234.ts.net.:30443', 'https://dsh-owner.tail1234.ts.net:30443/ws/mobile',
+      'https://dsh-owner.tail1234.ts.net:30443?x=1', 'https://dsh-owner.tail1234.ts.net:30443#x',
+      'https://user:pw@dsh-owner.tail1234.ts.net:30443', 'http://dsh-owner.tail1234.ts.net:30443',
+      'https://100.64.1.2:30443', 'https://dsh-owner.tail1234.ts.net:30443 ', ' https://dsh-owner.tail1234.ts.net:30443',
+      'https://[::1]:30443',
     ]) assert.equal(normalizeWebOrigin(bad), null, bad)
+    // The wrote form is exactly one canonical spelling: comparing the whole string (no port or
+    // case folding) is the fence, so a port origin is matched only by its own exact string.
+    assert.equal(normalizeWebOrigin(`${ORIGIN}:30443`), `${ORIGIN}:30443`)
   })
 
   await check('tuple: disabled default, one-value persistence, refused write leaves the file as it was', () => {
@@ -508,6 +600,8 @@ try {
 
   await check('owner guidance is browser-only, fixed /ws/mobile, and never claims readiness', () => {
     const guidance = webIngressStatus({ enabled: false, origin: ORIGIN, listening: false, port: 30_443, error: null })
+    // Amendment A3: `assets` is reported by the gateway's own `webIngressReport` (live instance
+    // checks below), never folded into this guidance's `listening`.
     assert.deepEqual(Object.keys(guidance).sort(),
       ['configured', 'enabled', 'error', 'host', 'listening', 'origin', 'port', 'trust', 'wsPath'])
     // Spec 031 §2/§7: the browser path is the contract's `/ws/mobile` regardless of the direct
@@ -523,6 +617,65 @@ try {
     const unconfigured = webIngressStatus({ enabled: false, origin: '', listening: false, port: 0, error: null })
     assert.equal(unconfigured.origin, null)
     assert.equal(unconfigured.configured, false)
+  })
+
+  // ---------------------------------------------------------------------------------------
+  // 1b. Amendment A1/A2/A3 (owner-approved 2026-11-15), pure policy first
+  // ---------------------------------------------------------------------------------------
+  await check('A1: the tuple and the owner plan accept only canonical port origins', () => {
+    const portOrigin = `${ORIGIN}:30443`
+    assert.deepEqual(readWebIngress({ enabled: true, port: 30_443, origin: portOrigin }), { enabled: true, port: 30_443, origin: portOrigin })
+    for (const bad of [{ enabled: true, port: 30_443, origin: `${ORIGIN}:443` }, { enabled: true, port: 30_443, origin: `${ORIGIN}:030443` },
+      { enabled: true, port: 30_443, origin: `${ORIGIN}:0` }, { enabled: true, port: 30_443, origin: `${ORIGIN}:30443/` }]) {
+      assert.throws(() => readWebIngress(bad), /web ingress origin/, JSON.stringify(bad))
+    }
+    const current = { enabled: false, port: 0, origin: '' }
+    assert.deepEqual(planWebIngress({ enabled: true, port: 30_443, origin: portOrigin }, current, 31_111),
+      { enabled: true, port: 30_443, origin: portOrigin })
+    // A padded copy of an accepted spelling is refused, never silently repaired into one.
+    assert.throws(() => planWebIngress({ origin: ` ${portOrigin}` }, current, 31_111), (error) => error.status === 400)
+    assert.throws(() => planWebIngress({ origin: `${ORIGIN}:443` }, current, 31_111), (error) => error.status === 400)
+    // `origin: ''` still clears the stored origin; enabling after that is refused (needs one).
+    assert.equal(planWebIngress({ origin: '' }, { enabled: false, port: 30_443, origin: portOrigin }, 31_111).origin, '')
+    assert.throws(() => planWebIngress({ origin: '' }, { enabled: true, port: 30_443, origin: portOrigin }, 31_111),
+      (error) => error.status === 400)
+  })
+
+  await check('A2 policy: asset root, SPA fallback and type/header rules', () => {
+    // A missing configured root never falls back to something else and never throws.
+    const missing = resolveAssetRoot(path.join(temp, 'no-such-assets'), path.join(temp, 'no-such-default'))
+    assert.deepEqual({ root: missing.root, source: missing.source }, { root: null, source: 'env' })
+    assert.equal(webAssetsStatus(missing).configured, true, 'a configured-but-missing root is still "configured"')
+    assert.equal(webAssetsStatus(missing).indexPresent, false)
+    assert.equal(webAssetsStatus(missing).source, 'env', 'an unusable env root is reported as env, never as none')
+    // No root resolved yet (before a listener attempt): nothing configured, nothing to serve.
+    assert.deepEqual(webAssetsStatus(null), { configured: false, indexPresent: false, source: 'none' })
+    // The default fallback: a default that exists is `source: 'default'` and not "configured".
+    const custom = path.join(temp, 'assets-custom')
+    fs.mkdirSync(custom, { recursive: true })
+    fs.writeFileSync(path.join(custom, 'index.html'), '<!doctype html><title>pwa</title>')
+    assert.deepEqual(webAssetsStatus(resolveAssetRoot(undefined, custom)), { configured: false, indexPresent: true, source: 'default' })
+    // An env root wins over the repository default; the default names the built PWA.
+    const resolved = resolveAssetRoot(custom, path.join(temp, 'no-such-default'))
+    assert.equal(resolved.source, 'env')
+    assert.equal(webAssetsStatus(resolved).indexPresent, true)
+    // SPA fallback: an ALLOWLIST of the app's own file routes (one plain-name id segment for `s`
+    // and `session`), each with an optional trailing slash. Everything else is a file request or a
+    // 404 — including an extension-less path, `/api`, `/dsh`, `/mgw` and the browser WS path.
+    for (const [pathname, expected] of [['/', true], ['/pair', true], ['/pair/', true], ['/privacy', true],
+      ['/settings', true], ['/schedules', true], ['/storage', true], ['/conversations', true], ['/s', true],
+      ['/session', true], ['/session/abc', true], ['/s/abc', true], ['/session/abc/', true],
+      ['/missing.js', false], ['/assets/app.js', false], ['/pair/data.json', false], ['/app.MAP', false],
+      ['/deep/link/abc', false], ['/s/abc/def', false], ['/session/a.b', false], ['/s/abc/a.b', false],
+      ['/api/sessions', false], ['/dsh', false], ['/dsh/x', false],
+      ['/mgw/pending', false], ['/ws/mobile', false], ['/ws/other', false], ['', false], ['relative', false]]) {
+      assert.equal(spaFallback(pathname), expected, pathname)
+    }
+    // The service worker and the manifest are the types a browser needs; identical header policy.
+    assert.equal(assetTypeFor('/x/sw.js'), 'text/javascript; charset=utf-8')
+    assert.equal(assetTypeFor('/x/manifest.json'), 'application/manifest+json')
+    assert.match(ASSET_CSP, /frame-ancestors 'none'/)
+    assert.match(ASSET_CSP, /object-src 'none'/)
   })
 
   // ---------------------------------------------------------------------------------------
@@ -951,8 +1104,12 @@ try {
       }
     })
 
-    await check('admin fence: /mgw and the static/DSH surface answer 404 on the web port', async () => {
-      for (const [pathName, headers] of [['/mgw/pending', { Origin: ORIGIN }], ['/', {}], ['/mgw', { Forwarded: 'for=203.0.113.9', Origin: ORIGIN }]]) {
+    // Amendment A2: `/` now serves the built PWA from this suite's own asset root, so the admin
+    // fence is pinned for `/mgw` and DSH-shaped paths — never one of them served with 200.
+    await check('admin fence: /mgw and the DSH surface answer 404 (never 200) on the web port', async () => {
+      for (const [pathName, headers] of [['/mgw/pending', { Origin: ORIGIN }], ['/mgw/status', {}],
+        ['/mgw', { Forwarded: 'for=203.0.113.9', Origin: ORIGIN }], ['/api/sessions', { Origin: ORIGIN }],
+        ['/dsh', {}], ['/settings/devices', {}]]) {
         const answer = await new Promise((resolve, reject) => {
           const socket = tls.connect({ host: '127.0.0.1', port: webPort, rejectUnauthorized: false })
           socket.once('secureConnect', () => {
@@ -963,6 +1120,10 @@ try {
           socket.once('error', reject)
           socket.once('data', (chunk) => { socket.destroy(); resolve(chunk.toString('latin1')) })
         })
+        // Amendment A2: `/mgw/pending` and `/mgw/status` are extension-less, so the SPA fallback
+        // answers them with `index.html` — and it must NOT: no management route may be reachable
+        // here, and a page is not `/mgw`. 404 only, never 200 (the static surface is `/`, `/pair`
+        // and the build's real files). A DSH-shaped path outside `/mgw` stays a generic 404.
         assert.match(answer, /^HTTP\/1\.1 404 /, `${pathName} must not be served on the web port`)
       }
     })
@@ -981,6 +1142,464 @@ try {
       await assert.rejects(webUpgrade({ port: webPort, headers: { Origin: ORIGIN, Host: 'dsh-owner.tail1234.ts.net' }, protocols: ['dsh-mobile-v1'], pathName: '/mgw/pending' }),
         (error) => error.status === 404)
     })
+
+    // -------------------------------------------------------------------------------------
+    // Amendment A2/A3: the same listener serves the built PWA as GET/HEAD static files.
+    // This suite's root is its own fixture tree; nothing here reads the app's build output.
+    // -------------------------------------------------------------------------------------
+    const assetRoot = path.join(temp, 'pwa-assets')
+    const outsideDir = path.join(temp, 'outside')
+    fs.mkdirSync(path.join(assetRoot, 'assets'), { recursive: true })
+    fs.mkdirSync(path.join(assetRoot, '.hidden'), { recursive: true })
+    fs.mkdirSync(outsideDir, { recursive: true })
+    fs.writeFileSync(path.join(assetRoot, 'index.html'), '<!doctype html><title>pwa entry</title>')
+    fs.writeFileSync(path.join(assetRoot, 'assets', 'app.js'), 'console.log("pwa")')
+    fs.writeFileSync(path.join(assetRoot, 'assets', 'app.js.map'), '{"version":3}')
+    fs.writeFileSync(path.join(assetRoot, '.env'), 'SECRET=test-only')
+    fs.writeFileSync(path.join(assetRoot, '.hidden', 'x.txt'), 'hidden')
+    fs.writeFileSync(path.join(assetRoot, 'sw.js'), 'self.addEventListener("install", () => {})')
+    fs.writeFileSync(path.join(assetRoot, 'manifest.json'), '{"name":"pwa"}')
+    fs.writeFileSync(path.join(outsideDir, 'secret.txt'), 'outside-the-root')
+    // Review fixtures: bait files that REALLY exist, so a refusal is told apart from a miss. The
+    // management/DSH prefixes get real files; a `.map` and a dot-less name carry the ADS / device
+    // spellings the Windows path layer would otherwise resolve to the same file.
+    for (const dir of ['mgw', 'api', 'dsh']) {
+      fs.mkdirSync(path.join(assetRoot, dir), { recursive: true })
+      fs.writeFileSync(path.join(assetRoot, dir, 'bait.js'), `bait-${dir}`)
+      fs.writeFileSync(path.join(assetRoot, `${dir}.js`), `bait-${dir}-file`)
+    }
+    fs.writeFileSync(path.join(assetRoot, 'web-assets.mjs'), 'export const bait = true')
+    fs.writeFileSync(path.join(assetRoot, 'pair.js'), 'console.log("pair bait")')
+    // The real built PWA (dist is git-ignored) must never leak into these assertions: its files
+    // are dotfile-free, so a root that never serves a fixture proves the root under test is the
+    // fixture. When the OS refuses links, only the junction rows are split out (see below).
+    const builtPwa = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'apps', 'mobile-companion', 'dist')
+    const probeRoot = resolveAssetRoot(assetRoot, builtPwa)
+    assert.equal(probeRoot.source, 'env', 'the env root wins over the repository default')
+    let linked = false
+    try {
+      fs.symlinkSync(outsideDir, path.join(assetRoot, 'linked'), 'junction')
+      linked = true
+    } catch { /* link privileges are not granted on this host: the junction case is reported, not asserted */ }
+    // A fresh instance whose asset root is this fixture tree. The root is the ENV choice
+    // (`DSH_MGW_WEB_ASSETS_DIR`) and is read when the listener opens, so it is set only while
+    // this gateway's listener is enabled and is restored immediately afterwards: no other
+    // listener in this process can pick it up by accident.
+    const assetsGateway = await startGateway('assets', {
+      lanPort: await freePort(),
+      gatewayStateFile: path.join(temp, 'assets-state.json'),
+      deviceFile: path.join(temp, 'assets-devices.json'),
+    })
+    try {
+      await withAssetsEnv(assetRoot, async () => {
+        await assetsGateway.waitForLan()
+        const enabled = await assetsGateway.post('web-ingress', { enabled: true, port: await freePort(), origin: `${ORIGIN}:30443` })
+        assert.equal(enabled.status, 200, JSON.stringify(enabled.data))
+        const status = await assetsGateway.status()
+        // A1 live: a port origin is configured, persisted, and the guidance names it verbatim.
+        assert.equal(status.webIngress.origin, `${ORIGIN}:30443`)
+        assert.deepEqual(createGatewayState(assetsGateway.stateFile).webIngress, { enabled: true, port: enabled.data.port, origin: `${ORIGIN}:30443` })
+        // A3: assets reported separately, never folded into listening/active/ready.
+        assert.deepEqual(status.webIngress.assets, { configured: true, indexPresent: true, source: 'env' })
+        assert.equal(status.webIngress.active, true)
+        assert.equal('ready' in status.webIngress, false)
+      })
+      const assetPort = (await assetsGateway.status()).webIngress.port
+      assert.equal(process.env.DSH_MGW_WEB_ASSETS_DIR, undefined, 'the env override is restored after the check')
+
+      await check('A2 assets: GET/HEAD serve the entry, files and SW/manifest types with the header policy', async () => {
+        const entry = await webHttpGet({ port: assetPort })
+        assert.equal(entry.status, 200)
+        assert.match(entry.body, /pwa entry/)
+        assert.equal(entry.headers['content-type'], 'text/html; charset=utf-8')
+        assert.equal(entry.headers['x-content-type-options'], 'nosniff')
+        assert.equal(entry.headers['content-security-policy'], ASSET_CSP)
+        assert.match(entry.headers['content-security-policy'], /frame-ancestors 'none'/)
+        assert.equal(entry.headers['cache-control'], 'no-cache')
+        const script = await webHttpGet({ port: assetPort, pathName: '/assets/app.js' })
+        assert.equal(script.status, 200)
+        assert.equal(script.headers['content-type'], 'text/javascript; charset=utf-8')
+        const worker = await webHttpGet({ port: assetPort, pathName: '/sw.js' })
+        assert.equal(worker.status, 200)
+        assert.equal(worker.headers['content-type'], 'text/javascript; charset=utf-8')
+        assert.equal(worker.headers['cache-control'], 'no-cache', 'the service worker is never cached')
+        const manifest = await webHttpGet({ port: assetPort, pathName: '/manifest.json' })
+        assert.equal(manifest.status, 200)
+        assert.equal(manifest.headers['content-type'], 'application/manifest+json')
+        // HEAD: the same status/headers/length as GET, no body.
+        const head = await webHttpGet({ port: assetPort, method: 'HEAD', pathName: '/assets/app.js' })
+        assert.equal(head.status, 200)
+        assert.equal(head.headers['content-type'], script.headers['content-type'])
+        assert.equal(head.headers['content-length'], script.headers['content-length'])
+        assert.equal(head.body, '')
+      })
+
+      await check('A2 assets: the SPA fallback is the app route ALLOWLIST; 404s never echo a path', async () => {
+        // Every page the app's own file router owns answers the entry: the static routes and the
+        // two dynamic ones (one plain-name id segment), plus the trailing-slash spelling.
+        for (const pathName of ['/', '/pair', '/privacy', '/schedules', '/settings', '/storage',
+          '/conversations', '/session/abc', '/s/abc']) {
+          const answer = await webHttpGet({ port: assetPort, pathName })
+          assert.equal(answer.status, 200, pathName)
+          assert.match(answer.body, /pwa entry/, pathName)
+        }
+        // Everything else is a 404: a dotted file request, an extension-less path that is NOT a
+        // route (an old shape rule answered every one of those with the entry page), two segments
+        // under a dynamic route, and the prefixes this listener must be indistinguishable from.
+        for (const pathName of ['/missing.js', '/assets/nope.css', '/nothing/here.json', '/app.MAP',
+          '/deep/link/abc', '/s/abc/def', '/session/a.b', '/api/sessions', '/dsh', '/dsh/x']) {
+          const answer = await webHttpGet({ port: assetPort, pathName })
+          assert.equal(answer.status, 404, pathName)
+          assert.equal(answer.headers['content-type'], 'text/plain', pathName)
+          assert.equal(answer.body, '', `${pathName}: a generic 404 carries no body and no path`)
+          assert.equal((answer.body + JSON.stringify(answer.headers)).includes(assetRoot), false, pathName)
+        }
+      })
+
+      await check('A2 assets: traversal, encoded separators, dotfiles, maps and a junction are refused', async () => {
+        for (const pathName of [
+          '/../outside/secret.txt', '/assets/../../outside/secret.txt', '/%2e%2e/outside/secret.txt',
+          '/assets/..%2F..%2Foutside%2Fsecret.txt', '/..%5Coutside%5Csecret.txt', '/.env', '/.hidden/x.txt',
+          '/assets/app.js.map', '/assets/APP.JS.MAP', '/assets/%2e%2e/%2e%2e/outside/secret.txt',
+          '/%00', '/assets/app.js%00.txt', '//outside/secret.txt',
+          ...(linked ? ['/linked/secret.txt', '/linked/x.txt'] : []),
+        ]) {
+          const answer = await webHttpGet({ port: assetPort, pathName })
+          assert.equal(answer.status, 404, `${pathName} (job ${linked ? 'junction' : 'no-junction'})`)
+          assert.equal(answer.body.includes('outside-the-root'), false, pathName)
+          assert.equal(answer.body.includes('SECRET=test-only'), false, pathName)
+        }
+        if (!linked) console.log('DEBUG: symlink/junction refused by the OS here; the junction case was not exercised')
+      })
+
+      await check('A2 assets: methods other than GET/HEAD are 405 with the headers, nothing else answers 200', async () => {
+        for (const method of ['POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'TRACE']) {
+          const answer = await webHttpGet({ port: assetPort, method, pathName: '/' })
+          assert.equal(answer.status, 405, method)
+          assert.equal(answer.headers.allow, 'GET, HEAD')
+          assert.equal(answer.body, '')
+        }
+        // HTTP (not an upgrade) on `/ws/mobile` is NOT the asset handler's request at all: the
+        // listener answers 426 (Upgrade Required, `Upgrade: websocket`) before any lookup, so it
+        // can never become a page whatever root is served. Every `/ws/...` path is the same.
+        for (const pathName of ['/ws/mobile', '/ws/mobile?x=1', '/ws/other', '/ws']) {
+          const answer = await webHttpGet({ port: assetPort, pathName })
+          assert.equal(answer.status, 426, pathName)
+          assert.notEqual(answer.status, 200, pathName)
+          assert.equal(answer.body, '', `${pathName}: a 426 carries no page`)
+          assert.equal(answer.headers.upgrade, 'websocket', pathName)
+        }
+      })
+
+      await check('A2 assets (review M1/M2): ADS, device names, normalisable and encoded paths are refused on files that EXIST', async () => {
+        // Each name below has a REAL file behind it (fixture above), so a 404 is a refusal and not
+        // a miss. Control rows prove the files really are servable by their plain spelling.
+        for (const pathName of ['/assets/app.js', '/web-assets.mjs', '/pair.js']) {
+          assert.equal((await webHttpGet({ port: assetPort, pathName })).status, 200, `control ${pathName}`)
+        }
+        for (const pathName of [
+          '/web-assets.mjs::$DATA', '/assets/app.js::$DATA', '/assets/app.js.map::$DATA', '/assets/app.js.map:$DATA',
+          '/assets/app.js:stream', '/index.html::$DATA', '/CON', '/con.js', '/NUL', '/nul.txt', '/assets/COM1',
+          '/assets/LPT9.js', '/PRN', '/AUX.html',
+          '/x/../index.js', '/x/../assets/app.js', '/assets/../assets/app.js', '/./assets/app.js', '/assets/./app.js',
+          '/%2e/assets/app.js', '/assets/%2e/app.js', '/%2E%2E/index.html', '/assets/%2e%2e/assets/app.js',
+          '//host/assets/app.js', '//assets/app.js', '/assets//app.js', '///index.html',
+          '/assets%2fapp.js', '/assets%2Fapp.js', '/assets%5capp.js', '/%61ssets/app.js', '/assets/app%2ejs',
+          '/assets\\app.js', '/assets/app.js%00', '/assets/app.js%20', '/assets/app.js.',
+          '/assets/app.js#frag', '/assets/app.js/.', '/assets/app.js/',
+        ]) {
+          const answer = await webHttpGet({ port: assetPort, pathName })
+          assert.notEqual(answer.status, 200, `${pathName} must not be served`)
+          assert.equal(answer.body.includes('console.log("pwa")'), false, `${pathName} leaked app.js`)
+          assert.equal(answer.body.includes('export const bait'), false, `${pathName} leaked web-assets.mjs`)
+          assert.equal(answer.body.includes('{"version":3}'), false, `${pathName} leaked the map`)
+        }
+        // The real `.map` and a mixed-case twin are never in the snapshot either.
+        for (const pathName of ['/assets/app.js.map', '/assets/APP.JS.MAP']) {
+          assert.equal((await webHttpGet({ port: assetPort, pathName })).status, 404, pathName)
+        }
+      })
+
+      await check('A2 assets (review M3): /mgw /api /dsh and /ws are classified before any file lookup', async () => {
+        for (const prefix of ['mgw', 'api', 'dsh']) {
+          const exact = (await webHttpGet({ port: assetPort, pathName: `/${prefix}.js` })).status
+          assert.equal(exact, 200, `control: /${prefix}.js is a real, servable file (a prefix is a segment, not a string prefix)`)
+          for (const pathName of [`/${prefix}`, `/${prefix}/`, `/${prefix}/bait.js`, `/${prefix}/missing`,
+            `/${prefix.toUpperCase()}/bait.js`, `/${prefix}/bait.js?x=1`]) {
+            const answer = await webHttpGet({ port: assetPort, pathName })
+            assert.equal(answer.status, 404, `${pathName} must be 404 though bait exists`)
+            assert.equal(answer.body.includes(`bait-${prefix}`), false, pathName)
+          }
+        }
+      })
+
+      await check('A2 assets (review M4): a snapshot is served from memory; later disk edits and new links change nothing', async () => {
+        const before = await webHttpGet({ port: assetPort, pathName: '/assets/app.js' })
+        assert.equal(before.body, 'console.log("pwa")')
+        fs.writeFileSync(path.join(assetRoot, 'assets', 'app.js'), 'console.log("EDITED-AFTER-SNAPSHOT")')
+        fs.writeFileSync(path.join(assetRoot, 'late.js'), 'late-file')
+        fs.writeFileSync(path.join(assetRoot, 'index.html'), '<!doctype html><title>EDITED entry</title>')
+        try {
+          const after = await webHttpGet({ port: assetPort, pathName: '/assets/app.js' })
+          assert.equal(after.body, 'console.log("pwa")', 'the served bytes are the snapshot, not the disk')
+          assert.equal((await webHttpGet({ port: assetPort, pathName: '/late.js' })).status, 404, 'a file added later is not served')
+          assert.match((await webHttpGet({ port: assetPort, pathName: '/' })).body, /pwa entry/)
+        } finally {
+          fs.writeFileSync(path.join(assetRoot, 'assets', 'app.js'), 'console.log("pwa")')
+          fs.writeFileSync(path.join(assetRoot, 'index.html'), '<!doctype html><title>pwa entry</title>')
+          fs.rmSync(path.join(assetRoot, 'late.js'), { force: true })
+        }
+        // Removing a file after the snapshot does not remove it from the answer either.
+        fs.renameSync(path.join(assetRoot, 'sw.js'), path.join(assetRoot, 'sw.js.moved'))
+        try {
+          const gone = await webHttpGet({ port: assetPort, pathName: '/sw.js' })
+          assert.equal(gone.status, 200)
+          assert.match(gone.body, /addEventListener/)
+        } finally {
+          fs.renameSync(path.join(assetRoot, 'sw.js.moved'), path.join(assetRoot, 'sw.js'))
+        }
+      })
+
+      await check('A2 snapshot: only regular files with plain names enter; links are skipped at every level', async () => {
+        const snapRoot = path.join(temp, 'snap-fixture')
+        fs.mkdirSync(path.join(snapRoot, 'ok'), { recursive: true })
+        fs.mkdirSync(path.join(snapRoot, '.git'), { recursive: true })
+        fs.mkdirSync(path.join(snapRoot, 'CON'), { recursive: true })
+        fs.writeFileSync(path.join(snapRoot, 'index.html'), 'entry')
+        fs.writeFileSync(path.join(snapRoot, 'ok', 'a.js'), 'a')
+        fs.writeFileSync(path.join(snapRoot, 'ok', 'a.js.map'), 'map')
+        fs.writeFileSync(path.join(snapRoot, 'ok', 'B.MAP'), 'map')
+        fs.writeFileSync(path.join(snapRoot, '.env'), 'secret')
+        fs.writeFileSync(path.join(snapRoot, '.git', 'config'), 'git')
+        fs.writeFileSync(path.join(snapRoot, 'CON', 'x.js'), 'dev')
+        fs.writeFileSync(path.join(snapRoot, 'nul.txt'), 'dev')
+        fs.writeFileSync(path.join(snapRoot, 'bad name.js'), 'space')
+        fs.writeFileSync(path.join(snapRoot, 'caf\u00e9.js'), 'unicode')
+        let snapLinked = false
+        try {
+          fs.symlinkSync(outsideDir, path.join(snapRoot, 'ok', 'jlink'), 'junction')
+          fs.symlinkSync(path.join(outsideDir, 'secret.txt'), path.join(snapRoot, 'flink.txt'), 'file')
+          snapLinked = true
+        } catch { /* link privileges are not granted here: reported below, not asserted */ }
+        const snap = resolveAssetRoot(snapRoot, path.join(temp, 'no-such-default')).snapshot
+        assert.deepEqual([...snap.keys()].sort(), ['/index.html', '/ok/a.js'],
+          `only plain regular files (links: ${snapLinked ? 'exercised' : 'not permitted by the OS'})`)
+        assert.equal(webAssetsStatus(resolveAssetRoot(snapRoot, '')).indexPresent, true)
+        // No `index.html` in the snapshot means no entry, whatever else is there.
+        const noIndex = path.join(temp, 'snap-noindex')
+        fs.mkdirSync(noIndex, { recursive: true })
+        fs.writeFileSync(path.join(noIndex, 'only.js'), 'x')
+        assert.equal(webAssetsStatus(resolveAssetRoot(noIndex, '')).indexPresent, false)
+        if (!snapLinked) console.log('DEBUG: symlink/junction refused by the OS here; link skipping was not exercised')
+      })
+
+      await check('A2 snapshot (round 2 M1): an identity or content change between lstat and read discards the WHOLE snapshot', async () => {
+        const root = path.join(temp, 'snap-unstable')
+        fs.mkdirSync(path.join(root, 'sub'), { recursive: true })
+        fs.writeFileSync(path.join(root, 'index.html'), 'entry')
+        fs.writeFileSync(path.join(root, 'sub', 'a.js'), 'aaaa')
+        const real = fs.realpathSync(root)
+        // Control: the same fixture is stable and complete with no hook.
+        const clean = buildAssetSnapshot(real)
+        assert.equal(clean.error, null)
+        assert.deepEqual([...clean.snapshot.keys()].sort(), ['/index.html', '/sub/a.js'])
+        // Identity is BigInt end to end: a Windows file id is > Number.MAX_SAFE_INTEGER, where
+        // `ino + 1` as a Number would equal `ino`. Every injected identity below is `ino + <n>n`,
+        // and the positive control proves it is really a DIFFERENT identity from the original.
+        const bump = (stats, extra) => Object.assign(Object.create(Object.getPrototypeOf(stats)), stats, extra)
+        const probeStat = fs.lstatSync(path.join(real, 'sub', 'a.js'), { bigint: true })
+        assert.equal(typeof probeStat.ino, 'bigint', 'the identity under test is a BigInt')
+        for (const delta of [1n, 7n, 9n]) {
+          assert.notEqual(bump(probeStat, { ino: probeStat.ino + delta }).ino, probeStat.ino, `control: ino + ${delta}n differs from the original`)
+        }
+        // Even at an id no Number can tell apart from its neighbour, the BigInt bump is distinct.
+        const huge = 2n ** 63n - 1n
+        assert.notEqual(huge + 1n, huge)
+        assert.equal(Number(huge) + 1, Number(huge), 'control: this is exactly the case a Number identity would miss')
+        // 1. The path is re-pointed at ANOTHER file after the fd opened it: (dev,ino) no longer match.
+        const swap = () => ({
+          fstatSync: (fd, o) => { const s = fs.fstatSync(fd, o); return bump(s, { ino: s.ino + 1n }) },
+        })
+        const identity = buildAssetSnapshot(real, { fs: { fstatSync: swap().fstatSync } })
+        assert.equal(identity.error, 'identity')
+        assert.equal(identity.snapshot.size, 0, 'nothing is served from a partly-read tree')
+        // 2. The pathname is lstat'ed AFTER the read and is now a different file.
+        let calls = 0
+        const after = buildAssetSnapshot(real, { fs: { lstatSync: (p, o) => {
+          const s = fs.lstatSync(p, o)
+          if (p.endsWith('a.js') && ++calls === 2) return bump(s, { ino: s.ino + 7n })
+          return s
+        } } })
+        assert.equal(after.error, 'identity')
+        assert.equal(after.snapshot.size, 0)
+        // 3. The content shrinks between fstat and read (short read): size no longer matches.
+        const shrink = buildAssetSnapshot(real, { fs: { readSync: (fd, buf, off, len, pos) => {
+          const n = fs.readSync(fd, buf, off, Math.max(0, len - 2), pos)
+          return n
+        } } })
+        assert.equal(shrink.error, 'identity')
+        assert.equal(shrink.snapshot.size, 0)
+        // 4. realpath escapes the root.
+        const escape = buildAssetSnapshot(real, { fs: { realpathSync: (p) => (p.endsWith('a.js') ? outsideDir : fs.realpathSync(p)) } })
+        assert.equal(escape.error, 'outside-root')
+        assert.equal(escape.snapshot.size, 0)
+        // 5. A directory that changed identity while it was being listed.
+        let dirCalls = 0
+        const dirSwap = buildAssetSnapshot(real, { fs: { lstatSync: (p, o) => {
+          const s = fs.lstatSync(p, o)
+          if (p.endsWith('sub') && ++dirCalls === 2) return bump(s, { ino: s.ino + 9n })
+          return s
+        } } })
+        assert.equal(dirSwap.error, 'identity')
+        assert.equal(dirSwap.snapshot.size, 0)
+        // The status says so, with a fixed word and no path.
+        const resolved = resolveAssetRoot(real, '', { fs: { fstatSync: swap().fstatSync } })
+        const report = webAssetsStatus(resolved)
+        assert.deepEqual(report, { configured: true, indexPresent: false, source: 'env', unstable: 'identity' })
+        assert.equal(JSON.stringify(report).includes(root), false)
+      })
+
+      await check('A2 snapshot (round 2 M2): entry, file, byte and deadline budgets fail closed', async () => {
+        const root = path.join(temp, 'snap-budget')
+        fs.mkdirSync(root, { recursive: true })
+        fs.writeFileSync(path.join(root, 'index.html'), 'entry')
+        for (let index = 0; index < 30; index += 1) fs.mkdirSync(path.join(root, `d${index}`))
+        for (let index = 0; index < 30; index += 1) fs.writeFileSync(path.join(root, `.skip${index}`), 'x')
+        const real = fs.realpathSync(root)
+        // Entries: every one is counted, skipped ones (dotfiles) and empty directories included.
+        assert.equal(buildAssetSnapshot(real).error, null, 'control: 61 entries are within the default budget')
+        const entries = buildAssetSnapshot(real, { maxEntries: 40 })
+        assert.equal(entries.error, 'entry-budget')
+        assert.equal(entries.snapshot.size, 0)
+        // The walk STOPS at the limit instead of listing everything first.
+        let listed = 0
+        const lazy = buildAssetSnapshot(real, { maxEntries: 10, fs: { opendirSync: (p) => {
+          const handle = fs.opendirSync(p)
+          return { readSync: () => { const entry = handle.readSync(); if (entry !== null) listed += 1; return entry }, closeSync: () => handle.closeSync() }
+        } } })
+        assert.equal(lazy.error, 'entry-budget')
+        assert.ok(listed <= 11, `iterator stopped at the budget, read ${listed} entries`)
+        // Files and bytes.
+        const bigRoot = path.join(temp, 'snap-bytes')
+        fs.mkdirSync(bigRoot, { recursive: true })
+        fs.writeFileSync(path.join(bigRoot, 'index.html'), 'entry')
+        fs.writeFileSync(path.join(bigRoot, 'big.bin'), Buffer.alloc(4096, 1))
+        const bigReal = fs.realpathSync(bigRoot)
+        assert.equal(buildAssetSnapshot(bigReal).error, null, 'control: the same files fit the default byte budget')
+        const bytes = buildAssetSnapshot(bigReal, { maxBytes: 1000 })
+        assert.equal(bytes.error, 'byte-budget')
+        assert.equal(bytes.snapshot.size, 0)
+        // A file whose size grows AFTER fstat is caught by the read bound, not by trusting fstat.
+        const grow = buildAssetSnapshot(bigReal, { maxBytes: 5000, fs: { fstatSync: (fd, o) => {
+          const s = fs.fstatSync(fd, o)
+          return Object.assign(Object.create(Object.getPrototypeOf(s)), s, { size: s.size > 100n ? 10n : s.size })
+        } } })
+        assert.ok(['byte-budget', 'identity'].includes(grow.error), String(grow.error))
+        assert.equal(grow.snapshot.size, 0)
+        assert.equal(buildAssetSnapshot(real, { maxFiles: 0 }).error, 'file-budget')
+        // A hostile size (negative, or a Number where a BigInt was asked for) fails closed, never
+        // reaches an allocation.
+        const negative = buildAssetSnapshot(bigReal, { fs: { fstatSync: (fd, o) => {
+          const s = fs.fstatSync(fd, o)
+          return Object.assign(Object.create(Object.getPrototypeOf(s)), s, { size: -1n })
+        } } })
+        assert.equal(negative.error, 'identity')
+        assert.equal(negative.snapshot.size, 0)
+        const numberStats = buildAssetSnapshot(bigReal, { fs: { fstatSync: (fd) => fs.fstatSync(fd) } })
+        assert.equal(numberStats.error, 'identity', 'Number stats are refused: identity must be BigInt')
+        assert.equal(numberStats.snapshot.size, 0)
+        // Deadline: an injected clock that jumps past the limit after the first step.
+        let clock = 1_000
+        const slow = buildAssetSnapshot(real, { deadlineMs: 50, now: () => { clock += 40; return clock } })
+        assert.equal(slow.error, 'deadline')
+        assert.equal(slow.snapshot.size, 0)
+        assert.equal(webAssetsStatus(resolveAssetRoot(real, '', { maxEntries: 5 })).unstable, 'entry-budget')
+      })
+
+      await check('A2 assets (review minor): /ws is 426 even with no asset root', async () => {
+        const bare = await startGateway('no-root-ws', {
+          lanPort: await freePort(),
+          gatewayStateFile: path.join(temp, 'no-root-ws-state.json'),
+          deviceFile: path.join(temp, 'no-root-ws-devices.json'),
+        })
+        try {
+          await bare.waitForLan()
+          await withAssetsEnv(path.join(temp, 'no-such-assets-2'), async () => {
+            const applied = await bare.post('web-ingress', { enabled: true, port: await freePort(), origin: ORIGIN })
+            assert.equal(applied.status, 200, JSON.stringify(applied.data))
+            const report = (await bare.status()).webIngress
+            assert.equal(report.assets.indexPresent, false)
+            for (const pathName of ['/ws', '/ws/mobile', '/ws/other', '/WS/mobile']) {
+              const answer = await webHttpGet({ port: report.port, pathName })
+              assert.equal(answer.status, 426, pathName)
+              assert.equal(answer.headers.upgrade, 'websocket', pathName)
+            }
+            assert.equal((await webHttpGet({ port: report.port, pathName: '/' })).status, 404)
+          })
+        } finally {
+          await bare.close()
+        }
+      })
+
+      await check('A1 live: the port origin is the one WS Origin accepted; the portless form is refused', async () => {
+        // A controller check only runs when a real `check()` passed: record it in the summary.
+        checks += 1
+        const wsOrigin = `${ORIGIN}:30443`
+        assert.equal(webOriginAccepted({ headers: { origin: wsOrigin } }, wsOrigin).ok, true)
+        // The fence is exact: the portless spelling of the SAME origin is a different string.
+        assert.equal(webOriginAccepted({ headers: { origin: ORIGIN } }, wsOrigin).ok, false)
+        assert.equal(webOriginAccepted({ headers: { origin: `${wsOrigin}/` } }, wsOrigin).ok, false)
+        assert.equal(webOriginAccepted({ headers: { origin: wsOrigin } }, ORIGIN).ok, false)
+        // A real WS over TLS with that Origin reaches the pairing state machine (HTTP 401 = served).
+        await assert.rejects(webUpgrade({ port: assetPort, headers: { Origin: wsOrigin }, protocols: ['dsh-mobile-v1'] }),
+          (error) => error.status === 401)
+        await assert.rejects(webUpgrade({ port: assetPort, headers: { Origin: ORIGIN }, protocols: ['dsh-mobile-v1'] }),
+          (error) => error.status === 403, 'the portless origin is not this configured origin')
+        // The upgrade path still owns `/ws/mobile`: a plain HTTP request there is 426, never a page.
+        const plainWs = await webHttpGet({ port: assetPort, pathName: '/ws/mobile' })
+        assert.equal(plainWs.status, 426)
+        assert.notEqual(plainWs.status, 200)
+      })
+
+      await check('A3: no usable asset root reports indexPresent false and still answers a generic 404', async () => {
+        const bare = await startGateway('no-assets', {
+          lanPort: await freePort(),
+          gatewayStateFile: path.join(temp, 'no-assets-state.json'),
+          deviceFile: path.join(temp, 'no-assets-devices.json'),
+        })
+        try {
+          await bare.waitForLan()
+          // The env names a directory that does not exist: it is reported as configured but
+          // unusable, and it NEVER silently falls back to the repository default (which does exist
+          // on this machine, so a silent fallback would serve the real PWA here).
+          await withAssetsEnv(path.join(temp, 'no-such-assets'), async () => {
+            const applied = await bare.post('web-ingress', { enabled: true, port: await freePort(), origin: ORIGIN })
+            assert.equal(applied.status, 200, JSON.stringify(applied.data))
+            const report = (await bare.status()).webIngress
+            assert.deepEqual(report.assets, { configured: true, indexPresent: false, source: 'env' })
+            // A missing root never withholds the browser path and never claims ready.
+            assert.equal(report.active, true)
+            assert.equal('ready' in report, false)
+            for (const pathName of ['/', '/pair', '/deep']) {
+              const answer = await webHttpGet({ port: report.port, pathName })
+              assert.equal(answer.status, 404, pathName)
+              assert.equal(answer.body.includes('no-such-assets'), false, pathName)
+            }
+            await expectServed(report.port)
+          })
+          // Restored: the env value is gone, so the repository default decides — `default` when that
+          // build exists on this machine, `none` when it does not (a fresh export has no dist), and
+          // never the unusable env value.
+          assert.equal(process.env.DSH_MGW_WEB_ASSETS_DIR, undefined)
+          const defaultRoot = webAssetsStatus(resolveAssetRoot(undefined, builtPwa))
+          assert.equal(defaultRoot.source, fs.existsSync(builtPwa) ? 'default' : 'none')
+        } finally {
+          await bare.close()
+        }
+      })
+    } finally {
+      await assetsGateway.close()
+    }
 
     await check('the exact configured origin is served; Serve-own x-forwarded-for is not a refusal', async () => {
       // A real ws client with the accepted origin reaches the pairing state machine; the upgrade
