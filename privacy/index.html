@@ -20,20 +20,11 @@ a { color: #0645ad; }
 <body>
 <h1>DSH Orbit — Privacy Policy</h1>
 
-<blockquote>
-<p><strong>DRAFT 2 (2026-11-14) — pending public hosting and final reviewer approval; not published.</strong> Every
-factual claim below is checked against this repository's source; the <em>How this was verified</em> table at
-the end names the file for each one. The in-app Privacy screen (<code>app/privacy.tsx</code>) carries a shorter
-version of the same statements and shows the policy version and contact itself (<code>privacy.p10</code>).</p>
-</blockquote>
-
 <p><strong>Effective date:</strong> not yet set (to be set on the submission build) · <strong>Version:</strong> DRAFT 2 · <strong>Applies
 to:</strong> DSH Orbit, iOS and Android (<code>com.dshext.companion</code>), and the web/PWA build of the same product
 when it is served from a host's Tailscale address.</p>
 
 <p><strong>Contact:</strong> <a href="mailto:developer@sunjin.vn">developer@sunjin.vn</a></p>
-
-<hr>
 
 <h2>1. What this app is</h2>
 
@@ -233,26 +224,8 @@ release, with a new version line and date.</p>
 
 <p><strong><a href="mailto:developer@sunjin.vn">developer@sunjin.vn</a></strong></p>
 
-<hr>
-
-<h2>How this was verified (internal — strip before publishing)</h2>
-
-<table>
-<thead><tr><th>Claim</th><th>Evidence</th></tr></thead>
-<tbody>
-<tr><td>Native pins the leaf, no CA fallback, no cleartext; nothing sent on mismatch</td><td><code>modules/pinned-ws/</code> (leaf SHA-256 pin, <code>client/pin-mismatch</code>), <code>plugins/withPinnedWsConfig.js</code> (empty Android <code>&lt;trust-anchors&gt;</code>, ATS assertion), <code>src/platform/pinned-transport.ts:1-20</code></td></tr>
-<tr><td>Web: <code>wss://</code> only, hostname must end <code>.ts.net</code>, no pinning, <code>certSha256</code> ignored, device id/credential as subprotocols, browser TLS validation</td><td><code>src/platform/pinned-transport.web.ts:85-98,124-156</code> (<code>isTailnetUrl</code>, <code>wss:</code> check, <code>certSha256</code> intentionally unused), <code>src/core/gateway-address.ts:39-48</code>, <code>src/core/client.ts:680-700</code></td></tr>
-<tr><td>Native store = platform encrypted store; iOS <code>WHEN_UNLOCKED_THIS_DEVICE_ONLY</code>; no Android <code>requireAuthentication</code>, app gates unlock</td><td><code>src/platform/secure-store.ts:12-15</code> (option + the comment saying <code>requireAuthentication</code> would double-prompt), <code>src/platform/install-id.ts:10-13</code>, <code>src/platform/biometrics.ts:1-4</code></td></tr>
-<tr><td>Web store = IndexedDB, non-extractable AES-GCM key in the same DB, hosts JSON, device id in <code>localStorage</code></td><td><code>src/platform/secure-store.web.ts:1-30</code>, <code>src/platform/install-id.web.ts:1-20</code></td></tr>
-<tr><td>Web unlock is a passkey challenge, not phone biometrics</td><td><code>src/platform/biometrics.web.ts:1-12</code></td></tr>
-<tr><td>Web push: only endpoint + 2 keys leave the page; payload <code>{v,kind,sessionId,requestId?}</code>; fixed text on device</td><td><code>src/core/web-push.ts:24-31</code>, <code>src/platform/web-push.web.ts:1-3</code>, <code>plugins/mobile-gateway/lib/web-push/service.mjs:25-50</code>, <code>public/sw.js</code> (push section)</td></tr>
-<tr><td>Native notification = fixed line + tool name + ids + deep link</td><td><code>src/platform/notifications.ts:52-76</code>; no APNs/FCM registration in <code>src/</code></td></tr>
-<tr><td>No analytics/crash/ad SDK</td><td><code>apps/mobile-companion/package.json</code> dependency list</td></tr>
-<tr><td>Debug log opt-in, bounded, redacted</td><td><code>src/platform/debug-log-file.ts:93-102</code>, <code>src/core/debug-log.ts</code></td></tr>
-<tr><td>Import check: <code>src/core</code> imports no react-native/expo/node</td><td>gate <code>npm run check:core</code> (passes)</td></tr>
-</tbody>
-</table>
-
 <p><a href="../">Home</a> · <a href="../vi/" hreflang="vi" lang="vi">Tiếng Việt</a></p>
+
+<p>© 2026 Sunjin Vina</p>
 </body>
 </html>
