@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSH Orbit — Chính sách quyền riêng tư</title>
+<style>
+body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; line-height: 1.6;
+       max-width: 46rem; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; background: #fff; }
+h1 { font-size: 1.6rem; }
+h2 { font-size: 1.2rem; margin-top: 2rem; }
+table { border-collapse: collapse; width: 100%; margin: 0.75rem 0; font-size: 0.95rem; }
+th, td { border: 1px solid #ccc; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+th { background: #f4f4f4; }
+blockquote { margin: 1rem 0; padding: 0.5rem 1rem; border-left: 4px solid #ccc; background: #f9f9f9; }
+code { background: #f4f4f4; padding: 0 0.2rem; }
+a { color: #0645ad; }
+</style>
+</head>
+<body>
+<h1>DSH Orbit — Chính sách quyền riêng tư</h1>
+
+<blockquote>
+<p><strong>BẢN NHÁP 2 (14-11-2026) — đang chờ địa chỉ công khai và duyệt lần cuối; chưa công bố.</strong> Mọi
+khẳng định dưới đây đã đối chiếu với mã nguồn trong kho này; bảng <em>Cách kiểm chứng</em> ở cuối bản
+tiếng Anh ghi tệp cho từng điểm. Màn Quyền riêng tư trong ứng dụng (<code>app/privacy.tsx</code>) hiển thị bản
+rút gọn của cùng các nội dung đó, kèm phiên bản chính sách và địa chỉ liên hệ (<code>privacy.p10</code>).</p>
+</blockquote>
+
+<p><strong>Ngày hiệu lực:</strong> chưa đặt (sẽ đặt trên bản build gửi duyệt) · <strong>Phiên bản:</strong> NHÁP 2 · <strong>Áp dụng
+cho:</strong> DSH Orbit, iOS và Android (<code>com.dshext.companion</code>), và bản web/PWA của cùng sản phẩm khi được
+phục vụ từ địa chỉ Tailscale của một Host.</p>
+
+<p><strong>Liên hệ:</strong> <a href="mailto:developer@sunjin.vn">developer@sunjin.vn</a></p>
+
+<hr>
+
+<h2>1. Ứng dụng này là gì</h2>
+
+<p>DSH Orbit là trình điều khiển cho <strong>máy tính DeepSeek Harness (DSH) của chính bạn</strong> ("Host"). Máy
+tính làm việc: chạy agent, gọi model, chạy công cụ, và mọi thứ chạm tới tệp và mạng của bạn. Ứng dụng
+ghép đôi với máy đó, liệt kê phiên, xem lịch sử và trả lời yêu cầu phê duyệt. Ứng dụng <strong>không</strong> chạy
+mã của Host, Node, terminal (PTY) hay công cụ của agent trên điện thoại; nó chỉ hiển thị kết quả Host
+gửi về và gửi quyết định của bạn trở lại.</p>
+
+<p>Bạn không tạo tài khoản với chúng tôi. Không có đăng nhập vào dịch vụ của chúng tôi, và ứng dụng
+không gửi gì tới máy chủ do nhà phát triển tự dựng.</p>
+
+<h2>2. Điện thoại kết nối tới Host thế nào — bản native</h2>
+
+<ul>
+<li>Ứng dụng gọi địa chỉ trong mã ghép đôi bạn đã quét hoặc dán, và chỉ chấp nhận <code>wss://</code>.</li>
+<li>Chứng chỉ TLS được <strong>ghim (pin) vào Host</strong>: ứng dụng chỉ chấp nhận kết nối khi SHA-256 của chứng
+  chỉ lá bằng giá trị trong mã ghép đôi. Không có đường lui sang nhà cung cấp chứng chỉ công cộng,
+  không kiểm tra tên miền, không tin CA do người dùng cài, không có nút "chấp nhận không hợp lệ", không
+  có HTTP thô. Khi không khớp, bắt tay TLS bị huỷ <strong>trước khi</strong> mã ghép đôi, mã thiết bị hay thông tin
+  truy cập được gửi.</li>
+<li>Trên Android, cấu hình bảo mật mạng tin cậy <strong>0</strong> CA và tắt HTTP thô; trên iOS ứng dụng không cho
+  phép tải tuỳ ý.</li>
+</ul>
+
+<h2>3. Bản web/PWA kết nối tới Host thế nào — yếu hơn, có chủ đích</h2>
+
+<p>Trình duyệt không thể soi chứng chỉ TLS trước khi thiết lập kết nối, nên bản web <strong>không ghim</strong> gì và
+cũng không kiểm tra địa chỉ IP:</p>
+
+<ul>
+<li>Transport chỉ chấp nhận URL <code>wss://</code> có tên miền kết thúc bằng <code>.ts.net</code> (tên Tailscale); mọi địa chỉ
+  khác bị từ chối trước khi mở socket.</li>
+<li>Sau đó chứng chỉ máy chủ được <strong>chính trình duyệt kiểm tra TLS</strong> theo kho nhà cung cấp chứng chỉ của
+  nó — không phải bằng chứng chỉ lá đã ghim, và cũng không phải do ứng dụng này quyết định.</li>
+<li>Giá trị <code>certSha256</code> trong mã ghép đôi bị <strong>bỏ qua</strong> trên web. Nếu bạn ghép bản web bằng đúng mã
+  dùng cho điện thoại, ghim không áp dụng ở đó.</li>
+<li>Trình duyệt không cho phép đặt header cho WebSocket, nên trên web mã thiết bị theo lần cài đặt đi
+  như subprotocol <code>dsh-device.&lt;id&gt;</code> thay cho header <code>X-DSH-Device-ID</code>, và thông tin truy cập đi như
+  subprotocol <code>dsh-auth.&lt;token&gt;</code>. Trình duyệt có thể ghi lại các giá trị bắt tay đó trong công cụ mạng
+  của nó — coi hồ sơ trình duyệt đã ghép đôi là nơi giữ thông tin truy cập.</li>
+</ul>
+
+<p>Nếu cần ghim, dùng ứng dụng iOS hoặc Android. Bản web dành cho origin Tailscale của chính Host.</p>
+
+<h2>4. Dữ liệu ứng dụng gửi đi, và đi đâu</h2>
+
+<table>
+<thead><tr><th>Dữ liệu</th><th>Đích</th><th>Khi nào</th></tr></thead>
+<tbody>
+<tr><td>Bằng chứng ghép đôi và mã ghép đôi dùng một lần</td><td>Chỉ Host đã ghép, qua TLS (web: tới origin Tailscale của Host)</td><td>Khi ghép đôi</td></tr>
+<tr><td>Mã thiết bị ngẫu nhiên theo lần cài đặt (UUID)</td><td>Host của bạn: header <code>X-DSH-Device-ID</code> trên native, subprotocol <code>dsh-device.&lt;id&gt;</code> trên web</td><td>Mỗi lần kết nối, để Host dùng lại bản ghi thiết bị tin cậy</td></tr>
+<tr><td>Thông tin truy cập theo thiết bị do Host cấp</td><td>Lưu trên điện thoại (hoặc trình duyệt); gửi lại đúng Host đã ghép</td><td>Mỗi lần kết nối</td></tr>
+<tr><td>Nội dung phiên — tiêu đề, lịch sử tin nhắn, câu lệnh bạn gửi, quyết định phê duyệt</td><td>Host của bạn, qua kết nối TLS</td><td>Khi bạn dùng ứng dụng</td></tr>
+<tr><td>Vân tay chứng chỉ trong mã ghép đôi</td><td>Chỉ dùng tại máy, chỉ trên native; không bao giờ gửi đi</td><td>Khi kết nối native</td></tr>
+</tbody>
+</table>
+
+<p>Vì vậy nội dung phiên và thông tin ghép đôi/truy cập chỉ đi tới <strong>Host bạn đã ghép</strong>. Đường phụ tuỳ
+chọn duy nhất là thông báo trên web: nếu bạn bật, Host gửi thông điệp <strong>đã mã hoá</strong> nói ở phần 6 tới
+dịch vụ đẩy của trình duyệt bạn. Ứng dụng không có phân tích hành vi, không SDK báo cáo sự cố, không
+SDK quảng cáo và không thư viện theo dõi.</p>
+
+<h2>5. Dữ liệu được lưu, và mức bảo vệ</h2>
+
+<p><strong>iOS và Android (native):</strong></p>
+
+<table>
+<thead><tr><th>Hạng mục</th><th>Nơi lưu</th><th>Cách xoá</th></tr></thead>
+<tbody>
+<tr><td>Thông tin truy cập (theo từng Host)</td><td>Vùng lưu trữ mã hoá của nền tảng — nền Keystore trên Android, Keychain trên iOS. Trên iOS lưu với <code>WHEN_UNLOCKED_THIS_DEVICE_ONLY</code> (chỉ đọc được khi thiết bị đã mở khoá, không chuyển sang thiết bị khác)</td><td><em>Quên máy tính này</em> trong ứng dụng, hoặc thu hồi thiết bị trên Host</td></tr>
+<tr><td>Mã thiết bị theo lần cài đặt</td><td>Cùng vùng mã hoá</td><td>Còn trên thiết bị này cho tới khi xoá mục đã lưu — xem quy tắc gỡ ứng dụng bên dưới (mất mã chỉ làm Host ghi nhận thiết bị mới)</td></tr>
+<tr><td>Danh sách Host đã ghép (tên, địa chỉ, vân tay chứng chỉ) — không có thông tin truy cập</td><td>Cùng vùng mã hoá</td><td><em>Quên máy tính này</em></td></tr>
+<tr><td>Nhật ký gỡ lỗi tuỳ chọn (có giới hạn, đã làm mờ; chỉ bản build bật cờ gỡ lỗi mới ghi)</td><td>Thư mục tài liệu riêng của ứng dụng</td><td>Cài đặt → Bộ nhớ đệm</td></tr>
+<tr><td>Các tệp mà màn Bộ nhớ đệm liệt kê</td><td>Thư mục tài liệu riêng của ứng dụng</td><td>Cài đặt → Bộ nhớ đệm</td></tr>
+</tbody>
+</table>
+
+<ul>
+<li>Ứng dụng <strong>không</strong> tạo mục gắn với sinh trắc học trên Android: tuỳ chọn lưu trữ nó dùng không có
+  <code>requireAuthentication</code> của Android, nên việc đọc thông tin truy cập không được Keystore tự chặn.
+  Bước mở khoá là <strong>cổng của chính ứng dụng</strong> — ứng dụng yêu cầu sinh trắc học hoặc mật mã thiết bị và
+  chỉ đọc thông tin truy cập sau khi xác thực thành công. Ai thao tác được kho đã mở khoá của thiết bị
+  này thì đọc được dữ liệu trong đó; bảo vệ là khoá thiết bị cộng cổng của ứng dụng, không phải một
+  hộp thoại sinh trắc học cho từng lần đọc.</li>
+<li><strong>Gỡ ứng dụng:</strong> trên Android, gỡ ứng dụng sẽ xoá vùng lưu trữ nền Keystore, nên thông tin truy cập và
+  mã thiết bị đi theo. Trên iOS, mục Keychain <strong>có thể tồn tại sau khi gỡ</strong>; hãy <em>Quên máy tính này</em>
+  trước (thao tác đó xoá bản ghi Host rồi cố xoá thông tin truy cập theo đúng khoá đó), hoặc thu hồi
+  thiết bị trên Host — thu hồi gỡ quyền truy cập, làm mục còn lại không dùng được.</li>
+<li>Ứng dụng chỉ xin quyền camera (quét mã QR ghép đôi), sinh trắc học / mật mã thiết bị (mở khoá), và
+  thông báo. Không có quyền thư viện ảnh, danh bạ hay tệp chung.</li>
+</ul>
+
+<p><strong>Web/PWA:</strong></p>
+
+<table>
+<thead><tr><th>Hạng mục</th><th>Nơi lưu</th><th>Cách xoá</th></tr></thead>
+<tbody>
+<tr><td>Thông tin truy cập, dưới dạng bản mã AES-GCM</td><td>IndexedDB của trình duyệt. Khoá AES-256 bọc dữ liệu là <strong>không thể xuất</strong> (script trong trang không lấy được khoá), nhưng khoá nằm <strong>cùng một IndexedDB</strong> với bản mã</td><td><em>Quên máy tính này</em> yêu cầu ứng dụng xoá tại máy (nỗ lực tốt nhất); xoá dữ liệu trang là cách xoá chắc chắn</td></tr>
+<tr><td>Danh sách Host đã ghép, dạng JSON không mã hoá</td><td>Cùng IndexedDB</td><td><em>Quên máy tính này</em> (nỗ lực tốt nhất), hoặc xoá dữ liệu trang</td></tr>
+<tr><td>Mã thiết bị theo lần cài đặt</td><td><code>localStorage</code></td><td>Xoá dữ liệu trang</td></tr>
+</tbody>
+</table>
+
+<p>Kho trên web <strong>yếu hơn Keychain/Keystore có chủ đích</strong>: không có phần cứng bảo vệ, không tách riêng
+theo ứng dụng, không gắn với việc mở khoá thiết bị. Ai đọc được hồ sơ trình duyệt (hoặc chạy được
+script trong origin đó) đều có thể giải mã thông tin truy cập đã lưu; hồ sơ trình duyệt chính là ranh
+giới bảo mật. Gỡ một PWA <strong>không</strong> bảo đảm trình duyệt đã xoá dữ liệu trang, nên sau bản web hãy <em>Quên
+máy tính này</em> trong ứng dụng <strong>và</strong> xoá dữ liệu trang trong trình duyệt.</p>
+
+<p>Mở khoá trên web, khi Host cấp quyền đó, không phải hộp thoại sinh trắc học của điện thoại: Host gửi
+thử thách và trình duyệt trả lời bằng passkey đã đăng ký cho lần ghép đôi đó.</p>
+
+<h2>6. Thông báo</h2>
+
+<p><strong>Native (iOS/Android): chỉ cục bộ.</strong> Ứng dụng tự tạo thông báo trên điện thoại khi kết nối đang mở
+báo có yêu cầu phê duyệt. Nội dung gồm một dòng cố định ngắn, tên công cụ (một từ cố định trong bộ từ
+vựng công cụ, không phải nội dung của bạn), và các mã định danh — phiên, phê duyệt, yêu cầu — kèm
+đường dẫn sâu mà lần chạm sẽ mở. Thông báo <strong>không</strong> mang tham số của yêu cầu phê duyệt, đầu vào của
+công cụ, nội dung tin nhắn hay thông tin truy cập. Ứng dụng không đăng ký token đẩy từ xa với Apple
+(APNs) hay Google (FCM); không có dịch vụ đẩy nào của chúng tôi. Vì ứng dụng đóng socket đã xác thực
+khi xuống nền, thông báo chỉ có thể được tạo khi ứng dụng đang chạy.</p>
+
+<p><strong>Web (PWA): tuỳ chọn, và có rời khỏi trình duyệt.</strong> Nếu bạn bật thông báo trong Cài đặt, trình duyệt
+tạo một đăng ký đẩy và ứng dụng trao cho Host của bạn <strong>endpoint</strong> của đăng ký (một URL tại origin
+dịch vụ đẩy — dịch vụ đẩy do Google, Apple, Mozilla, Microsoft hoặc hãng trình duyệt bạn dùng vận
+hành) cùng hai khoá của đăng ký. Host của bạn sau đó gửi tới dịch vụ đẩy đó một thông điệp <strong>đã mã
+hoá</strong>, mà toàn bộ nội dung dạng rõ là <code>{ v, kind, sessionId, requestId? }</code> — số phiên bản, loại sự kiện
+(<code>approval</code>, <code>question</code>, <code>session-finished</code>), mã phiên, và với hai loại cần tương tác là mã yêu cầu.
+Nội dung thông báo cố định (tiếng Anh hoặc tiếng Việt, theo ngôn ngữ trình duyệt) do service worker của
+ứng dụng viết trên máy, không nằm trong thông điệp.</p>
+
+<p>Vì vậy dịch vụ đẩy (Google, Apple, Mozilla, Microsoft hoặc hãng trình duyệt của bạn) thấy <strong>siêu dữ
+liệu giao nhận</strong> của thông điệp đó: danh tính đẩy của Host bạn, endpoint và thời điểm giao, cộng những
+gì nhà cung cấp tự ghi. Nó <strong>không</strong> nhận nội dung thông điệp ở dạng đọc được (payload được mã hoá bằng
+khoá của đăng ký), và hoàn toàn không nhận tiêu đề phiên, câu lệnh hay tham số phê duyệt.</p>
+
+<p><strong>Tắt thông báo</strong> gồm hai lần thử: ứng dụng báo Host của bạn quên đăng ký này (huỷ phía Host), rồi ứng
+dụng cố huỷ chính đăng ký trong trình duyệt. Bước nào cũng có thể thất bại.</p>
+
+<p><em><strong>Quên máy tính này</strong></em> chỉ xoá ghép đôi tại máy, và đó là nỗ lực tốt nhất. <strong>Thu hồi thiết bị trên
+Host</strong> chặn <strong>các lần gửi về sau</strong>: nó gỡ quyền truy cập và gỡ đăng ký đã lưu trên Host, nên từ đó Host
+không tạo thêm thông báo nào cho thiết bị này. Những gì dịch vụ đẩy đã nhận hay đã xếp hàng trước đó vẫn
+có thể tới trình duyệt, và dịch vụ đẩy có thể giữ hồ sơ các lần giao cũ theo chính sách của chính họ.</p>
+
+<h2>7. Build và phát hành</h2>
+
+<p>Văn bản này nói về lúc ứng dụng chạy, không nói về cách build hay phân phối. Việc build và phát hành
+dùng công cụ đám mây của Expo (EAS) và App Store của Apple hoặc Google Play; nếu có bản build cho cửa
+hàng, các nhà cung cấp đó thấy bản build và tự tạo chẩn đoán cửa hàng/sự cố của họ, theo <strong>chính sách
+của họ</strong>, và những gì nhà phát triển nhận được từ bảng điều khiển của họ tuỳ nhà cung cấp.</p>
+
+<h2>8. Quyền kiểm soát của bạn</h2>
+
+<ul>
+<li><strong>Thu hồi thiết bị trên Host</strong> kết thúc ở phía Host: quyền truy cập bị gỡ và đăng ký phía Host bị xoá,
+  nên từ đó không còn lần gửi nào được tạo ra. Ứng dụng xoá thông tin truy cập nó đang giữ (và kiểm tra
+  lại việc xoá).</li>
+<li><em><strong>Quên máy tính này</strong></em> trong ứng dụng: xoá bản ghi Host đã ghép rồi mới cố xoá thông tin truy cập
+  theo đúng khoá đó — kể cả thông tin còn lại từ lần cài iOS trước đó. Nếu không xoá được, ứng dụng báo
+  lỗi dọn dẹp chứ không cho rằng đã xoá xong. Nó không ngắt ghép đôi gì trên Host.</li>
+<li><strong>Tắt thông báo trên web</strong>: ứng dụng báo Host quên đăng ký, rồi cố huỷ đăng ký trong trình duyệt
+  (phần 6).</li>
+<li><strong>Xoá dữ liệu trang của trình duyệt</strong> sau <em>Quên</em> trên bản web, vì chỉ gỡ ứng dụng là không đủ.</li>
+<li><strong>Xoá nhật ký gỡ lỗi và các tệp liệt kê</strong> ở Cài đặt → Bộ nhớ đệm; việc này không làm mất ghép đôi.</li>
+<li><strong>Gỡ ứng dụng:</strong> trên Android vùng lưu trữ mã hoá và tệp riêng đi theo; trên iOS mục Keychain có thể
+  tồn tại sau khi gỡ — xem phần 5.</li>
+</ul>
+
+<h2>9. Trẻ em</h2>
+
+<p>Ứng dụng là trình điều khiển cho một công cụ lập trình và không hướng tới trẻ em. Nhà phát triển không
+cố ý thu thập thông tin cá nhân của bất kỳ ai thông qua ứng dụng, kể cả trẻ em; ứng dụng vốn không có
+đường "thu thập" nào — nó nói chuyện với Host của chính bạn.</p>
+
+<h2>10. Bảo mật</h2>
+
+<p>Thông tin truy cập nằm trong vùng lưu trữ mã hoá của nền tảng (native) hoặc kho IndexedDB đã mã hoá
+như phần 5 (web); không bao giờ được ghi vào nhật ký hay thông báo. Trên native, kết nối ghim chứng chỉ
+của Host; trên web, transport chỉ chấp nhận <code>wss://</code> tới tên miền <code>.ts.net</code> và chứng chỉ do trình duyệt
+kiểm tra (phần 3). Quyết định phê duyệt gắn với đúng yêu cầu đang hiển thị: một quyết định chỉ áp dụng
+một lần, và yêu cầu đã thay đổi sau khi hiển thị thì bị từ chối.</p>
+
+<h2>11. Thay đổi chính sách</h2>
+
+<p>Khi một tính năng làm thay đổi bất kỳ điểm nào ở trên, văn bản này và màn Quyền riêng tư trong ứng
+dụng thay đổi trong cùng bản phát hành, kèm dòng phiên bản và ngày mới.</p>
+
+<h2>12. Liên hệ</h2>
+
+<p><strong><a href="mailto:developer@sunjin.vn">developer@sunjin.vn</a></strong></p>
+
+<hr>
+
+<p>Bảng đối chiếu mã nguồn (<em>How this was verified</em>) nằm ở bản tiếng Anh,
+<code>docs/privacy-policy-en.md</code>.</p>
+
+<p><a href="../../">Home</a> · <a href="../../privacy/" hreflang="en" lang="en">English</a></p>
+</body>
+</html>
