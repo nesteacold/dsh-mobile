@@ -62,7 +62,12 @@ function uploadRequest({ sessionId, body = Buffer.alloc(0), name, mediaType, sig
   if (sessionId !== undefined) query.set('sessionId', sessionId)
   if (name !== undefined) query.set('name', name)
   if (mediaType !== undefined) query.set('mediaType', mediaType)
-  const headers = { 'content-type': contentType }
+  // `contentType: null` sends NO content-type at all. This is synthetic: the
+  // installed composer's `postRaw` names `application/octet-stream` for every body
+  // it sends (measured in dsh-client-file-upload lib/client.js, 0.2.2-rc.3), and a
+  // Blob body would name the Blob's own type. Both absent and foreign types are
+  // driven here to measure that the route reads neither.
+  const headers = contentType === null ? {} : { 'content-type': contentType }
   if (contentLength !== undefined) headers['content-length'] = String(contentLength)
   return new Request(`http://dsh.internal${UPLOAD_PATH}?${query.toString()}`, {
     method: 'POST', headers, body: bodyStream(body), signal, duplex: 'half',
@@ -583,21 +588,99 @@ test('remote details travel only as the small flat map the contract defines', as
   }
 })
 
-test('the transfer method and content type are checked exactly as the native route checks them', async (t) => {
+test('the transfer method is the one protocol gate: content type is metadata only, and a refusal is JSON', async (t) => {
+  // OBSERVED 2026-11-15: the owner's 12 KB `.zip` attached in the remote composer
+  // did not reach the Host; PNG attachments arrived. The composer reports any
+  // non-200 as `file upload transport failed with HTTP N` (installed
+  // dsh-client-file-upload lib/client.js:2 — `postRaw` throws that text for the
+  // worker, `customTransport` for the in-process fetch — checks the STATUS before
+  // it reads the body).
+  // ROOT CAUSE NOT ESTABLISHED. One explanation, INFERRED / UNCONFIRMED: the
+  // installed composer's `postRaw` always sends `content-type:
+  // application/octet-stream` (measured in that same blob), so a copy of the native
+  // route's content-type gate (`handleFileUploadHttp` answers 415, pinned
+  // src/http-route.ts:27-30) would refuse a declared `application/zip` on its type
+  // alone. This test measures the PATCH, not that explanation: the type never
+  // reaches a frame, whatever it says. The cross-site / owner fences are upstream in
+  // the dsh-client-connection admit path (installed lib/index.js:1049-1055, 742-749,
+  // 240-249, 829-831) and are not exercised here — this suite passes a fake
+  // connection Map, so the route's own refusals are all it can measure.
   const root = scratch(t)
+  // Bytes shaped like a zip local-file header plus one entry; only byte equality matters.
+  const zip = Buffer.concat([
+    Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('x'.repeat(12)), Buffer.from([0x50, 0x4b, 0x01, 0x02]),
+    Buffer.from('\0\u00ff\u00fe'), Buffer.from('dsh-attachment'),
+  ])
+  const expected = crypto.createHash('sha256').update(zip).digest('hex')
+  const cases = [
+    ['declared zip type', 'application/zip'],
+    ['type with parameters', 'application/zip; charset=binary'],
+    ['no content-type at all', null],
+    ['the octet-stream the worker names', STREAMING],
+    ['a text type', 'text/plain'],
+    ['a JSON type', 'application/json'],
+    ['a multipart type', 'multipart/form-data; boundary=x'],
+  ]
+  for (const [label, contentType] of cases) {
+    const hostValue = { receiptId: 'rcpt-zip', file: { attachmentId: 'sha256:zip', name: 'bundle.zip', bytes: zip.length } }
+    const link = fakeLink(chunkedAnswer({ chunkBytes: 5, hostValue }))
+    const { connection, record } = hostConnection()
+    route({ connection, connect: async () => ({ connection: link }), tmpDir: root }).install()
+    const response = await record.fetch(uploadRequest({ sessionId: TAGGED, body: zip, name: 'bundle.zip', contentType }))
+    // A transport refusal would be a non-200 status the composer cannot read a body
+    // from; an accepted upload is the route's HTTP 200 envelope.
+    assert.equal(response.status, 200, `${label}: must not be refused`)
+    assert.deepEqual(await response.json(), { ok: true, value: hostValue }, label)
+    const chunks = link.frames.filter((frame) => frame.type === 'remote-upload-chunk')
+    // Byte-exact: the request type reaches no frame, changes no byte and selects no kind.
+    assert.equal(Buffer.concat(chunks.map((frame) => Buffer.from(frame.data, 'base64'))).equals(zip),
+      true, `${label}: every byte arrives exactly`)
+    assert.equal(link.frames[0].type, 'remote-upload-open', label)
+    assert.equal(link.frames[0].sha256, expected, label)
+    assert.equal(link.frames[0].size, zip.length, label)
+    assert.equal(link.frames[0].kind, 'file', label)
+    assert.equal(link.frames[0].name, 'bundle.zip', label)
+    assert.equal('mediaType' in link.frames[0], false, `${label}: a file upload never carries a mediaType`)
+    assert.deepEqual(fs.readdirSync(root), [], `${label}: the staged copy is gone`)
+  }
+
+  // Size is still a gate, whatever the request says its content type is: a
+  // declared length over the bound is refused before any dial, as a JSON failure.
+  let dialled = false
   const { connection, record } = hostConnection()
-  route({ connection, connect: noDial, tmpDir: root }).install()
-
-  const wrongType = await record.fetch(uploadRequest({
-    sessionId: TAGGED, body: Buffer.from('x'), contentType: 'text/plain',
+  route({
+    connection,
+    connect: async () => { dialled = true; return { connection: fakeLink(() => { throw new Error('no frame') }) } },
+    tmpDir: root,
+    maxSpoolBytes: 4,
+  }).install()
+  const tooBig = await record.fetch(uploadRequest({
+    sessionId: TAGGED, body: Buffer.from('0123456789'), contentLength: 10, contentType: 'application/zip',
   }))
-  assert.equal(wrongType.status, 415)
-  assert.equal(await wrongType.text(), 'content type must be application/octet-stream')
+  assert.equal(tooBig.status, 200)
+  assert.equal(tooBig.headers.get('content-type'), 'application/json; charset=utf-8')
+  const tooBigBody = await tooBig.json()
+  assert.equal(tooBigBody.ok, false)
+  assert.equal(tooBigBody.error.code, 'file-too-large')
+  assert.deepEqual(tooBigBody.error.details, { maxBytes: 4 })
+  assert.equal(dialled, false, 'an oversized body costs no dial, whatever its content type')
+  assert.deepEqual(fs.readdirSync(root), [])
 
-  const wrongMethod = await record.fetch(new Request(`http://dsh.internal${UPLOAD_PATH}?sessionId=${TAGGED}`,
+  // The one protocol refusal left is the method, and it is JSON too — with the
+  // `allow` header the route has always sent.
+  const method = hostConnection()
+  route({ connection: method.connection, connect: noDial, tmpDir: root }).install()
+  const wrongMethod = await method.record.fetch(new Request(`http://dsh.internal${UPLOAD_PATH}?sessionId=${TAGGED}`,
     { method: 'GET' }))
   assert.equal(wrongMethod.status, 405)
   assert.equal(wrongMethod.headers.get('allow'), 'POST')
+  assert.equal(wrongMethod.headers.get('content-type'), 'application/json; charset=utf-8')
+  const methodBody = await wrongMethod.json()
+  assert.equal(methodBody.ok, false)
+  assert.equal(typeof methodBody.error.code, 'string')
+  assert.equal(typeof methodBody.error.message, 'string')
+  assert.deepEqual(methodBody.error.details, {})
+  assert.deepEqual(fs.readdirSync(root), [])
 })
 
 test('dispose restores the exact function, and never clobbers a later wrapper', async (t) => {

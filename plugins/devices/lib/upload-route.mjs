@@ -34,8 +34,34 @@ import { restrictToOwnerSync } from './secure-file.mjs'
 
 /** The one local route this module intercepts (contract revision 8). */
 export const UPLOAD_PATH = '/api/session/uploadFileBinary'
-/** The record's own content-type requirement, copied from the native handler. */
-const UPLOAD_CONTENT_TYPE = 'application/octet-stream'
+/**
+ * The body's content type is metadata only on this route: the bytes are the
+ * file, so the type is never read, matched or parsed here. The wrapped route
+ * accepts a raw body whatever the `content-type` header says — the header decides
+ * nothing on the remote path.
+ *
+ * Observed 2026-11-15: the owner's 12 KB `.zip` did not reach the remote Host. The
+ * composer reports any non-200 as `file upload transport failed with HTTP N`
+ * because it checks the status before it reads the body (installed
+ * dsh-client-file-upload lib/client.js:2 — `postRaw` throws that text for the
+ * worker, `customTransport` for the in-process fetch).
+ *
+ * Why it did not reach the Host is NOT established. One explanation, labelled
+ * INFERRED/UNCONFIRMED: the installed composer's `postRaw` names
+ * `content-type: application/octet-stream` for every body it sends (measured in
+ * the same blob), so if the remote path had kept the native route's content-type
+ * gate (`handleFileUploadHttp` answers 415, pinned src/http-route.ts:27-30) a
+ * declared `application/zip` would be refused on that type alone. This patch
+ * removes that gate: it is not a claim that the type caused the symptom.
+ *
+ * What this wrapper is NOT: the cross-site / owner fences in front of it are
+ * upstream in the dsh-client-connection admit path (installed lib/index.js:
+ * 1049-1055 the `/api` route admits before any bridge, 742-749 `admit()`, 240-249
+ * `isTrustedApiRequest` host/Origin/`sec-fetch-site` checks, 829-831 the
+ * dispatcher's `peer.principal.kind === 'owner'` refusal). The comments here
+ * describe what this module does; they do not replace that carrier review.
+ */
+const UPLOAD_METHOD = 'POST'
 /** The kind of every answer to a `remote-upload-*` frame. */
 const RESULT_KIND = 'remote-upload-result'
 /**
@@ -432,6 +458,24 @@ export class UploadRoute {
     return this.#upload(request, url, tagged)
   }
 
+  /**
+   * The route's refusal envelope, for the protocol-level failures the route used
+   * to answer with a bare status (405/415).
+   *
+   * The composer's worker reports any non-200 as the transport text
+   * `file upload transport failed with HTTP N` and throws (installed
+   * dsh-client-file-upload lib/client.js:2, postRaw and customTransport) instead of reading the
+   * body, so a JSON body alone cannot make such a refusal displayable — the
+   * status must stay what it was. The JSON (with a record `details`) is carried
+   * for every other reader of this route, and is what the contract asks of a
+   * refusal.
+   */
+  #refusalResponse(status, error, extraHeaders = {}) {
+    return jsonResponse(status, { ok: false, error: {
+      code: error.code, message: error.message, details: error.details ?? {},
+    } }, extraHeaders)
+  }
+
   /** The request, unread, to the native handler under any number of our wrappers. */
   #bodyUnread(request) {
     const original = this.#root?.fetch
@@ -456,11 +500,10 @@ export class UploadRoute {
 
   /** One host-tagged upload: the revision-8 frame sequence, answered as the route does. */
   async #upload(request, url, { hostId, sessionId }) {
-    // Same refusals, in the same order and with the same answers, as
-    // `handleFileUploadHttp`: these are protocol-level, not transfer outcomes.
-    if (request.method !== 'POST') return new Response(null, { status: 405, headers: { allow: 'POST' } })
-    if (request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() !== UPLOAD_CONTENT_TYPE) {
-      return new Response('content type must be application/octet-stream', { status: 415 })
+    // Same method refusal the route gives (the only protocol gate kept here: the
+    // content type is metadata, see UPLOAD_METHOD), and in the route's JSON shape.
+    if (request.method !== UPLOAD_METHOD) {
+      return this.#refusalResponse(405, failure('bad-request', 'the upload route accepts POST only'), { allow: UPLOAD_METHOD })
     }
     // `mediaType` is what selects the Host's image store on the native route, so
     // it selects `kind` here too; `name` is forwarded only when it is usable.

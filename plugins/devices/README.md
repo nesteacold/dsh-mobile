@@ -98,6 +98,29 @@ single object field the right seam. The whole implementation is `lib/upload-rout
   back in the `chunkBytes` the open answer reported; the file is deleted on success, refusal, cancel
   and error. The staging bound is `MAX_SPOOL_BYTES` (512 MiB, the gateway's default
   `fileUploadMaxBytes`), and a `content-length` over it is refused before anything is dialled.
+- **The wrapped route accepts a raw body whatever the `content-type` header says.** The header is
+  metadata only: it is never read, matched or parsed, and it selects no kind or media type. The bytes
+  are the file. This deviation applies only to tagged requests; untagged ones still reach the native
+  handler unchanged, its own content-type gate included.
+  - **Observed symptom (2026-11-15).** The owner's 12 KB `.zip` did not reach the remote Host, while
+    PNG attachments arrived. The remote composer showed `file upload transport failed with HTTP N`:
+    it reports any non-200 as that text without reading the body (installed
+    `dsh-client-file-upload` 0.2.2-rc.3 `lib/client.js`, both the worker and the in-process
+    `customTransport`).
+  - **Root cause: NOT established.** One explanation — **(c) inferred / unconfirmed** — is a type
+    mismatch: the installed composer's `postRaw` always sends
+    `content-type: application/octet-stream` (measured in that same `lib/client.js`), so if the
+    remote path had kept the native route's content-type gate (`handleFileUploadHttp` answers 415,
+    pinned `src/http-route.ts:27-30`) a declared `application/zip` would be refused on its type alone.
+    Removing that gate is this patch; it is not a confirmation of that explanation.
+- **The cross-site fence is upstream, and untested here.** The CSRF/auth and owner fences in front of
+  this wrapper belong to the Connection carrier, not to this plugin: the installed
+  `dsh-client-connection` `lib/index.js` admits the `/api` route (:1049-1055) through `admit()`
+  (:742-749), whose `isTrustedApiRequest` (:240-249) rejects a foreign `host`, a `sec-fetch-site:
+  cross-site` request and a foreign `origin`, before any bridge reaches a Fetch route; the dispatcher
+  then refuses any peer that is not the owner (:829-831). This suite builds a `Map`-shaped fake
+  connection, so none of that is exercised by `test/upload-route.test.mjs`, and this plugin adds no
+  fence of its own — an untagged request keeps only whatever that carrier path already applies.
 - **Refusals before the transfer.** Contract 8.2 is exact that a *transfer* failure is
   `{ ok: false }` inside a `remote-upload-result`, and everything `handleRemoteUpload` answers is. The
   four frames still pass the gateway's own dispatcher gates first — live credential, socket web lock,
