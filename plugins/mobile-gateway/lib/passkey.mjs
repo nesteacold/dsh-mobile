@@ -142,6 +142,10 @@ export function loadPasskeyStore(file) {
  * @param {(deviceId: string) => void} options.onPasskeyChanged called after the stored record of
  *   `deviceId` changed under it (a replacement closes that device's other sockets)
  * @param {() => void} [options.onApprovalSettled] called after an approval is decided
+ * @param {string[]} [options.allowedOrigins] the gateway's `allowedOrigins`, the DEFAULT origin
+ *   policy when `originPolicy` is absent
+ * @param {(socket: object, origin: string) => boolean} [options.originPolicy] the gateway's
+ *   ingress-aware decision: whether this SOCKET's origin may be a passkey site (read per call)
  * @param {(line: string) => void} [options.log]
  * @param {() => number} [options.now]
  */
@@ -211,13 +215,23 @@ export function createPasskeyService(options) {
 
   /**
    * The site this socket speaks for: the EXACT `Origin` it presented, and that origin must be
-   * one of the gateway's `allowedOrigins`. Fail closed — no origin, a foreign one or one that
-   * is not a plain `scheme://host[:port]` is refused before any challenge exists.
+   * one the gateway accepts FOR THAT SOCKET'S INGRESS. Fail closed — no origin, a foreign one or
+   * one that is not a plain `scheme://host[:port]` is refused before any challenge exists.
+   *
+   * `options.originPolicy(socket, origin)` answers the ingress decision (the gateway's own
+   * `passkeyOriginPolicy`): a DIRECT socket needs the origin in `allowedOrigins`, while a socket
+   * that arrived on the web ingress accepts the CURRENTLY configured web-ingress origin, because
+   * that listener already served it (the browser reached the WSS through Serve's origin). The
+   * policy is read per call, never cached, so a replaced or disabled ingress stops admitting
+   * passkeys at once — and it never widens `allowedOrigins` for any other socket.
    */
   const siteFor = (socket) => {
     const origin = typeof socket.origin === 'string' ? socket.origin : ''
     if (origin === '') refuse(PASSKEY_CODES.verificationFailed)
-    if (!options.allowedOrigins.includes(origin)) refuse(PASSKEY_CODES.verificationFailed)
+    const admitted = typeof options.originPolicy === 'function'
+      ? options.originPolicy(socket, origin) === true
+      : options.allowedOrigins.includes(origin)
+    if (!admitted) refuse(PASSKEY_CODES.verificationFailed)
     const host = originHostname(origin)
     if (host === undefined) refuse(PASSKEY_CODES.verificationFailed)
     return { origin, rpId: host }

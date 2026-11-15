@@ -23,12 +23,19 @@ export function createPairingSocketAcceptor({
     // A forwarding-family header means the peer address names the proxy, not the caller; the Host
     // it addressed may legitimately be a tailnet name for a DIRECT tailnet client, so the display
     // field keys on the header family alone and leaves a real tailnet peer's address intact.
-    const proxied = isForwardedRequest(req)
+    //
+    // Spec 031 step 2: a request that arrived on the WEB ingress (Serve dials the loopback
+    // upstream from this machine) is ALWAYS in the same conservative class, whatever headers it
+    // carries: its peer address is Serve's, never the browser's, and adding, removing or varying
+    // a forwarding-family header must not move it to a different bucket or record a confident
+    // wrong address.
+    const proxied = transport.web === true || isForwardedRequest(req)
     const clientIp = proxied ? '' : String(req.socket?.remoteAddress ?? '').replace(/^::ffff:/, '')
     // Spec 023 R2: every proxied request shares the one `proxied` bucket (the peer address names
     // the proxy, not the caller). A DIRECT tailnet peer also addresses a non-loopback Host, so the
     // Host alone cannot be the signal or direct peers would share a bucket (acceptance: they do
-    // not); the forwarding-family header is. Same classifier as `clientIp` above.
+    // not); the forwarding-family header is. Same classifier as `clientIp` above, and the web
+    // ingress joins it unconditionally for the reason stated there.
     const pairingSource = pairingSourceKey({ proxied, peerAddress: req.socket?.remoteAddress })
     const serverNonce = crypto.randomBytes(24).toString('base64url')
     let state = longCode !== undefined ? 'proof-long' : 'proof-otp'
@@ -84,6 +91,10 @@ export function createPairingSocketAcceptor({
         // is the owner page, not the browser that is pairing — so the browser origin
         // has to be captured here, while the upgrade request is still the one at hand.
         origin: req.headers.origin,
+        // Spec 031 step 2: which listener raised this request. Approval rechecks that the
+        // ingress is still the same live attempt (a disabled or replaced ingress invalidates
+        // its pending requests), and ending one ingress ends only its own requests.
+        ingress: transport.ingress,
         end: finish,
         // Approve re-checks this after its (possibly stalled) body read: the
         // state machine must be unfinished and the socket still OPEN.

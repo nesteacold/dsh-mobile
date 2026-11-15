@@ -49,6 +49,19 @@ test('export list snapshot', () => {
     'FORWARDING_HEADER_NAMES', 'FORWARDING_HEADER_PREFIXES', 'QUERY_CREDENTIAL_PARAMS', 'TRUSTED_LOCAL_AUTHORITY',
     'addressesLoopbackAuthority', 'assertTrustedLocalAuthority', 'classifyRequest', 'extractCredential',
     'isForwardedRequest', 'isLoopback', 'isLoopbackPeer', 'isNonLocalRequest', 'isSameOrigin', 'originAllowed',
-    'parseProtocols', 'queryCredentialParams',
+    'parseProtocols', 'queryCredentialParams', 'webIngressFence',
   ])
+})
+
+// Spec 031 step 2: the web (Serve) ingress fence. Serve dials this machine, so a browser arrives
+// from loopback; a forwarding header a CALLER can set is refused, and Serve's own
+// `x-forwarded-for` is not (it is Serve's, and its values are never read).
+test('webIngressFence: loopback only, caller-settable forwarding headers refused', () => {
+  assert.deepEqual(trust.webIngressFence(req({ host: '127.0.0.1:1' })), { ok: true })
+  assert.deepEqual(trust.webIngressFence(req({ host: '127.0.0.1:1', 'x-forwarded-for': '203.0.113.9' })), { ok: true }, "Serve's own header")
+  assert.deepEqual(trust.webIngressFence(req({ host: '127.0.0.1:1', forwarded: 'for=203.0.113.9' })), { ok: false, reason: 'caller-forwarding-header' })
+  assert.deepEqual(trust.webIngressFence(req({ host: '127.0.0.1:1', 'X-Real-IP': '203.0.113.9' })), { ok: false, reason: 'caller-forwarding-header' })
+  assert.deepEqual(trust.webIngressFence(req({ host: '127.0.0.1:1' }, '192.168.1.5')), { ok: false, reason: 'not-loopback' })
+  assert.deepEqual(trust.webIngressFence(req({ host: '127.0.0.1:1' }, '100.64.0.1')), { ok: false, reason: 'not-loopback' })
+  assert.deepEqual(trust.webIngressFence(req({ host: '127.0.0.1:1' }, '::1')), { ok: true })
 })

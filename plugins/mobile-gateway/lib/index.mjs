@@ -15,7 +15,13 @@ import { TRANSPORT_DEFAULTS, normalizeTransportConfig, managedStunServers } from
 import { assistantFinish, failureDetails, toolResultDetails, turnReasonDetails } from './session-event-details.mjs'
 import { toolImages } from './tool-images.mjs'
 import { REMOTE_DISABLED, REMOTE_DISABLED_STATUS, resolveRemoteControl } from './remote-control.mjs'
-import { FORWARDING_HEADER_NAMES, FORWARDING_HEADER_PREFIXES, QUERY_CREDENTIAL_PARAMS, TRUSTED_LOCAL_AUTHORITY, addressesLoopbackAuthority, assertTrustedLocalAuthority, extractCredential, isForwardedRequest, isLoopback, isLoopbackPeer, isNonLocalRequest, isSameOrigin, originAllowed, parseProtocols, queryCredentialParams } from './request-trust.mjs'
+import { FORWARDING_HEADER_NAMES, FORWARDING_HEADER_PREFIXES, QUERY_CREDENTIAL_PARAMS, TRUSTED_LOCAL_AUTHORITY, addressesLoopbackAuthority, assertTrustedLocalAuthority, extractCredential, isForwardedRequest, isLoopback, isLoopbackPeer, isNonLocalRequest, isSameOrigin, originAllowed, parseProtocols, queryCredentialParams, webIngressFence } from './request-trust.mjs'
+// Spec 031 step 2: the loopback web (Serve) ingress. Its origin policy, persisted tuple and
+// owner-facing status guidance live in that leaf module; this file owns only the listener.
+import {
+  WEB_INGRESS_HOST, WEB_WS_PATH, ingressIdentity, listenerIngress, normalizeWebOrigin, planWebIngress, readWebIngress,
+  webIngressLabel, webIngressStatus, webOriginAccepted,
+} from './web-ingress.mjs'
 // @dsh-ext/mobile-gateway — persistent Host plugin.
 //
 // Two directions:
@@ -315,6 +321,16 @@ const Config = Schema.object({
   // That range is 49152-65535 by default but is commonly retuned — one machine we
   // measured ran 1024-15000, which covers 3081. 20000-39999 stays outside both.
   lanPort: Schema.natural().min(0).max(65535).default(30081),
+  // Spec 031 step 2: the loopback web (Serve) ingress. Off by default; the persisted
+  // tuple (`POST /mgw/web-ingress`) overrides this config at start, exactly like the
+  // saved gateway mode. The bind is always 127.0.0.1 and is not configurable.
+  webIngress: Schema.object({
+    enabled: Schema.boolean().default(false),
+    // 0 = ephemeral (tests only); a real ingress needs a fixed port Serve is pointed at.
+    port: Schema.natural().min(0).max(65535).default(0),
+    // Canonical `https://<label>.ts.net`; empty means "not configured".
+    origin: Schema.string().default(''),
+  }).default({}),
   tlsCertificateDir: Schema.string().default(''),
   webrtc: Schema.object({
     enabled: Schema.boolean().default(false),
@@ -1416,6 +1432,26 @@ const plugin = {
     }
     const configuredEndpoints = normalizeEndpoints(options.endpoints)
     const gatewayState = createGatewayState(options.gatewayStateFile || `${deviceFile}.gateway.json`)
+    // Spec 031 step 2: the web (Serve) ingress tuple. The saved tuple (written by
+    // POST /mgw/web-ingress) overrides the config key at start, the same precedence the
+    // saved gateway mode has. A malformed saved tuple or config value fails the start
+    // closed — it is never repaired into an enabled ingress the owner did not choose.
+    const initialWebIngress = (() => {
+      const saved = gatewayState.webIngress
+      try {
+        // The config value goes through the SAME validator as the tuple, and the origin
+        // through the same canonical check: a config typo must fail here, not silently
+        // normalise into a different origin Serve does not serve.
+        const fromConfig = readWebIngress({
+          enabled: options.webIngress?.enabled === true,
+          port: Number(options.webIngress?.port ?? 0),
+          origin: normalizeWebOrigin(options.webIngress?.origin ?? '') ?? (options.webIngress?.origin ?? ''),
+        })
+        return saved === undefined ? fromConfig : saved
+      } catch (error) {
+        throw new Error(`mobile-gateway: ${error.message}`)
+      }
+    })()
     // A listen address picked on the Devices page outlives the process, exactly
     // like the saved gateway mode; the configured `lanHost` is the fallback.
     // A stale pick is dropped instead of leaving the TLS listener without an
@@ -1461,7 +1497,12 @@ const plugin = {
       records: passkeyStore.records,
       file: passkeyStoreFile,
       allowedOrigins,
-
+      // Spec 031 step 2: the passkey site follows the INGRESS the socket arrived on. A web-ingress
+      // browser runs on the origin that ingress served (it is not in `allowedOrigins`, and never
+      // needs to be); a direct socket keeps the `allowedOrigins` rule unchanged. Declared below
+      // (the web-ingress live helpers are not defined yet here); every call happens after this
+      // closure returned.
+      originPolicy: (socket, origin) => passkeyOriginPolicy(socket, origin),
       gatewayName: gatewayIdentity.gatewayName,
       listDevices: () => registry.list(),
       // A replacement invalidates the device's other sockets: they show the lock screen again and
@@ -1814,6 +1855,28 @@ const plugin = {
     let lanListening = false
     let lanListenError = null
     let lanBoundPort = options.lanPort
+    // Spec 031 step 2: the loopback web (Serve) ingress, a SECOND plugin-owned TLS listener that
+    // serves only `/ws/mobile`, always on 127.0.0.1, sharing this gateway's identity, device
+    // registry, pairing state machine and approval route. Its tuple is persisted as one value;
+    // the listener and the switch are changed only inside `inLanLane`, so a simultaneous
+    // direct rebind and web toggle can never interleave, and each carries its own generation.
+    let webIngressState = { enabled: initialWebIngress.enabled, port: initialWebIngress.port,
+      origin: initialWebIngress.origin, generation: 0 }
+    let webIngressDesired = initialWebIngress
+    let webIngressServer = null
+    // Spec 031: the identity of the LISTENER ATTEMPT `webIngressServer` is, made fresh in
+    // `beginWebAttempt`. A restoration over the same tuple moves only `webGeneration`, so the
+    // tuple generation alone cannot tell a socket's listener from the one that replaced it.
+    let webListenerIngress = null
+    let webListening = false
+    let webListenError = null
+    let webBoundPort = 0
+    let webGeneration = 0
+    let webSettle = null
+    let webLane = Promise.resolve()
+    // The generation of the direct listener ATTEMPT in force, for the ingress identity a
+    // pending pairing records (approval refuses a request whose direct listener was replaced).
+    let lanAttemptGeneration = 0
     // Blocker 3 (review 2026-11-10): listener changes are serialized and every
     // listener carries a generation. Two overlapping POST /mgw/listen requests
     // used to close each other's listener and both report success, because both
@@ -1832,6 +1895,9 @@ const plugin = {
     let rtc = null
     // Assigned once the listener factory below is defined (T014 reuses it).
     let openLanListener = () => {}
+    // Spec 031 step 2: the same slot pattern for the web ingress, because the gateway switch is
+    // defined above the listener factory and a switch-ON must restore an enabled web ingress.
+    let reopenWebIngress = () => {}
     // Same reason: POST /mgw/listen closes the listener and re-opens it on
     // another address through the factory, so the slot exists before the route
     // can be reached (a route must never touch a TDZ binding).
@@ -1886,6 +1952,7 @@ const plugin = {
     // observes the generation it asked for.
     const beginLanAttempt = () => {
       lanGeneration += 1
+      lanAttemptGeneration = lanGeneration
       let resolve
       const promise = new Promise((done) => { resolve = done })
       const settle = { generation: lanGeneration, promise, resolve, settled: false }
@@ -1909,6 +1976,12 @@ const plugin = {
 
     // Close the plugin-owned TLS listener. The DSH web server route stays
     // registered (it is loopback and gated by the switch itself).
+    //
+    // Spec 031 step 2: this closes the DIRECT listener only. The web ingress has its own
+    // listener and is closed by its own transitions (disable, replace, the gateway switch-off
+    // via `applyDisabledState`): a direct rebind or rotation here must not strand a browser
+    // path the owner enabled. Its pending pairings stop being approvable, because the ingress
+    // identity of an approval is checked against the attempt in force (see `ingressStillLive`).
     const closeRemoteListeners = () => {
       // Whatever was waiting on this listener can never be settled by it any
       // more, so the attempt is superseded before the socket goes away.
@@ -1940,12 +2013,79 @@ const plugin = {
 
     // Listener-changing operations run one at a time: a second POST /mgw/listen
     // waits for the first one and then applies (see PROTOCOL.md §15), so no
-    // request ever closes the listener another request is using.
+    // request ever closes the listener another request is using. Spec 031 step 2:
+    // the web ingress toggle and the gateway switch-off take the SAME lane, so a
+    // rebind can never race an ingress change (a direct rebind leaves the web
+    // ingress untouched, and a web toggle leaves the direct listener untouched).
     const inLanLane = (operation) => {
       const run = lanLane.then(operation, operation)
       lanLane = run.then(() => {}, () => {})
       return run
     }
+
+    // ---- spec 031 step 2: the loopback web (Serve) ingress ---------------------
+    // Its own generation/settle pair mirrors the direct listener's: only events of the
+    // attempt in force may settle it, and a waiter only ever observes its own attempt.
+    const beginWebAttempt = () => {
+      webGeneration += 1
+      // A fresh identity for every listener attempt: a restore, an identical-tuple retry and a
+      // replacement each start one, and each listener hands it to the sockets it upgrades.
+      const attemptIngress = webListenerIngress = listenerIngress('web', webIngressState.generation)
+      let resolve
+      const promise = new Promise((done) => { resolve = done })
+      const settle = { generation: webGeneration, promise, resolve, settled: false, ingress: attemptIngress }
+      webSettle = settle
+      return settle
+    }
+
+    const settleWebAttempt = (settle, outcome) => {
+      if (!settle || settle.settled) return
+      settle.settled = true
+      settle.resolve(outcome)
+    }
+
+    const abortWebAttempts = () => {
+      webGeneration += 1
+      settleWebAttempt(webSettle, { ok: false, aborted: true })
+      webSettle = null
+    }
+
+    /** Whether the web ingress that raised a request/connection is still the SAME live attempt. */
+    const webIngressLive = (identity) => {
+      if (!identity || identity.kind !== 'web') return false
+      // The token is the LISTENER attempt's own symbol: a restoration, a retry or a replacement
+      // over the same tuple is a different attempt, whatever its tuple generation says.
+      return webIngressActive()
+        && identity.token === webListenerIngress?.token
+        && webListening === true
+        && webIngressServer !== null
+    }
+
+    /** The web ingress is serving: enabled, switched on, and its listener up. */
+    const webIngressActive = () => webIngressState.enabled === true && gatewayEnabled === true && webListening === true
+
+    /**
+     * Spec 021 + spec 031 §7: which origin may be a passkey site for THIS socket's ingress.
+     *
+     * A DIRECT socket (the listener, the DSH loopback route) keeps the existing rule exactly:
+     * its exact `Origin` must be in `allowedOrigins`. A socket that arrived on the WEB ingress is
+     * a browser whose page ran on the origin that ingress served — it presented that exact,
+     * configured origin at the upgrade fence — so its passkey site is that origin's host, without
+     * the owner having to list it twice. The rule is evaluated per passkey frame, so the origin
+     * is "currently configured": a disable or a replacement stops admitting the old origin at
+     * once, and nothing here ever widens `allowedOrigins` for a direct socket or the upgrade
+     * fences.
+     */
+    const passkeyOriginPolicy = (socket, origin) => {
+      const ingress = socket?.ingress
+      if (ingress && ingress.kind === 'web') {
+        return webIngressLive(ingress) && webIngressState.origin !== '' && origin === webIngressState.origin
+      }
+      return allowedOrigins.includes(origin)
+    }
+
+    // Serialized with every other listener change. `operation` is the body of a transition.
+    const inWebLane = (operation) => inLanLane(async () => { webLane = await operation(webLane) })
 
     const listenAbortedError = () => {
       const error = new Error('the listen change was cancelled: the mobile gateway is disabled or stopping')
@@ -1973,6 +2113,10 @@ const plugin = {
         // otherwise the first pair would wait on a connection that cannot
         // happen. The timeout still starts with the switch-on.
         if (gatewayEnabled) openLanListener()
+        // Spec 031 step 2: the web ingress the owner left enabled is restored here too. This
+        // branch is the DEFAULT of POST /mgw/gateway {enabled:true}, so restoring it only in
+        // the branch below would leave a re-enable in temporary mode with no web path at all.
+        if (gatewayEnabled) reopenWebIngress()
         waitExpiresAt = Date.now() + options.gatewayWaitTimeoutMs
         waitTimer = setTimeout(() => {
           waitTimer = null
@@ -1991,6 +2135,9 @@ const plugin = {
       } else if (gatewayEnabled) {
         // Re-enabling may re-open the LAN listener that a previous switch-off closed.
         openLanListener()
+        // Spec 031 step 2: and the web ingress, when the owner left it enabled. Both ingresses
+        // are gated by the same switch, so a switch-on restores exactly what it switched off.
+        reopenWebIngress()
       }
       log(`mobile gateway mode=${mode}${reason ? `: ${reason}` : ''}`)
     }
@@ -1999,8 +2146,15 @@ const plugin = {
     // `pendingSockets` is declared with the pairing state machine further down;
     // a start-up call (setGatewayMode 'startup') runs before it exists.
     let endPendingPairings = () => {}
+    // Spec 031 step 2: hoisted with its sibling above, because the start-up call (and the
+    // direct listener teardown) can reach it before the pairing state machine below assigns it.
+    var endWebPendingPairings = () => {}
     const applyDisabledState = () => {
       endPendingPairings()
+      // Spec 031 step 2: the global switch-off gates BOTH ingresses — a disabled gateway must
+      // not leave a browser path listening behind the direct listener's teardown.
+      closeWebListener('mobile gateway disabled')
+      endWebPendingPairings()
       rtc?.closeAll()
       // Snapshot first: each close() synchronously drops the client from `clients`.
       // `isOpen` re-reads the underlying TCP socket, which survives the graceful
@@ -2756,6 +2910,19 @@ const plugin = {
                 sans: tlsIdentity?.sans ?? [],
                 error: lanListenError,
               },
+              // Spec 031 step 2: the web (Serve) ingress, described SEPARATELY from the direct
+              // listener. This is owner-facing guidance for the BROWSER path only
+              // (`browser-ca-same-origin`, `/ws/mobile` on the HTTPS origin). It is never merged
+              // into a pairing payload: a browser does not observe this gateway's leaf (Serve
+              // terminates TLS), so it must never be handed a gateway pin.
+              webIngress: {
+                ...webIngressStatus(webIngressReport()),
+                // Whether the loopback upstream is up NOW: enabled, switched on, listening. NOT
+                // "ready": spec 031 §7 makes readiness an accepted client-hello after pairing
+                // (and any passkey unlock), which no listener state can stand in for, so it is
+                // never reported here as `ready`.
+                active: webIngressActive(),
+              },
               tls: {
                 fingerprint256: tlsIdentity?.fingerprint256 ?? null,
                 sans: tlsIdentity?.sans ?? [],
@@ -3110,6 +3277,70 @@ const plugin = {
               pairingString: qrPayload,
               svg,
             })
+          } else if (req.method === 'POST' && p === '/mgw/web-ingress') {
+            // Spec 031 step 2: the owner's configure action for the loopback web (Serve) ingress.
+            // The SAME owner-side guards as `/mgw/listen` — `/mgw` is already proxy-fenced above,
+            // the loopback peer is rechecked because this route opens a remote surface, and the
+            // Host/Origin pair is rechecked because the shared same-origin test compares two
+            // caller-supplied headers (DNS rebinding). It never touches the direct listener.
+            if (!isLoopback(req)) {
+              sendJson(res, 403, { error: 'forbidden', message: 'web ingress changes are loopback-only' })
+              return
+            }
+            assertTrustedLocalAuthority(req)
+            const body = await readBody(req)
+            // Validate fully BEFORE anything is persisted or moved. The direct port in force is
+            // the one a collision must be refused against (`webIngress` and the direct listener
+            // may never share a port).
+            let desired
+            try {
+              desired = planWebIngress(body, { enabled: webIngressState.enabled, port: webIngressState.port,
+                origin: webIngressState.origin }, lanBoundPort)
+            } catch (error) {
+              if (Number.isInteger(error?.status)) throw error
+              throw badRequest(error?.message ?? 'invalid web ingress')
+            }
+            // An enabled ingress is a remote surface: the same preconditions the other remote
+            // switches have, so this route can never turn one on by itself.
+            if (desired.enabled && !remoteControlEnabled()) throw remoteDisabledError('enable remote control before enabling the web ingress')
+            if (desired.enabled && !gatewayEnabled) {
+              const error = new Error('enable the mobile gateway before enabling the web ingress')
+              error.status = 409
+              error.code = 'gateway/disabled'
+              throw error
+            }
+            // Serialized with every other listener change (see `inLanLane`): a direct rebind or
+            // rotation that is in flight finishes first, so this never closes a listener another
+            // request is using and the direct port this validated against is still the one in
+            // force when the transition runs.
+            let outcome
+            try {
+              outcome = await inLanLane(async () => {
+                // Re-plan INSIDE the lane: the direct port may have moved while this waited.
+                let inLane
+                try {
+                  inLane = planWebIngress(body, { enabled: webIngressState.enabled, port: webIngressState.port,
+                    origin: webIngressState.origin }, lanBoundPort)
+                } catch (error) {
+                  if (Number.isInteger(error?.status)) throw error
+                  throw badRequest(error?.message ?? 'invalid web ingress')
+                }
+                return applyWebIngress(inLane, 'set on the Devices page')
+              })
+            } catch (error) {
+              // A bind failure already persisted the owner's tuple; the reply says so and the
+              // live state is whatever the status reports, never a claim of readiness.
+              const status = Number.isInteger(error?.status) ? error.status : 500
+              sendJson(res, status, {
+                error: error?.code ?? (status < 500 ? 'bad-request' : 'internal'),
+                ...(error?.code ? { code: error.code } : {}),
+                message: error?.message ?? String(error),
+                webIngress: { ...webIngressStatus(webIngressReport()), active: webIngressActive() },
+              })
+              return
+            }
+            log(`web ingress configured: enabled=${desired.enabled}, port=${desired.port}, origin=${desired.origin || '-'}`)
+            sendJson(res, 200, outcome)
           } else if (req.method === 'GET' && p === '/mgw/pending') {
             // Spec 008 P1b Window 2. Loopback + (for writes) same-origin come from
             // the guards at the top of this handler; a remote device never gets here.
@@ -3123,6 +3354,14 @@ const plugin = {
             // carries the pairing names and the passkey verification codes — i.e. exactly what an
             // owner uses to decide. So the Host must name THIS machine's loopback authority.
             assertTrustedLocalAuthority(req)
+            // Spec 031 step 2: with the gateway off nothing is approvable (the approval route's
+            // own recheck answers the decision). Listing requests that can no longer be approved
+            // would make the owner decide on a dead surface after a switch-off that a stalled
+            // approval was racing; the answer keeps the shape the Devices page reads.
+            if (!gatewayEnabled) {
+              sendJson(res, 409, { error: 'gateway/disabled', pending: [], offers: pairingRequests.offerCount() })
+              return
+            }
             // Spec 021 §14.3: a passkey replacement request is a pending approval of kind
             // `passkey` — listed beside the pairing requests so the Devices page shows both.
             sendJson(res, 200, { pending: [...pairingRequests.list(), ...passkeyService.pendingApprovals()], offers: pairingRequests.offerCount() })
@@ -3199,6 +3438,18 @@ const plugin = {
               granted = request.requestedScopes.filter((scope) => body.scopes.includes(scope))
             }
             if (!remoteControlEnabled() || !gatewayEnabled) throw remoteDisabledError('remote control is off; the request cannot be approved')
+            // Spec 031 step 2: the ingress that raised this request must still be the SAME live
+            // attempt. A body read may stall, and the owner's other actions (a web ingress
+            // disable or a replacement, the gateway switch-off, a port move) run in that window:
+            // a request whose ingress is gone is no longer approvable, and it says exactly what a
+            // decided request says (same 404, no new wire state).
+            if (!ingressStillLive(waiting)) {
+              const stale = pairingRequests.take(id)
+              if (stale && pendingSockets.get(id) === waiting) { pendingSockets.delete(id); waiting.end('pairing/disabled', CLOSE_PAIRING_REJECTED) }
+              log(`pairing approval refused: the ingress that raised ${id} is no longer live`)
+              sendJson(res, 404, { error: 'not-found', message: 'no such pending request (it may have expired, been decided or the client left)' })
+              return
+            }
             // `take` is the single-winner gate: a second approval, a reject, a
             // timeout or a disconnect that ran during the body wait already took it.
             const taken = pairingRequests.take(id)
@@ -3504,8 +3755,11 @@ const plugin = {
       if (!activationHold) { start(); return }
       let hold
       try { hold = activationHold(details) } catch (error) { hold = undefined }
-      if (hold && typeof hold.then === 'function') hold.catch(() => {}).then(() => start())
-      else start()
+      if (hold && typeof hold.then === 'function') {
+        hold.catch(() => {}).then(() => start())
+        return
+      }
+      start()
     }
     const activateBusinessConnection = (adapter, device, channel, transport = {}, paired = null, credentialGeneration) => {
       // Spec 005 re-review: activation is not authentication. An RTC business
@@ -3628,8 +3882,20 @@ const plugin = {
       const id = ++counter
       ws.filterSessionId = undefined
       ws.clientHello = null
+      // Spec 031 step 2: a connection must not outlive the ingress that served it. The checks
+      // above run synchronously, but a test hold (`testActivationHold`) or a later await inside
+      // activation may hand control back while a disable/replacement closes the ingress in the
+      // lane; this socket is then refused BEFORE it joins `clients` or receives a hello.
+      if (transport.ingress && transport.ingress.kind === 'web' && !webIngressLive(transport.ingress)) {
+        log('web ingress connection refused at activation: the ingress is no longer live')
+        try { adapter.close(CLOSE_REVOKED, 'web ingress disabled') } catch (error) { /* socket already gone */ }
+        return undefined
+      }
       // Contract §1 duplicate-in-flight bookkeeping for this socket.
       ws.inFlightRequestIds = new Set()
+      // Spec 031 step 2: the web ingress owns its connections explicitly, so a disable or a
+      // port/origin replacement closes exactly the sockets it served — never a direct one.
+      ws.ingress = transport.ingress
       clients.add(ws)
       if (device) registry.connected(device.id)
       markDeviceConnected()
@@ -4543,6 +4809,39 @@ const plugin = {
       for (const waiting of [...pendingSockets.values()]) waiting.end('pairing/disabled', CLOSE_PAIRING_REJECTED)
       pairingRequests.clear()
     }
+    // Spec 031 step 2: a disabled or replaced web ingress invalidates the pending requests IT
+    // raised, and only those: a direct request keeps waiting for its own decision. The offer
+    // table is left alone (offers are not bound to a listener; proof binds the certificate).
+    endWebPendingPairings = () => {
+      let ended = 0
+      for (const [id, waiting] of [...pendingSockets.entries()]) {
+        if (!waiting.ingress || waiting.ingress.kind !== 'web') continue
+        pendingSockets.delete(id)
+        pairingRequests.take(id)
+        waiting.end('pairing/disabled', CLOSE_PAIRING_REJECTED)
+        ended += 1
+      }
+      if (ended > 0) log(`web ingress invalidated ${ended} pending pairing request(s)`)
+    }
+
+    /**
+     * Approval recheck (spec 031 "Invariants": approval rechecks live connection and enabled
+     * state). Called AFTER any (possibly stalled) body read. A request raised on an ingress
+     * that was disabled, replaced or switched off while the owner was deciding is no longer
+     * approvable: the same 404 a decided/expired request gets, and its socket is ended.
+     */
+    const ingressStillLive = (waiting) => {
+      const identity = waiting?.ingress
+      if (!identity || typeof identity !== 'object') return true // a request raised before this existed
+      if (identity.kind === 'web') return webIngressLive(identity)
+      // A DIRECT request keeps its existing meaning: the gateway being on is what it needs, and
+      // the socket's liveness is already checked beside this (`waiting.live()`). A rebind does
+      // not terminate upgraded sockets (see the rebind note in the listener factory), so a
+      // direct request raised before the address moved is still approvable exactly as before —
+      // spec 031 requires the existing direct semantics to stay unchanged.
+      if (identity.kind === 'direct') return gatewayEnabled === true
+      return false
+    }
 
     const acceptPendingSocket = createPairingSocketAcceptor({
       pairingRequests, pendingSockets, reservedLongCodes, registry,
@@ -4562,7 +4861,11 @@ const plugin = {
         // Spec 005 FR5: before `gatewayEnabled`, so a foreign Origin is refused
         // (403) even while the gateway is off, and it learns nothing about what
         // it presented.
-        if (!originAllowed(req, allowedOrigins)) {
+        // Spec 031 step 2: the web ingress is browser-only and already matched its EXACT
+        // configured origin in its own listener (a missing/foreign origin never reaches
+        // here). Its origin is therefore not required to appear in `allowedOrigins`, which
+        // stays the separate owner list for the direct/loopback routes.
+        if (transport.web !== true && !originAllowed(req, allowedOrigins)) {
           log(`auth rejected: WebSocket upgrade from a foreign Origin (${String(req.headers.origin).slice(0, 200)})`)
           rejectUpgrade(socket, 403, 'Origin is not an allowed WebSocket origin')
           return
@@ -4639,6 +4942,9 @@ const plugin = {
           }
           wss.handleUpgrade(req, socket, head, (socketClient) => acceptPendingSocket(socketClient, {
             req, clientDeviceId, deviceName: extractClientDeviceName(req), transport, longCode,
+            // Spec 031 step 2: which listener this request was raised on (already captured when
+            // the upgrade entered the gateway; approval rechecks it after its body read).
+            ingress: transport.ingress,
           }))
           return
         }
@@ -4733,7 +5039,8 @@ const plugin = {
     const disposeUpgrade = webServer.registerUpgrade({
       path: wsPath,
       handler(req, socket, head) {
-        handleMobileUpgrade(req, socket, head, { port: webServer.port })
+        // The DSH web server's own route: the owner's loopback admin path, never the web ingress.
+        handleMobileUpgrade(req, socket, head, { port: webServer.port, ingress: ingressIdentity('direct', lanAttemptGeneration) })
       },
     })
     log(`upgrade route registered: ${wsPath}`)
@@ -4944,6 +5251,291 @@ const plugin = {
         : `the listener could not be rebound to ${host} (${failure}) and did not come back on ${previousHost} (${rolled.error || lanListenError || 'no listener'})`)
     })
     openLanListener()
+
+    // ---- spec 031 step 2: the loopback web (Serve) ingress listener ----------
+    // A SECOND plugin-owned TLS listener for the browser path only: always 127.0.0.1, always
+    // this gateway's TLS identity (the browser trusts it by CA/hostname, never by the gateway
+    // leaf pin — Serve terminates TLS in front of it), the same `/ws/mobile` upgrade handler
+    // and therefore the same device registry, pairing state machine and approval route. It
+    // serves NOTHING else: no static assets, no DSH routes, no `/mgw` management surface.
+    // Declared as a hoisted function: the gateway switch (defined above this block) reaches
+    // pplyDisabledState -> closeWebListener during a DISABLED start-up, before this point.
+    function closeWebListener(reason) {
+      abortWebAttempts()
+      // Whatever was waiting on this listener can never be settled by it any more.
+      if (!webIngressServer) return
+      const listener = webIngressServer
+      webIngressServer = null
+      webListening = false
+      try { listener.close() } catch (error) {
+        log(`web ingress listener close failed: ${error && error.message ? error.message : String(error)}`)
+      }
+      // `server.close()` does not terminate upgraded sockets: the connections that went
+      // through THIS ingress are closed here, so a disabled/replaced ingress cannot keep a
+      // browser connected (spec 031: "disable/replaced ingress invalidates its connections").
+      if (reason) closeWebIngressConnections(reason)
+    }
+
+    function openWebListener() {
+      if (webIngressState.enabled !== true || gatewayEnabled !== true || webIngressServer) return null
+      if (webIngressState.origin === '' || webIngressState.port === 0) {
+        webListening = false
+        const refused = beginWebAttempt()
+        webListenError = 'the web ingress needs a configured origin and a fixed port'
+        settleWebAttempt(refused, { ok: false, error: webListenError })
+        return refused
+      }
+      const origin = webIngressState.origin
+      const listener = https.createServer(tlsServerOptions(tlsIdentity), (req, res) => {
+        // No page, no static asset, no DSH route, no management surface on this port. A plain
+        // HTTP request (Serve should never forward one) learns only that a TLS listener is here.
+        sendJson(res, 404, { error: 'not-found' })
+      })
+      const attempt = beginWebAttempt()
+      webIngressServer = listener
+      listener.on('connection', (socket) => {
+        tlsSockets.add(socket)
+        socket.once('close', () => tlsSockets.delete(socket))
+      })
+      listener.on('tlsClientError', () => {
+        // A browser that does not trust this certificate never reaches HTTP; nothing to log.
+      })
+      listener.on('upgrade', (req, socket, head) => {
+        let pathname
+        try {
+          pathname = new URL(req.url || '/', 'https://web.invalid').pathname
+        } catch {
+          rejectUpgrade(socket, 400, 'invalid WebSocket path')
+          return
+        }
+        // The ONLY path, and it is the contract's fixed `WEB_WS_PATH` — never the configurable
+        // direct listener path (`options.path`): Serve is mounted on `/ws/mobile`, so a gateway
+        // with a non-default direct path must not move the browser path (or strand the PWA).
+        // `/mgw` and everything else answers 404, so this listener is indistinguishable from
+        // one that has no management surface at all.
+        if (pathname !== WEB_WS_PATH) {
+          rejectUpgrade(socket, 404, 'not found')
+          return
+        }
+        // Serve dials this listener from this machine, so a browser arrives from loopback.
+        // The fence refuses a non-loopback peer and any forwarding header a CALLER can set
+        // (`Forwarded`, `X-Real-IP`); nothing in a header grants identity or a scope.
+        const fence = webIngressFence(req)
+        if (!fence.ok) {
+          log(`web ingress refused a request: ${fence.reason}`)
+          rejectUpgrade(socket, 403, 'the web ingress accepts loopback browser traffic only')
+          return
+        }
+        // The exact configured origin, present, and nothing else: a browser sends its Origin
+        // on every WebSocket, so a missing one is not this surface's client at all.
+        const originCheck = webOriginAccepted(req, origin)
+        if (!originCheck.ok) {
+          log(`web ingress refused an upgrade: ${originCheck.reason}`)
+          rejectUpgrade(socket, 403, 'the web ingress accepts the configured browser origin only')
+          return
+        }
+        // Same identity, same pin claim: `certSha256` is the certificate THIS process
+        // presents, so a pairing code issued for another identity is refused as before.
+        handleMobileUpgrade(req, socket, head, {
+          lan: false, web: true, port: webBoundPort, tls: true, certSha256: tlsIdentity.fingerprint256,
+          // The identity of the LISTENER this upgrade arrived on (this closure's own attempt),
+          // never one read from the mutable state.
+          ingress: attempt.ingress,
+        })
+      })
+      // A busy port is an ERROR, never a service identity success and never a shifted port:
+      // Serve is pointed at exactly this port, so a silent move would leave the browser path
+      // dead while the status claimed a listener.
+      //
+      // A server that never bound must not keep its OWNERSHIP slot: `webIngressServer !== null`
+      // is what every check reads as "this ingress owns a listener", and leaving a failed one
+      // there made an identical re-apply look configured-and-unchanged instead of retrying. The
+      // close only releases the event loop for a server that never listened and never terminates
+      // an upgraded socket.
+      const failed = () => {
+        if (webIngressServer === listener) webIngressServer = null
+        webListening = false
+        try { listener.close() } catch { /* never listening: nothing holds it */ }
+      }
+      listener.on('error', (error) => {
+        if (attempt.generation !== webGeneration) return
+        failed()
+        webListenError = typeof error?.code === 'string' ? error.code : (error && error.message ? error.message : String(error))
+        log(`web ingress listener failed: ${webListenError}`)
+        settleWebAttempt(attempt, { ok: false, error: webListenError })
+      })
+      listener.on('listening', () => {
+        if (attempt.generation !== webGeneration) return
+        webListening = true
+        webListenError = null
+        const address = listener.address()
+        if (address && typeof address === 'object') webBoundPort = address.port
+        log(`web ingress listening: ${WEB_INGRESS_HOST}:${webBoundPort}${WEB_WS_PATH} for ${origin}; certSha256=${tlsIdentity.fingerprint256}; authentication forced`)
+        settleWebAttempt(attempt, { ok: true, port: webBoundPort })
+      })
+      // `listen()` can throw SYNCHRONOUSLY (a port the range does not allow): the ownership
+      // slot taken above is released here too, with the failure recorded where status reads it.
+      try {
+        listener.listen(webIngressState.port, WEB_INGRESS_HOST)
+      } catch (error) {
+        if (attempt.generation === webGeneration) {
+          failed()
+          webListenError = error && error.message ? error.message : String(error)
+          log(`web ingress listener failed: ${webListenError}`)
+          settleWebAttempt(attempt, { ok: false, error: webListenError })
+        }
+      }
+      return attempt
+    }
+
+    /** Wait for exactly one web attempt; `null` means a later transition superseded it. */
+    async function awaitWebSettled(settle) {
+      if (!settle) return null
+      let timer
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false, timedOut: true }), LAN_SETTLE_TIMEOUT_MS)
+        timer.unref?.()
+      })
+      const outcome = await Promise.race([settle.promise, timeout])
+      clearTimeout(timer)
+      if (settle.generation !== webGeneration) return null
+      return outcome
+    }
+
+    /** The state `webIngressStatus` reports; also used by the management status route. */
+    const webIngressReport = () => ({
+      enabled: webIngressState.enabled === true,
+      origin: webIngressState.origin,
+      listening: webListening === true,
+      port: webListening ? webBoundPort : webIngressState.port,
+      error: webListenError,
+    })
+
+    // Startup: a persisted enabled tuple binds inside the listener lane, after the direct
+    // listener exists, so a start never races its own teardown and the direct port it is
+    // checked against is already known. Its failure is reported, never fatal: the direct
+    // listener must still serve a paired device.
+    const openPersistedWebIngress = () => inLanLane(async () => {
+      try {
+        if (webIngressState.enabled !== true || gatewayEnabled !== true) return null
+        const attempt = openWebListener()
+        const outcome = await awaitWebSettled(attempt)
+        if (outcome === null) return null
+        if (!outcome.ok) {
+          log(`web ingress did not start: ${outcome.error || webListenError || 'no listener'}`)
+          return null
+        }
+        log(`web ingress restored from the saved tuple for ${webIngressState.origin}`)
+        return outcome
+      } catch (error) {
+        // A start must never take the direct listener down with a web-port failure.
+        webListening = false
+        webListenError = error && error.message ? error.message : String(error)
+        log(`web ingress restore failed: ${webListenError}`)
+        return null
+      }
+    }).catch((error) => log(`web ingress restore failed: ${error && error.message ? error.message : String(error)}`))
+
+    // The same helper restores the ingress after a gateway switch-off/on cycle (setGatewayMode).
+    reopenWebIngress = () => { openPersistedWebIngress() }
+    // A persisted enabled web ingress comes up at start, in its own lane: nothing waits on it
+    // (the direct listener is already registered and serving) and a failure is only logged.
+    void openPersistedWebIngress()
+
+    /**
+     * Close every live connection this web ingress served (a disable or a replacement).
+     * `CLOSE_REVOKED` is the contract's "re-authenticate", never "credential gone": the device
+     * record is untouched, and its direct connection — if it has one — stays open.
+     */
+    function closeWebIngressConnections(reason) {
+      const served = [...clients].filter((client) => client.ingress && client.ingress.kind === 'web')
+      if (served.length === 0) return
+      for (const client of served) {
+        const socket = client.adapter?.socket
+        closingSockets.add({ isOpen: () => !!socket && socket.readyState !== 3, terminate: () => client.terminate() })
+      }
+      for (const client of served) client.close(CLOSE_REVOKED, reason)
+      terminateWedgeSockets()
+      log(`web ingress closed ${served.length} connection(s): ${reason}`)
+    }
+
+    /**
+     * Apply an owner transition on the web ingress. Runs inside the listener lane, so it is
+     * serialized with direct rebinds, rotations and the gateway switch-off. `desired` was
+     * validated by `planWebIngress` BEFORE this ran.
+     *
+     * The tuple is persisted first: a failed save changes nothing live, and a failed bind leaves
+     * the owner's choice on disk while the status reports the error — never a claim of a listener
+     * that is not there. The DIRECT listener is never touched here (spec 031: a web disable
+     * leaves direct intact) and is never rebound because of this transition (a direct rebind
+     * likewise leaves this ingress alone: "direct rebind must not strand web").
+     */
+    const applyWebIngress = async (desired, direction) => {
+      // "The tuple did not change" is NOT "the ingress is healthy": a previous attempt may have
+      // failed to bind (its server ownership is already released), or the switch/gateway may have
+      // taken the listener down, while the configured tuple stayed exactly as it is. So an
+      // identical ENABLED tuple with no listening listener is retried as a fresh attempt (a new
+      // generation, so any pending request of the dead attempt is stale); only a live one short-
+      // circuits as unchanged. A disabled tuple has nothing to listen for.
+      const sameTuple = webIngressState.enabled === desired.enabled && webIngressState.port === desired.port
+        && webIngressState.origin === desired.origin
+      const retry = sameTuple && desired.enabled === true && !webListening
+      if (sameTuple && !retry) {
+        return { ...webIngressStatus(webIngressReport()), persists: true, changed: false }
+      }
+      // The attempt identity of the tuple in force: a disable keeps the generation it had
+      // (nothing new was raised), an enable/replace moves to a fresh one so every pending
+      // request raised on the previous attempt is stale.
+      const generation = webIngressState.generation + 1
+      let persists = true
+      // An identical retry saved nothing new: the tuple that failed is already on disk, and a
+      // refused write now would claim the owner's retry changed something it did not.
+      if (!retry) {
+        try {
+          gatewayState.setWebIngress({ enabled: desired.enabled, port: desired.port, origin: desired.origin })
+        } catch (error) {
+          persists = false
+          log(`web ingress tuple was not persisted: ${error.message}`)
+          const failure = new Error(`the web ingress could not be saved (${error.message}); nothing was changed`)
+          failure.status = 500
+          throw failure
+        }
+      }
+      // The switch is committed before anything moves live.
+      webIngressState = { enabled: desired.enabled, port: desired.port, origin: desired.origin, generation }
+      if (desired.enabled !== true) {
+        closeWebListener('web ingress disabled')
+        endWebPendingPairings()
+        log(`web ingress disabled${direction ? ` (${direction})` : ''}; direct listener untouched`)
+        return { ...webIngressStatus(webIngressReport()), persists, changed: true }
+      }
+      // A changed origin/port or a re-enable: the old listener (and its connections) goes first,
+      // so the new attempt binds the port it asked for and nothing of the previous attempt
+      // survives it.
+      closeWebListener('web ingress replaced')
+      endWebPendingPairings()
+      webListenError = null
+      const attempt = openWebListener()
+      const outcome = await awaitWebSettled(attempt)
+      if (outcome === null) {
+        // Superseded by a later transition in the lane: this caller must not report readiness.
+        const error = new Error('the web ingress change was superseded by a later change')
+        error.status = 409
+        error.code = 'web-ingress/superseded'
+        throw error
+      }
+      if (!outcome.ok) {
+        // The previous listener is already gone and the failed attempt released its ownership;
+        // the tuple stays on disk and the status reports the error, so the owner can re-apply
+        // the identical tuple once the port is free — that re-apply retries (see the top).
+        const failure = new Error(`the web ingress could not listen on ${WEB_INGRESS_HOST}:${desired.port} (${outcome.error || webListenError || 'no listener'})`)
+        failure.status = 409
+        failure.code = 'web-ingress/bind-failed'
+        throw failure
+      }
+      log(`web ingress ${retry ? 're-applied' : 'enabled'}${direction ? ` (${direction})` : ''} for ${desired.origin} on ${WEB_INGRESS_HOST}:${webBoundPort}; direct listener untouched`)
+      return { ...webIngressStatus(webIngressReport()), persists, changed: true }
+    }
 
     const disposeEvents = ctx.on('session/event', (session, event) => {
       // Approval binding (T026): every `tool/call` is cached before any client
@@ -5413,6 +6005,9 @@ const plugin = {
       // the plugin — it is superseded here and answers 409 instead of touching a
       // listener that teardown is about to close.
       abortLanAttempts()
+      // Spec 031 step 2: the web ingress listener and its connections go with the plugin.
+      closeWebListener('plugin stopping')
+      endWebPendingPairings()
       cancelVisibleRefresh()
       for (const cancel of [...joinCancellers]) cancel()
       joinCancellers.clear()
@@ -5456,6 +6051,9 @@ const plugin = {
       disposeQuestions()
       disposeApprovals()
       if (lanServer) lanServer.close()
+      // Spec 031 step 2: the web ingress listener is closed by closeWebListener above,
+      // together with every connection it served.
+      if (webIngressServer) webIngressServer.close()
       for (const client of clients) {
         client.sessionFollower?.stop()
         client.terminate()

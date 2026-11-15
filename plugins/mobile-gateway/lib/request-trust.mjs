@@ -55,6 +55,29 @@ function isLoopback(req) {
   return isLoopbackPeer(req)
 }
 
+/**
+ * The fence for the plugin-owned web (Serve) ingress (spec 031 step 2). That listener is a RAW
+ * TLS loopback upstream that `tailscale serve` dials, so it must serve nobody else: the peer
+ * must be loopback on this machine, and the request must carry NO forwarding-family header.
+ *
+ * A browser reaching the upstream goes page -> Serve -> 127.0.0.1, and Serve forwards the
+ * headers the browser sent; a header it adds itself (`x-forwarded-for`) is Serve's, not
+ * caller text, and is therefore not a reason to refuse a real browser on this one listener.
+ * `Forwarded` (RFC 7239, a standard and deliberately NOT in the forwarding family above) and
+ * `X-Real-IP` are exactly the spellings a caller CAN set, so they are refused here. Nothing
+ * in these headers is ever read for identity, and a refusal never echoes them.
+ * @param {object} req the upgrade request
+ * @returns {{ok: boolean, reason?: string}}
+ */
+function webIngressFence(req) {
+  if (!isLoopbackPeer(req)) return { ok: false, reason: 'not-loopback' }
+  const headers = req && req.headers
+  if (!headers) return { ok: false, reason: 'headers-unreadable' }
+  const names = Object.keys(headers).map((name) => name.toLowerCase())
+  if (names.includes('forwarded') || names.includes('x-real-ip')) return { ok: false, reason: 'caller-forwarding-header' }
+  return { ok: true }
+}
+
 function parseProtocols(req) {
   const value = req.headers['sec-websocket-protocol']
   if (typeof value !== 'string') return []
@@ -190,4 +213,5 @@ export {
   FORWARDING_HEADER_NAMES, FORWARDING_HEADER_PREFIXES, QUERY_CREDENTIAL_PARAMS, TRUSTED_LOCAL_AUTHORITY,
   addressesLoopbackAuthority, assertTrustedLocalAuthority, classifyRequest, extractCredential, isForwardedRequest,
   isLoopback, isLoopbackPeer, isNonLocalRequest, isSameOrigin, originAllowed, parseProtocols, queryCredentialParams,
+  webIngressFence,
 }

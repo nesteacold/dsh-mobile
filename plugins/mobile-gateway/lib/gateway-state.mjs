@@ -3,6 +3,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { normalizeTransportConfig } from './transport-config.mjs'
 import { restrictToOwnerSync } from './secure-file.mjs'
+import { normalizeWebOrigin, readWebIngress } from './web-ingress.mjs'
 
 export const PAIRING_ROUTES = ['p2p', 'auto-lan', 'auto', 'lan', 'cloudflare', 'custom', 'tailscale']
 
@@ -36,6 +37,10 @@ export function createGatewayState(file) {
     if (value.remoteControl !== undefined && typeof value.remoteControl !== 'boolean') {
       throw new Error('invalid remote control switch')
     }
+    // Spec 031 step 2: the web (Serve) ingress tuple. Optional for the same reason as
+    // `listenHost`: a file written before the ingress existed still validates, and the
+    // caller reads the absent value as the disabled default.
+    if (value.webIngress !== undefined) readWebIngress(value.webIngress)
     return value
   }
   const read = () => validate(JSON.parse(fs.readFileSync(file, 'utf8')))
@@ -95,6 +100,18 @@ export function createGatewayState(file) {
     setRemoteControl(enabled) {
       if (typeof enabled !== 'boolean') throw new TypeError('invalid remote control switch')
       const next = { ...state, remoteControl: enabled }
+      validate(next)
+      write(next)
+      state = next
+    },
+    // Spec 031 step 2: the web (Serve) ingress tuple. Absent means "never configured",
+    // which reads as disabled — never as an enabled ingress with a guessed port.
+    get webIngress() { return state.webIngress === undefined ? undefined : readWebIngress(state.webIngress) },
+    // Written as ONE value (switch, port and origin together), so a torn or refused write can
+    // never leave the next start enabled without the origin or port it was enabled with.
+    setWebIngress(tuple) {
+      const validated = readWebIngress(tuple)
+      const next = { ...state, webIngress: { enabled: validated.enabled, port: validated.port, origin: normalizeWebOrigin(validated.origin) ?? '' } }
       validate(next)
       write(next)
       state = next
