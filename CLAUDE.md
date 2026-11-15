@@ -84,6 +84,14 @@ repo's `AGENTS.md` / `CLAUDE.md` and the role briefs.
   never wrap a method it did not install; no weakening of gateway authorization; a reviewer pass on
   the wrapper for every DSH version bump; the plugin README lists the wrapped methods. A1 otherwise
   unchanged.
+- 2026-11-15: owner approved **A1.2**, extending A1.1 so `plugins/devices` may also wrap the renderer's
+  `globalThis.__DSH_HOST_PATHS__.pathFor` (the bridge that turns a picked local file into an
+  `@"path"` mention). Purpose only: for a session owned by a remote Host, a non-image file picked in
+  the composer must take DSH's existing byte-upload path (so the bytes reach that Host) instead of a
+  controller-local path the Host cannot read. Same A1.1 conditions apply (structural self-test, no
+  wrap and a visible reason on mismatch, exact restore, never wrap what it did not install, no
+  weakening of authorization, reviewer pass, README lists it). Local sessions keep DSH's behaviour.
+  Spec `specs/033-remote-file-attach/`.
 
 ## Standing rules
 - Spec Kit is the work process: every feature gets `specs/<###-slug>/` before code.

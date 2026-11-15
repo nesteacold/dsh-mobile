@@ -10,7 +10,7 @@ import vm from 'node:vm'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 
-import { check, finish } from './helpers.mjs'
+import { check, finish, createFakeComposerDocument, pickFiles } from './helpers.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const require = createRequire(import.meta.url)
@@ -2683,4 +2683,283 @@ await check('start page: the doorway strings exist in vi and en as real translat
   assert.equal(doors.find((entry) => entry.providerId === 'dsh-ext.devices.r-a.devices').title(), 'Thiết bị · Qoder-Sigma')
   for (const dispose of vi.disposers) { try { dispose() } catch { /* teardown */ } }
 })
+// ------------------------------------------------------- spec 033 (A1.2) integration
+// The REAL shell path, end to end: lib/client.js is a chunk too, so it runs through the
+// same fake __ModuleLoader__ a page uses; its `require.async('./client.remote-file-attach.js')`
+// is answered the way DSH's loader answers it — by executing the second chunk's source and
+// taking the factory it REGISTERS (a bare `module.exports` registers nothing and the real
+// loader fails the request, so this check would fail exactly where DSH would). Then apply()
+// -> install -> a composer pick -> dispose, against a fake document shaped like the
+// installed composer (picker beside [data-composer-input], reset before intakeFiles).
+await check('spec 033: client.js loads the real chunk through require.async, installs the wrap on apply(), answers a remote pick, and restores the bridge on dispose', async () => {
+  const chunkPath = path.join(here, '../lib/client.remote-file-attach.js')
+  let chunk = null
+  const chunkSource = fs.readFileSync(chunkPath, 'utf8')
+  const registrations = []
+  const composer = createFakeComposerDocument({ sessions: ['h:2f1d1a52-6d7c-4d3e-9a58-1f0f1a2b3c4d:s-1', 's-local'], elsewhere: true })
+  let api
+  const document = composer.document
+  const bridge = { pathFor: (file) => `C:\\Users\\owner\\Downloads\\${file.name}` }
+  Object.defineProperty(document, '__DSH_HOST_PATHS__', { value: bridge, writable: true, configurable: true, enumerable: false })
+  const disposers = []
+  // The loader half of the page: registration, then the factory's return value.
+  const requireAsync = async (spec) => {
+    const name = spec.replace(/^\.\//, '')
+    assert.equal(name, 'client.remote-file-attach.js', 'client.js asks for this package\'s own chunk')
+    let registered = null
+    const loaderWindow = { __ModuleLoader__: { load: (registration) => { registered = registration } } }
+    vm.runInNewContext(chunkSource, { window: loaderWindow, queueMicrotask, Promise, setTimeout, clearTimeout })
+    assert.notEqual(registered, null, 'the chunk registers itself (a bare module.exports would register nothing)')
+    assert.equal(registered.id, '@dsh-ext/devices', 'with the package id its route serves')
+    assert.equal(registered.chunk, name, 'and the chunk name the URL segment names')
+    registrations.push(registered)
+    chunk = registered.factory(() => { throw new Error('the chunk must stay a leaf module') })
+    return chunk
+  }
+  const requireFn = (spec) => {
+    assert.equal(spec, 'react', 'client.js requires only the platform seed')
+    return React
+  }
+  requireFn.async = requireAsync
+  const window = {
+    __ModuleLoader__: { load: ({ id, factory }) => { api = { id, ...factory(requireFn) } } },
+    setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {}, confirm: () => true,
+  }
+  document.baseURI = 'http://127.0.0.1:3080/'
+  document.head = { appendChild() {} }
+  document.createElement = () => ({ remove() {} })
+  vm.runInNewContext(source, { window, document, fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+    URL, console, setTimeout, clearTimeout, queueMicrotask, Promise, navigator: { language: 'en-US' } })
+  const ctx = {
+    locale: { getSnapshot: () => ({ active: 'en-US' }), subscribe: () => () => {} },
+    effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out); return () => { out?.() } },
+    // The seat for the page itself; every other slot is refused (this fixture has no UI).
+    slots: {
+      inject(slot, fn) { return () => {} },
+      register(meta, component) { return { meta, component } },
+    },
+  }
+  api.apply(ctx)
+  // `ctx.effect` installed the wrap for a window it looks up itself (none in a vm without
+  // `window`), so attach the page through the documented seam: `{global, doc}`.
+  disposers.push(api.testing.installRemoteFileAttach({ global: document, doc: document }))
+  // `installRemoteFileAttach` attaches on a promise: let the chunk answer.
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(registrations.length, 1, 'the chunk was requested once and registered once')
+  const attachUI = api.testing && api.testing.attachUI
+  assert.equal(attachUI.getSnapshot().wrapped, true, 'apply() wrapped the bridge')
+  assert.equal(attachUI.getSnapshot().reason, null)
+  assert.equal(typeof bridge.pathFor, 'function')
+  assert.notEqual(bridge.pathFor(function () {}), 'C:\\Users\\owner\\Downloads\\undefined', 'the live member is the wrapper')
+  // DSH's composer inject captured the bridge BEFORE the chunk arrived (`apply.ts:504`,
+  // `const bridge = hostPathBridge()`), and calls `bridge?.pathFor(file)` (`:520`) on that
+  // object for as long as it is mounted — so every pick below goes through THIS reference.
+  const captured = { pathFor: bridge.pathFor }
+  // A pick in the REMOTE composer: the capture listener client.js installed claims it, and
+  // the answer is `''` — DSH's own "upload these bytes".
+  const remote = composer.composers[0]
+  const local = composer.composers[1]
+  // A file input the session around it renders for something else: the capture listener sees a
+  // pick, the composer region above the picker does not — no claim, DSH's own answer.
+  assert.deepEqual(pickFiles(document, remote.elsewhere, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }],
+    (file) => captured.pathFor(file)), ['C:\\Users\\owner\\Downloads\\bundle.zip'])
+  // A batch DSH refuses before it ever asks (`pathFor` never runs): the claim still ends —
+  // the fake's dispatcher counts one capture call per ancestor, so the claim count is not
+  // asserted here (the claim itself is the module's business, not this shell's).
+  pickFiles(document, remote.fileInput, [], () => { throw new Error('no pathFor for an empty batch') })
+  // The VM realm has its own timers, so a host `setTimeout(0)` would not flush the chunk's: a
+  // real macrotask does (setImmediate fires on a check phase after every timer has fired).
+  // The VM realm has its own timers, so flush the queue with another LISTENER task instead: the
+  // claim this pick was replaced by is younger than both and cannot be ended by a microtask.
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.equal(captured.pathFor({ name: 'fresh.zip', type: 'application/zip', size: 7 }),
+    'C:\\Users\\owner\\Downloads\\fresh.zip', 'the refused pick never answers a later call')
+  assert.deepEqual(pickFiles(document, remote.fileInput, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }],
+    (file) => captured.pathFor(file)), [''])
+  assert.deepEqual(pickFiles(document, local.fileInput, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }],
+    (file) => captured.pathFor(file)), ['C:\\Users\\owner\\Downloads\\bundle.zip'])
+  assert.equal(attachUI.getSnapshot().calls, 5, 'the page can see the wrap being used (the probes, then each pick)')
+  // Dispose: the exact original reference is back and the listener is gone.
+  for (const dispose of disposers.splice(0)) dispose()
+  assert.equal(bridge.pathFor({ name: 'bundle.zip' }), 'C:\\Users\\owner\\Downloads\\bundle.zip', 'the original method is back')
+  assert.equal(attachUI.getSnapshot().wrapped, false)
+  assert.equal(document.listenerCount('change'), 2, 'only the two pickers\' own listeners remain (client.js removed its capture one)')
+})
+
+// The reviewer finding of 2026-11-16, on the shell path: a bridge whose own `pathFor` cannot
+// be replaced used to be "wrapped" by re-pointing the global binding, while every composer
+// injected before the chunk arrived (apply.ts:504 captures the bridge once) still held the
+// original object — a remote zip stayed a controller path and the page said wrapped.
+await check('spec 033: an immutable bridge member is REFUSED, nothing is re-pointed, and the Devices page says bridge-frozen', async () => {
+  const chunkPath = path.join(here, '../lib/client.remote-file-attach.js')
+  const chunkSource = fs.readFileSync(chunkPath, 'utf8')
+  const composer = createFakeComposerDocument({ sessions: ['h:2f1d1a52-6d7c-4d3e-9a58-1f0f1a2b3c4d:s-1'] })
+  let api
+  const document = composer.document
+  const original = (file) => `C:\\Users\\owner\\Downloads\\${file.name}`
+  const bridge = {}
+  Object.defineProperty(bridge, 'pathFor', { value: original, writable: false, configurable: false, enumerable: true })
+  Object.defineProperty(document, '__DSH_HOST_PATHS__', { value: bridge, writable: true, configurable: true, enumerable: false })
+  const requireFn = (spec) => {
+    assert.equal(spec, 'react', 'client.js requires only the platform seed')
+    return React
+  }
+  requireFn.async = async (spec) => {
+    let registered = null
+    const loaderWindow = { __ModuleLoader__: { load: (registration) => { registered = registration } } }
+    vm.runInNewContext(chunkSource, { window: loaderWindow, queueMicrotask, Promise, setTimeout, clearTimeout })
+    assert.equal(spec, './client.remote-file-attach.js')
+    return registered.factory(() => { throw new Error('the chunk must stay a leaf module') })
+  }
+  const window = {
+    __ModuleLoader__: { load: ({ id, factory }) => { api = { id, ...factory(requireFn) } } },
+    setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {}, confirm: () => true,
+  }
+  document.baseURI = 'http://127.0.0.1:3080/'
+  document.head = { appendChild() {} }
+  document.createElement = () => ({ remove() {} })
+  vm.runInNewContext(source, { window, document, fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+    URL, console, setTimeout, clearTimeout, queueMicrotask, Promise, navigator: { language: 'en-US' } })
+  const disposers = []
+  const ctx = {
+    locale: { getSnapshot: () => ({ active: 'en-US' }), subscribe: () => () => {} },
+    effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out); return () => { out?.() } },
+    slots: { inject(slot, fn) { return () => {} }, register(meta, component) { return { meta, component } } },
+  }
+  api.apply(ctx)
+  disposers.push(api.testing.installRemoteFileAttach({ global: document, doc: document }))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const attachUI = api.testing.attachUI
+  const snapshot = attachUI.getSnapshot()
+  assert.equal(snapshot.wrapped, false, 'no wrap is reported')
+  assert.equal(snapshot.reason, 'bridge-frozen', 'and the reason the page renders is the measured one')
+  // Nothing was re-pointed: the binding holds the very object the composer captured, and that
+  // object's member is DSH's own function — the old delegating mode failed both.
+  assert.equal(document.__DSH_HOST_PATHS__, bridge, 'the global binding still holds DSH\'s bridge')
+  assert.equal(Object.getOwnPropertyDescriptor(bridge, 'pathFor').value, original, 'and its pathFor is DSH\'s own')
+  // The pick the composer makes through its retained reference: DSH's own answer, never a
+  // silent "uploaded" claim.
+  assert.deepEqual(pickFiles(document, composer.composers[0].fileInput, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }],
+    (file) => bridge.pathFor(file)), ['C:\\Users\\owner\\Downloads\\bundle.zip'])
+  assert.equal(attachUI.getSnapshot().wrapped, false, 'still visibly not wrapped after the pick')
+  for (const dispose of disposers.splice(0)) dispose()
+  assert.equal(attachUI.getSnapshot().reason, 'bridge-frozen', 'dispose keeps saying why, so a reload is diagnosable')
+})
+
+// Reviewer round 4, on the shell path: a bridge frozen AFTER the wrap was installed. The
+// restore is refused by a boolean (not a throw), and the wrapper the device keeps calling must
+// stay DSH's own method — never `undefined` for every pick.
+await check('spec 033: a bridge frozen after install, then disposed, keeps a callable passthrough (bridge-frozen)', async () => {
+  const chunkPath = path.join(here, '../lib/client.remote-file-attach.js')
+  const chunkSource = fs.readFileSync(chunkPath, 'utf8')
+  const composer = createFakeComposerDocument({ sessions: ['h:2f1d1a52-6d7c-4d3e-9a58-1f0f1a2b3c4d:s-1'] })
+  let api
+  const document = composer.document
+  const original = (file) => (file === null || file === undefined ? '' : `C:\\Users\\owner\\Downloads\\${file.name}`)
+  const bridge = { pathFor: original }
+  Object.defineProperty(document, '__DSH_HOST_PATHS__', { value: bridge, writable: true, configurable: true, enumerable: false })
+  const requireFn = (spec) => {
+    assert.equal(spec, 'react', 'client.js requires only the platform seed')
+    return React
+  }
+  requireFn.async = async (spec) => {
+    let registered = null
+    const loaderWindow = { __ModuleLoader__: { load: (registration) => { registered = registration } } }
+    vm.runInNewContext(chunkSource, { window: loaderWindow, queueMicrotask, Promise, setTimeout, clearTimeout })
+    assert.equal(spec, './client.remote-file-attach.js')
+    return registered.factory(() => { throw new Error('the chunk must stay a leaf module') })
+  }
+  const window = {
+    __ModuleLoader__: { load: ({ id, factory }) => { api = { id, ...factory(requireFn) } } },
+    setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {}, confirm: () => true,
+  }
+  document.baseURI = 'http://127.0.0.1:3080/'
+  document.head = { appendChild() {} }
+  document.createElement = () => ({ remove() {} })
+  vm.runInNewContext(source, { window, document, fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+    URL, console, setTimeout, clearTimeout, queueMicrotask, Promise, navigator: { language: 'en-US' } })
+  const disposers = []
+  const ctx = {
+    locale: { getSnapshot: () => ({ active: 'en-US' }), subscribe: () => () => {} },
+    effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out); return () => { out?.() } },
+    slots: { inject(slot, fn) { return () => {} }, register(meta, component) { return { meta, component } } },
+  }
+  api.apply(ctx)
+  disposers.push(api.testing.installRemoteFileAttach({ global: document, doc: document }))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const attachUI = api.testing.attachUI
+  assert.equal(attachUI.getSnapshot().wrapped, true, 'the wrap is installed before the freeze')
+  const wrapper = bridge.pathFor
+  assert.notEqual(wrapper, original)
+  Object.freeze(bridge)
+  assert.equal(Reflect.defineProperty(bridge, 'pathFor', { value: original }), false, 'the restore is refused by a boolean')
+  for (const dispose of disposers.splice(0)) dispose()
+  assert.equal(bridge.pathFor, wrapper, 'the wrapper is still DSH\'s member')
+  assert.equal(bridge.pathFor({ name: 'bundle.zip' }), 'C:\\Users\\owner\\Downloads\\bundle.zip', 'and it answers DSH\'s own path')
+  assert.equal(bridge.pathFor(null), '', 'exactly what DSH\'s own method answers, for a non-file too')
+  const after = attachUI.getSnapshot()
+  assert.equal(after.wrapped, false)
+  assert.equal(after.reason, 'bridge-frozen', 'the page says the bridge is frozen, never that it was restored')
+})
+
+// Reviewer finding 2026-11-16, on the shell path: a bridge whose `pathFor` was made
+// NON-CONFIGURABLE but is still WRITABLE after the wrap. The exact restore is refused, yet
+// plain assignment of the original still takes — the case a restore used to fill with a
+// stand-in object, after which every composer threw `pathFor is not a function`.
+await check('spec 033: a non-configurable but writable member after install gets its own pathFor back on dispose, never a non-callable stand-in', async () => {
+  const chunkPath = path.join(here, '../lib/client.remote-file-attach.js')
+  const chunkSource = fs.readFileSync(chunkPath, 'utf8')
+  const composer = createFakeComposerDocument({ sessions: ['h:2f1d1a52-6d7c-4d3e-9a58-1f0f1a2b3c4d:s-1'] })
+  let api
+  const document = composer.document
+  const original = (file) => `C:\\Users\\owner\\Downloads\\${file.name}`
+  const bridge = { pathFor: original }
+  Object.defineProperty(document, '__DSH_HOST_PATHS__', { value: bridge, writable: true, configurable: true, enumerable: false })
+  const requireFn = (spec) => {
+    assert.equal(spec, 'react', 'client.js requires only the platform seed')
+    return React
+  }
+  requireFn.async = async (spec) => {
+    let registered = null
+    const loaderWindow = { __ModuleLoader__: { load: (registration) => { registered = registration } } }
+    vm.runInNewContext(chunkSource, { window: loaderWindow, queueMicrotask, Promise, setTimeout, clearTimeout })
+    assert.equal(spec, './client.remote-file-attach.js')
+    return registered.factory(() => { throw new Error('the chunk must stay a leaf module') })
+  }
+  const window = {
+    __ModuleLoader__: { load: ({ id, factory }) => { api = { id, ...factory(requireFn) } } },
+    setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {}, confirm: () => true,
+  }
+  document.baseURI = 'http://127.0.0.1:3080/'
+  document.head = { appendChild() {} }
+  document.createElement = () => ({ remove() {} })
+  vm.runInNewContext(source, { window, document, fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+    URL, console, setTimeout, clearTimeout, queueMicrotask, Promise, navigator: { language: 'en-US' } })
+  const disposers = []
+  const ctx = {
+    locale: { getSnapshot: () => ({ active: 'en-US' }), subscribe: () => () => {} },
+    effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out); return () => { out?.() } },
+    slots: { inject(slot, fn) { return () => {} }, register(meta, component) { return { meta, component } } },
+  }
+  api.apply(ctx)
+  disposers.push(api.testing.installRemoteFileAttach({ global: document, doc: document }))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const attachUI = api.testing.attachUI
+  assert.equal(attachUI.getSnapshot().wrapped, true, 'the wrap is installed first')
+  const wrapper = bridge.pathFor
+  assert.notEqual(wrapper, original)
+  Object.defineProperty(bridge, 'pathFor', { configurable: false })
+  assert.equal(Reflect.defineProperty(bridge, 'pathFor',
+    { value: original, writable: true, configurable: true, enumerable: true }), false, 'the exact restore is refused (a boolean)')
+  for (const dispose of disposers.splice(0)) dispose()
+  assert.equal(typeof bridge.pathFor, 'function', 'the composer\'s bridge member is callable after dispose')
+  assert.equal(bridge.pathFor({ name: 'bundle.zip' }), 'C:\\Users\\owner\\Downloads\\bundle.zip', 'and it answers DSH\'s own path')
+  assert.equal(bridge.pathFor, original, 'the bridge\'s own function, assigned back, not a stand-in object')
+  const after = attachUI.getSnapshot()
+  assert.equal(after.wrapped, false)
+  assert.equal(after.reason, 'bridge-frozen', 'an inexact restore is still reported as frozen')
+  assert.deepEqual(pickFiles(document, composer.composers[0].fileInput, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }],
+    (file) => bridge.pathFor(file)), ['C:\\Users\\owner\\Downloads\\bundle.zip'], 'a pick after dispose keeps DSH\'s own behaviour')
+})
+
 finish('client')

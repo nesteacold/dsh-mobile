@@ -11,6 +11,25 @@ window.__ModuleLoader__.load({
     const module = { exports: {} }
     const exports = module.exports
 
+    // Spec 033 (A1.2): the remote file-attach wrap (`__DSH_HOST_PATHS__.pathFor`) is a
+    // second client file of this package — `lib/client.remote-file-attach.js`, a
+    // package-local chunk — and one IMPLEMENTATION, not a copy. That file ships in DSH's
+    // own chunk envelope (`window.__ModuleLoader__.load({id, chunk, factory})`, measured in
+    // `dsh-client-ui-sidebar-terminal/lib/client.terminal.js`), because DSH serves it
+    // verbatim and its loader refuses a bundle that did not register
+    // (`dsh-client-modules` `importChunk`). `require.async` is how DSH requests such a
+    // chunk, and its answer is the factory's return value — the very object
+    // `test/remote-file-attach.test.mjs` exercises. A shell that cannot hand it over gets NO
+    // wrap and the page says so (`bridge-module-missing`), which is the A1.2 failure mode
+    // rather than a silent second path. A request that answers late is re-published when
+    // `installRemoteFileAttach` attaches, which is why this is one shared promise rather
+    // than a per-effect request.
+    const remoteFileAttach = typeof require.async === 'function'
+      ? require.async('./client.remote-file-attach.js')
+      // Settled, never rejected: a rejection here would be an unhandled promise for a
+      // shell that simply has no chunk loader, and the failure is already visible.
+      : Promise.resolve(null)
+
     // ---------------------------------------------------------------- i18n
     // vi/en; Vietnamese when the DSH locale is vi*, English otherwise (the
     // gateway reads the same ctx.locale snapshot: `getSnapshot().active`).
@@ -290,6 +309,32 @@ window.__ModuleLoader__.load({
         sidebarReasonNoHost: 'No remote host is connected.',
         sidebarReasonNoActions: 'This shell provides no workspace actions.',
         sidebarReasonRoutingOff: 'Multi-host routing is off',
+        // --- spec 033 (A1.2): a file picked for a remote session reaches that Host as bytes ---
+        attachTitle: 'Remote file attach',
+        attachOn: 'Files picked for a remote session are sent to that host as bytes',
+        attachNoBridge: 'This shell has no local file path, so every picked file already uploads',
+        attachOffUnknown: 'Files picked for a remote session are NOT sent to that host',
+        attachReason: 'Reason',
+        attachNoModule: 'this shell did not hand over the wrap',
+        attachNoWindow: 'no window to wrap',
+        attachNotInstalled: 'the wrap did not run',
+        attachFrozen: 'the local file-path bridge cannot be replaced',
+        attachShape: 'the local file-path bridge is not the one DSH exposes',
+        attachKeys: 'the local file-path bridge has unexpected keys',
+        attachPathFor: 'the local file-path bridge has no pathFor function',
+        attachReplaced: 'another writer replaced the local file-path bridge',
+        attachLast: 'Last pick not uploaded',
+        attachPickLocal: 'it belongs to a local session, so DSH keeps its own behaviour',
+        attachPickAmbiguous: 'its session could not be known for certain, so DSH kept its own behaviour',
+        attachPickNoComposer: 'no composer was open',
+        attachPickNoDocument: 'the page could not be read',
+        attachPickNoSession: 'its composer shows no session',
+        attachPickElsewhere: 'it did not come from a composer',
+        attachPickBrowser: 'it was not a composer pick this page could see',
+        attachPickUncertain: 'its composer could not be identified',
+        attachPickStale: 'its composer changed before the pick finished',
+        attachPickPassthrough: 'another bridge answered this pick',
+        attachPickUnknown: 'its session is unknown',
         'reason.dsh-version-mismatch': 'this DSH version is not the pinned one',
         'reason.dsh-version-unknown': 'the DSH version is unknown',
         'reason.no-gateway': 'the gateway is missing',
@@ -580,6 +625,32 @@ window.__ModuleLoader__.load({
         sidebarReasonNoHost: 'Chưa có host từ xa nào kết nối.',
         sidebarReasonNoActions: 'Giao diện này không cung cấp thao tác với workspace.',
         sidebarReasonRoutingOff: 'Định tuyến đa host đang tắt',
+        // --- spec 033 (A1.2): tệp chọn cho phiên từ xa đến host đó dưới dạng byte ---
+        attachTitle: 'Đính kèm tệp từ xa',
+        attachOn: 'Tệp chọn cho phiên từ xa được gửi tới host đó dưới dạng byte',
+        attachNoBridge: 'Giao diện này không có đường dẫn tệp cục bộ, nên mọi tệp chọn đều đã được tải lên',
+        attachOffUnknown: 'Tệp chọn cho phiên từ xa KHÔNG được gửi tới host đó',
+        attachReason: 'Lý do',
+        attachNoModule: 'giao diện này không cung cấp phần bọc',
+        attachNoWindow: 'không có cửa sổ để bọc',
+        attachNotInstalled: 'phần bọc chưa chạy',
+        attachFrozen: 'không thay thế được cầu nối đường dẫn tệp cục bộ',
+        attachShape: 'cầu nối đường dẫn tệp cục bộ không phải loại DSH cung cấp',
+        attachKeys: 'cầu nối đường dẫn tệp cục bộ có khóa bất thường',
+        attachPathFor: 'cầu nối đường dẫn tệp cục bộ không có hàm pathFor',
+        attachReplaced: 'thành phần khác đã thay cầu nối đường dẫn tệp cục bộ',
+        attachLast: 'Lần chọn gần nhất không được tải lên',
+        attachPickLocal: 'tệp thuộc một phiên cục bộ nên DSH giữ nguyên cách xử lý của nó',
+        attachPickAmbiguous: 'không xác định chắc chắn được phiên nên DSH giữ nguyên cách xử lý của nó',
+        attachPickNoComposer: 'không có ô soạn nào đang mở',
+        attachPickNoDocument: 'không đọc được trang',
+        attachPickNoSession: 'ô soạn của tệp không hiển thị phiên nào',
+        attachPickElsewhere: 'tệp không đến từ ô soạn',
+        attachPickBrowser: 'đây không phải lượt chọn từ ô soạn mà trang này thấy được',
+        attachPickUncertain: 'không xác định được ô soạn của tệp',
+        attachPickStale: 'ô soạn của tệp đã thay đổi trước khi lượt chọn xong',
+        attachPickPassthrough: 'cầu nối khác đã trả lời lượt chọn này',
+        attachPickUnknown: 'không rõ phiên của tệp',
         'reason.dsh-version-mismatch': 'phiên bản DSH không đúng bản đã ghim',
         'reason.dsh-version-unknown': 'chưa rõ phiên bản DSH',
         'reason.no-gateway': 'thiếu gateway',
@@ -2443,6 +2514,29 @@ window.__ModuleLoader__.load({
     })()
     const useRemoteUI = () => React.useSyncExternalStore(remoteUI.subscribe, remoteUI.getSnapshot, remoteUI.getSnapshot)
 
+    // Spec 033 (A1.2): whether a FILE picked in a remote session's composer is sent to
+    // that Host as BYTES. `wrapped`/`reason` are the wrap's own MEASURED answer
+    // (`lib/client.remote-file-attach.js` `status()`), never this page's assumption, and
+    // `last` is the state of the last pick the wrap did not upload (spec R6: a pick it
+    // cannot attribute keeps DSH's behaviour, and the page says which state that was).
+    const attachUI = (() => {
+      let snapshot = { state: 'idle', wrapped: null, reason: null, surface: null, shape: null, calls: 0, claims: 0, last: null }
+      const listeners = new Set()
+      const publish = (patch) => {
+        snapshot = { ...snapshot, ...patch }
+        for (const listener of [...listeners]) {
+          // A status surface must never take the page down.
+          try { listener() } catch { /* keep publishing */ }
+        }
+      }
+      return {
+        getSnapshot: () => snapshot,
+        subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
+        set: publish,
+      }
+    })()
+    const useAttachUI = () => React.useSyncExternalStore(attachUI.subscribe, attachUI.getSnapshot, attachUI.getSnapshot)
+
     // What a click may call. Empty until the shell hands the service over
     // (installRemoteSurfaces); every affordance disables itself instead of
     // pretending. Session rows and workspaces are the native browser's own, so the
@@ -2757,6 +2851,138 @@ window.__ModuleLoader__.load({
         h('h3', null, tr('sidebarGrouping')),
         h('div', { className: 'dshdev-muted', 'data-testid': 'sidebar-grouping-state' },
           status.grouped ? `${tr('sidebarOn')} (${status.hosts})` : `${tr('sidebarOffState')} — ${groupingReasonText(status.reason)}`))
+    }
+
+    /**
+     * Spec 033 (A1.2): install the `__DSH_HOST_PATHS__.pathFor` wrap on this renderer and
+     * return its disposer.
+     *
+     * What it adds to the wrap (which lives in `lib/client.remote-file-attach.js` and
+     * does all of the deciding): the per-PICK certainty the attribution needs. A
+     * `pathFor` wrapper cannot be told which session it answers for — the composer calls
+     * it with one argument — so a delegated capture listener claims the pick when DSH's
+     * own hidden `input[type=file]` fires `change`. Capture, because DSH's own handler
+     * drains `e.target.files` and then sets `e.target.value=''` before it hands the files
+     * on, so by the time `pathFor` runs the picker is already empty; the listener reads
+     * neither `.files` nor `value`, only which composer the picker sits in. Everything the
+     * wrap cannot attribute then keeps DSH's own behaviour (R6), and `notice` tells the
+     * page why.
+     *
+     * `deps` is a test seam only: production passes nothing, so the host is `window` and
+     * its own `document`. One `effect` owns both halves, so a reload restores exactly
+     * what it installed and removes its listener first.
+     * @returns {() => void} disposer
+     */
+    function installRemoteFileAttach(deps = {}) {
+      const host = deps.global ?? (typeof window === 'undefined' ? null : window)
+      const doc = 'doc' in deps ? deps.doc : (host && host.document) || null
+      if (host === null || typeof host !== 'object') {
+        attachUI.set({ state: 'ready', wrapped: false, reason: 'no-window' })
+        return () => {}
+      }
+      const wrap = typeof deps.wrapper === 'function' ? deps.wrapper() : remoteFileAttach
+      let disposed = false
+      let attach = null
+      let listener = null
+      const publish = () => {
+        if (disposed || attach === null) return
+        const status = attach.status()
+        const last = attach.takeNotice()
+        attachUI.set({
+          state: 'ready', wrapped: status.wrapped, reason: status.reason,
+          surface: status.surface, shape: status.shape, calls: status.calls, claims: attach.claimedPicks,
+          last: last === null ? attachUI.getSnapshot().last : { reason: last.reason, sessionId: last.sessionId },
+        })
+      }
+      Promise.resolve(wrap).then((module) => {
+        if (disposed) return
+        // The chunk's factory return value; a shell that hands back the registration
+        // instead of the exports (`{id, chunk, factory}`) is read the same way the
+        // loader would read it, so a wrapper built around either answers the same.
+        let loaded = module
+        if (typeof loaded?.remoteFileIntakeFor !== 'function' && typeof loaded?.factory === 'function') {
+          loaded = loaded.factory(() => { throw new Error('the remote file attach chunk must stay a leaf module') })
+        }
+        if (loaded === null || typeof loaded !== 'object' || typeof loaded.remoteFileIntakeFor !== 'function') {
+          attachUI.set({ state: 'ready', wrapped: false, reason: 'bridge-module-missing' })
+          return
+        }
+        const chunk = loaded
+        attach = chunk.remoteFileIntakeFor({
+          global: host, doc,
+          log: () => { /* the reason travels on `status()`, never into a console */ },
+          onNotice: () => publish(),
+        })
+        attach.install()
+        publish()
+        // The pick signal: claim the batch the moment DSH's picker reports its files, binding
+        // the claim to exactly those files. Its turn ends one task after this dispatch, which
+        // is after DSH's own loop over the batch has asked its bridge.
+        if (doc !== null && typeof doc.addEventListener === 'function') {
+          listener = (event) => { if (chunk.adoptPickerFrom(attach, event) !== null) publish() }
+          doc.addEventListener(chunk.PICK_EVENT ?? 'change', listener, true)
+        }
+      }, () => {
+        // A shell that cannot hand the chunk over: no wrap, and the page shows it.
+        attachUI.set({ state: 'ready', wrapped: false, reason: 'bridge-module-missing' })
+      })
+      return () => {
+        disposed = true
+        if (doc !== null && typeof doc.removeEventListener === 'function' && listener !== null) {
+          doc.removeEventListener('change', listener, true)
+        }
+        listener = null
+        if (attach !== null) attach.uninstall()
+        const after = attach === null ? { wrapped: false, reason: 'not-installed' } : attach.status()
+        attachUI.set({ state: 'ready', wrapped: after.wrapped, reason: after.reason, calls: 0 })
+      }
+    }
+
+    // The Devices page's own line about the wrap, so a failed install is visible in the UI
+    // instead of only in a log (A1.2). Same honesty rule as the upload note: it states what
+    // was MEASURED, names the reason, and claims nothing while the module is still arriving.
+    const ATTACH_REASON_KEYS = {
+      'no-bridge': 'attachNoBridge', 'bridge-frozen': 'attachFrozen', 'bridge-shape': 'attachShape',
+      'bridge-keys': 'attachKeys', 'bridge-pathFor': 'attachPathFor', 'bridge-replaced': 'attachReplaced',
+      'bridge-module-missing': 'attachNoModule', 'not-installed': 'attachNotInstalled', 'no-window': 'attachNoWindow',
+    }
+    const attachReasonText = (reason) => {
+      const value = String(reason || '')
+      const key = ATTACH_REASON_KEYS[value]
+      return key ? tr(key) : value
+    }
+    // The state of the last pick the wrap did NOT upload, per R6. `certain` here means
+    // "attributed exactly, and the answer DSH itself would give (a local session)".
+    const ATTACH_STATE_KEYS = {
+      certain: 'attachPickLocal', 'ambiguous': 'attachPickAmbiguous', 'no-composer': 'attachPickNoComposer',
+      'no-document': 'attachPickNoDocument', 'no-session': 'attachPickNoSession', 'picker-elsewhere': 'attachPickElsewhere',
+      'picker-document': 'attachPickBrowser', 'composer-uncertain': 'attachPickUncertain',
+      'stale-batch': 'attachPickStale', 'bridge-passthrough': 'attachPickPassthrough',
+      'browser-chrome': 'attachPickBrowser',
+    }
+    function RemoteAttachStatus() {
+      useLang()
+      const attach = useAttachUI()
+      if (attach.state !== 'ready') return null
+      const reason = attach.reason ? attachReasonText(attach.reason) : ''
+      const line = attach.wrapped === true
+        ? (attach.reason === 'no-bridge' ? tr('attachNoBridge') : `${tr('attachOn')}${attach.shape ? ` (${attach.shape})` : ''}`)
+        : `${tr('attachOffUnknown')} — ${reason}`
+      const last = attach.last
+      return h('div', { className: attach.wrapped === true ? 'dshdev-card' : 'dshdev-card dshdev-warn',
+        'data-testid': 'remote-attach', 'data-wrapped': attach.wrapped === true ? 'yes' : 'no',
+        'data-reason': attach.reason || '', role: 'status' },
+      h('strong', null, tr('attachTitle')),
+      h('div', { className: 'dshdev-muted', 'data-testid': 'remote-attach-state' }, line),
+      attach.wrapped === true && attach.reason !== 'no-bridge' && attach.surface
+        ? h('div', { className: 'dshdev-muted', 'data-testid': 'remote-attach-surface' }, `${attach.surface}.pathFor`)
+        : null,
+      attach.wrapped !== true && attach.reason
+        ? h('div', { className: 'dshdev-muted', 'data-testid': 'remote-attach-reason' }, tr('attachReason') + ': ' + reason)
+        : null,
+      last === null || last === undefined ? null
+        : h('div', { className: 'dshdev-muted', 'data-testid': 'remote-attach-last', 'data-state': last.reason },
+          tr('attachLast') + ': ' + tr(ATTACH_STATE_KEYS[last.reason] ?? 'attachPickUnknown')))
     }
 
     /**
@@ -3117,6 +3343,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dshdev-tabs', role: 'tablist' }, tabs.map(([id, label]) =>
           h('button', { key: id, type: 'button', role: 'tab', 'aria-selected': tab === id, className: 'dshdev-tab dshdev-seg-btn', onClick: () => setTab(id) }, label))),
         tab === 'allow' ? h(AllowTab) : h(ConnectTab),
+        h(RemoteAttachStatus),
         h(SelfUpdate))
     }
 
@@ -3207,6 +3434,16 @@ window.__ModuleLoader__.load({
         { name: 'plugins.detail.section', id: 'dsh-mobile-self-update', order: 10 },
         (props) => (isMobileBundleSubject(props && props.subject)
           ? h('div', { className: 'dshdev', 'data-testid': 'bundle-self-update' }, h(SelfUpdate)) : null)))
+      // Spec 033 (A1.2): remote file attach. One effect owns the wrap AND the pick
+      // listener, so a reload restores exactly what it installed (A1.2: "exact restore
+      // on dispose", never wrap what it did not install) and a shell without
+      // `ctx.effect` simply keeps DSH's own behaviour, which the page states.
+      if (typeof ctx.effect === 'function') {
+        ctx.effect(() => installRemoteFileAttach(), 'devices: remote file attach')
+      } else {
+        attachUI.set({ state: 'ready', wrapped: false, reason: 'not-installed' })
+      }
+
       // Spec 008 P2b. Gated on the client context's own capability (`ctx.inject` is
       // how a browser plugin waits for optional services): without it there is no
       // way to reach the workspace/session actions, so nothing is installed and the
@@ -3228,6 +3465,9 @@ window.__ModuleLoader__.load({
       HostChip, SessionBanners, OfflineBanner, ModelStatusBanner, RemoteTerminalEntry,
       SessionHostBadge, PermissionsEditor, scopesForKind,
       RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText, hostLinkOf,
+      // Spec 033 (A1.2): the wrap's measured state, the page line, and the installer (so a
+      // test proves install-on-start / restore-on-dispose without a live window).
+      attachUI, RemoteAttachStatus, installRemoteFileAttach, attachReasonText, ATTACH_REASON_KEYS,
       // spec 016 Phase 3
       BrowserAgentTab, agentKindOf,
       // spec 028

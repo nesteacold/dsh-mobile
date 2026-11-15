@@ -13,6 +13,9 @@
 windows_user_path:Users\me
 windows_user_path:Users\x
 windows_user_path:Users\remote
+# Spec 033 tests (plugins/devices) use `owner` as the placeholder controller account
+# for a picked file's local path. Not a real account name.
+windows_user_path:Users\owner
 
 # The documented placeholder host for the remote iOS build; the script has to put
 # *some* well-formed tailnet name in its help line.
