@@ -318,6 +318,12 @@ validate_args() {
         preview | production | development) : ;;
         *) die 2 "bad --profile '$PROFILE' (preview|production|development)" ;;
     esac
+    # Spec 032 — RELEASE GUARD. `DSH_SCREENSHOT_MODE=1` bakes the store-screenshot gate into the
+    # app (app.config.ts). A store/release build must never carry it, so this refuses BEFORE the
+    # lock, the volume or any transfer: an env var that leaked into the shell cannot reach a build.
+    if [ "${DSH_SCREENSHOT_MODE:-}" = '1' ] && [ "$PROFILE" = 'production' ]; then
+        die 2 "refusing to build: DSH_SCREENSHOT_MODE=1 with --profile=production (a store build must never carry screenshot mode); use --profile=development or unset DSH_SCREENSHOT_MODE"
+    fi
     case "$SOURCE" in
         worktree | head) : ;;
         *) die 2 "bad --source '$SOURCE' (worktree|head)" ;;

@@ -10,9 +10,11 @@ credential in this repo.
 **Scope** — the scripts under [`../scripts/remote-ios-build/`](../scripts/remote-ios-build/):
 `Invoke-RemoteIosBuild.ps1` (Windows driver, PowerShell 5.1), `mac/ios-build.sh` (remote
 orchestrator), `mac/cleanup-after-build.sh` (post-run disk reclaimer, §4.8),
+`mac/cleanup-dev-caches.sh` (manual Docker-build-cache / Claude-temp reclaimer, §4.9; dry run by
+default, never called by the driver),
 `mac/bootstrap-mac.sh` (one-time checks), `ios-build.conf.example` (config template),
 `test/dryrun.Tests.ps1` (contract test), `test/package.Tests.ps1` (FR-007 source package
-regression test).
+regression test), `test/cleanup-dev-caches.tests.sh` (the §4.9 tool's tests, macOS only).
 
 **Non-goals (explicitly out of bounds here)**
 
@@ -439,6 +441,209 @@ nothing to reclaim from this project (no stale stage dirs, no DerivedData of thi
 volumes, no unavailable simulators) while `--all-derived-data --pod-cache --npm-cache
 --device-support --archives --volumes` offered ~1.8 GB — i.e. the pipeline itself was clean and the
 growth came from the other tooling on that disk.
+
+### 4.9 Workstation caches: Docker build cache and Claude temp leftovers (cleanup-dev-caches.sh)
+
+`cleanup-after-build.sh` only ever looks at this project's own paths. Two other things grow on a
+Mac that also runs agent sessions and Docker builds, and `mac/cleanup-dev-caches.sh` reclaims
+exactly those — **manually, never from the driver and never after a build**:
+
+```bash
+# on the Mac (or over ssh); the staged copy is not needed - run it from the repo or a copy
+bash scripts/remote-ios-build/mac/cleanup-dev-caches.sh --docker-build-cache --claude-temp         # dry run
+bash scripts/remote-ios-build/mac/cleanup-dev-caches.sh --apply --docker-build-cache --claude-temp # delete
+```
+
+**It is a dry run unless you pass `--apply`, and `--apply` needs at least one explicit scope flag** —
+there is no "--apply everything". Only two write actions exist in the whole script:
+
+| Scope | The single action it performs | Never touched |
+|---|---|---|
+| `--docker-build-cache` | `docker builder prune -a -f` (BuildKit cache) | images, containers, volumes, networks, `Docker.raw`, system/build cache settings |
+| `--claude-temp` | `rm -rf` of one proven-stale **subdirectory at a time** under the Claude temp root | the root itself, files in it, anything outside that root |
+
+**How a temp subdirectory earns deletion** (any doubt is a `SKIP`, never a delete):
+
+- the root is *derived*, never hardcoded: `claude-<uid>` under `$TMPDIR` and/or the legacy
+  `/tmp/claude-<uid>` — both are examined when both exist (on this Mac only the legacy one held
+  anything, 3.9 GB). It must be a real directory (lstat, no symlink) with a real parent, owned by
+  this UID, mode 0700/0755, and not inside a git work tree;
+- the candidate is a real directory immediately under the root, same owner, not on a read-only
+  mount, and older than `--temp-min-age-hours` (default 24, minimum 1) by **both** its directory
+  mtime and its newest file — touching any file protects the whole candidate;
+- no process **holds it open**, has it as (or under) its **cwd**, or **names it on its command
+  line** (`lsof` and `ps` are both asked; if either probe cannot run, the candidate is skipped).
+  One measured trap: `lsof +D` exits **1 both when it finds nothing and when it finds matches**, so
+  the exit code is not evidence — the field output is;
+- immediately before deleting, the exact absolute path is re-checked: physical parent is still the
+  recorded root, one name component, no symlink, **same `dev:ino`** as at planning time (the parent
+  is world-writable, 1777, so a name can be swapped), same owner, still old enough, still unused;
+- build outputs are never candidates: paths this repository tracks (and tracked paths with
+  subdirectories appended) are kept.
+
+**Concurrency is inherently racy** — a process that starts using a candidate between the check
+and the delete is not seen. Run `--apply` on a quiet Mac.
+
+**Tests** (`test/cleanup-dev-caches.tests.sh`, macOS only — Git Bash cannot run it):
+`bash test/cleanup-dev-caches.tests.sh <path-to-script>` proves, against a sandbox under `$HOME`
+and a mocked Docker client (no daemon contact): a dry run changes nothing and issues no Docker
+write; `--apply` without a scope is refused; symlink candidates and symlinked/git-work-tree roots
+are refused; an in-use (cwd, command line, open file) or recently-written candidate is skipped and
+survives; `lsof`'s exit code is not read as evidence; an uninspectable candidate fails closed; and
+the only Docker write ever attempted is `builder prune -a -f`.
+
+Measured on the owner's Mac, 2026-11-14, after an owner-approved cleanup: Docker build cache
+`11.68 GB` → `0 B` (`docker builder prune -a -f`), with images 16, containers 17 and volumes 25
+unchanged; a real dry run of `--claude-temp` plans 13 stale empty helper directories and skips the
+3.9 GB project copy because a live agent session holds it open **and** it is newer than 24 h.
+
+### 4.9a Store screenshots on an iOS simulator (spec 032)
+
+App Store screenshots are captured on an **iOS simulator without a human answering Face ID**.
+A headless capture run over ssh cannot pass the native unlock gate (spec A020 calls
+LocalAuthentication), so every screenshot used to show the lock screen. Spec 032 adds one
+dedicated **screenshot build**: a build-time flag that lets the gate run against demo data.
+
+**iOS simulator only** (owner decision 2026-11-15). Android screenshots are **not** covered: this
+build has no emulator detection, so `decideScreenshotMode` returns `normal` on Android
+unconditionally, and Android needs a separate, owner-approved design.
+
+**How the mode is switched on** (all three must hold; anything else is the normal gate):
+
+| Condition | Where it is checked |
+|---|---|
+| the build baked `DSH_SCREENSHOT_MODE=1` into `expo.extra.screenshotMode` | `src/core/screenshot-mode.ts` (`flag-off` otherwise) |
+| the platform is exactly `ios` AND the app runs on an **iOS simulator** — the `simulator` property the pinned-ws native Expo module exports (`module.simulator`; `Constants { simulator }` is `#if targetEnvironment(simulator)`, there is no `constants()` function; Android always `false`) | `src/platform/screenshot-mode.ts` → `src/core/screenshot-mode.ts` (`physical-device` for a device, an unknown fact, or Android → `android`) |
+| the build profile is **not** a production/store profile | `src/core/screenshot-mode.ts` (`production-profile` otherwise) |
+
+It is a **build** decision, never a runtime toggle: no setting, deep link or storage value can
+switch it on, and no release build can carry it (see the release guard below).
+
+**Demo data only.** In this mode the controller keeps its own in-memory host/credential store
+(`src/platform/demo-store.ts`): `start`, pair, connect, reconnect, revoke, forget and the
+failed-pair cleanup never read, write or delete the device's keychain credential or host list. It
+dials the loopback fake gateway (`e2e/harness/gateway.mjs`) through the **native pinned transport**
+(the TLS leaf pin is checked in the handshake, before any credential header is sent — no
+`demo-pair.txt` step exists any more), and presents the token the fixture minted for the
+simulator. It refuses to pair anything that is not a loopback pairing, so a capture run cannot
+reach a real paired computer or a real credential.
+
+### Capture procedure (on the Mac; the lead dispatches it after review)
+
+Step 1 runs on **Windows, in Git Bash only** (the `git archive` pipe; not PowerShell 5.1, which
+would decode the tar stream as text and corrupt it — the driver runs the same pipe through
+`cmd.exe` for that reason). Steps 2 and later run in an interactive `ssh mac` shell: the
+screenshot flag is read while the app is built and bundled, so a variable set on Windows never
+reaches the Mac.
+
+`<App>` / `<Scheme>` are the generated project's own names (`expo prebuild` takes them from
+`app.json`); read them from `ios/`. **One** simulator only: `SIM` is assigned in step 2, on the Mac
+shell itself, and every `simctl` call and the `xcodebuild` name it explicitly, so this run never
+touches another booted simulator on the owner's Mac. A bare `booted` would select whichever device
+happens to be booted.
+
+```bash
+# 1. stage the source: Git Bash on Windows, in the repo (NOT PowerShell 5.1 — it decodes the
+#    tar stream as text and corrupts it). HEAD only, so commit first. An uncommitted tree is NOT
+#    in the archive: tar the working tree instead (`git ls-files -co --exclude-standard`
+#    + `tar -cf -`), since `git archive` carries committed files only.
+git archive HEAD | ssh mac 'mkdir -p ~/.dsh-ios-build/sim/src && tar -x -C ~/.dsh-ios-build/sim/src'
+
+# 2. on the Mac. Local values do not cross ssh: SIM is assigned here, in this shell, and exported
+#    so step 5's xcodebuild and every later step read it.
+ssh mac
+SIM=<udid>                                   # xcrun simctl list devices: pick the Shutdown one,
+                                             # NOT `booted` — another simulator may be booted
+export PATH=/opt/homebrew/bin:$PATH LANG=en_US.UTF-8
+export DSH_SCREENSHOT_MODE=1 EAS_BUILD_PROFILE=development   # a release profile is refused
+export SIM
+cd ~/.dsh-ios-build/sim/src/apps/mobile-companion
+
+# 3. dependencies + generated project (npm ci needs network; use the Mac's own node, not Windows)
+npm ci --no-audit --no-fund
+npx expo prebuild --platform ios --no-install
+cd ios && pod install && cd ..
+
+# 4. JSI Sendable patch. Apply the two edits BY HAND, the same two patch_jsi_slot_sendable
+#    makes in scripts/remote-ios-build/mac/ios-build.sh: do not copy the function, it hard-codes
+#    VOL_PATH and its /usr/bin helpers. Find the files under node_modules (the copy that compiles
+#    is usually nested under expo-modules-core):
+#    a. JavaScriptValue+Slot.swift: `public struct Slot: ~Copyable {` ->
+#       `public struct Slot: ~Copyable, @unchecked Sendable {`
+#    b. JavaScriptObject.swift: insert `let slotValue = JavaScriptValue.Slot(slot)` immediately
+#       BEFORE the `try runtime._withUnsafeGuaranteedRef { runtime in` line, and replace the
+#       argument in `try encode(JavaScriptValue.Slot(slot), runtime)` with `slotValue` — the
+#       pointer is made outside the isolated closure. (Exactly ios-build.sh's awk at L897-905.)
+#    Check the declarations first — if they are not found, do not guess: stop and report.
+
+# 5. build the simulator app. Never set SKIP_BUNDLING: the JavaScript bundle is what carries the
+#    spec-032 screenshot code.
+xcodebuild -workspace ios/<Scheme>.xcworkspace -scheme <Scheme> -configuration Release \
+  -sdk iphonesimulator -destination "id=$SIM" -derivedDataPath ~/.dsh-ios-build/sim/dd \
+  CODE_SIGNING_ALLOWED=NO build
+
+# 6. run it on the one simulator
+xcrun simctl boot "$SIM"                     # only if it is listed as Shutdown (booting a booted
+                                             # device fails; `booted` may be someone else's)
+xcrun simctl install "$SIM" ~/.dsh-ios-build/sim/dd/Build/Products/Release-iphonesimulator/<App>.app
+xcrun simctl launch "$SIM" com.dshext.companion
+
+# 7. fixture on loopback (the only Host this build will accept: codes are one-shot; start with --help to
+#    rotate a code). `<node>` is an absolute path a simulator run can reach, e.g. /usr/local/bin/node.
+<node> e2e/harness/gateway.mjs --bind 127.0.0.1 --lan-host 127.0.0.1 \
+  --port 3443 --control-port 3444 --fixed-pairing-code <43-char base64url code> &
+#    -> print pairing code / endpoint from the startup block (--print-json)
+
+# 8. a status bar a store reviewer expects (no carrier/battery noise)
+xcrun simctl status_bar "$SIM" override --time 9:41 --batteryState charged --batteryLevel 100 \
+  --cellularMode active --cellularBars 4 --wifiBars 3
+xcrun simctl ui "$SIM" appearance dark      # or light: the app follows the system scheme
+
+# 9. pair inside the app (Pair screen, "paste the code shown on your computer") using step 7's code.
+#    The pin comes from the pairing payload itself; the native transport checks the leaf.
+
+# 10. screenshots (per screen, after the app settles; 1 s is enough on a simulator)
+mkdir -p ~/.dsh-ios-build/artifacts/shots
+xcrun simctl io "$SIM" screenshot ~/.dsh-ios-build/artifacts/shots/01-home.png
+```
+
+**MAT-032-PIN** (the native pin, proven on this simulator build). Stop the capture fixture first,
+then run a SECOND fixture with a DIFFERENT leaf on its OWN ports (never reuse 3443/3444), pair, and
+ask that run what it saw:
+
+```bash
+<node> e2e/harness/gateway.mjs --cert-mode wrong --bind 127.0.0.1 --lan-host 127.0.0.1 \
+  --port 3543 --control-port 3544 &
+# 1. pair in the app with THIS run's pairing code — the negative run's startup block, not step 7's.
+# 2. expect client/pin-mismatch in the app — not a connect, not a retry loop.
+# 3. read that run's evidence (GET /state is read-only; no x-fixture-token needed):
+curl -s http://127.0.0.1:3544/state
+```
+
+In that JSON `evidence.consumedPairingCodes` stays empty (no code was consumed, so no credential
+was minted), `evidence.frames` is empty and `evidence.upgradeAttempts` is `0`: the pin is checked in
+the TLS handshake, so the HTTP upgrade never happens. `evidence.tlsFailures` is the positive signal
+— the transport aborted the handshake instead. Only the negative run's `controlToken` (from its own
+startup block) is for mutating calls. The Node unit test is **not** this evidence: it does not
+execute the Swift delegate, so MAT-032-PIN needs the native simulator run above. Only the
+`simulator` constant is conditional (`#if targetEnvironment(simulator)`); the delegate itself is
+inside every build.
+
+**Which screens** (capture at least these; the status line `screenshot mode · demo data only`
+proves the build is a demo build):
+
+| # | Screen | How to reach it |
+|---|---|---|
+| 01 | Conversations (list) | launch, gate opens by itself |
+| 02 | A conversation with an approval card | tap the fixture session (`sess-alpha`) |
+| 03 | Approval card states | the fixture serves `apv-hash` / `apv-null` / `decided` |
+| 04 | Settings | ⋯ menu, row "Settings" |
+| 05 | Pair screen | ⋯ menu, "Pair another computer" |
+
+Cleanup on the Mac: `xcrun simctl status_bar "$SIM" clear`, then `cleanup-after-build.sh` (the Mac
+helper the build stages; it never touches anything written in the last few hours), then
+`rm -rf ~/.dsh-ios-build/sim`. **Do not** ship the screenshot build: the release guard is the reason
+a store build cannot be produced with the flag, and the lead's existing store builds are unchanged.
 
 ## 5. Phases
 

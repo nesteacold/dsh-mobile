@@ -35,6 +35,8 @@ import {
   coerceHistoryEvent,
   coerceHistoryEvents,
   defaultClientMsgId,
+  isDemoPairingHost,
+  isLoopbackPairingEndpoint,
   isReconnectable,
   normalizeOtp,
   PAIRING_QR_VERSION,
@@ -100,6 +102,8 @@ import { readWebUnlockGrant, saveWebUnlockGrant } from '../src/platform/web-gran
 import { assertPasskey, lockPasskeySocket, registerPasskey, watchPasskeyApproval } from '../src/platform/passkey';
 import { lockReasonFor, type LockReason } from './core/web-lock';
 import { debugLogSinksFromEnv } from '../src/platform/debug-log-file';
+// Spec 032: the demo mode's own in-memory host/credential store (never the device's secure store).
+import { createDemoStore, DEMO_GATEWAY_TOKEN, type DemoStore } from './platform/demo-store';
 import { appVersion, platformName } from './runtime';
 import type { Locale } from '../i18n';
 
@@ -534,6 +538,20 @@ export interface ControllerOptions {
    * any frame moves, and a browser cannot pin a leaf). Injected by tests, which have no `window`.
    */
   webLocation?: () => WebLocation | null;
+  /**
+   * Spec 032 — store-screenshot mode (set ONLY by the `unlocked-demo` gate decision, which itself
+   * requires a build-time flag, a simulator/emulator and a non-production profile).
+   *
+   * Set: the controller refuses to pair ANY host that is not a loopback demo pairing, never reads
+   * or writes the secure store's credential entry (the demo credential is the fixture's own fixed
+   * `token`, kept in memory), and connects through `transport` instead of the pinned native one.
+   * Unset (every normal build, and a normal gate on a simulator): nothing below applies.
+   */
+  screenshotMode?: {
+    readonly enabled: true;
+    /** The fake-gateway transport (`src/platform/pinned-transport.demo.ts`). */
+    readonly transport: typeof createPinnedTransport;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +835,36 @@ export class AppController {
   private readonly passkeySteps: { register: typeof registerPasskey; assert: typeof assertPasskey; lock: typeof lockPasskeySocket };
   /** Spec 020: the page location used for the same-origin gateway address (null on native). */
   private readonly readWebLocation: () => WebLocation | null;
+  /**
+   * Spec 032 — the demo mode of this controller, or `null` for a normal build. Non-null changes
+   * exactly four things: which hosts may be paired/connected (`isDemoPairingHost` only), which
+   * credential is presented (the fixture's token, held in memory), which transport dials (the
+   * loopback demo transport), and which store is used (this object's in-memory `demoStore`, never
+   * the device's secure store or host list).
+   */
+  private readonly screenshotMode: { readonly transport: typeof createPinnedTransport } | null = null;
+
+  /**
+   * Spec 032: in demo mode EVERY host-list read/write and credential write/delete goes here — an
+   * in-memory store that dies with the process. A demo revoke/forget must never read, verify or
+   * delete a real pairing's keychain credential (`deleteCredentialInstance` → `forgetHost` →
+   * `deleteToken` does exactly that for a real host).
+   */
+  private readonly demoStore: DemoStore | null = null;
+
+  /**
+   * Spec 032: the demo socket's credential — the token the fixture minted for this device in its
+   * `paired` frame. Held in memory only (never written to the secure store) and cleared on lock,
+   * on stop and on a new pairing, exactly like the real credential closure. The `DemoStore`
+   * records it too, so it never needs a secure-store read; `null` means "use the fixed fallback".
+   */
+  private demoToken: string | null = null;
+
+  /** Spec 032: true when this controller only ever talks to the loopback demo fixture. */
+  get demoMode(): boolean {
+    return this.screenshotMode !== null;
+  }
+
   private openSessionId: string | null = null;
   /**
    * Spec 018 item 5 — task list / goal per session, as the Host projected them.
@@ -861,6 +909,12 @@ export class AppController {
     this.pairApprovalTimeoutMs = options.pairApprovalTimeoutMs ?? DEFAULT_PAIR_APPROVAL_TIMEOUT_MS;
     this.passkeySteps = options.passkey ?? { register: registerPasskey, assert: assertPasskey, lock: lockPasskeySocket };
     this.readWebLocation = options.webLocation ?? readWebLocation;
+    const mode = options.screenshotMode;
+    if (mode?.enabled === true) {
+      this.screenshotMode = { transport: mode.transport };
+      this.demoStore = createDemoStore();
+      this.createTransport = mode.transport;
+    }
   }
 
   /**
@@ -922,7 +976,10 @@ export class AppController {
     // false, so `pair()` refuses rather than checking a `paired` frame against a list it cannot
     // stand behind (a previous lifecycle's, or an empty one).
     this.hostsLoaded = false;
-    const hosts = await readHosts();
+    // Spec 032: a demo build never reads the device's host list (it may hold a REAL pairing); it
+    // reads its own in-memory store, seeded with whatever a previous start/pairing left there.
+    const demo = this.demoStore;
+    const hosts = demo !== null ? demo.hosts() : await readHosts();
     if (!this.isLifecycleCurrent(hook)) return;
     this.hosts = hosts;
     this.hostsLoaded = true;
@@ -980,6 +1037,11 @@ export class AppController {
     const notification = this.unsubscribeNotification;
     this.unsubscribeNotification = null;
     this.started = false;
+    // Spec 032: a stop (unmount) drops the in-memory demo credential with every other listener.
+    if (this.screenshotMode !== null) {
+      this.demoToken = null;
+      this.demoStore?.dropCredentials();
+    }
     notification?.();
   }
 
@@ -1011,6 +1073,11 @@ export class AppController {
     this.unlocked = false;
     this.beginGeneration();
     this.teardownConnection('locked');
+    // Spec 032: a lock drops the demo credential too (it is held in memory, not in the store).
+    if (this.screenshotMode !== null) {
+      this.demoToken = null;
+      this.demoStore?.dropCredentials();
+    }
     this.pairing = null;
     this.banner = 'none';
     // The lock is per connection (contract §14.2): a later `unlock()` opens a NEW socket that starts
@@ -1446,6 +1513,16 @@ export class AppController {
       payload = withSameOriginEndpoint(parsed.payload, this.webLocation());
     }
     this.pairing = null;
+    // Spec 032 — the demo gate never pairs anything but the loopback fixture. Refused BEFORE any
+    // socket exists, so a screenshot build has no path to a real Host or a real credential.
+    if (this.screenshotMode !== null && !isLoopbackPairingEndpoint([payload.publicUrl, ...payload.endpoints])) {
+      const code = 'client/bad-url';
+      const message = 'Screenshot builds pair only with the local demo gateway';
+      this.debug.warn('pair rejected: screenshot mode pairs only with the loopback demo fixture', { errorCode: code });
+      this.pairing = { kind: otpFlow ? 'connect' : 'qr', code, message };
+      this.bump();
+      return { ok: false, code, message };
+    }
     // A new attempt never inherits the previous one's approval code (§3.8).
     this.pairingPending = null;
     this.remoteControlOff = false;
@@ -1477,6 +1554,12 @@ export class AppController {
         if (seenPaired) return;
         seenPaired = true;
         if (frame.gatewayId !== undefined) pairedGatewayId = frame.gatewayId;
+        // Spec 032: the fixture's per-run token is this demo socket's credential; it stays in
+        // memory and is never written to the secure store (see `persistToken` below). A normal
+        // build is always `demoMode === false`, so nothing changes there.
+        if (this.demoMode && typeof (frame as { token?: unknown }).token === 'string') {
+          this.demoToken = (frame as { token: string }).token;
+        }
         const device = { id: frame.device.id, name: frame.device.name };
         // Spec 021: the `paired` frame is where a web pairing learns it must create a passkey. This
         // is recorded SYNCHRONOUSLY, because the decision below (keep the pairing socket for the
@@ -1671,12 +1754,21 @@ export class AppController {
       // it here is what makes the first-use trust a one-time event instead of a permanent stance.
       const adoptedPin = pairingClient.adoptedPin;
       if (adoptedPin !== null && payload.certSha256 === '') payload.certSha256 = adoptedPin;
-      const host = pairedHostFromPayload(payload, { id: device.id, name: payload.gatewayName }, Date.now(), pairedGatewayId);
+      const host = pairedHostFromPayload(
+        payload,
+        { id: device.id, name: payload.gatewayName },
+        Date.now(),
+        pairedGatewayId,
+        // Spec 032: the mode's own loopback test (identical to the default rule), passed explicitly
+        // so the demo-ness of a record can never drift from the mode that wrote it.
+        { classify: (publicUrl, endpoints) => isLoopbackPairingEndpoint([publicUrl, ...endpoints]) },
+      );
       attempt.host = host;
       const hosts = await this.serializeHostWrite(async () => {
         // Re-check *after* waiting for earlier reads/writes: a stale attempt writes nothing.
         if (!this.isCurrent(generation)) return null;
-        return saveHost(host);
+        // Spec 032: a demo pairing is recorded in the in-memory demo store, never in `saveHost`.
+        return this.demoStore === null ? saveHost(host) : this.demoStore.saveHost(host);
       });
       // M5: `saveHost` is awaited; a lock/forget/new pairing may have landed while it was in
       // flight, so neither the list nor the active host may be written by a stale attempt.
@@ -1767,10 +1859,17 @@ export class AppController {
           // The one-time code was consumed and its token is safely stored: keep the host record
           // so an update / retry can reconnect later instead of forcing a fresh QR.
           try {
-            const recovered = pairedHostFromPayload(payload, { id: savedDevice.id, name: payload.gatewayName }, Date.now(), pairedGatewayId);
+            const recovered = pairedHostFromPayload(
+              payload,
+              { id: savedDevice.id, name: payload.gatewayName },
+              Date.now(),
+              pairedGatewayId,
+              { classify: (publicUrl, endpoints) => isLoopbackPairingEndpoint([publicUrl, ...endpoints]) },
+            );
             const hosts = await this.serializeHostWrite(async () => {
               if (!this.isCurrent(attemptGeneration)) return null;
-              return saveHost(recovered);
+              // Spec 032: the recovery write of a demo pairing stays in the demo store too.
+              return this.demoStore === null ? saveHost(recovered) : this.demoStore.saveHost(recovered);
             });
             // M5: the recovery write is awaited too — re-check before mutating controller state.
             if (hosts !== null && this.isCurrent(attemptGeneration) && this.host === null) {
@@ -2500,6 +2599,16 @@ export class AppController {
 
   /** Register a new credential instance; resolves with the revision that owns it. */
   private persistToken(gatewayId: string, token: string): Promise<number> {
+    // Spec 032: a screenshot build keeps the demo credential in its OWN in-memory store. The
+    // secure-store credential entry is never written there either — the mode may not read OR store
+    // one, and a real pairing of the same gateway must keep whatever it holds. The revision is
+    // registered exactly like the real path, so revoke/forget own the demo instance the same way.
+    const demo = this.demoStore;
+    if (demo !== null) {
+      this.demoToken = token;
+      demo.saveToken(gatewayId, token);
+      return Promise.resolve(this.bumpCredentialRevision(gatewayId));
+    }
     // Register before the write lands: any revocation that starts while it is in flight captured
     // an older revision, so it can never delete this fresh instance.
     const revision = this.bumpCredentialRevision(gatewayId);
@@ -2658,13 +2767,26 @@ export class AppController {
     // assert on, and it reads nothing through it (see `startWebLockSession`).
     const lockPending = options.lockPending === true;
     if (!this.unlocked && !lockPending) return null;
+    // Spec 032: the demo mode connects to the loopback fixture with the fixture's own token and
+    // NEVER reads the secure store's credential entry. Anything that is not a demo pairing is
+    // refused here, so the gate being open can never reach a real paired credential.
+    const demo = this.demoStore;
+    const demoMode = this.screenshotMode !== null;
+    if (demoMode && !isDemoPairingHost(host)) {
+      this.debug.warn('connection refused: screenshot mode connects only to a demo pairing', { gatewayId: host.gatewayId });
+      this.banner = 'offline';
+      this.bump();
+      return null;
+    }
     const generation = this.beginGeneration();
     this.teardownConnection('reconnect');
     // M5 ownership: remember which credential revision the read starts from. If a newer `paired`
     // write registers while the read is in flight, this socket must not claim the newer instance —
     // recording the older revision makes a revocation of this socket leave that fresh token alone.
     const revisionBeforeRead = this.credentialRevision(host.gatewayId);
-    const token = await readToken(host.gatewayId);
+    // `readToken` is called ONLY in the non-demo path: the source guard in
+    // `test/screenshot-mode.test.ts` keeps that true for any future edit.
+    const token = demo === null ? await readToken(host.gatewayId) : this.demoToken ?? DEMO_GATEWAY_TOKEN;
     if (!this.isCurrent(generation) || (!this.unlocked && !lockPending)) {
       this.debug.info('token read superseded before connecting', { gatewayId: host.gatewayId });
       return null;
@@ -2692,7 +2814,10 @@ export class AppController {
         return;
       }
       this.debug.info('connect attempt', { gatewayId: host.gatewayId, installId: host.deviceId });
-      client.connect({ url: host.publicUrl, certSha256: host.certSha256, token: credential, installId: host.deviceId });
+      // Spec 032: the demo credential is whatever the fixture minted for THIS device and sent in
+      // `paired` (a per-run, throwaway token); `DEMO_GATEWAY_TOKEN` is only the pre-pairing fallback.
+      const presented = demoMode ? this.demoToken ?? credential : credential;
+      client.connect({ url: host.publicUrl, certSha256: host.certSha256, token: presented, installId: host.deviceId });
     };
     const reconnector = new Reconnector({
       connect,
@@ -3219,13 +3344,24 @@ export class AppController {
    * it — whenever the token wipe was slow (see the M5 test for a revocation parked on its token
    * write). Dropping it with the record removal keeps the two in step, and a wipe that fails still
    * drops the record, exactly as the callers' own prune does.
+   *
+   * SPEC 032: in demo mode the same transaction runs against the controller's own in-memory store
+   * (`DemoStore.forgetHost`), NEVER against `forgetHost` — a real forget reads the keychain entry
+   * back and deletes it, which a demo revoke/forget must not do to a real pairing's credential.
    */
   private deleteCredentialInstance(gatewayId: string, revision: number, record: PairedHost | null): Promise<boolean> {
+    const demo = this.demoStore;
     return this.enqueueCredentialOperation(gatewayId, async () => {
       if (this.credentialRevision(gatewayId) !== revision) return false;
       await this.serializeHostWrite(async () => {
         this.dropHostRecord(record);
-        return forgetHost(gatewayId);
+        if (demo === null) {
+          await forgetHost(gatewayId);
+          return;
+        }
+        demo.forgetHost(gatewayId);
+        // The demo credential dies with its host (the secure-store wipe is not reachable here).
+        this.demoToken = null;
       });
       this.bumpCredentialRevision(gatewayId);
       return true;

@@ -80,6 +80,8 @@ internal class PinnedWsRegistry(private val emitter: PinnedWsEmitter) {
     val pin = (options["certSha256"] as? String)?.trim()?.lowercase() ?: ""
     val protocols = stringList(options["protocols"])
     val headers = stringMap(options["headers"])
+    // Spec 032 is iOS-simulator only and no caller sends a trust-relaxation option: unknown option
+    // keys are never read, and OkHttp's trust manager decides on the pinned leaf alone.
 
     // Names only, normalized (trim + lowercase) before the allow-list check and the sort, capped
     // at [MAX_LOGGED_HEADER_NAMES]: a header value would be the bearer token itself.

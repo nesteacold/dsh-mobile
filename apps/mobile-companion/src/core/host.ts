@@ -28,6 +28,43 @@ export interface PairedHost {
   deviceName: string;
   /** Epoch ms of the successful pairing. */
   pairedAt: number;
+  /**
+   * Spec 032 — `true` when the pairing payload's `endpoints[]` are ALL loopback
+   * (`wss://127.0.0.1:<port>`, `localhost`, `::1`): the pairing came from the fake gateway
+   * (`e2e/harness/gateway.mjs`), not a real Host. Absent on every host paired before this field
+   * existed and on any host that offered a non-loopback address. A build in the
+   * `unlocked-demo` gate mode refuses to pair anything else (`isDemoPairingHost`).
+   */
+  demoPairing?: boolean;
+}
+
+/**
+ * Spec 032 — true only for a pairing that can never have reached a real Host: the flag above plus
+ * a loopback `publicUrl` AND every endpoint loopback. Both are re-checked (not just the flag) so a
+ * stored record edited by hand — `demoPairing: true` with a Tailscale address — cannot pass as a
+ * demo pairing.
+ */
+export function isDemoPairingHost(host: PairedHost): boolean {
+  return host.demoPairing === true && isLoopbackPairingEndpoint([host.publicUrl, ...host.endpoints]);
+}
+
+/**
+ * Spec 032 — true when every address in `urls` is `wss://` on the loopback interface. `new URL`
+ * only names `127.0.0.1` / `localhost` / `::1` as hostnames; a lookup string such as
+ * `127.0.0.1.evil.example` is a different hostname and is not loopback.
+ */
+export function isLoopbackPairingEndpoint(urls: readonly string[]): boolean {
+  if (urls.length === 0) return false;
+  return urls.every((url) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return false;
+    }
+    if (parsed.protocol !== 'wss:' || parsed.username !== '' || parsed.password !== '') return false;
+    return parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '[::1]';
+  });
 }
 
 /**
@@ -42,6 +79,13 @@ export function pairedHostFromPayload(
   device: { id: string; name: string },
   pairedAt: number,
   gatewayIdFromHello?: string,
+  /**
+   * Spec 032: the loopback test for {@link PairedHost.demoPairing}. Default = the policy above; a
+   * caller may pass `() => false` to write a record that can never be treated as a demo pairing.
+   */
+  demo: { classify: (publicUrl: string, endpoints: readonly string[]) => boolean } = {
+    classify: (publicUrl, endpoints) => isLoopbackPairingEndpoint([publicUrl, ...endpoints]),
+  },
 ): PairedHost {
   // Contract §3.5: `hello.gatewayId` is the Host's own statement of its identity. It wins when the
   // payload has none (OTP pairing); a payload pairing keeps the QR's id, which the Host already
@@ -57,6 +101,7 @@ export function pairedHostFromPayload(
     deviceId: device.id,
     deviceName: device.name,
     pairedAt,
+    ...(demo.classify(payload.publicUrl, payload.endpoints) ? { demoPairing: true } : {}),
   };
 }
 

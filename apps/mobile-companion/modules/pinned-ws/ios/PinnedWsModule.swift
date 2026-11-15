@@ -38,6 +38,18 @@ public final class PinnedWsModule: Module {
 
     Events(PinnedWsEventName.all)
 
+    // Spec 032: the store-screenshot gate's ONE runtime input, fixed at compile time. A binary
+    // built for a device — including a "Designed for iPad" app running on a Mac — takes the `#else`
+    // branch and reports `false`, so it can never unlock the demo gate; and no runtime value, call
+    // or environment variable can change it.
+    Constants {
+      #if targetEnvironment(simulator)
+      return ["simulator": true]
+      #else
+      return ["simulator": false]
+      #endif
+    }
+
     AsyncFunction("connect") { (id: String, url: String, options: [String: Any?]) in
       do {
         try self.registry.connect(id: id, url: url, options: options)

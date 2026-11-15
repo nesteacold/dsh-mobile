@@ -19,6 +19,8 @@
 // This file may import react-native (`npm run check:core` only guards `src/core`): it decides
 // whether the native module exists in this build and how to reach it.
 
+import { Platform } from 'react-native';
+
 import {
   CoreError,
   TRANSPORT_ERROR,
@@ -543,7 +545,9 @@ export class PinnedTransport implements Transport {
 /**
  * The construction options the app's factory may pass. It only ever sets `trace` and
  * `onListenerFailure`; every other option stays inside the module so production keeps one
- * behaviour (module lookup, upgrade mapping, socket ids) and only diagnostics can differ.
+ * behaviour (module lookup, upgrade mapping, socket ids) and only diagnostics can differ. Every
+ * socket this file creates uses the shipped pin-only trust path: there is no allowance, relaxable
+ * challenge handling or "accept anything" switch in it, for any build.
  */
 export type CreatePinnedTransportOptions = Pick<PinnedTransportOptions, 'trace' | 'onListenerFailure'>;
 

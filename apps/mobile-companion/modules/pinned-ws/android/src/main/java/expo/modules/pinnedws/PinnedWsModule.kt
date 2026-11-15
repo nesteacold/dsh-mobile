@@ -38,6 +38,12 @@ class PinnedWsModule : Module() {
 
     Events(*PinnedWsEmitter.EVENT_NAMES)
 
+    // Spec 032 is iOS-simulator only: Android never reports a simulator, because no JS-visible
+    // Android fact can tell an emulator from an emulator running on a Play-enabled machine.
+    Constants {
+      "simulator" to false
+    }
+
     AsyncFunction("connect") { id: String, url: String, options: Map<String, Any?> ->
       try {
         pinnedRegistry.connect(id, url, options)

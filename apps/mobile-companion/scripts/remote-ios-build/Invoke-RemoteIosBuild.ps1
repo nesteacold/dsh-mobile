@@ -764,6 +764,12 @@ $problems = New-Object System.Collections.ArrayList
 if ($EffectiveProfile -ne 'preview' -and $EffectiveProfile -ne 'production' -and $EffectiveProfile -ne 'development') {
     [void]$problems.Add(("bad -Profile '{0}' (preview|production|development)" -f $EffectiveProfile))
 }
+# Spec 032 — RELEASE GUARD (Windows side). Screenshot mode is a simulator-capture build only; a
+# store/release profile must never carry it. Refused here, before any ssh call, and again on the
+# Mac (mac/ios-build.sh validate_args) so neither side depends on the other having done it.
+if ([string]$env:DSH_SCREENSHOT_MODE -eq '1' -and $EffectiveProfile -eq 'production') {
+    [void]$problems.Add('refusing to build: DSH_SCREENSHOT_MODE=1 with -Profile production (a store build must never carry screenshot mode); use -Profile development or unset DSH_SCREENSHOT_MODE')
+}
 if (-not (Test-UInt $EffectiveQuota 8 200)) {
     [void]$problems.Add(("bad -QuotaGb '{0}' (whole number of GB, 8..200)" -f $EffectiveQuota))
 }

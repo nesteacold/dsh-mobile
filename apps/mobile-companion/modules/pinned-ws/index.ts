@@ -23,6 +23,7 @@ export {
   type PinnedWsCloseEvent,
   type PinnedWsErrorEvent,
   type PinnedWsAdapter,
+  type PinnedWsConstants,
   type PinnedWsEventName,
   type PinnedWsListenerFailure,
   type PinnedWsListenerFailureReporter,

@@ -406,7 +406,9 @@ extension PinnedWsConnection {
       // Client certificates, HTTP/proxy authentication and every other method are not part of
       // this transport. `.cancelAuthenticationChallenge` rather than `.performDefaultHandling`:
       // default handling is what would run the platform's CA evaluation (or a credential lookup)
-      // and so would reintroduce a trust decision this transport does not make.
+      // and so would reintroduce a trust decision this transport does not make. There was a
+      // spec-032 "loopback allowance" here (review #2 removed it): no option, build or target can
+      // switch this to `.performDefaultHandling`.
       completionHandler(.cancelAuthenticationChallenge, nil)
       return
     }

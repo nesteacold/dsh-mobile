@@ -50,7 +50,7 @@ export { Reconnector, backoffDelayMs, planResync, realClock, BACKOFF_DELAYS_MS, 
 export type { ReconnectClock, ReconnectSnapshot, ReconnectState, ResyncInput } from './reconnect';
 export { redactArgsPreview, redactDiagnostic, redactFingerprint, redactString, redactValue, REDACTED } from './redact';
 export type { RedactOptions } from './redact';
-export { PAIRED_HOST_SCHEMA_VERSION, pairedHostFromPayload, isReconnectable, describeHost } from './host';
+export { PAIRED_HOST_SCHEMA_VERSION, pairedHostFromPayload, isReconnectable, describeHost, isDemoPairingHost, isLoopbackPairingEndpoint } from './host';
 export type { PairedHost } from './host';
 // Contract revision 5 (§3.8): the OTP first-pairing flow — code normalization and the two derived
 // values the Host checks (`otpProof`, `verificationCode`). The SHA-256/HMAC primitives they need
@@ -125,3 +125,6 @@ export {
   projectionUpdateKind,
 } from './projections';
 export type { GoalView, SessionPanel, TodoListItem, TodoStatus, TodoStatusView } from './projections';
+// Spec 032: the build-time store-screenshot flag — the whole gate decision, unit-tested in the core.
+export { decideScreenshotMode, isProductionProfile, resolveBuildProfile, SCREENSHOT_MODE_EXTRA_KEY } from './screenshot-mode';
+export type { ScreenshotDecision, ScreenshotDecisionReason, ScreenshotGate, ScreenshotModeInput } from './screenshot-mode';

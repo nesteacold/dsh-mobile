@@ -56,7 +56,7 @@ export type PinnedWsEventName = keyof PinnedWsEventMap;
 
 export const PINNED_WS_EVENT_NAMES: readonly PinnedWsEventName[] = ['onOpen', 'onMessage', 'onClose', 'onError'];
 
-/** The native object: two methods plus the Expo event emitter surface. */
+/** The native object: three methods, the event emitter surface, and the exported build constants. */
 export interface PinnedWsAdapter {
   /**
    * Start a socket. Resolves once the attempt was accepted, NOT when it is open (`onOpen` is an
@@ -70,6 +70,19 @@ export interface PinnedWsAdapter {
   send(id: string, text: string): Promise<boolean>;
   close(id: string, code: number, reason: string): Promise<void>;
   addListener(name: PinnedWsEventName, listener: (event: unknown) => void): { remove(): void };
+  /**
+   * Spec 032 — the module's build constants (`Constants { simulator: Bool }`) are exported as
+   * PROPERTIES on the module object (Expo decorates the `Constants` dictionary onto it), not as a
+   * `constants()` function. `src/platform/screenshot-mode` reads `module.simulator` lazily; a
+   * property that is absent or not exactly `true` is "unknown" (the normal unlock gate).
+   */
+  readonly simulator?: boolean;
+}
+
+/** Build constants of the native module (spec 032), exported as properties on the module object. */
+export interface PinnedWsConstants {
+  /** `true` ONLY on an iOS simulator (`#if targetEnvironment(simulator)`); `false` on device/Android. */
+  simulator: boolean;
 }
 
 export const PinnedWsEvents = {

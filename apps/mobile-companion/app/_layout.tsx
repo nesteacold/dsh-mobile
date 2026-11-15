@@ -18,6 +18,9 @@ import { StartupSequence, type StartupStatus } from '../src/core/startup';
 import { UnlockAttempts } from '../src/core/unlock-attempt';
 import { lockAction, unlockCopyKey } from '../src/core/web-lock';
 import { authenticate, initialNotificationUrl, unlockCapability, unlockUnavailableKey } from '../src/platform';
+import { createDemoTransport } from '../src/platform/pinned-transport.demo';
+import type { CreatePinnedTransportOptions } from '../src/platform/pinned-transport';
+import { buildProfileLabel, nativePinnedWsConstants, screenshotDecision } from '../src/platform/screenshot-mode';
 import { detectLocale, t, type Interpolate, type Locale, type MessageKey } from '../i18n';
 import { PairPanel } from '../src/ui/pair-panel';
 // UI ported from Clarklevis1995/dsh-mobile androidApp/.../ui/DshTheme.kt (MIT).
@@ -54,7 +57,69 @@ export default function RootLayout() {
    * gate, and it renders from the bootstrap state below instead.
    */
   const isWeb = Platform.OS === 'web';
-  const controller = useMemo(() => new AppController({ locale: () => locale }), [locale]);
+  /**
+   * Spec 032 — the screenshot gate. `useState` reads SYNCHRONOUSLY, so the decision is made once
+   * on the first render: `null` means "still checking" (the gate stays shut), `'unlocked-demo'`
+   * is the store-screenshot mode and anything else is `normal` (the untouched A020 gate).
+   *
+   * The decision is asynchronous only in form; the simulator fact is the native module's
+   * COMPILE-TIME constant (`#if targetEnvironment(simulator)`), never a runtime heuristic. The
+   * first frame still renders `checking` and the effect starts the same cold start as before.
+   * Screenshot mode is on ONLY when the build baked `DSH_SCREENSHOT_MODE`, this is an iOS
+   * SIMULATOR and the profile is not production (see `src/core/screenshot-mode.ts`); Android is
+   * always `normal`.
+   */
+  const [demoGate, setDemoGate] = useState<boolean | null>(null);
+  /**
+   * Spec 032 — the compile-time iOS simulator fact of this binary (`modules/pinned-ws`
+   * `Constants { simulator }`, read as a PROPERTY on the module). `undefined` until the demo decision
+   * resolved; `false` when the module cannot be read (unknown). It is handed to the demo transport
+   * factory so that build's fact reaches it explicitly instead of being assumed. It is not a trust
+   * switch: the demo socket runs the shipped pin-only handshake (review #2 removed the loopback
+   * allowance from every layer).
+   */
+  const [demoSimulator, setDemoSimulator] = useState<boolean | undefined>(undefined);
+  useEffect(() => {
+    if (isWeb) {
+      setDemoGate(false);
+      return;
+    }
+    let alive = true;
+    void screenshotDecision().then((decision) => {
+      if (!alive) return;
+      const demo = decision.gate === 'unlocked-demo';
+      setDemoGate(demo);
+      setDemoSimulator(demo ? nativePinnedWsConstants().simulator === true : false);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [isWeb]);
+  /**
+   * The controller. Spec 032: it is built once the screenshot decision is known, and only a demo
+   * gate hands it the loopback demo transport — so a normal build is the same object it always
+   * was, and the demo build can never dial `pinned-ws`. The factory also receives this build's
+   * COMPILE-TIME simulator constant explicitly (see the header of `pinned-transport.demo.ts`).
+   */
+  const controller = useMemo(
+    () =>
+      new AppController({
+        locale: () => locale,
+        ...(demoGate === true
+          ? {
+              screenshotMode: {
+                enabled: true as const,
+                transport: (options?: CreatePinnedTransportOptions) =>
+                  createDemoTransport({
+                    ...(options === undefined ? {} : options),
+                    isSimulator: demoSimulator === true,
+                  }),
+              },
+            }
+          : {}),
+      }),
+    [locale, demoGate, demoSimulator],
+  );
   const [snapshot, setSnapshot] = useState<AppStateSnapshot>(() => controller.snapshot());
   const [gate, setGate] = useState<GateStatus>('checking');
   const [gateMessage, setGateMessage] = useState<string | null>(null);
@@ -141,19 +206,34 @@ export default function RootLayout() {
           setGateMessage(tr(unlockUnavailableKey()));
           return;
         }
-        const result = await authenticate(tr('unlock.prompt'), controller.passkeyConnection);
-        // A020/M5: the platform prompt outlives a background lock, a newer attempt or an
-        // unmount, so its answer is only usable while this attempt is still current. Acting on
-        // a stale success would open the gate and read the credential in the background.
-        if (!attempts.isCurrent(attempt)) return;
-        if (!result.ok) {
-          setGate('locked');
-          setGateMessage(unlockFailureCopy(result.reason, tr));
-          return;
+        /**
+         * Spec 032 — the screenshot gate. `demoGate === true` means every condition of
+         * `src/core/screenshot-mode.ts` held (build flag + simulator/emulator + non-production
+         * profile) for THIS build. The biometric prompt is skipped because a headless simulator
+         * cannot answer it; the controller is in demo mode (loopback fixture only, in-memory demo
+         * credential, never the secure store), so opening the gate cannot reach a real credential.
+         * Everything else — a normal build, a physical phone, a production profile, web — still
+         * runs `authenticate()` below unchanged.
+         */
+        if (demoGate === true) {
+          setGateMessage(null);
+          setGate('unlocked');
+          await controller.unlock();
+        } else {
+          const result = await authenticate(tr('unlock.prompt'), controller.passkeyConnection);
+          // A020/M5: the platform prompt outlives a background lock, a newer attempt or an
+          // unmount, so its answer is only usable while this attempt is still current. Acting on
+          // a stale success would open the gate and read the credential in the background.
+          if (!attempts.isCurrent(attempt)) return;
+          if (!result.ok) {
+            setGate('locked');
+            setGateMessage(unlockFailureCopy(result.reason, tr));
+            return;
+          }
+          setGateMessage(result.capability === 'passcode' ? tr('unlock.passcodeOnly') : null);
+          setGate('unlocked');
+          await controller.unlock();
         }
-        setGateMessage(result.capability === 'passcode' ? tr('unlock.passcodeOnly') : null);
-        setGate('unlocked');
-        await controller.unlock();
         // A web device is still LOCKED on its socket while the passkey asserts; the Host's `webLock`
         // decides that, and the gate above it renders the lock screen (`WebLockGate`). A successful
         // passkey assertion clears it in the snapshot, which re-renders this tree unstuck.
@@ -166,7 +246,7 @@ export default function RootLayout() {
         unlocking.current = false;
       }
     },
-    [attempts, controller, router, startup, tr],
+    [attempts, controller, demoGate, router, startup, tr],
   );
 
   // Re-lock whenever the app leaves the foreground (the credential must not stay usable).
@@ -191,8 +271,10 @@ export default function RootLayout() {
   }, [attempts, controller]);
 
   useEffect(() => {
-    if (gate === 'checking' && !isWeb) void attemptUnlock(true);
-  }, [gate, attemptUnlock, isWeb]);
+    // Spec 032: `demoGate === null` means the screenshot decision has not resolved yet, and the
+    // decision decides WHICH controller exists — so the gate waits for it on native.
+    if (gate === 'checking' && (!isWeb ? demoGate !== null : true)) void attemptUnlock(true);
+  }, [demoGate, gate, attemptUnlock, isWeb]);
 
   /**
    * Spec 021 — on web the Host's confirmed assertion is what opens the gate.
@@ -243,6 +325,14 @@ export default function RootLayout() {
    * no conversation — even though the credential is already readable.
    */
   const webLock = snapshot.webLock;
+  /**
+   * Spec 032 — the demo gate shows its own status line instead of the unlock screen: whoever runs
+   * the manual capture (docs/remote-ios-build.md §4.9a) can see at a glance that this build
+   * skipped the prompt on purpose (testID `screenshot-gate-demo`; no e2e flow uses it yet), with
+   * the profile it was built for. Not localised: it only exists in a build that is never shipped,
+   * and the locale of a capture Mac is not the app's own choice.
+   */
+  const demoStatus = demoGate === true ? `screenshot mode · demo data only · ${buildProfileLabel()}` : null;
 
   return (
     <SafeAreaProvider>
@@ -270,6 +360,12 @@ export default function RootLayout() {
         ) : (
           <View style={[styles.gate, { backgroundColor: palette.bg }]}>
             <Text style={[styles.title, { color: palette.text }]}>{tr('unlock.title')}</Text>
+            {demoStatus !== null ? (
+              // Spec 032: this build is in screenshot mode; no prompt will appear by design.
+              <Text style={[styles.message, { color: palette.textMuted }]} testID="screenshot-gate-demo">
+                {demoStatus}
+              </Text>
+            ) : null}
             <Text style={[styles.subtitle, { color: palette.textMuted }]}>{tr('unlock.subtitle')}</Text>
             {gateMessage !== null ? <Text style={[styles.message, { color: palette.warning }]}>{gateMessage}</Text> : null}
             {gate === 'checking' ? null : (
