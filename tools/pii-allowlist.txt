@@ -69,3 +69,16 @@ email:p@x.example
 # public mailbox, not personal information. It appears only in the in-app privacy strings
 # (i18n/index.ts) and the two policy drafts (apps/mobile-companion/docs/privacy-policy-*.md).
 email:developer@sunjin.vn
+# Spec 031 web-ingress test fixtures (plugins/mobile-gateway/test/web-ingress.test.mjs): invented
+# tailnet names, a userinfo-in-origin attack string and CGNAT addresses used as fake peers. None is a
+# real Host, account or address.
+tsnet:dsh-owner.tail1234.ts.net
+tsnet:box.tailnet-1234.ts.net
+email:pw@dsh-owner.tail1234.ts.net
+tailscale_ip:100.64.1.2
+tailscale_ip:100.64.7.7
+tailscale_ip:100.64.8.8
+tailscale_ip:100.64.9.9
+# Spec 031 PWA pair-link attack fixture (apps/mobile-companion/test/pair-web-origin.test.ts):
+# userinfo-with-password inside a= on a reserved .example domain; not a mailbox.
+email:pass@attacker.example.com

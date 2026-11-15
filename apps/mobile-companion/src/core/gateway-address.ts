@@ -47,6 +47,60 @@ export function sameOriginGatewayUrl(location: WebLocation | null | undefined): 
   return `wss://${host}${GATEWAY_WS_PATH}`;
 }
 
+/** Why the page's own origin is not a gateway target (spec 031 §8's unsupported-host guidance). */
+export type WebOriginRefusal = 'insecure' | 'not-tailnet';
+
+/**
+ * The address a one-time-code pairing dials, and the OTP form's state for this platform.
+ *
+ * Spec 031 §8: the browser shows its current origin and never accepts an address override it would
+ * then ignore. On a supported origin there is no typed address at all — `sameOrigin` is the only
+ * one used, whatever a link or a scan carried. On an unsupported origin the flow is refused (`null`)
+ * with the reason, so the screen can say why instead of pretending a code could pair.
+ */
+export type OtpAddressPlan =
+  | { kind: 'unsupported'; reason: WebOriginRefusal }
+  // Not a page: the form is typeable, but a phone cannot prove a code (no certificate in it).
+  | { kind: 'native' }
+  // A page whose origin is the gateway's: fixed address, no typed field.
+  | { kind: 'same-origin'; url: string; origin: string };
+
+export function planOtpAddress(location: WebLocation | null | undefined): OtpAddressPlan {
+  if (location === null || location === undefined) return { kind: 'native' };
+  const url = sameOriginGatewayUrl(location);
+  if (url === null) {
+    return { kind: 'unsupported', reason: location.protocol !== 'https:' ? 'insecure' : 'not-tailnet' };
+  }
+  // The origin the page was served from, exactly as the browser writes it (`location.host`).
+  return { kind: 'same-origin', url, origin: `https://${location.host.trim()}` };
+}
+
+/**
+ * What one submit of the pair screen may do, decided BEFORE any controller or socket exists.
+ *
+ * Spec 031 §8: a page that is not the gateway's own tailnet HTTPS origin has no verified route, so
+ * NEITHER form may dial from it — the 8-digit code or a QR/long string would just be a socket the
+ * browser refuses (or worse, the self-signed listener the QR carries). `link` says the input was a
+ * recognized `/pair#a=…&c=…` link: the web pairs with its code only, never its address, and a
+ * phone explains it, because a code carries no certificate to pin. A phone's code or QR is refused
+ * for that same reason (see `createPinnedTransport`); its QR / long string keeps its own pin.
+ */
+export function planPairSubmit(
+  plan: OtpAddressPlan,
+  onWeb: boolean,
+  link: boolean,
+): { kind: 'blocked'; reason: 'insecure' | 'not-tailnet' | 'otpNative' | 'otpLinkNative' } | { kind: 'otp'; url: string; origin: string } | { kind: 'qr' } {
+  // A plan exists only for a page, so `unsupported` is a web page without a verified route.
+  if (plan.kind === 'unsupported') return { kind: 'blocked', reason: plan.reason };
+  // The browser pairs through the page's own origin: the code form, and a link that only fills it.
+  if (onWeb) {
+    if (plan.kind !== 'same-origin') return { kind: 'blocked', reason: 'otpNative' };
+    return { kind: 'otp', url: plan.url, origin: plan.origin };
+  }
+  if (link) return { kind: 'blocked', reason: 'otpLinkNative' };
+  return plan.kind === 'native' ? { kind: 'qr' } : { kind: 'blocked', reason: 'otpNative' };
+}
+
 /**
  * Rewrite a pairing payload so the web build connects through the origin it was served from.
  *

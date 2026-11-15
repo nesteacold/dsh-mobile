@@ -59,8 +59,8 @@ export { OTP_DIGITS, OTP_SUBPROTOCOL, normalizeOtp, otpProof, verificationCode }
 export type { OtpRejectReason } from './pairing-otp';
 export { parseSessionDeepLink, sessionDeepLink } from './deeplink';
 export type { SessionDeepLink } from './deeplink';
-export { GATEWAY_WS_PATH, sameOriginGatewayUrl, withSameOriginEndpoint } from './gateway-address';
-export type { WebLocation } from './gateway-address';
+export { GATEWAY_WS_PATH, planOtpAddress, sameOriginGatewayUrl, withSameOriginEndpoint } from './gateway-address';
+export type { OtpAddressPlan, WebLocation, WebOriginRefusal } from './gateway-address';
 export { DebugLog } from './debug-log';
 export type { LogLine, LogSink } from './debug-log';
 export { lowerPermission, readPermissionOptions, reasonMessage, toLowerOutcome, toOptionsView } from './permission-lower';

@@ -138,6 +138,13 @@ export type MessageKey =
   | 'pair.modeOtp'
   | 'pair.otpAddress'
   | 'pair.otpAddressPlaceholder'
+  // Spec 031 §8: the browser shows its current origin as read-only text, and refuses the code flow
+  // outright on a host that is not the gateway's origin.
+  | 'pair.webAddressLabel'
+  | 'pair.webOrigin'
+  | 'pair.webOriginFixed'
+  | 'pair.webUnsupported'
+  | 'pair.webUnsupportedInsecure'
   | 'pair.otpCode'
   | 'pair.otpPlaceholder'
   | 'pair.errorTitle'
@@ -515,6 +522,13 @@ const en = {
   'pair.modeOtp': '8-digit code',
   'pair.otpAddress': 'Your computer’s address',
   'pair.otpAddressPlaceholder': '192.168.1.20:3081',
+  // Spec 031 §8: what the PWA dials is whatever page it was opened from — the owner must see it, and
+  // cannot type over it (a typed address used to be ignored, which read as a bug).
+  'pair.webAddressLabel': 'This page connects through its own address',
+  'pair.webOrigin': 'Current page: {origin}',
+  'pair.webOriginFixed': 'The gateway is reached at {url} — this address is fixed by the page you opened, so there is nothing to type here.',
+  'pair.webUnsupported': 'This page is not served from its Tailscale HTTPS address (*.ts.net), so the browser has no verified route to the gateway and cannot pair with the 8-digit code here. Open the app at the address your computer gave you (for example https://box.tailnet.ts.net) over HTTPS, then try again.',
+  'pair.webUnsupportedInsecure': 'This page is not served over HTTPS, so the browser cannot use the gateway route and cannot pair with the 8-digit code here. Open the app at the HTTPS address your computer gave you (for example https://box.tailnet.ts.net), then try again.',
   'pair.otpCode': 'Pairing code from your computer',
   'pair.otpPlaceholder': '8 digits',
   'pair.errorTitle': 'Could not pair',
@@ -860,6 +874,11 @@ const vi = {
   'pair.modeOtp': 'Mã 8 số',
   'pair.otpAddress': 'Địa chỉ máy tính của bạn',
   'pair.otpAddressPlaceholder': '192.168.1.20:3081',
+  'pair.webAddressLabel': 'Trang này kết nối qua chính địa chỉ của nó',
+  'pair.webOrigin': 'Trang hiện tại: {origin}',
+  'pair.webOriginFixed': 'Gateway được truy cập tại {url} — địa chỉ này cố định theo trang bạn mở, nên không có gì để nhập ở đây.',
+  'pair.webUnsupported': 'Trang này không được phục vụ từ địa chỉ HTTPS Tailscale (*.ts.net) của nó, nên trình duyệt không có đường đã xác minh tới gateway và không thể ghép đôi bằng mã 8 số ở đây. Hãy mở ứng dụng tại địa chỉ máy tính đã đưa (ví dụ https://box.tailnet.ts.net) qua HTTPS rồi thử lại.',
+  'pair.webUnsupportedInsecure': 'Trang này không được phục vụ qua HTTPS, nên trình duyệt không dùng được đường tới gateway và không thể ghép đôi bằng mã 8 số ở đây. Hãy mở ứng dụng tại địa chỉ HTTPS máy tính đã đưa (ví dụ https://box.tailnet.ts.net) rồi thử lại.',
   'pair.otpCode': 'Mã ghép đôi trên máy tính',
   'pair.otpPlaceholder': '8 chữ số',
   'pair.errorTitle': 'Không ghép đôi được',

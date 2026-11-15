@@ -27,6 +27,8 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { planOtpAddress, planPairSubmit } from '../src/core/gateway-address';
+
 const APP_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'app');
 // Spec 021: the pair screen body moved to `src/ui/pair-panel.tsx` so the web bootstrap of the root
 // layout can render it before any route mounts (a browser whose passkey is not asserted yet has no
@@ -79,14 +81,20 @@ describe('pair screen hooks', () => {
     for (const id of ['pair-mode-code', 'pair-mode-otp', 'pair-otp-address', 'pair-otp-input', 'pair-otp-submit']) {
       assert.equal(count(ids, id), 1, `${id} is rendered exactly once`);
     }
+    // Spec 031 §8: the PWA shows the page's own origin as read-only text (never an address field),
+    // and an unsupported host gets its own guidance box instead of the code form.
+    assert.equal(count(ids, 'pair-otp-origin'), 1);
+    assert.equal(count(ids, 'pair-web-unsupported'), 1);
     assert.deepEqual(ids.toSorted(), [
       'pair-manual-input',
       'pair-mode-code',
       'pair-mode-otp',
       'pair-otp-address',
       'pair-otp-input',
+      'pair-otp-origin',
       'pair-otp-submit',
       'pair-submit',
+      'pair-web-unsupported',
     ]);
   });
 });
@@ -147,24 +155,50 @@ describe('pair screen: the one-time-code form on a phone', () => {
     // A code carries no certificate, and the native transport refuses an unpinned socket outright,
     // so the attempt would burn one of the Host's three proofs before failing. The guard must
     // therefore sit before this form's own `controller.pair(...)` call, not after it.
-    const guard = source.indexOf("if (Platform.OS !== 'web')");
-    assert.ok(guard > 0, 'the native guard is rendered');
-    // The OTP form's connect: the FIRST `controller.pair(` after the guard. (The QR form's call
-    // appears earlier in the file and is a different flow.)
+    //
+    // Spec 031 §8: the guard is the seam (`planPairSubmit`), which answers `native`/`otpNative` for
+    // a phone's code. Both handlers call it; the CODE handler is the second call, and its refusal
+    // must return before any controller call — the QR flow's `pair()` earlier in the file must not
+    // stand in for it.
+    const seamCalls = [...source.matchAll(/\bplanPairSubmit\(/g)].map((match) => match.index ?? -1);
+    assert.equal(seamCalls.length, 2, 'each submit handler consults the seam');
+    const codeHandlerStart = seamCalls[1] ?? -1;
+    assert.ok(codeHandlerStart > 0, 'the code handler calls the seam');
+    const guard = source.indexOf("if (decision.kind === 'blocked')", codeHandlerStart);
+    assert.ok(guard > codeHandlerStart, 'the code handler checks its own decision');
+    // The OTP form's connect: the FIRST `controller.pair(` after the guard.
     const connect = source.indexOf('controller.pair(', guard);
     assert.ok(connect > 0, 'the OTP form does connect on the web');
     assert.ok(guard < connect, 'the guard runs before the connection is opened');
-    // It refuses through the localized failure state, which is what the screen renders.
+    // It refuses through the copy the screen renders, and returns before touching any controller.
     const guarded = source.slice(guard, connect);
-    assert.match(guarded, /setFailure\('pair\.error\.otpNative'\)/);
-    assert.match(guarded, /return;/, 'nothing reaches the controller');
+    assert.match(guarded, /setFailure\(refusalKey[\s\S]*?return;/, 'the failure is rendered and the handler returns');
+    assert.equal(guarded.includes('controller.'), false, 'nothing reaches the controller');
+    assert.equal(source.includes('otpGatewayUrl(otpAddress'), false, 'the code never dials a typed address');
   });
 
-  it('keeps the web on the one-time-code flow', () => {
-    // Spec 020: a browser cannot pin by construction, so the code flow is its honest first-use path.
-    // The guard is an early return for native only; it must not remove the web call.
-    assert.match(source, /if \(Platform\.OS !== 'web'\) \{[\s\S]*?return;[\s\S]*?\}/);
-    assert.equal(source.includes("if (Platform.OS === 'web') return;"), false, 'the web path is not short-circuited');
+  it('keeps a supported web page on the one-time-code flow', () => {
+    // Spec 020/031: a browser cannot pin by construction, so the code flow is its honest first-use
+    // path — through the page's OWN origin (`planOtpAddress`), never a typed address.
+    //
+    // The guard is the seam, not a short-circuit: a supported page reaches the decision as `otp`,
+    // and only `blocked` refuses. The guard up front is the render (no code form on a foreign page).
+    assert.match(source, /const otpBlocked = web\.kind === 'unsupported'/);
+    const codeHandlerStart = ([...source.matchAll(/\bplanPairSubmit\(/g)].map((match) => match.index ?? -1))[1] ?? -1;
+    assert.ok(codeHandlerStart > 0, 'the code handler calls the seam');
+    assert.match(
+      source.slice(codeHandlerStart),
+      RegExp("if \\(decision\\.kind !== 'otp'\\) \\{[\\s\\S]*?return;[\\s\\S]*?\\n" + '    }'.replace('}', '\\}')),
+    );
+    assert.ok(source.slice(codeHandlerStart).includes("const { url, origin } = decision;"), 'the code handler dials the seam URL');
+    // The connect uses the seam's own `url`/`origin` — never `otpGatewayUrl(otpAddress)` — and it
+    // comes after the `blocked` guard above, so a refused code never opens a socket.
+    // The connect hands the controller the seam's own `url` (labelled with its `origin` as the name
+    // shown while connecting) — never `otpGatewayUrl(otpAddress)`, the typed native field.
+    assert.ok(source.slice(codeHandlerStart).includes("controller.pair('', { otp: { otp: normalized.otp, url, gatewayName: origin } })"));
+    // And the seam itself: a supported page gets the code flow, a phone does not.
+    assert.equal(planPairSubmit(planOtpAddress({ protocol: 'https:', host: 'host.example.ts.net:8443' }), true, false).kind, 'otp');
+    assert.deepEqual(planPairSubmit(planOtpAddress(null), true, false), { kind: 'blocked', reason: 'otpNative' });
   });
 });
 

@@ -20,7 +20,7 @@ import { ActivityIndicator, Platform, ScrollView, StyleSheet, Text, TextInput, T
 import { CameraView, useCameraPermissions } from 'expo-camera';
 
 import type { AppController, AppStateSnapshot } from '../app-state';
-import { GATEWAY_WS_PATH, sameOriginGatewayUrl } from '../core/gateway-address';
+import { GATEWAY_WS_PATH, planOtpAddress, planPairSubmit } from '../core/gateway-address';
 import { normalizeOtp, OTP_DIGITS } from '../core/pairing-otp';
 import { readWebLocation } from '../platform/web-location';
 import { consumePairHash } from '../platform/pair-hash';
@@ -56,24 +56,57 @@ export function PairPanel(props: {
   const [mode, setMode] = useState<PairMode>('code');
   const [manual, setManual] = useState('');
   const [otpCode, setOtpCode] = useState('');
+  // Native only: the supported-page branch never renders a typeable address (spec 031 §8).
   const [otpAddress, setOtpAddress] = useState('');
   const [busy, setBusy] = useState(false);
   const [scanLocked, setScanLocked] = useState(false);
   const [failure, setFailure] = useState<MessageKey | null>(null);
   const [connectingTo, setConnectingTo] = useState<string | null>(null);
-  // The same-origin gateway address this page will use (spec 020), or null on native / a page that
-  // is not served from a tailnet HTTPS origin. Computed once: the origin cannot change under a
-  // mounted screen (`tailscale serve` never rewrites the page), and reading it per render would
-  // make the hint depend on a global this component does not own.
-  const webGatewayUrl = useMemo(() => (Platform.OS === 'web' ? sameOriginGatewayUrl(readWebLocation()) : null), []);
+  // The gateway address this page dials (spec 020), or null on native / a page that is not served
+  // from a tailnet HTTPS origin. Computed once: the origin cannot change under a mounted screen
+  // (`tailscale serve` never rewrites the page), and reading it per render would make the hint
+  // depend on a global this component does not own.
+  //
+  // Spec 031 §8: the PAGE's own origin is the sole authority for the browser. It is shown as
+  // read-only text (never a field that could be typed over and ignored), and a foreign page refuses
+  // the one-time-code flow here instead of falling back to an address someone typed.
+  const web = useMemo(() => planOtpAddress(Platform.OS === 'web' ? readWebLocation() : null), []);
+  const webOrigin = web.kind === 'same-origin' ? web.origin : null;
+  const webGatewayUrl = web.kind === 'same-origin' ? web.url : null;
+  const webUnsupportedKey: MessageKey | null = web.kind === 'unsupported'
+    ? (web.reason === 'insecure' ? 'pair.webUnsupportedInsecure' : 'pair.webUnsupported')
+    : null;
+  // The code form needs a reason to hide when an unsupported page is opened with a pairing link.
+  const otpBlocked = web.kind === 'unsupported';
+
+  // The copy for a submit the seam blocked. Both forms read the same decision, so neither can
+  // disagree with the other about a foreign page.
+  const refusalKey = useCallback(
+    (decision: Extract<ReturnType<typeof planPairSubmit>, { kind: 'blocked' }>): MessageKey => {
+      switch (decision.reason) {
+        case 'insecure':
+          return 'pair.webUnsupportedInsecure';
+        case 'otpNative':
+          return 'pair.error.otpNative';
+        case 'otpLinkNative':
+          return 'pair.error.otpLinkNative';
+        default:
+          // `not-tailnet`: the host/HTTPS guidance already shown for this page.
+          return webUnsupportedKey ?? 'pair.webUnsupported';
+      }
+    },
+    [webUnsupportedKey],
+  );
 
   // The pairing-code link (`/pair#a=…&c=…`, the desktop dialog's QR). Read once on mount; the web
   // adapter strips the fragment from the address bar before anything else sees it. The form is only
   // PRE-FILLED: nothing is dialled until the user taps Pair, and the Host still approves.
+  //
+  // Only the CODE is taken from it. The link's `a=` address is never adopted: on a supported page
+  // the address is the page's own origin, so a link cannot redirect the app to another host.
   const [prefilled, setPrefilled] = useState(false);
   const applyPairLink = useCallback((link: PairLink) => {
     setMode('otp');
-    setOtpAddress(link.address);
     setOtpCode(link.otp);
     setFailure(null);
     setPrefilled(true);
@@ -86,17 +119,28 @@ export function PairPanel(props: {
   const submit = useCallback(
     async (raw: string) => {
       if (busy || raw.trim() === '') return;
+      setFailure(null);
       // A scanned/pasted pairing-code link is not a pairing string. The web pre-fills the code form;
       // a phone app keeps its rule (no OTP on native: a code carries no pin) and says so plainly.
       const link = parsePairLinkUrl(raw);
-      if (link !== null) {
+      // Spec 031 §8: one seam decides both flows, before any controller or socket exists. A page
+      // that is not the gateway's tailnet HTTPS origin has no verified route, so a QR address or a
+      // pasted long string is refused here too — not only the 8-digit code form.
+      const decision = planPairSubmit(web, Platform.OS === 'web', link !== null);
+      if (decision.kind === 'blocked') {
         setScanLocked(false);
-        if (Platform.OS === 'web') applyPairLink(link);
-        else setFailure('pair.error.otpLinkNative');
+        // A phone explains a code link; the web pre-fills it. Anything blocked is refused, with the
+        // copy that already exists for its reason.
+        if (decision.reason === 'otpNative' && link !== null) applyPairLink(link);
+        else setFailure(refusalKey(decision));
+        return;
+      }
+      if (link !== null) {
+        // The web adopts only the link's CODE; its `a=` address never reaches the connect.
+        applyPairLink(link);
         return;
       }
       setBusy(true);
-      setFailure(null);
       const parsed = controller.parsePairPayload(raw);
       if (!parsed.ok) {
         setFailure(errorKey(pairErrorFromQr(parsed.code as never)));
@@ -115,13 +159,13 @@ export function PairPanel(props: {
       setFailure(errorKey(pairErrorFromCode(result.code)));
       setScanLocked(false);
     },
-    [busy, controller, onPaired, applyPairLink],
+    [busy, controller, onPaired, applyPairLink, web, refusalKey],
   );
 
   /**
    * Submit the one-time-code form (contract revision 5). The code is validated locally FIRST, so a
-   * typo never opens a socket or spends one of the Host's three proof attempts; the address is
-   * normalized to a `wss://…/ws/mobile` URL the transport will accept.
+   * typo never opens a socket or spends one of the Host's three proof attempts; a supported page
+   * dials its OWN origin, which `planOtpAddress` already derived.
    */
   const submitOtp = useCallback(async () => {
     if (busy) return;
@@ -131,27 +175,29 @@ export function PairPanel(props: {
       setFailure(normalized.reason === 'otp/empty' ? 'pair.error.otpRequired' : 'pair.error.otpBadLength');
       return;
     }
-    // A phone cannot complete this flow at all: an 8-digit code carries no certificate, and the
-    // native transport refuses an unpinned socket outright (see `createPinnedTransport` —
-    // `PinnedTrustManager` has no code path that returns success without a pin). Attempting it
-    // would spend one of the Host's three proof attempts before the transport refused. Refuse here
-    // and point at the flow that does work on a device; the browser keeps the code flow because it
-    // cannot pin by construction either (spec 020) and relies on the CA store instead.
-    if (Platform.OS !== 'web') {
+    // Spec 031 §8: a page that is not served from the gateway's tailnet HTTPS origin has no verified
+    // route to it, and no typed address is accepted as a fallback. Refuse before any socket exists.
+    // The same seam decides both forms: on an unsupported page nothing dials, and a phone cannot
+    // complete this flow at all — an 8-digit code carries no certificate, and the native transport
+    // refuses an unpinned socket outright (see `createPinnedTransport`). Attempting it would spend
+    // one of the Host's three proof attempts before the transport refused.
+    const decision = planPairSubmit(web, Platform.OS === 'web', false);
+    if (decision.kind === 'blocked') {
+      setFailure(refusalKey(decision));
+      return;
+    }
+    if (decision.kind !== 'otp') {
+      // Native lands here (the seam answers `qr` off the web): an 8-digit code has no pin, refuse.
       setFailure('pair.error.otpNative');
       return;
     }
-    const url = otpGatewayUrl(otpAddress, webGatewayUrl);
-    if (url === null) {
-      setFailure('pair.error.badAddress');
-      return;
-    }
+    const { url, origin } = decision;
     setBusy(true);
-    setConnectingTo(otpAddress.trim());
+    setConnectingTo(origin);
     // The pin is deliberately NOT supplied here: the OTP offer carries the fingerprint and the
     // challenge states the leaf the proof is keyed to, which is the contract's trust-on-first-use
     // for a code that cannot carry one. The controller stores what it adopted.
-    const result = await controller.pair('', { otp: { otp: normalized.otp, url, gatewayName: otpAddress.trim() } });
+    const result = await controller.pair('', { otp: { otp: normalized.otp, url, gatewayName: origin } });
     setBusy(false);
     // The code was spent either way; keep the field empty so a retry cannot resubmit it by accident.
     setOtpCode('');
@@ -161,7 +207,7 @@ export function PairPanel(props: {
     }
     setConnectingTo(null);
     setFailure(errorKey(pairErrorFromCode(result.code)));
-  }, [busy, controller, onPaired, otpAddress, otpCode, webGatewayUrl]);
+  }, [busy, controller, onPaired, otpCode, web, refusalKey]);
 
   // A pairing failure the controller recorded outside `pair()` (close 4004, version gate).
   useEffect(() => {
@@ -221,51 +267,75 @@ export function PairPanel(props: {
 
       {mode === 'otp' ? (
         <>
-          {prefilled ? (
-            <Text style={styles.addressHint}>{tr('pair.linkPrefilled')}</Text>
-          ) : null}
-          <Text style={styles.section}>{tr('pair.otpAddress')}</Text>
-          <TextInput
-            style={styles.input}
-            testID="pair-otp-address"
-            value={otpAddress}
-            onChangeText={setOtpAddress}
-            placeholder={tr('pair.otpAddressPlaceholder')}
-            autoCapitalize="none"
-            autoCorrect={false}
-            editable={!busy}
-            textContentType="none"
-            importantForAutofill="no"
-          />
-          {webGatewayUrl !== null ? (
-            <Text style={styles.addressHint}>{tr('pair.webAddress', { url: webGatewayUrl })}</Text>
-          ) : null}
-          <Text style={styles.section}>{tr('pair.otpCode')}</Text>
-          <TextInput
-            style={styles.otpInput}
-            testID="pair-otp-input"
-            value={otpCode}
-            onChangeText={setOtpCode}
-            placeholder={tr('pair.otpPlaceholder')}
-            // `number-pad` on a phone; the code is 8 digits, and a letter cannot be typed into it.
-            keyboardType="number-pad"
-            autoCapitalize="none"
-            autoCorrect={false}
-            editable={!busy}
-            maxLength={12}
-            // The one-time code stays on screen only while typing; it is never persisted.
-            textContentType="oneTimeCode"
-            importantForAutofill="no"
-          />
-          <TouchableOpacity
-            style={[styles.primary, (busy || otpCode.trim() === '') && styles.disabled]}
-            testID="pair-otp-submit"
-            accessibilityRole="button"
-            disabled={busy || otpCode.trim() === ''}
-            onPress={() => void submitOtp()}
-          >
-            <Text style={styles.primaryText}>{tr('pair.submit')}</Text>
-          </TouchableOpacity>
+          {/* Spec 031 §8: a page that is not the gateway's origin has no verified route, so the code
+              flow is refused here with the host/HTTPS guidance — never an address to type instead.
+              The box sits where the form would be, so a pairing link cannot hide the reason. */}
+          {otpBlocked ? (
+            <View style={styles.error} accessibilityRole="alert">
+              <Text style={styles.errorTitle}>{tr('pair.errorTitle')}</Text>
+              {webOrigin !== null ? <Text style={styles.errorText}>{tr('pair.webOrigin', { origin: webOrigin })}</Text> : null}
+              <Text style={styles.errorText} testID="pair-web-unsupported">{tr(webUnsupportedKey ?? 'pair.webUnsupported')}</Text>
+            </View>
+          ) : (
+            <>
+              {prefilled ? (
+                <Text style={styles.addressHint}>{tr('pair.linkPrefilled')}</Text>
+              ) : null}
+              {webGatewayUrl !== null ? (
+                <>
+                  {/* Read-only on purpose: this is the address the page really dials, and a field
+                      here was editable while its input was ignored (spec 031 §8). */}
+                  <Text style={styles.section}>{tr('pair.webAddressLabel')}</Text>
+                  <Text style={styles.addressHint} testID="pair-otp-origin">{tr('pair.webOrigin', { origin: webOrigin ?? '' })}</Text>
+                  <Text style={styles.addressHint}>{tr('pair.webOriginFixed', { url: webGatewayUrl })}</Text>
+                </>
+              ) : (
+                <>
+                  {/* Native: the form is typeable, but the code itself is refused before any
+                      connection (a code carries no certificate to pin), as it always was. */}
+                  <Text style={styles.section}>{tr('pair.otpAddress')}</Text>
+                  <TextInput
+                    style={styles.input}
+                    testID="pair-otp-address"
+                    value={otpAddress}
+                    onChangeText={setOtpAddress}
+                    placeholder={tr('pair.otpAddressPlaceholder')}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    editable={!busy}
+                    textContentType="none"
+                    importantForAutofill="no"
+                  />
+                </>
+              )}
+              <Text style={styles.section}>{tr('pair.otpCode')}</Text>
+              <TextInput
+                style={styles.otpInput}
+                testID="pair-otp-input"
+                value={otpCode}
+                onChangeText={setOtpCode}
+                placeholder={tr('pair.otpPlaceholder')}
+                // `number-pad` on a phone; the code is 8 digits, and a letter cannot be typed into it.
+                keyboardType="number-pad"
+                autoCapitalize="none"
+                autoCorrect={false}
+                editable={!busy}
+                maxLength={12}
+                // The one-time code stays on screen only while typing; it is never persisted.
+                textContentType="oneTimeCode"
+                importantForAutofill="no"
+              />
+              <TouchableOpacity
+                style={[styles.primary, (busy || otpCode.trim() === '') && styles.disabled]}
+                testID="pair-otp-submit"
+                accessibilityRole="button"
+                disabled={busy || otpCode.trim() === ''}
+                onPress={() => void submitOtp()}
+              >
+                <Text style={styles.primaryText}>{tr('pair.submit')}</Text>
+              </TouchableOpacity>
+            </>
+          )}
         </>
       ) : (
         <>
@@ -301,15 +371,22 @@ export function PairPanel(props: {
             </View>
           )}
 
-          <Text style={styles.section}>{tr('pair.manual')}</Text>
           {/* Spec 020: on the web the app reaches the gateway through the origin it was served from
               (`tailscale serve` routes `/ws/mobile` there), not the self-signed address inside the QR —
               a browser refuses that one before any frame moves. Say which address will be used, so the
               owner is never surprised by what the app dials. Native reads `null` here, so this line
-              never appears on a phone. */}
+              never appears on a phone.
+              Spec 031 §8: the same page origin is also the OTP target, so the unsupported-host
+              guidance is shown up front instead of only under the code tab. */}
           {webGatewayUrl !== null ? (
             <Text style={styles.addressHint}>{tr('pair.webAddress', { url: webGatewayUrl })}</Text>
+          ) : webUnsupportedKey !== null ? (
+            <View style={styles.notice}>
+              {webOrigin !== null ? <Text style={styles.noticeText}>{tr('pair.webOrigin', { origin: webOrigin })}</Text> : null}
+              <Text style={styles.noticeText}>{tr(webUnsupportedKey)}</Text>
+            </View>
           ) : null}
+          <Text style={styles.section}>{tr('pair.manual')}</Text>
           <TextInput
             style={styles.input}
             testID="pair-manual-input"
@@ -341,19 +418,20 @@ export function PairPanel(props: {
 }
 
 /**
- * The gateway address a one-time-code pairing dials.
+ * The gateway address a one-time-code pairing dials ON NATIVE.
  *
  * The Host dialog shows `host:port` (its `lan.urls` host list), which is not a URL: the scheme, the
- * `/ws/mobile` path and `wss` are ours to add. On the WEB build the page's own origin wins outright
- * (spec 020 — `tailscale serve` already routes `/ws/mobile` there, and a browser cannot trust the
- * Host's self-signed listener), so an empty or partial typed address still reaches the gateway.
+ * `/ws/mobile` path and `wss` are ours to add. A phone refuses the code before it gets here anyway
+ * (a code carries no certificate to pin, see `submitOtp`); the form stays for the flow's shape.
+ *
+ * Spec 031 §8: the browser has no use for this — its only address is the page's own origin
+ * (`planOtpAddress`), and a typed fallback is exactly the override that used to be ignored.
  *
  * Returns null when the result is not a `wss://` URL with a host: a caller must not hand the
  * transport something it will refuse with `client/bad-url` after opening a screen.
  */
-export function otpGatewayUrl(typed: string, sameOrigin: string | null): string | null {
+export function otpGatewayUrl(typed: string): string | null {
   const raw = typed.trim();
-  if (sameOrigin !== null && raw === '') return sameOrigin;
   if (raw === '') return null;
   let candidate: URL;
   try {
@@ -365,8 +443,7 @@ export function otpGatewayUrl(typed: string, sameOrigin: string | null): string 
   if (candidate.username !== '' || candidate.password !== '') return null;
   // A typed host:port has no path; give it the gateway's.
   if (candidate.pathname === '/' || candidate.pathname === '') candidate.pathname = GATEWAY_WS_PATH;
-  // On the web the page's origin is the one address the browser can actually reach.
-  return sameOrigin !== null ? sameOrigin : candidate.toString();
+  return candidate.toString();
 }
 
 function errorKey(kind: ReturnType<typeof pairErrorFromCode>): MessageKey {
