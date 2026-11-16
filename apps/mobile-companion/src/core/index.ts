@@ -128,3 +128,6 @@ export type { GoalView, SessionPanel, TodoListItem, TodoStatus, TodoStatusView }
 // Spec 032: the build-time store-screenshot flag — the whole gate decision, unit-tested in the core.
 export { decideScreenshotMode, isProductionProfile, resolveBuildProfile, SCREENSHOT_MODE_EXTRA_KEY } from './screenshot-mode';
 export type { ScreenshotDecision, ScreenshotDecisionReason, ScreenshotGate, ScreenshotModeInput } from './screenshot-mode';
+// Spec 032: WHERE a demo pairing failed — the controller logs the stage, the pair screen shows it.
+export { PAIR_FAILURE_STAGE, pairFailureDetail, pairFailureStageFromCode } from './pair-failure';
+export type { PairFailureStage } from './pair-failure';

@@ -85,7 +85,11 @@ describe('pair screen hooks', () => {
     // and an unsupported host gets its own guidance box instead of the code form.
     assert.equal(count(ids, 'pair-otp-origin'), 1);
     assert.equal(count(ids, 'pair-web-unsupported'), 1);
+    // Spec 032 amendment: the DEMO-ONLY diagnosis line (`code · stage=…`). Static and rendered once;
+    // the panel gates it on `controller.demoMode`, so a shipped screen renders no such element.
+    assert.equal(count(ids, 'pair-failure-detail'), 1);
     assert.deepEqual(ids.toSorted(), [
+      'pair-failure-detail',
       'pair-manual-input',
       'pair-mode-code',
       'pair-mode-otp',

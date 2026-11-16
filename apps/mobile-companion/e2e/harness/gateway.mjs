@@ -17,7 +17,9 @@
 // WHAT IT ADDS OVER `test/support/fake-gateway.ts`
 //   * binds and advertises `127.0.0.1` by default; a phone on the LAN is an explicit opt-in
 //     (`--bind <hostIP|0.0.0.0> --lan-host <hostIP>`, warned about at startup);
-//   * prints the pairing QR text and rotates it on demand (codes are one-time and ≤ 5 min TTL);
+//   * prints the pairing QR text and rotates it on demand. Every advertised code is accepted until
+//     its own `expiresAt` (≤ 5 min), a code is consumed at most once, and `--fixed-pairing-code`
+//     stays accepted across rotations — so "fetch a payload, paste it" always works;
 //   * a loopback-only control API so a test run can force the scenario (drop sockets, revoke,
 //     change an approval hash, refuse the upgrade with 401/403, gate the protocol version);
 //   * certificate modes (wrong / expired / not-yet-valid) built for the pin and validity checks;
@@ -78,6 +80,11 @@ const PAIRING_NONCE = /^[A-Za-z0-9_-]{16,64}$/
 const PAIRING_PROOF_TYPE = 'pairing-proof'
 /** Refusals of pre-admission frames allowed before the pairing socket is closed (contract §3.8). */
 const PAIRING_MAX_REFUSALS = 3
+/**
+ * How many minted offers stay advertised (`GET /state` → `pairing.qr`). Older codes are still
+ * accepted until their own expiry; only the printed payload rotates.
+ */
+const MAX_ADVERTISED_OFFERS = 8
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -222,8 +229,15 @@ class FixtureGateway {
     this.connections = new Set()
     /** Accepted bearer/device tokens. */
     this.tokens = new Set()
-    /** Outstanding, unused pairing codes. */
-    this.pairingCodes = new Set()
+    /**
+     * Outstanding, unused pairing codes → their own expiry (epoch ms).
+     *
+     * An accepted code is one the upgrade will take AND whose real expiry has not passed: a code
+     * minted by `/pairing/new`, plus `--fixed-pairing-code` when the operator set one. Admission
+     * removes the entry (the code is one-time), so this map is the at-most-once bookkeeping that
+     * `evidence.offeredPairingCodes` / `consumedPairingCodes` report.
+     */
+    this.pairingCodes = new Map()
     /**
      * Spec 011: sessions created through `session-create`, in creation order. They are served by
      * every later `sessions`/`search` answer so the app's refresh really sees the new row.
@@ -320,21 +334,18 @@ class FixtureGateway {
     this.publicPort = await this.listen()
     this.endpoint = `wss://${formatHost(publicHost)}:${this.publicPort}`
 
-    // One-time / rotating pairing offer.
-    if (this.options.fixedPairingCode !== null) {
-      const code = this.options.fixedPairingCode
-      this.pairingCodes.add(code)
-      this.offer = buildPairingOffer({
-        publicUrl: this.endpoint,
-        certSha256: this.certificateSet.advertisedSha256,
-        gatewayId: this.gatewayId,
-        gatewayName: this.options.name,
-        pairingCode: code,
-        ttlMs: this.options.ttlMs,
-      })
-    } else {
-      this.rotatePairingCode()
-    }
+    // Pairing offers: the advertised payload(es) come from `mintPairingOffer`, which is also the
+    // single place that records an accepted code — so what the payload advertises and what the
+    // upgrade accepts cannot drift apart (MEASURED BUG: `--fixed-pairing-code` used to be accepted
+    // while `/pairing/new` advertised something else, and a rotate then left the operator's code the
+    // only working one while the printed payload was already dead).
+    this.offers = []
+    // The operator's own code is always accepted: it is the value `--fixed-pairing-code` documents
+    // as reusable across runs. It is advertised with the same TTL as a minted code (≤ 5 min per
+    // contract §2), and it is re-advertised (fresh `expiresAt`) on every `/pairing/new` — a code
+    // this fixture advertises must never be one it would refuse.
+    if (this.options.fixedPairingCode !== null) this.mintPairingOffer(this.options.fixedPairingCode)
+    if (this.offers.length === 0) this.mintPairingOffer()
 
     await this.startControlServer()
     return this
@@ -400,18 +411,86 @@ class FixtureGateway {
     })
   }
 
-  rotatePairingCode () {
-    const code = newPairingCode()
-    this.pairingCodes.add(code)
-    this.offer = buildPairingOffer({
+  /**
+   * Mint one pairing offer and accept its code until that offer's own `expiresAt`.
+   *
+   * The payload `expiresAt` IS the code's expiry: one clock read, one value, so the advertisement
+   * and the acceptance rule cannot disagree. Minting never invalidates another code — rotating is
+   * not expiring (a client that already fetched a payload keeps working until its own expiry, which
+   * is what "rotate" has to mean for a capture run). With `--fixed-pairing-code`, the operator's
+   * code IS the advertisement: the payload is rebuilt for it with a fresh `expiresAt` instead of
+   * advertising a second code the operator never sees.
+   */
+  mintPairingOffer (pairingCode) {
+    const fixed = this.options.fixedPairingCode
+    const expiresAt = Date.now() + this.options.ttlMs
+    const code = pairingCode ?? fixed ?? newPairingCode()
+    const offer = buildPairingOffer({
       publicUrl: this.endpoint ?? null,
       certSha256: this.certificateSet.advertisedSha256,
       gatewayId: this.gatewayId,
       gatewayName: this.options.name,
       pairingCode: code,
-      ttlMs: this.options.ttlMs,
+      expiresAt,
     })
-    return this.offer
+    this.pairingCodes.set(offer.pairingCode, offer.expiresAt)
+    // A re-advertised code is not a second offer: replace its entry so the list stays one payload
+    // per code and the newest (current) expiry is the one printed.
+    this.offers = this.offers.filter((entry) => entry.pairingCode !== offer.pairingCode)
+    this.offers.push(offer)
+    // Bounded history: an older payload is still accepted until its own expiry, it just stops being
+    // advertised once newer ones exist.
+    while (this.offers.length > MAX_ADVERTISED_OFFERS) this.offers.shift()
+    return offer
+  }
+
+  /**
+   * The pairing offer advertised right now (printed at startup, `POST /pairing/new`, `GET /state`).
+   *
+   * Only offers whose code is still accepted are advertised: a payload this fixture would refuse
+   * must never be the one an operator pastes. `alsoAccepted` names the other live codes (normal
+   * when a rotate happened inside the TTL), and is additive — readers of `qr` / `pairingCode` /
+   * `expiresAt` / `payload` are unaffected.
+   */
+  get offer () {
+    const live = this.offers.filter((entry) => this.acceptsPairingCode(entry.pairingCode))
+    const advertise = live.at(-1) ?? this.offers.at(-1)
+    if (live.length <= 1) return advertise
+    return {
+      ...advertise,
+      alsoAccepted: live
+        .filter((entry) => entry.pairingCode !== advertise.pairingCode)
+        .map((entry) => ({ pairingCode: entry.pairingCode, expiresAt: entry.expiresAt })),
+    }
+  }
+
+  /** Every code the upgrade would accept right now, with the expiry it was accepted until. */
+  acceptedPairingCodes () {
+    const now = Date.now()
+    return [...this.pairingCodes].map(([code, expiresAt]) => ({ code, expiresAt, expired: expiresAt <= now }))
+  }
+
+  /**
+   * Is this code acceptable right now? One rule, used by the upgrade: known, and not past the
+   * `expiresAt` its own payload advertised. An expired entry is dropped on sight.
+   */
+  acceptsPairingCode (code) {
+    const expiresAt = this.pairingCodes.get(code)
+    if (expiresAt === undefined) return false
+    if (expiresAt > Date.now()) return true
+    this.pairingCodes.delete(code)
+    return false
+  }
+
+  /**
+   * Consume a code (one-time, at most once). Returns `true` when this call consumed it, so a second
+   * proof on the same code can never take it twice and the evidence lists the code exactly once.
+   */
+  consumePairingCode (code) {
+    if (!this.acceptsPairingCode(code)) return false
+    this.pairingCodes.delete(code)
+    this.evidence.consumedPairingCodes.push(code)
+    return true
   }
 
   async startControlServer () {
@@ -440,7 +519,10 @@ class FixtureGateway {
     if (/[?&](token|pairingCode|pairing_code)=/.test(url)) return { status: 401, reason: 'credential-in-query' }
     if (this.authFrom(request) !== null) return null
     const pairing = this.pairingFrom(request)
-    if (pairing !== null && this.pairingCodes.has(pairing.code)) return null
+    // Accepted = the code is in the accepted set AND not past its own expiry. Unknown and expired
+    // both refuse with the contract's one wording (`pairing/expired`), and an expired entry is
+    // dropped rather than remembered.
+    if (pairing !== null && this.acceptsPairingCode(pairing.code)) return null
     return { status: 401, reason: pairing === null ? 'no-credential' : 'pairing/expired' }
   }
 
@@ -592,8 +674,17 @@ class FixtureGateway {
   admitPairing (connection, clientNonce) {
     const pairing = connection.pairing
     if (pairing === null || pairing.pending !== null) return
-    this.pairingCodes.delete(pairing.code)
-    this.evidence.consumedPairingCodes.push(pairing.code)
+    // The upgrade checked the code, but the proof is what consumes it: a code whose TTL ran out
+    // between the two frames is no longer a credential, and a second proof on an already-consumed
+    // code must not re-admit (at most once). Both close 4410 like the OTP-expiry path.
+    if (!this.consumePairingCode(pairing.code)) {
+      this.evidence.pairingRejections.push({ reason: 'pairing/expired', close: PAIRING_CLOSE_CODES.expired })
+      if (connection.socket.readyState === 1) {
+        connection.socket.send(JSON.stringify({ kind: 'pairing-rejected', reason: 'pairing/expired' }))
+      }
+      connection.socket.close(PAIRING_CLOSE_CODES.expired, 'pairing/expired')
+      return
+    }
     this.evidence.pairingProofs.push(clientNonce)
     pairing.proofNonce = clientNonce
     pairing.admitted = true
@@ -1067,10 +1158,19 @@ class FixtureGateway {
     const run = async () => {
       const body = await readBody()
       switch (`${request.method} ${url.pathname}`) {
-        // Rotate the one-time pairing code (codes are consumed at first use and expire in ≤ 5 min).
+        // Mint a fresh pairing code and advertise it. The returned payload is accepted end to end
+        // until its own `expiresAt`, and the codes already advertised stay accepted until theirs —
+        // a rotate never invalidates a payload a client just fetched.
         case 'POST /pairing/new': {
-          const offer = this.rotatePairingCode()
-          return json(200, { qr: offer.text, pairingCode: offer.pairingCode, expiresAt: offer.expiresAt, endpoint: this.endpoint })
+          const offer = this.mintPairingOffer()
+          return json(200, {
+            qr: offer.text,
+            pairingCode: offer.pairingCode,
+            expiresAt: offer.expiresAt,
+            endpoint: this.endpoint,
+            // Truthful view of what is accepted right now (additive field, no reader depends on it).
+            acceptedPairingCodes: this.acceptedPairingCodes(),
+          })
         }
         // Hold a pairing in `pairing-pending` until approve/reject/expire (contract §3.8), so a
         // device run can exercise the real two-party approval flow.
@@ -1249,7 +1349,16 @@ class FixtureGateway {
       advertisedSha256: this.certificateSet.advertisedSha256,
       servedSha256: sha256OfCertificate(this.certificateSet.served.cert),
       servedWindow: this.certificateSet.served.window,
-      pairing: this.offer === undefined ? null : { qr: this.offer.text, pairingCode: this.offer.pairingCode, expiresAt: this.offer.expiresAt },
+      pairing: this.offer === undefined ? null : {
+        qr: this.offer.text,
+        pairingCode: this.offer.pairingCode,
+        expiresAt: this.offer.expiresAt,
+        // The decoded payload: a capture procedure stages the exact text it will paste, never a
+        // byte-align of `pbcopy` guesses. `null` publicUrl when read before the listener is up.
+        payload: this.offer.payload,
+        // Codes still accepted (each until its own expiry), including `--fixed-pairing-code`.
+        accepted: this.acceptedPairingCodes(),
+      },
       scenario: { ...this.scenario, mismatchOnce: [...this.scenario.mismatchOnce] },
       sessions: this.sessionRows(),
       approvals: this.approvals,
@@ -1346,9 +1455,16 @@ if (options.help) {
   --lan-host <ip|auto>     host written into the pairing QR (default 127.0.0.1; 'auto' = first
                            non-internal IPv4, for a deliberate LAN run)
   --name <name>            gatewayName shown before pairing (default dsh-e2e)
-  --fixed-pairing-code <c> reuse one code instead of rotating (repeatable runs)
+  --fixed-pairing-code <c> also accept this operator code; it is the one the payload advertises and
+                           it survives a rotate (repeatable runs)
+  --ttl-ms <ms>            pairing-code lifetime for every advertised code (default 240000; the
+                           contract caps an advertised expiry at 5 min)
   --print-json             print one JSON startup block (for scripts)
   --quiet                  only print the startup block/QR
+
+Every advertised code (a minted one and --fixed-pairing-code alike) is accepted until its own
+expiresAt and consumed at most once; POST /pairing/new (x-fixture-token) mints another without
+invalidating the ones already out.
 
 Docs: apps/mobile-companion/e2e/README.md
 `)
@@ -1381,8 +1497,9 @@ if (options.printJson) {
   approvals     ${startup.approvals.map((approval) => `${approval.approvalId}(${approval.argsHash === null ? 'null-hash' : 'hash'})`).join(', ')}
 
   Post the QR below into the app (pair screen, "Or paste the code shown on your computer").
-  It is single-use and expires at ${new Date(startup.pairing.expiresAt).toISOString()}:
-  POST ${startup.controlUrl}/pairing/new  (x-fixture-token) rotates it.
+  It is single-use and expires at ${new Date(startup.pairing.expiresAt).toISOString()}.
+  POST ${startup.controlUrl}/pairing/new  (x-fixture-token) mints another one; every code it has
+  handed out stays accepted until its own expiry.
 
   ${startup.pairing.qr}
 `)

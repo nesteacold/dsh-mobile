@@ -537,10 +537,35 @@ screenshot flag is read while the app is built and bundled, so a variable set on
 reaches the Mac.
 
 `<App>` / `<Scheme>` are the generated project's own names (`expo prebuild` takes them from
-`app.json`); read them from `ios/`. **One** simulator only: `SIM` is assigned in step 2, on the Mac
-shell itself, and every `simctl` call and the `xcodebuild` name it explicitly, so this run never
-touches another booted simulator on the owner's Mac. A bare `booted` would select whichever device
-happens to be booted.
+`app.json`); read them from `ios/`. **One** simulator only — the `SIM` rule below.
+
+**The five traps that cost a run** (each one measured; fold them in, do not rediscover them):
+
+| Trap | What actually happens | What to do instead |
+|---|---|---|
+| `ssh mac 'cmd'` without `-T` | the command runs but **no output** comes back when the caller is not a terminal: the run looks dead and you retry blind | `ssh -T mac 'cmd'` for anything whose real output you need to read (`ssh -T mac 'xcrun simctl list devices'`) |
+| `POST /pairing/new` without the control token | **403** `missing or wrong x-fixture-token` — the caller then "falls back" to the startup code and the paste fails later for an unrelated-looking reason | send the header: `-H "x-fixture-token: $(…controlToken from the startup block…)"`; the token is per run |
+| `simctl pbcopy` before the Mac's `pbcopy` | the **first** `pbcopy` into the simulator empties the Mac clipboard, so copying Mac-side after it stages an empty string and the paste field stays blank | copy on the **Mac first**, then `simctl pbcopy`: `printf %s "$QR" \| pbcopy` **then** `printf %s "$QR" \| xcrun simctl pbcopy "$SIM"` |
+| `idb ui press` | this `idb` has **no `ui press`** subcommand — long-press is not available that way | long-press with a zero-length swipe: `idb ui swipe <x> <y> <x> <y> --duration 1.5` |
+| `idb ui text "$QR"` | the payload is **non-ASCII-safe base64url**, and `ui text` mangles it (same class of corruption as the Android `input text` trap in `device-validation.md` §2.4) | never type the payload. Use the clipboard (`pasteText`, a paste-menu tap) and prove the field with `idb ui describe-all` before submitting |
+
+Two more that are not shortcuts but preconditions:
+
+- **`idb` must be bound to the target UDID.** `idb` talks to a *companion daemon per device*; started
+  against anything else it drives the wrong simulator (or none) and every swipe types into a screen
+  nobody is capturing. Bind it explicitly —
+  `open -a Simulator --args -CurrentDeviceUDID "$SIM"` — and then **terminate and relaunch** the app
+  (`xcrun simctl terminate … ; xcrun simctl launch …`), because the running process keeps the surface
+  it was started on. Verify with `idb list-targets` that the bound UDID is `$SIM`.
+- **Verify the field, then submit.** `idb ui describe-all` must show the pair field carrying exactly
+  the payload, and `pair-submit` must be *enabled* (it is disabled while the field is empty — the same
+  proof the Maestro flow uses). Only then tap `pair-submit`. A submit on a corrupted paste spends the
+  one-time code and looks like a fixture failure.
+
+**The `SIM` rule (do not weaken it).** `SIM` is assigned in step 2, in the Mac shell itself, and every
+`simctl` call and the `xcodebuild` name it explicitly. Never use a bare `booted`: that selects
+whichever simulator happens to be booted, which on the owner's Mac may be someone else's device, and
+`idb`/`simctl pbcopy`/screenshots would then hit it.
 
 ```bash
 # 1. stage the source: Git Bash on Windows, in the repo (NOT PowerShell 5.1 — it decodes the
@@ -552,8 +577,8 @@ git archive HEAD | ssh mac 'mkdir -p ~/.dsh-ios-build/sim/src && tar -x -C ~/.ds
 # 2. on the Mac. Local values do not cross ssh: SIM is assigned here, in this shell, and exported
 #    so step 5's xcodebuild and every later step read it.
 ssh mac
-SIM=<udid>                                   # xcrun simctl list devices: pick the Shutdown one,
-                                             # NOT `booted` — another simulator may be booted
+SIM=<udid>                                   # ssh -T mac 'xcrun simctl list devices' — pick the
+                                             # Shutdown one, NOT `booted` (see the SIM rule)
 export PATH=/opt/homebrew/bin:$PATH LANG=en_US.UTF-8
 export DSH_SCREENSHOT_MODE=1 EAS_BUILD_PROFILE=development   # a release profile is refused
 export SIM
@@ -582,30 +607,69 @@ xcodebuild -workspace ios/<Scheme>.xcworkspace -scheme <Scheme> -configuration R
   -sdk iphonesimulator -destination "id=$SIM" -derivedDataPath ~/.dsh-ios-build/sim/dd \
   CODE_SIGNING_ALLOWED=NO build
 
-# 6. run it on the one simulator
-xcrun simctl boot "$SIM"                     # only if it is listed as Shutdown (booting a booted
+# 6. install, and bind the tooling to this ONE simulator (the idb precondition, above)
+xcrun simctl boot "$SIM" 2>/dev/null || true  # only if it is listed as Shutdown (booting a booted
                                              # device fails; `booted` may be someone else's)
 xcrun simctl install "$SIM" ~/.dsh-ios-build/sim/dd/Build/Products/Release-iphonesimulator/<App>.app
+open -a Simulator --args -CurrentDeviceUDID "$SIM"
+idb list-targets | grep -i "$SIM"            # must appear, or idb is driving another device
 xcrun simctl launch "$SIM" com.dshext.companion
 
-# 7. fixture on loopback (the only Host this build will accept: codes are one-shot; start with --help to
-#    rotate a code). `<node>` is an absolute path a simulator run can reach, e.g. /usr/local/bin/node.
+# 7. fixture on loopback (the only Host this build will accept). <node> is an absolute path a
+#    simulator run can reach, e.g. /usr/local/bin/node.
 <node> e2e/harness/gateway.mjs --bind 127.0.0.1 --lan-host 127.0.0.1 \
-  --port 3443 --control-port 3444 --fixed-pairing-code <43-char base64url code> &
-#    -> print pairing code / endpoint from the startup block (--print-json)
+  --port 3443 --control-port 3444 --print-json > /tmp/fixture.json &
+#    -> /tmp/fixture.json is the startup block: .pairing.qr (the payload to paste),
+#       .pairing.pairingCode, .pairing.expiresAt, .controlUrl, .controlToken.
+#    Pairing codes accepted now: .pairing.accepted (each until its own expiresAt). The fixture also
+#    accepts --fixed-pairing-code and re-advertises it on every rotate, but this run does not need it.
 
 # 8. a status bar a store reviewer expects (no carrier/battery noise)
 xcrun simctl status_bar "$SIM" override --time 9:41 --batteryState charged --batteryLevel 100 \
   --cellularMode active --cellularBars 4 --wifiBars 3
 xcrun simctl ui "$SIM" appearance dark      # or light: the app follows the system scheme
 
-# 9. pair inside the app (Pair screen, "paste the code shown on your computer") using step 7's code.
-#    The pin comes from the pairing payload itself; the native transport checks the leaf.
+# 9. PAIR — clipboard order matters (trap 3), and the payload is never typed (trap 5).
+QR=$(python3 -c 'import json;print(json.load(open("/tmp/fixture.json"))["pairing"]["qr"])')
+printf %s "$QR" | pbcopy                     # Mac clipboard FIRST ...
+open -a Simulator --args -CurrentDeviceUDID "$SIM"
+#    ... THEN the simulator's, in this order only: the reverse empties the Mac's.
+printf %s "$QR" | xcrun simctl pbcopy "$SIM"
+#    If you need a fresh payload (a code burned by a bad paste), mint one — with the token:
+#      curl -s -X POST http://127.0.0.1:3444/pairing/new -H "x-fixture-token: <controlToken>" \
+#        | python3 -c 'import json,sys;print(json.load(sys.stdin)["qr"])'
+#    A new code is accepted until its own expiresAt; minting never invalidates the old one, and a
+#    consumed code is gone for good (at most once).
+# 9a. reach the paste field, long-press it, choose Paste (idb has no `ui press` — trap 4):
+#       idb ui describe-all                     # find the pair field's frame, read its centre
+#       idb ui swipe <x> <y> <x> <y> --duration 1.5
+# 9b. PROVE the field before submitting (never submit a suspect paste):
+#       idb ui describe-all | grep -A2 pair-manual-input
+#       #   the field's value must equal "$QR" exactly, and pair-submit must be enabled.
+#     Then tap pair-submit. The pin comes from the payload; the native transport checks the leaf.
 
 # 10. screenshots (per screen, after the app settles; 1 s is enough on a simulator)
 mkdir -p ~/.dsh-ios-build/artifacts/shots
 xcrun simctl io "$SIM" screenshot ~/.dsh-ios-build/artifacts/shots/01-home.png
 ```
+
+**If pairing still refuses, read the fixture's own evidence before touching the app** — it says which
+code arrived and whether it was refused:
+
+```bash
+curl -s http://127.0.0.1:3444/state | python3 -c '
+import json,sys; s=json.load(sys.stdin)
+print("accepted now:", [c["code"][:8] for c in s["pairing"]["accepted"]])
+print("offered     :", [c[:8] for c in s["evidence"]["offeredPairingCodes"]])
+print("consumed    :", [c[:8] for c in s["evidence"]["consumedPairingCodes"]])
+print("refusals    :", s["evidence"]["upgradeRefusals"])'
+```
+
+`offeredPairingCodes` = the codes that reached the upgrade, `consumedPairingCodes` = the ones a proof
+took (at most once each), `accepted` = what the fixture would take right now. A code in `offered` but
+never `consumed`, with a `pairing/expired` refusal, means the paste was stale (past its `expiresAt`):
+mint a fresh one. A code in neither list means the clipboard/paste did not land — go back to step 9b.
+
 
 **MAT-032-PIN** (the native pin, proven on this simulator build). Stop the capture fixture first,
 then run a SECOND fixture with a DIFFERENT leaf on its OWN ports (never reuse 3443/3444), pair, and
@@ -629,8 +693,10 @@ execute the Swift delegate, so MAT-032-PIN needs the native simulator run above.
 `simulator` constant is conditional (`#if targetEnvironment(simulator)`); the delegate itself is
 inside every build.
 
-**Which screens** (capture at least these; the status line `screenshot mode · demo data only`
-proves the build is a demo build):
+**Which screens** (capture at least these). The unlocked-demo gate returns without prompting, so the
+lock screen's `screenshot mode · demo data only` line is never rendered in this build and proves
+nothing here: the evidence that this is the demo build is that the gate opens with no Face ID prompt
+on a headless simulator, plus the baked-in flag (check the installed bundle's `app.config`/`extra`).
 
 | # | Screen | How to reach it |
 |---|---|---|

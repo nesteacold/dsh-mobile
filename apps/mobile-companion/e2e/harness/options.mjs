@@ -85,6 +85,10 @@ export function parseFixtureArgs (argv) {
       case '--lan-host': options.lanHost = next(); break
       case '--name': options.name = next(); break
       case '--fixed-pairing-code': options.fixedPairingCode = next(); break
+      // Pairing-code lifetime, shared by minted and `--fixed-pairing-code` offers. Contract §2 caps
+      // the advertised `expiresAt` at 5 min; a test passes a short value to exercise the real
+      // expiry refusal instead of waiting it out.
+      case '--ttl-ms': options.ttlMs = Number(next()); break
       case '--print-json': options.printJson = true; break
       case '--quiet': options.quiet = true; break
       case '--help':

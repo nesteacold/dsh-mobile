@@ -41,8 +41,10 @@ import {
   normalizeOtp,
   PAIRING_QR_VERSION,
   pairedHostFromPayload,
+  PAIR_FAILURE_STAGE,
   parsePairingQr,
   parseSessionDeepLink,
+  redactString,
   withSameOriginEndpoint,
   type ApprovalCardStatus,
   type ApprovalRequestedFrame,
@@ -1516,7 +1518,20 @@ export class AppController {
     } else {
       const parsed = this.parsePairPayload(raw);
       if (!parsed.ok) {
-        this.debug.warn('pair rejected: unusable pairing payload', { errorCode: parsed.code });
+        // Spec 032 amendment: a demo pairing that dies HERE is indistinguishable from one that dies
+        // later — both reach the screen as `pair.error.generic`. The refuse itself is unchanged; the
+        // diagnosis carries `stage: 'parse'` so the demo-only detail line (pair-panel) can say WHICH
+        // step refused. The head of the payload is the one thing that identifies a garbled copy, and
+        // it is only ever logged redacted: `redactString` masks the pairing code, a `dsh-pair.<code>`
+        // subprotocol, tokens in a URL and any bearer/JWT, so a real secret cannot reach the log.
+        this.debug.warn('pair rejected: unusable pairing payload', {
+          stage: PAIR_FAILURE_STAGE.parse,
+          // The stage a real failure reached, with the code that refuses it. In demo mode the
+          // detail line shows exactly this.
+          errorCode: parsed.code,
+          rawLength: raw.length,
+          rawHead: redactString(raw.slice(0, 24)),
+        });
         this.pairing = { kind: 'qr', code: parsed.code, message: parsed.message };
         this.bump();
         return { ok: false, code: parsed.code, message: parsed.message };
@@ -1534,7 +1549,16 @@ export class AppController {
     if (this.screenshotMode !== null && !isLoopbackPairingEndpoint([payload.publicUrl, ...payload.endpoints])) {
       const code = 'client/bad-url';
       const message = 'Screenshot builds pair only with the local demo gateway';
-      this.debug.warn('pair rejected: screenshot mode pairs only with the loopback demo fixture', { errorCode: code });
+      this.debug.warn('pair rejected: screenshot mode pairs only with the loopback demo fixture', {
+        stage: PAIR_FAILURE_STAGE.demoLoopback,
+        errorCode: code,
+        // Host addresses, not secrets: they are the reason the refusal fired (a demo build accepted
+        // only a loopback endpoint), and `redactString` still masks a credential or a query value a
+        // payload could carry. In demo mode the detail line shows them.
+        publicUrl: payload.publicUrl,
+        endpoints: payload.endpoints,
+        reason: 'non-loopback',
+      });
       this.pairing = { kind: otpFlow ? 'connect' : 'qr', code, message };
       this.bump();
       return { ok: false, code, message };

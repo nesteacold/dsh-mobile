@@ -21,6 +21,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 
 import type { AppController, AppStateSnapshot } from '../app-state';
 import { GATEWAY_WS_PATH, planOtpAddress, planPairSubmit } from '../core/gateway-address';
+import { pairFailureDetail, pairFailureStageFromCode } from '../core/pair-failure';
 import { normalizeOtp, OTP_DIGITS } from '../core/pairing-otp';
 import { readWebLocation } from '../platform/web-location';
 import { consumePairHash } from '../platform/pair-hash';
@@ -61,6 +62,10 @@ export function PairPanel(props: {
   const [busy, setBusy] = useState(false);
   const [scanLocked, setScanLocked] = useState(false);
   const [failure, setFailure] = useState<MessageKey | null>(null);
+  // Spec 032: the code behind a generic failure, and the stage `pair()` recorded for it. Demo mode
+  // only (see `pairFailureDetail`); in a normal build `controller.demoMode` is false, `detail` stays
+  // null and nothing below renders — the shipped screen is unchanged.
+  const [failureCode, setFailureCode] = useState<{ code: string; stage: ReturnType<typeof pairFailureStageFromCode> } | null>(null);
   const [connectingTo, setConnectingTo] = useState<string | null>(null);
   // The gateway address this page dials (spec 020), or null on native / a page that is not served
   // from a tailnet HTTPS origin. Computed once: the origin cannot change under a mounted screen
@@ -110,6 +115,8 @@ export function PairPanel(props: {
     setOtpCode(link.otp);
     setFailure(null);
     setPrefilled(true);
+    // Spec 032: the previous failure's diagnosis goes with the failure it described.
+    setFailureCode(null);
   }, []);
   useEffect(() => {
     const link = consumePairHash();
@@ -141,9 +148,13 @@ export function PairPanel(props: {
         return;
       }
       setBusy(true);
+      // Spec 032: and the previous failure's diagnosis goes with the failure it described.
+      setFailureCode(null);
       const parsed = controller.parsePairPayload(raw);
       if (!parsed.ok) {
         setFailure(errorKey(pairErrorFromQr(parsed.code as never)));
+        // Spec 032: the panel refused before `pair()` ran, so the stage is the payload's own.
+        setFailureCode({ code: parsed.code, stage: pairFailureStageFromCode(parsed.code) });
         setBusy(false);
         setScanLocked(false);
         return;
@@ -157,6 +168,9 @@ export function PairPanel(props: {
       }
       setConnectingTo(null);
       setFailure(errorKey(pairErrorFromCode(result.code)));
+      // The controller logged the stage it refused at; `pair()` does not return it, so the code's
+      // own family decides it here (a `qr/*` refusal is the payload parse, anything else the attempt).
+      setFailureCode({ code: result.code, stage: pairFailureStageFromCode(result.code) });
       setScanLocked(false);
     },
     [busy, controller, onPaired, applyPairLink, web, refusalKey],
@@ -170,6 +184,7 @@ export function PairPanel(props: {
   const submitOtp = useCallback(async () => {
     if (busy) return;
     setFailure(null);
+    setFailureCode(null);
     const normalized = normalizeOtp(otpCode);
     if (!normalized.ok) {
       setFailure(normalized.reason === 'otp/empty' ? 'pair.error.otpRequired' : 'pair.error.otpBadLength');
@@ -207,13 +222,27 @@ export function PairPanel(props: {
     }
     setConnectingTo(null);
     setFailure(errorKey(pairErrorFromCode(result.code)));
+    setFailureCode({ code: result.code, stage: pairFailureStageFromCode(result.code) });
   }, [busy, controller, onPaired, otpCode, web, refusalKey]);
 
   // A pairing failure the controller recorded outside `pair()` (close 4004, version gate).
   useEffect(() => {
     if (snapshot.pairing === null) return;
     setFailure(errorKey(pairErrorFromCode(snapshot.pairing.code)));
+    setFailureCode({ code: snapshot.pairing.code, stage: pairFailureStageFromCode(snapshot.pairing.code) });
   }, [snapshot.pairing]);
+
+  /**
+   * Spec 032 — the demo-only diagnosis line, or `null`.
+   *
+   * `controller.demoMode` is the same fact the controller refuses every non-loopback pairing on, and
+   * it is the ONLY switch here: a normal build gets `null`, so the pair screen is unchanged. It is
+   * computed at render (not stored) so it can never outlive a controller swap, and only a GENERIC
+   * failure shows it — a code with its own copy already says what went wrong.
+   */
+  const failureDetail = failureCode === null || failure === null || failure !== 'pair.error.generic'
+    ? null
+    : pairFailureDetail({ demo: controller.demoMode, code: failureCode.code, stage: failureCode.stage });
 
   return (
     <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
@@ -239,6 +268,17 @@ export function PairPanel(props: {
         <View style={styles.error} accessibilityRole="alert">
           <Text style={styles.errorTitle}>{tr('pair.errorTitle')}</Text>
           <Text style={styles.errorText}>{tr(failure)}</Text>
+          {/*
+            Spec 032 — DEMO ONLY. Every cause above collapses into `pair.error.generic`, so a
+            capture run (docs/remote-ios-build.md §4.9a) cannot tell a garbled fixture payload from a
+            socket that never opened. This line names the code and the stage `pair()` refused at, in
+            monospace so it is readable in a screenshot; `pairFailureDetail` returns null in a normal
+            build, so a shipped screen renders exactly what it did before. Display text only: no
+            gate, refusal or transport option reads it.
+          */}
+          {failureDetail !== null ? (
+            <Text style={styles.failureDetail} testID="pair-failure-detail">{failureDetail}</Text>
+          ) : null}
         </View>
       ) : null}
 
@@ -250,7 +290,7 @@ export function PairPanel(props: {
           testID="pair-mode-code"
           accessibilityRole="tab"
           accessibilityState={{ selected: mode === 'code' }}
-          onPress={() => { setMode('code'); setFailure(null); }}
+          onPress={() => { setMode('code'); setFailure(null); setFailureCode(null); }}
         >
           <Text style={[styles.modeText, mode === 'code' && styles.modeTextActive]}>{tr('pair.modeCode')}</Text>
         </TouchableOpacity>
@@ -259,7 +299,7 @@ export function PairPanel(props: {
           testID="pair-mode-otp"
           accessibilityRole="tab"
           accessibilityState={{ selected: mode === 'otp' }}
-          onPress={() => { setMode('otp'); setFailure(null); }}
+          onPress={() => { setMode('otp'); setFailure(null); setFailureCode(null); }}
         >
           <Text style={[styles.modeText, mode === 'otp' && styles.modeTextActive]}>{tr('pair.modeOtp')}</Text>
         </TouchableOpacity>
@@ -504,6 +544,9 @@ function makeStyles(palette: Palette) {
     error: { padding: 14, borderRadius: 14, backgroundColor: palette.surface, gap: 4, borderWidth: StyleSheet.hairlineWidth, borderColor: palette.danger },
     errorTitle: { fontWeight: '700', color: palette.danger },
     errorText: { fontSize: 14, color: palette.text },
+    // Spec 032: the demo-only diagnosis (code · stage=…). Monospace and muted so it reads as a
+    // machine fact beside the human copy, never as the explanation itself.
+    failureDetail: { fontSize: 12, color: palette.textMuted, fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }) },
     section: { fontSize: 13, color: palette.textMuted, marginTop: 6 },
     addressHint: { fontSize: 12, color: palette.textMuted },
     modeRow: { flexDirection: 'row', gap: 8 },

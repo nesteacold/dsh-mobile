@@ -16,6 +16,7 @@ map of what is here and what runs today.
 | `check-flows.mjs` — static check of every flow (appId/separator, subflow targets, locale coverage, tap anchoring, hook ids, no opaque matchers) | **Yes** — `node e2e/check-flows.mjs` (30 flows, every `id:` resolved against `app/**` + `src/**`) | Node ≥ 24 |
 | `run-e2e.mjs --dry-run` — wiring check of every checkpoint | **Yes** — 23/23 checkpoints wired, all control routes answered | Node ≥ 24 |
 | `harness/options.test.mjs` — entry-point options: loopback defaults, explicit `--bind`/`--lan-host` opt-in, exposure warning | **Yes** — `node --test e2e/harness/options.test.mjs` | Node ≥ 24 |
+| `harness/pairing-codes.test.mjs` — accepted pairing codes: a `/pairing/new` payload pairs end to end, a consumed code is refused (401), `--fixed-pairing-code` pairs without a control call, an expired code is refused | **Yes** — `node --test e2e/harness/pairing-codes.test.mjs` (4 tests) | Node ≥ 24 |
 | Maestro flows (`maestro/*.yaml`) | **No** | a dev build + `maestro` CLI (+ `adb` for Android) |
 | Server-side assertions in `run-e2e.mjs` | **No** | the same, because they read state produced by the app |
 | iOS specifics (A041, A034, A047) | **No** | macOS + Xcode or an owner-approved EAS build |
@@ -38,6 +39,7 @@ e2e/
     pairing.mjs      QR v3 payload encode (independent of the app parser on purpose)
     selftest.mjs     plays the phone over real TLS; proves the fixture's frames (runs now)
     options.test.mjs option parsing: loopback defaults, explicit LAN opt-in (runs now)
+    pairing-codes.test.mjs accepted-code rule: rotate pairs, consumed/expired refuse (runs now)
   maestro/
     config.yaml      flow set + shared constants
     subflows/
@@ -82,6 +84,10 @@ node e2e/run-e2e.mjs --dry-run
 
 # 4. Entry-point options: loopback defaults, explicit LAN opt-in, exposure warning (no listener).
 node --test e2e/harness/options.test.mjs
+
+# 5. Accepted pairing codes: a /pairing/new payload pairs end to end, a consumed code is refused
+#    (401), --fixed-pairing-code pairs with no control call, an expired code is refused.
+node --test e2e/harness/pairing-codes.test.mjs
 ```
 
 ## Running against a device
@@ -334,6 +340,30 @@ goal/task strip in `24`) needs a fixture control route for `hello.capabilities`,
   emulator or Maestro on this machine: the flows are structurally checked (`check-flows.mjs`), their
   hooks are checked against `app/**` + `src/**`, and the wiring is dry-run — that is all this machine
   can prove. Do not report T-01…T-23 as passing without a `report.json` from a device run.
+
+## Pairing codes: what is advertised is what is accepted
+
+A pairing code is a credential the operator has to paste, so the fixture's accept rule and its
+advertised payload are one decision, made in one place (`mintPairingOffer` in `harness/gateway.mjs`):
+
+| Rule | Consequence |
+|---|---|
+| `--fixed-pairing-code` is **always accepted** and **is what the payload advertises** | the code printed at startup is the code that pairs; a rotate re-advertises it with a fresh `expiresAt` instead of advertising a second code the operator never sees |
+| every code minted by `POST /pairing/new` is accepted **until its own `expiresAt`** | the payload's `expiresAt` IS that code's expiry (one clock read), so a pasted payload cannot be a code the fixture already refuses |
+| minting never invalidates another code | rotating is not expiring: a payload fetched a minute ago still pairs until its own expiry |
+| a code is consumed **at most once**, by the proof | `evidence.consumedPairingCodes` names it once; a replay is a 401 at the upgrade |
+| an expired code is refused (401 `pairing/expired`) and dropped | `--ttl-ms <ms>` sets the lifetime (default 240000; the contract caps it at 5 min) — the expiry test uses a short one instead of waiting |
+
+`POST /pairing/new` answers `{ qr, pairingCode, expiresAt, endpoint, acceptedPairingCodes }`, and
+`GET /state` → `pairing` carries `{ qr, pairingCode, expiresAt, payload, accepted, … }`. `payload` is
+the decoded offer and `accepted` lists every code accepted right now (each with its own `expiresAt`),
+so a capture run can stage the exact text it pastes and read back what the fixture would take.
+
+**Why this section exists.** A measured bug: the fixture minted and accepted a `/pairing/new` code but
+advertised the `--fixed-pairing-code` payload it built at startup, so a client that fetched
+`/pairing/new` and pasted the answer always presented a code the fixture refused. The owner's capture
+flow depends on `/pairing/new`; `pairing-codes.test.mjs` now fails loudly if the two ever drift apart
+again.
 
 ## Two-party pairing controls (contract §3.8)
 
