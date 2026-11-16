@@ -1200,7 +1200,10 @@ describe('AppController credential cleanup races (M5)', () => {
       const result = await controller.pair(pairingPayload(gateway, code));
 
       assert.equal(result.ok, false);
-      if (!result.ok) assert.equal(result.code, 'client/bad-message');
+      // Spec 032 amendment: an unusable store is the platform's credential store being unavailable,
+      // not a bad frame — `src/platform/install-id.ts` types it, so it no longer lands as
+      // `client/bad-message`.
+      if (!result.ok) assert.equal(result.code, 'client/store-unavailable');
       assert.equal(controller.snapshot().pairing?.kind, 'connect');
       // The failure happened before anything reached the host or the store.
       assert.equal(gateway.connectionAttempts, 0);

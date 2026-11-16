@@ -61,7 +61,11 @@ mode (`AppController` `screenshotMode` option), which:
 - keeps its **own host/credential lifecycle** (`src/platform/demo-store.ts`, in memory, dies with
   the process). In demo mode **no path** — pair, connect, reconnect, revoke, forget, failed-pair
   cleanup, push registration, upload — reaches `readHosts` / `saveHost` / `forgetHost` /
-  `readToken` / `saveToken`: `start()` reads the demo store's list, `pair()` writes it, and
+  `readToken` / `saveToken`, **nor the secure-store install id** (`getInstallId`): the demo
+  controller uses a per-controller in-memory install id, so the demo makes zero secure-store calls
+  (amendment 2026-11-16: an unsigned simulator Release build cannot use the Keychain, and the
+  install-id read made demo `pair()` fail as `client/bad-message` before any socket);
+  `start()` reads the demo store's list, `pair()` writes it, and
   `deleteCredentialInstance` (the one transaction a revoke or a forget uses) calls
   `DemoStore.forgetHost`. The device's real credential and host list are neither read nor written
   nor deleted. (Review #1 defect: the demo revoke/forget still reached `forgetHost()`, which reads
@@ -137,7 +141,10 @@ It is recorded only; it is not a trust switch.
 - Unit (`test/screenshot-demo-store.test.ts`, executable, in-process fixture over real TLS): with a
   REAL pairing's token + host list already on the device, a demo **start + pair + connect +
   reconnect**, a demo **revoke (4401)**, a demo **forget()** and a **failed pair** each leave the
-  keychain counters at zero deletes and at most the install id's own read/write, and the real token
+  keychain counters at zero reads, zero writes and zero deletes (the install id is in memory in
+  demo mode); a further case where the secure store throws on every call still pairs, connects and
+  reconnects; outside demo mode, a secure-store failure while reading the install id during pair
+  surfaces as `client/store-unavailable`, not a generic failure; and the real token
   and host list are byte-identical afterwards.
 - Unit (`test/screenshot-mode.test.ts`, source guards for the remaining paths): every real store
   call (`readHosts`/`saveHost`/`forgetHost`/`readToken`/`saveToken`) is behind the demo store being

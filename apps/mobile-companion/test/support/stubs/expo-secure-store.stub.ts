@@ -9,8 +9,19 @@ let deleteAttempts = 0;
 let retainedDeletesLeft = 0;
 /** Remaining reads that must reject: the wipe's verification read is unprovable. */
 let readFailuresLeft = 0;
+/**
+ * Every call rejects (spec 032: an unsigned simulator Release build has no Keychain entitlement,
+ * so `getItemAsync`/`setItemAsync` throw for real). Counted separately so a test can prove a path
+ * made no calls at all, not merely that its calls were ignored.
+ */
+let allCallsFail = false;
+let allFailAttempts = 0;
 
 export async function getItemAsync(key: string): Promise<string | null> {
+  if (allCallsFail) {
+    allFailAttempts += 1;
+    throw new Error('keystore unavailable: errSecMissingEntitlement');
+  }
   if (readFailuresLeft > 0) {
     readFailuresLeft -= 1;
     // A realistic native failure: the verification read of a wipe cannot prove anything here.
@@ -20,11 +31,19 @@ export async function getItemAsync(key: string): Promise<string | null> {
 }
 
 export async function setItemAsync(key: string, value: string): Promise<void> {
+  if (allCallsFail) {
+    allFailAttempts += 1;
+    throw new Error('keystore unavailable: errSecMissingEntitlement');
+  }
   store.set(key, value);
 }
 
 export async function deleteItemAsync(key: string): Promise<void> {
   deleteAttempts += 1;
+  if (allCallsFail) {
+    allFailAttempts += 1;
+    throw new Error('keystore unavailable: errSecMissingEntitlement');
+  }
   if (deleteFailuresLeft > 0) {
     deleteFailuresLeft -= 1;
     // A realistic native failure message. Tests assert it never reaches a log or a status.
@@ -53,6 +72,21 @@ export function resetSecureStore(): void {
   deleteAttempts = 0;
   retainedDeletesLeft = 0;
   readFailuresLeft = 0;
+  allCallsFail = false;
+  allFailAttempts = 0;
+}
+
+/**
+ * Test helper: EVERY store call rejects (`get`/`set`/`delete`), the way an unsigned Release build
+ * on a simulator answers — the Keychain has no entitlement there. Default off.
+ */
+export function failAllStoreCalls(fail = true): void {
+  allCallsFail = fail;
+}
+
+/** Test helper: how many calls were rejected because the whole store was failing. */
+export function allFailAttemptCount(): number {
+  return allFailAttempts;
 }
 
 /** Test helper: the next `times` deletes reject (default: every delete fails). */

@@ -10,10 +10,13 @@
 // reaches the keychain ONLY through those three calls, so the counters are the evidence for the
 // credential and the host list.
 //
-// ONE KNOWN, NON-CREDENTIAL CALL: the install id (`src/platform/install-id.ts`,
-// `dsh-companion.install-id`) is a random UUID that identifies this install to a Host — not a
-// credential, cached for the process, and what the pairing/`connect` send as `X-DSH-Device-ID`
-// (contract §3.2). Assertions allow at most that one get + one set, and never a delete.
+// ONE KNOWN, NON-CREDENTIAL CALL — GONE (spec 032 amendment 2026-11-16): the install id
+// (`src/platform/install-id.ts`, `dsh-companion.install-id`) used to be read from (and, on first
+// use, written to) the keychain even in demo mode. It is not a credential, but an unsigned Release
+// build on an iOS simulator has no Keychain entitlement, so that read THREW and demo `pair()` failed
+// as `client/bad-message` before any socket. Demo mode now takes a per-controller in-memory id
+// (`src/platform/demo-install-id.ts`), so the allowed counts are ZERO reads, ZERO writes and ZERO
+// deletes on every path. The last cases prove the mode against a store that throws on every call.
 //
 // The pairing frames come from the IN-PROCESS fixture (`test/support/fake-gateway.ts`, a real TLS +
 // WSS server on an ephemeral 127.0.0.1 port) through the ordinary Node pinned transport, so a demo
@@ -23,8 +26,10 @@
 // `src/platform/pinned-transport.demo.ts` and the real native-transport adapter, with real TLS.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { registerHooks } from 'node:module';
 import { before, beforeEach, describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { encodePairingPayload, type PairingPayload } from '../src/core';
 import type { PinnedWsAdapter } from '../modules/pinned-ws';
@@ -40,26 +45,43 @@ import { resetAppState } from './support/stubs/react-native.stub';
 const STORE_SOURCE = `
 const store = new Map();
 const counts = { get: 0, set: 0, remove: 0 };
+// Every call rejects while this is on: the Keychain of an unsigned simulator Release build.
+let throwing = false;
+let throwAttempts = 0;
+function guard() {
+  if (!throwing) return;
+  throwAttempts += 1;
+  throw new Error('keystore unavailable: errSecMissingEntitlement');
+}
 export async function getItemAsync(key) {
   counts.get += 1;
+  guard();
   return store.get(key) ?? null;
 }
 export async function setItemAsync(key, value) {
   counts.set += 1;
+  guard();
   store.set(key, value);
 }
 export async function deleteItemAsync(key) {
   counts.remove += 1;
+  guard();
   store.delete(key);
 }
-export async function isAvailableAsync() { return true; }
+export async function isAvailableAsync() { guard(); return true; }
 export const WHEN_UNLOCKED_THIS_DEVICE_ONLY = 'WHEN_UNLOCKED_THIS_DEVICE_ONLY';
 export const AFTER_FIRST_UNLOCK = 'AFTER_FIRST_UNLOCK';
 export const WHEN_UNLOCKED = 'WHEN_UNLOCKED';
 export function __counts() { return { ...counts }; }
-export function __reset() { store.clear(); counts.get = 0; counts.set = 0; counts.remove = 0; }
+export function __reset() {
+  store.clear();
+  counts.get = 0; counts.set = 0; counts.remove = 0;
+  throwing = false; throwAttempts = 0;
+}
 export function __seed(entries) { for (const [key, value] of entries) store.set(key, value); }
 export function __entries() { return [...store.entries()]; }
+export function __failAll() { throwing = true; }
+export function __failAttempts() { return throwAttempts; }
 `;
 
 const STORE_URL = `data:text/javascript;base64,${Buffer.from(STORE_SOURCE, 'utf8').toString('base64')}`;
@@ -76,6 +98,10 @@ interface CountingStore {
   __reset(): void;
   __seed(entries: Array<[string, string]>): void;
   __entries(): Array<[string, string]>;
+  /** Every call rejects from now on (an unsigned simulator Release build's keychain). */
+  __failAll(): void;
+  /** How many calls were rejected because the whole store was throwing. */
+  __failAttempts(): number;
 }
 
 let store: CountingStore;
@@ -188,13 +214,17 @@ function pairCode(letter: string): string {
   return 'A'.repeat(42) + (canonical[index] as string);
 }
 
-/** The device was not touched: no credential/host-list call, and the seeded real pairing survives. */
-function assertUntouched(label: string, allowed = { get: 1, set: 1 }): void {
+/** The device was not touched: no secure-store call at all, and the seeded real pairing survives. */
+function assertUntouched(label: string): void {
   const counts = store.__counts();
-  assert.ok(counts.remove === 0, `${label}: no secure-store delete was attempted (${JSON.stringify(counts)})`);
   assert.ok(
-    counts.get <= allowed.get && counts.set <= allowed.set,
-    `${label}: only the install id could have been read/written (${JSON.stringify(counts)})`,
+    counts.remove === 0,
+    `${label}: no secure-store delete was attempted (${JSON.stringify(counts)})`,
+  );
+  // Spec 032 amendment: demo mode has its own in-memory install id, so not even a read.
+  assert.ok(
+    counts.get === 0 && counts.set === 0,
+    `${label}: demo mode made zero secure-store reads/writes (${JSON.stringify(counts)})`,
   );
   assert.equal(
     store.__entries().find(([key]) => key === `${TOKEN_PREFIX}${GATEWAY_A}`)?.[1],
@@ -306,5 +336,105 @@ describe('spec 032 demo mode: zero secure-store calls on every path', () => {
       controller.stop();
       await gateway.close();
     }
+  });
+
+  // The simulator Release build this mode exists for: the Keychain answers every call with
+  // errSecMissingEntitlement. Before the amendment that read happened in `pair()` and turned into
+  // `client/bad-message` before any socket; the demo run must be unaffected.
+  it('a Keychain that THROWS on every call still pairs, connects and reconnects', async () => {
+    const code = pairCode('Q');
+    const gateway = await FakeGateway.create({ pairingCodes: [code] });
+    store.__failAll();
+    const controller = demoController();
+    try {
+      await controller.start();
+      assertUntouched('start, store throwing');
+      await controller.unlock();
+      const result = await controller.pair(pairingPayload(gateway, code));
+      assert.equal(result.ok, true, `demo pair failed: ${result.ok ? '' : result.code}`);
+      await waitFor(() => controller.snapshot().connection === 'ready', { label: 'demo socket ready' });
+      assertUntouched('pair + connect, store throwing');
+      gateway.dropAllConnections();
+      await waitFor(() => controller.snapshot().connection !== 'ready', { label: 'drop noticed' });
+      await controller.unlock();
+      assertUntouched('reconnect, store throwing');
+      // The store was never asked, so it never even had the chance to throw.
+      assert.equal(store.__failAttempts(), 0, 'no secure-store call reached the throwing store');
+    } finally {
+      controller.stop();
+      await gateway.close();
+    }
+  });
+
+  // The other direction, unchanged by this amendment except for the CODE: outside demo mode the
+  // install id still comes from the store, and a store failure there is typed
+  // `client/store-unavailable` (spec 032 acceptance), not the generic `client/bad-message`.
+  it('outside demo mode an unusable store during pair is client/store-unavailable', async () => {
+    const code = pairCode('U');
+    const gateway = await FakeGateway.create({ pairingCodes: [code] });
+    const transport = demoTransportFactoryFactory();
+    const controller = new AppController({ locale: () => 'en', transport, pairAckTimeoutMs: 20_000 });
+    try {
+      await controller.start();
+      await controller.unlock();
+      // The primed read is cached on success; clear it so pair()'s own read hits the store.
+      installId.clearInstallIdCache();
+      store.__failAll();
+      const result = await controller.pair(pairingPayload(gateway, code));
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.code, 'client/store-unavailable');
+      // Nothing reached the fixture: the failure is local, before any socket.
+      assert.equal(gateway.connectionAttempts, 0);
+    } finally {
+      controller.stop();
+      await gateway.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Source guard: the demo path cannot reach `getInstallId` at all
+// ---------------------------------------------------------------------------
+
+describe('spec 032 source guard: demo mode never calls getInstallId', () => {
+  const SRC = readFileSync(fileURLToPath(new URL('../src/app-state.ts', import.meta.url)), 'utf8');
+  /** Comments talk about `getInstallId` on purpose; only CODE counts. */
+  const CODE = SRC.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  /** The body of one method (from its declaration to the next blank-line-then-method boundary). */
+  function methodBody(name: string): string {
+    const start = CODE.indexOf(name);
+    assert.ok(start >= 0, `${name} must exist in app-state.ts`);
+    return CODE.slice(start, start + 20_000);
+  }
+
+  it('pair() reads the install id through the demo id first, and getInstallId only as the fallback', () => {
+    const body = methodBody('  async pair(');
+    const line = 'const installId = this.demoInstallId ?? (await getInstallId());';
+    assert.ok(body.includes(line), 'pair() must short-circuit the demo install id before getInstallId()');
+    // A bare `await getInstallId()` (the pre-amendment call) would bypass the demo id entirely.
+    assert.equal(/=\s*await getInstallId\(\)/.test(body), false, 'pair() must not await getInstallId() unconditionally');
+  });
+
+  it('primeInstallId() returns before getInstallId() when the demo id exists', () => {
+    const start = CODE.indexOf('private primeInstallId(): void {');
+    assert.ok(start >= 0, 'primeInstallId must exist');
+    const body = CODE.slice(start, CODE.indexOf('private async', start) > 0 ? CODE.indexOf('private async', start) : start + 2_000);
+    const demoGuard = body.indexOf('if (this.demoInstallId !== null) return;');
+    const read = body.indexOf('getInstallId()');
+    assert.ok(demoGuard >= 0, 'primeInstallId must skip the keychain in demo mode');
+    assert.ok(demoGuard < read, 'the demo guard runs BEFORE getInstallId()');
+  });
+
+  it('the demo install id is created in the constructor and is in memory only', () => {
+    assert.ok(CODE.includes('this.demoInstallId = createDemoInstallId();'), 'the constructor must create the demo id');
+    assert.ok(CODE.includes('this.installId = this.demoInstallId;'), 'the outbox source must see it immediately');
+    const DEMO_ID = readFileSync(fileURLToPath(new URL('../src/platform/demo-install-id.ts', import.meta.url)), 'utf8');
+    // The file's header names the secure store on purpose; only its CODE may not reach it.
+    const DEMO_ID_CODE = DEMO_ID.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    assert.equal(
+      /expo-secure-store|SecureStore/.test(DEMO_ID_CODE),
+      false,
+      'the demo install id must not import the secure store',
+    );
   });
 });

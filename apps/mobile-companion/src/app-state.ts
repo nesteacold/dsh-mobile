@@ -104,6 +104,8 @@ import { lockReasonFor, type LockReason } from './core/web-lock';
 import { debugLogSinksFromEnv } from '../src/platform/debug-log-file';
 // Spec 032: the demo mode's own in-memory host/credential store (never the device's secure store).
 import { createDemoStore, DEMO_GATEWAY_TOKEN, type DemoStore } from './platform/demo-store';
+// Spec 032: the demo mode's in-memory install id (the keychain may be unusable in a demo build).
+import { createDemoInstallId } from './platform/demo-install-id';
 import { appVersion, platformName } from './runtime';
 import type { Locale } from '../i18n';
 
@@ -730,6 +732,13 @@ export class AppController {
   private installId: string | null = null;
   /** The in-flight background install-id read (at most one; `null` again after a failure). */
   private installIdRead: Promise<void> | null = null;
+  /**
+   * Spec 032 amendment 2026-11-16: in demo mode the install id is created HERE, once per
+   * controller, and no secure-store call is ever made for it — an unsigned simulator Release build
+   * has no Keychain entitlement, so `getInstallId()` throws there and `pair()` would fail before
+   * any socket. `null` for a normal build (which reads and persists the id as before).
+   */
+  private readonly demoInstallId: string | null = null;
   private readonly outgoing = new Outbox({
     send: async (frame) => {
       const client = this.client;
@@ -913,6 +922,10 @@ export class AppController {
     if (mode?.enabled === true) {
       this.screenshotMode = { transport: mode.transport };
       this.demoStore = createDemoStore();
+      // Spec 032: the demo install id is in memory from here on, so no later path — start's prime
+      // or pair's own read — has a reason to open the secure store for it.
+      this.demoInstallId = createDemoInstallId();
+      this.installId = this.demoInstallId;
       this.createTransport = mode.transport;
     }
   }
@@ -941,6 +954,9 @@ export class AppController {
    */
   private primeInstallId(): void {
     if (this.installId !== null || this.installIdRead !== null) return;
+    // Spec 032: demo mode has its own in-memory id (set in the constructor); the keychain is never
+    // asked, on any path.
+    if (this.demoInstallId !== null) return;
     this.installIdRead = getInstallId().then(
       (id) => {
         this.installId = id;
@@ -1728,7 +1744,10 @@ export class AppController {
     /** Generation that owns this attempt's in-flight steps (the live one after `connectHost`). */
     let attemptGeneration = generation;
     try {
-      const installId = await getInstallId();
+      // Spec 032: demo mode uses its in-memory id and never calls `getInstallId()`. A normal build
+      // reads the stored one; an unusable store there is `client/store-unavailable` (typed by
+      // `src/platform/install-id.ts`), not the generic failure a bare throw used to become.
+      const installId = this.demoInstallId ?? (await getInstallId());
       // Cache it for the outbox even if this attempt turns out to be stale: it is per installation,
       // not per pairing attempt, and the read already happened.
       this.installId = installId;
