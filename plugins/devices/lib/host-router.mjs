@@ -248,6 +248,13 @@ const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 const EVENTS_ENDPOINT = '$events'
 /** The per-session history stream: one opening snapshot, then increments. */
 const SESSION_FOLLOW_ENDPOINT = 'session/follow'
+/**
+ * The Host-wide projection control stream. DSH's client folds each
+ * `{type:'projection', sessionId, seq, changes}` frame into the per-session
+ * `ProjectionValueStore` that the native model chip reads (`modelSelection`).
+ * Remote sessions never cross it on their own, so it is merged like the catalog.
+ */
+const SESSION_CONTROL_ENDPOINT = 'session/control'
 /** The Host-generation model catalog the native picker loads (it takes no argument). */
 const MODEL_CATALOG_ENDPOINT = 'session/modelCatalog'
 /**
@@ -2371,6 +2378,11 @@ export class HostRouter {
     if (endpoint === 'workspace/follow') {
       return Promise.resolve(this.#mergeFollow({ payload, uplink, peer, signal, control, uplinkWindow }))
     }
+    // Host-wide projection state is one stream in the native client. Remote
+    // sessions must land in it too or the model chip only ever reads Local.
+    if (endpoint === SESSION_CONTROL_ENDPOINT) {
+      return Promise.resolve(this.#mergeSessionControl({ payload, uplink, peer, signal, control, uplinkWindow }))
+    }
     // `$events` names no host: it stays the Local stream, with the connected
     // remotes' interaction cards merged into it (spec 008 P2c).
     if (endpoint === EVENTS_ENDPOINT) {
@@ -3006,6 +3018,240 @@ export class HostRouter {
       unsubscribe?.()
       this.#merges.delete(stop)
       stop()
+    }
+  }
+
+  /**
+   * Merge one `{type:'baseline', value:{projections}}` from a Host into the
+   * control-stream baseline. Record KEYS are session ids (the rename table only
+   * walks values), so they are tagged here; the block's projection values go
+   * through `#ingress` so a remote provider is named for its Host.
+   */
+  #mergeControlBaseline(target, baseline, hostId) {
+    const blocks = isPlainObject(baseline?.value?.projections) ? baseline.value.projections : {}
+    for (const [sessionId, block] of Object.entries(blocks)) {
+      if (!isPlainObject(block)) continue
+      // A raw remote id is always minted into this Host's namespace here; a
+      // pre-tagged one is refused by namespaceId before it can be published.
+      const key = hostId === null ? sessionId : namespaceId(hostId, sessionId)
+      target[key] = hostId === null || !isPlainObject(block.values)
+        ? { ...block }
+        : { ...block, values: this.#ingress(hostId, block.values, 'session/control baseline') }
+    }
+  }
+
+  /**
+   * `session/control` merged: one Local stream plus one per connected remote.
+   *
+   * DSH's client holds one projection store for all sessions; every host has its
+   * own control stream and its own seq space. Each host's baseline is folded into
+   * one combined baseline, and each later `{type:'projection'}` frame keeps its
+   * own (per-session) seq — a session id is namespaced, so seqs never collide.
+   * Without this, a remote `model/selection` append is durable on that Host but
+   * the native model chip never sees the `modelSelection` projection frame.
+   */
+  async *#mergeSessionControl(call) {
+    const { payload, uplink, peer, signal, control, uplinkWindow } = call
+    const queue = new ValueQueue()
+    const lifetime = new AbortController()
+    const stop = () => { lifetime.abort(); queue.close() }
+    this.#merges.add(stop)
+    /** @type {Map<string, {abort: () => void, blocks: Record<string, object>}>} */
+    const pumps = new Map()
+    // A terminal refusal belongs to one connection: a later host-set notification
+    // on that same connection must not resurrect it. A reconnect (new connection
+    // object) clears the marker, so a genuinely new link may be tried again.
+    /** @type {Map<string, object>} */
+    const refusedConnections = new Map()
+    const connectionOf = (hostId) => this.#hostById(hostId)?.connection
+    // A Host that keeps ending its control stream — whether or not it greeted with
+    // a baseline — is not feeding the chip; stop after this many short-lived
+    // re-opens instead of spinning.
+    const maxSilentReopens = 5
+    // A greeting baseline is not sustained progress: a Host can greet and drop in
+    // milliseconds. Only a stream open this long clears the short-lived streak.
+    const streamStableMs = 1000
+    let localBlocks = {}
+    let started = false
+    /** Increments that arrived before the first combined baseline (bounded by time, not count). */
+    const pending = []
+    const emit = (frame) => {
+      if (started) queue.push(frame)
+      else pending.push(frame)
+    }
+    const combinedBaseline = () => {
+      const projections = { ...localBlocks }
+      for (const pump of pumps.values()) Object.assign(projections, pump.blocks)
+      return { type: 'baseline', value: { projections } }
+    }
+    const publishBaseline = () => { if (started) queue.push(combinedBaseline()) }
+    // An obsolete pump must never remove the one that replaced it: `expected`
+    // binds this removal to the pump whose error or backoff actually ended.
+    const drop = (hostId, expected) => {
+      const pump = pumps.get(hostId)
+      if (!pump || (expected && pump !== expected)) return
+      pump.abort()
+      pumps.delete(hostId)
+      publishBaseline()
+    }
+
+    const start = (host) => {
+      if (pumps.has(host.hostId)) return
+      if (refusedConnections.has(host.hostId)) {
+        if (refusedConnections.get(host.hostId) === connectionOf(host.hostId)) return
+        refusedConnections.delete(host.hostId) // a new connection may retry
+      }
+      const hostControl = new AbortController()
+      const pump = { abort: () => hostControl.abort(), blocks: {} }
+      pumps.set(host.hostId, pump)
+      void (async () => {
+        let attempt = 0
+        let shortLived = 0
+        while (!hostControl.signal.aborted && !lifetime.signal.aborted) {
+          let progressed = false
+          let openedAt = 0
+          // The connection this attempt actually used: a refusal belongs to it,
+          // not to whatever connection is live when the error eventually arrives.
+          let openedConnection = null
+          try {
+            // Re-resolve on every attempt: a link that came back while this pump
+            // waited has a new connection, and a stale one cannot serve it.
+            const current = this.#hostById(host.hostId)
+            if (!current) {
+              await this.#awaitHost(host.hostId, AbortSignal.any([hostControl.signal, lifetime.signal]))
+              continue
+            }
+            openedConnection = current.connection
+            const source = await openedConnection.openStream(SESSION_CONTROL_ENDPOINT, {},
+              { signal: AbortSignal.any([hostControl.signal, lifetime.signal]) })
+            openedAt = Date.now()
+            for await (const frame of source) {
+              if (hostControl.signal.aborted || lifetime.signal.aborted) break
+              if (!isPlainObject(frame)) continue
+              if (frame.type === 'baseline') {
+                pump.blocks = {}
+                this.#mergeControlBaseline(pump.blocks, frame, host.hostId)
+                publishBaseline()
+                progressed = true
+                continue
+              }
+              if (frame.type === 'projection') {
+                emit(this.#ingress(host.hostId, frame, SESSION_CONTROL_ENDPOINT))
+                progressed = true
+              }
+            }
+            // A normal end (the Host sent `remote-stream-closed`) is recoverable:
+            // the link is still online, so re-open instead of leaving `pumps.has`
+            // to block every later host-change notification (the model chip froze).
+          } catch (error) {
+            if (hostControl.signal.aborted || lifetime.signal.aborted) return
+            this.#noteHostError(host.hostId, error)
+            // A refusal the Host produced (`auth/*`) or a hostile payload
+            // (`remote/id-leak`, `remote/payload-too-deep`) will not change on a
+            // re-open: end this pump, exactly as a single-attempt stream did.
+            if (!isLinkFailure(error)) {
+              this.#log(`${SESSION_CONTROL_ENDPOINT} from ${host.hostId} refused: ${error?.code ?? 'error'}`)
+              const liveHost = this.#hostById(host.hostId)
+              if (liveHost && liveHost.connection !== openedConnection) {
+                // A stale attempt's refusal says nothing about its replacement.
+                // The host-change notification could not start a pump while this
+                // one still held the slot, so hand that slot to the live link.
+                drop(host.hostId, pump)
+                start(liveHost)
+                return
+              }
+              refusedConnections.set(host.hostId, openedConnection ?? host.connection)
+              drop(host.hostId, pump)
+              return
+            }
+            this.#log(`${SESSION_CONTROL_ENDPOINT} from ${host.hostId} stopped: ${error?.code ?? 'error'}; it reopens with the link`)
+          }
+          if (hostControl.signal.aborted || lifetime.signal.aborted) return
+          if (pumps.get(host.hostId) !== pump) return
+          // A greeting baseline is not sustained progress. Only a stream that
+          // stayed open past the stability interval clears the short-lived streak;
+          // consecutive greet-and-drop opens are bounded below.
+          if (openedAt > 0 && Date.now() - openedAt >= streamStableMs) shortLived = 0
+          else if (openedAt > 0) shortLived += 1
+          if (shortLived > maxSilentReopens) {
+            this.#log(`${SESSION_CONTROL_ENDPOINT} from ${host.hostId} stopped after ${maxSilentReopens} short-lived re-opens`)
+            drop(host.hostId, pump)
+            return
+          }
+          // A delivered frame means the link works: a later end starts at the
+          // shortest delay. Silent ends keep growing the backoff.
+          if (progressed) attempt = 0
+          attempt += 1
+          if (attempt > maxSilentReopens) {
+            this.#log(`${SESSION_CONTROL_ENDPOINT} from ${host.hostId} stopped after ${maxSilentReopens} silent re-opens`)
+            drop(host.hostId, pump)
+            return
+          }
+          await this.#awaitHost(host.hostId, AbortSignal.any([hostControl.signal, lifetime.signal]), Math.min(100 * attempt, 1000))
+        }
+      })()
+    }
+
+    const onAbort = () => stop()
+    const watched = [signal, control?.signal].filter(Boolean)
+    for (const source of watched) {
+      if (source.aborted) onAbort()
+      else source.addEventListener('abort', onAbort, { once: true })
+    }
+    let unsubscribe = null
+    try {
+      const localSignal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal
+      const localControl = control ?? new AbortController()
+      const localSource = await this.#localOpen(SESSION_CONTROL_ENDPOINT, payload, uplink, peer, localSignal, localControl, uplinkWindow)
+      let settleLocal = { resolve: () => {}, reject: () => {} }
+      const localReady = new Promise((resolve, reject) => { settleLocal = { resolve, reject } })
+      localReady.catch(() => {})
+      void (async () => {
+        try {
+          for await (const frame of localSource) {
+            if (lifetime.signal.aborted) break
+            if (isPlainObject(frame) && frame.type === 'baseline') {
+              localBlocks = {}
+              this.#mergeControlBaseline(localBlocks, frame, null)
+              settleLocal.resolve()
+              publishBaseline()
+              continue
+            }
+            // Local frames are already in the controller's namespace.
+            emit(frame)
+          }
+        } catch (error) {
+          if (lifetime.signal.aborted) return
+          settleLocal.reject(error)
+          queue.fail(error)
+        }
+      })()
+
+      for (const host of this.#connectedHosts()) start(host)
+      unsubscribe = this.#onHostsChanged(() => {
+        const hosts = this.#connectedHosts()
+        const connected = new Set(hosts.map((host) => host.hostId))
+        // An offline paired host still appears in knownHosts and keeps its marker;
+        // a host removed from the inventory does not. start() separately checks the
+        // connection object, so a new Host reusing the id inherits no refusal.
+        const configured = new Set([...connected, ...this.#disconnectedHosts().map((host) => host.hostId)])
+        for (const hostId of refusedConnections.keys()) if (!configured.has(hostId)) refusedConnections.delete(hostId)
+        for (const host of hosts) start(host)
+        for (const hostId of [...pumps.keys()]) if (!connected.has(hostId)) drop(hostId)
+      })
+
+      await Promise.race([localReady, this.#delay(this.#baselineTimeoutMs)])
+      started = true
+      queue.push(combinedBaseline())
+      for (const frame of pending) queue.push(frame)
+      pending.length = 0
+      for await (const frame of queue) yield frame
+    } finally {
+      for (const source of watched) source.removeEventListener?.('abort', onAbort)
+      unsubscribe?.()
+      this.#merges.delete(stop)
+      stop()
+      refusedConnections.clear()
     }
   }
 

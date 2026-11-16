@@ -76,6 +76,9 @@ function createFakeRemote(hostId, hostName, options = {}) {
           pinnedSessionIds: options.pinned ?? [],
         } })
       }
+      if (endpoint === 'session/control') {
+        queue.push({ type: 'baseline', value: { projections: options.controlProjections ?? {} } })
+      }
       return queue
     },
   }
@@ -114,6 +117,7 @@ function createHarness({ remotes = [], dispatchRpc, connected: connectedIds, bas
       const queue = createQueue()
       localStreams.push({ endpoint, payload: clone(payload), payloadSeen: payload, window, queue })
       if (endpoint === 'workspace/follow') queue.push({ type: 'baseline', value: baseline })
+      if (endpoint === 'session/control') queue.push({ type: 'baseline', value: { projections: {} } })
       return queue
     },
   }
@@ -1455,6 +1459,384 @@ test('session/selectModel strips the host tag from the provider the picker match
   assert.deepEqual(local, { ok: true, value: { local: 'session/selectModel' } })
   assert.deepEqual(harness.localCalls.at(-1).payload.args,
     { sessionId: 's1', provider: 'deepseek-official', model: 'm' })
+})
+
+test('a successful remote selectModel reaches the native model chip through the control projection', async () => {
+  // The RPC answer alone never moves the chip: dsh-client-ui-model-selection's
+  // ModelDirectory current is derived from the `modelSelection` projection face
+  // (directory.ts syncInputs). The Host appends a durable `model/selection` event
+  // and folds it into a `session/control` projection frame; that frame is what
+  // this test follows from the remote Host to the projection store.
+  const oldSelection = selection('r9-fallback', 'old-model')
+  const newSelection = selection('r9-fallback', 'ds41-cmc-ccsonnet')
+  let hostB
+  hostB = createFakeRemote('hostB', 'Host B', {
+    controlProjections: { s1: projectedSelection('r9-fallback', 'old-model') },
+    replies: {
+      'session/selectModel'() {
+        // The frame DSH's SessionControlController broadcasts on onEventChanged
+        // when the Host folds `model/selection` (dsh-agent modelSelectionProjectionDefinition).
+        hostB.send({
+          type: 'projection', sessionId: 's1', seq: 9,
+          changes: [{ key: 'modelSelection', val: { lastUsed: oldSelection, next: newSelection } }],
+        })
+        return { selected: newSelection }
+      },
+    },
+  })
+  const harness = createHarness({ remotes: [hostB] })
+  // The native client opens ONE `session/control` stream for all sessions.
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  // The opening baseline names the remote session in this controller's namespace.
+  const baseline = (await nextFrame(source, 'session/control baseline')).value
+  assert.equal(baseline.type, 'baseline')
+  assert.deepEqual(Object.keys(baseline.value.projections), ['h:hostB:s1'])
+  assert.deepEqual(baseline.value.projections['h:hostB:s1'].values.modelSelection,
+    { lastUsed: { ...oldSelection, provider: 'r9-fallback@hostB' }, next: { ...oldSelection, provider: 'r9-fallback@hostB' } })
+
+  const answer = await harness.gateway.dispatchRpc('session/selectModel', {
+    args: { sessionId: 'h:hostB:s1', provider: 'r9-fallback@hostB', model: 'ds41-cmc-ccsonnet' },
+  }, undefined, {})
+  assert.equal(answer.ok, true, JSON.stringify(answer))
+
+  // The frame the native projection store consumes: key namespaced, seq kept,
+  // and the selection's provider tagged so it matches the merged picker catalog.
+  const frame = (await nextFrame(source, 'modelSelection projection frame')).value
+  assert.deepEqual(frame, {
+    type: 'projection', sessionId: 'h:hostB:s1', seq: 9,
+    changes: [{ key: 'modelSelection', val: {
+      lastUsed: { ...oldSelection, provider: 'r9-fallback@hostB' },
+      next: { ...newSelection, provider: 'r9-fallback@hostB' },
+    } }],
+  })
+  // Fold it the way ProjectionValueStore.apply + directory.syncInputs do: the
+  // chip's `current` is projection.next, so this is the value that must move.
+  const face = { ...baseline.value.projections['h:hostB:s1'].values.modelSelection }
+  const change = frame.changes.find((entry) => entry.key === 'modelSelection')
+  face.next = change.val.next
+  assert.deepEqual(face.next, { provider: 'r9-fallback@hostB', model: 'ds41-cmc-ccsonnet' })
+  assert.notDeepEqual(face.next, face.lastUsed, 'the chip reads a new selection, not the old one')
+  assertNoNamespacedId(hostB)
+  control.abort()
+})
+
+test('a normally-ended remote control stream is reopened and republishes the model chip', async () => {
+  // Regression: when a remote `session/control` iterator ends normally (the Host
+  // sent `remote-stream-closed`, remote-client.mjs:1020-1024), the pump must not
+  // stay registered as if it were still live. Otherwise a later host-change — or
+  // the reopen timer — cannot resubscribe, and the native model chip freezes on
+  // the last selection while the Host itself stays connected.
+  const oldSelection = selection('r9-fallback', 'old-model')
+  const midSelection = selection('r9-fallback', 'mid-model')
+  const newSelection = selection('r9-fallback', 'ds41-cmc-ccsonnet')
+  const hostB = createFakeRemote('hostB', 'Host B', {
+    controlProjections: { s1: projectedSelection('r9-fallback', 'old-model') },
+  })
+  const harness = createHarness({ remotes: [hostB] })
+  // One merged `session/control` stream, as the native client opens it.
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  // The opening baseline carries the remote session, tagged into this controller.
+  const baseline = (await nextFrame(source, 'session/control baseline')).value
+  assert.equal(baseline.type, 'baseline')
+  assert.deepEqual(Object.keys(baseline.value.projections), ['h:hostB:s1'])
+  assert.deepEqual(baseline.value.projections['h:hostB:s1'].values.modelSelection,
+    { lastUsed: { ...oldSelection, provider: 'r9-fallback@hostB' }, next: { ...oldSelection, provider: 'r9-fallback@hostB' } })
+  assert.equal(hostB.streams.filter((stream) => stream.endpoint === 'session/control').length, 1)
+
+  // The remote control stream ends NORMALLY — no error, the Host is still online.
+  // This is the harness's stream-close, mirroring remote-client's normal end.
+  hostB.closeStream()
+
+  // The pump must re-open a fresh `session/control` stream on the same, still-
+  // connected Host. Bound the wait so a stuck pump fails instead of hanging.
+  let reopened = false
+  const reopenDeadline = Date.now() + 1500
+  while (Date.now() < reopenDeadline) {
+    if (hostB.streams.filter((stream) => stream.endpoint === 'session/control').length >= 2) { reopened = true; break }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(reopened, true, 'a normally-ended control stream must be re-opened while the Host stays connected')
+  assert.equal(harness.router.status().hosts.find((host) => host.hostId === 'hostB').online, true,
+    'the Host was never disconnected')
+
+  // A fresh baseline on the re-opened stream replaces the old one in the merged
+  // stream. The re-open greets with the old baseline first, so read until the new
+  // (mid) selection shows up; both are tagged for the Host.
+  hostB.send({ type: 'baseline', value: { projections: { s1: projectedSelection('r9-fallback', 'mid-model') } } })
+  let republished
+  const baselineDeadline = Date.now() + 1500
+  while (Date.now() < baselineDeadline) {
+    const frame = (await nextFrame(source, 'republished session/control baseline')).value
+    if (frame.type === 'baseline'
+        && frame.value.projections['h:hostB:s1']?.values?.modelSelection?.next?.model === 'mid-model') {
+      republished = frame
+      break
+    }
+  }
+  assert.ok(republished, 'the re-opened stream republished the new baseline')
+  assert.deepEqual(republished.value.projections['h:hostB:s1'].values.modelSelection,
+    { lastUsed: { ...midSelection, provider: 'r9-fallback@hostB' }, next: { ...midSelection, provider: 'r9-fallback@hostB' } })
+
+  // A projection increment (seq past the baseline) still reaches the chip after
+  // the re-open, and folds into the face whose `next` the model directory reads.
+  hostB.send({
+    type: 'projection', sessionId: 's1', seq: 9,
+    changes: [{ key: 'modelSelection', val: { lastUsed: midSelection, next: newSelection } }],
+  })
+  const frame = (await nextFrame(source, 'modelSelection projection frame after re-open')).value
+  assert.deepEqual(frame, {
+    type: 'projection', sessionId: 'h:hostB:s1', seq: 9,
+    changes: [{ key: 'modelSelection', val: {
+      lastUsed: { ...midSelection, provider: 'r9-fallback@hostB' },
+      next: { ...newSelection, provider: 'r9-fallback@hostB' },
+    } }],
+  })
+  const face = { ...republished.value.projections['h:hostB:s1'].values.modelSelection }
+  const change = frame.changes.find((entry) => entry.key === 'modelSelection')
+  face.next = change.val.next
+  assert.deepEqual(face.next, { provider: 'r9-fallback@hostB', model: 'ds41-cmc-ccsonnet' })
+  assert.notDeepEqual(face.next, face.lastUsed, 'the chip reads a new selection, not the mid one')
+  assertNoNamespacedId(hostB)
+  control.abort()
+})
+
+test('a Host that greets with a baseline then closes stops reopening, and abort leaves no pending timer', async () => {
+  // Reviewer round 2: an opening baseline must not reset the reopen budget. A
+  // Host that sends its normal opening baseline and then closes (or throws a
+  // transient error) must not be re-opened every 100 ms forever.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const greetedStreams = []
+  const originalOpenStream = hostB.connection.openStream.bind(hostB.connection)
+  hostB.connection.openStream = async (endpoint, args, options) => {
+    if (endpoint !== 'session/control') return originalOpenStream(endpoint, args, options)
+    const queue = createQueue()
+    greetedStreams.push(queue)
+    queue.push({ type: 'baseline', value: { projections: { s1: projectedSelection('r9-fallback', 'old-model') } } })
+    // A short-lived stream: closes on its own without any test-side pumping.
+    const timer = setTimeout(() => queue.close(), 20)
+    timer.unref?.()
+    return queue
+  }
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const baseline = (await nextFrame(source, 'session/control baseline')).value
+  assert.equal(baseline.type, 'baseline')
+
+  // Reopens do happen: the greeting baseline must not have made them unbounded.
+  let sawReopen = false
+  const firstDeadline = Date.now() + 1500
+  while (Date.now() < firstDeadline) {
+    if (greetedStreams.length >= 2) { sawReopen = true; break }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(sawReopen, true, 'a normally-ended control stream is re-opened at least once')
+
+  // The streak must terminate: the count settles and stays bounded.
+  let last = greetedStreams.length
+  let stableSince = Date.now()
+  const settleDeadline = Date.now() + 3000
+  while (Date.now() < settleDeadline) {
+    if (greetedStreams.length !== last) { last = greetedStreams.length; stableSince = Date.now() }
+    if (greetedStreams.length >= 2 && Date.now() - stableSince > 600) break
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.ok(greetedStreams.length <= 7,
+    `reopening must stop after a small bound, got ${greetedStreams.length}`)
+  assert.equal(greetedStreams.length, last, 'reopening settled')
+
+  // Aborting the control must clear the pending reopen delay: no timer storm.
+  const atAbort = greetedStreams.length
+  control.abort()
+  await new Promise((resolve) => setTimeout(resolve, 500))
+  assert.equal(greetedStreams.length, atAbort, 'aborting control leaves no pending reopen timer')
+})
+
+test('aborting during the first reopen delay cancels that pending reopen', async () => {
+  // Reviewer round 3: the case above aborts after the streak has already settled,
+  // so it never proves a live timer is cleared. Here the first stream ends at once
+  // and the abort lands inside its 100 ms reopen window.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const streams = []
+  const originalOpenStream = hostB.connection.openStream.bind(hostB.connection)
+  let firstEnded
+  const firstStreamEnded = new Promise((resolve) => { firstEnded = resolve })
+  hostB.connection.openStream = async (endpoint, args, options) => {
+    if (endpoint !== 'session/control') return originalOpenStream(endpoint, args, options)
+    const queue = createQueue()
+    streams.push(queue)
+    queue.push({ type: 'baseline', value: { projections: {} } })
+    queue.close()
+    if (streams.length === 1) firstEnded()
+    return queue
+  }
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  // Pull one frame to start the merge, but abort while the first reopen is pending.
+  const firstFrame = nextFrame(source, 'merged baseline before reopen')
+  await firstStreamEnded
+  await firstFrame
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  const atAbort = streams.length
+  assert.equal(atAbort, 1, 'the first reopen delay is still pending at abort')
+  control.abort()
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  assert.equal(streams.length, atAbort, 'aborting during the delay opens no further control stream')
+})
+
+test('a terminal refusal is not retried by a later host-set notification on the same connection', async () => {
+  // Reviewer round 2: a refused Host drops its pump, but a later host-set
+  // notification used to call start() again and re-open the refused stream.
+  let attempts = 0
+  const hostB = createFakeRemote('hostB', 'Host B')
+  hostB.connection.openStream = async () => {
+    attempts += 1
+    throw Object.assign(new Error('forbidden'), { code: 'auth/forbidden-scope' })
+  }
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const baseline = (await nextFrame(source, 'merged baseline after refusal')).value
+  assert.equal(baseline.type, 'baseline')
+
+  const waitForAttempts = async (expected) => {
+    const deadline = Date.now() + 1500
+    while (Date.now() < deadline) {
+      if (attempts >= expected) return true
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    return false
+  }
+  assert.equal(await waitForAttempts(1), true, 'the refused stream was attempted once')
+
+  // A host-set notification on the SAME connection must not resurrect the pump.
+  harness.connect('hostB')
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.equal(attempts, 1, 'a terminal refusal is not retried on the same connection')
+
+  // A genuinely new connection for the same Host clears the marker and may retry.
+  hostB.connection = {
+    state: 'online',
+    async openStream() {
+      attempts += 1
+      const queue = createQueue()
+      queue.push({ type: 'baseline', value: { projections: {} } })
+      return queue
+    },
+  }
+  harness.connect('hostB')
+  assert.equal(await waitForAttempts(2), true, 'a new connection may retry the refused Host')
+  control.abort()
+})
+
+test('a stale stream refusal cannot blacklist the connection that replaced it', async () => {
+  // Reviewer round 3: the terminal-error handler used to record whichever
+  // connection was live when the error arrived. If A was replaced by B while A's
+  // open was still settling, the host-change notification could not start B (a
+  // pump already existed), and A's later refusal then marked B refused instead.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const connectionA = hostB.connection
+  const originalOpenA = connectionA.openStream.bind(connectionA)
+  let rejectA
+  const refusalA = new Promise((_resolve, reject) => { rejectA = reject })
+  refusalA.catch(() => {})
+  let attemptsA = 0
+  connectionA.openStream = async (endpoint, args, options) => {
+    if (endpoint !== 'session/control') return originalOpenA(endpoint, args, options)
+    attemptsA += 1
+    await refusalA // settles only after the host has switched to B
+  }
+  let attemptsB = 0
+  const connectionB = {
+    state: 'online',
+    async openStream(endpoint, args, options) {
+      if (endpoint !== 'session/control') return originalOpenA(endpoint, args, options)
+      attemptsB += 1
+      const queue = createQueue()
+      queue.push({ type: 'baseline', value: { projections: {} } })
+      return queue
+    },
+  }
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const baseline = (await nextFrame(source, 'merged baseline while A is pending')).value
+  assert.equal(baseline.type, 'baseline')
+  assert.equal(attemptsA, 1, 'A opened the first control stream')
+
+  // The host-change notification sees A's live pump and cannot start B yet.
+  hostB.connection = connectionB
+  harness.connect('hostB')
+  assert.equal(attemptsB, 0, 'B is blocked by A pump until A settles')
+
+  const waitFor = async (predicate) => {
+    const deadline = Date.now() + 1500
+    while (Date.now() < deadline) {
+      if (predicate()) return true
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    return false
+  }
+  rejectA(Object.assign(new Error('forbidden'), { code: 'auth/forbidden-scope' }))
+  assert.equal(await waitFor(() => attemptsB >= 1), true, 'A refusal must hand the slot to B')
+
+  // A refusal recorded against B would survive this remove/re-add on the SAME
+  // connection object and suppress the retry. No marker belongs to B here.
+  harness.disconnect('hostB')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  harness.connect('hostB')
+  assert.equal(await waitFor(() => attemptsB >= 2), true, 'B was not marked refused by A')
+  control.abort()
+})
+
+test('a host removed from the inventory loses its refusal marker', async () => {
+  // Reviewer round 3: a marker for a host that left the configured inventory
+  // must not outlive it, while an offline paired host keeps its marker.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const originalOpenStream = hostB.connection.openStream.bind(hostB.connection)
+  let attempts = 0
+  hostB.connection.openStream = async (endpoint, args, options) => {
+    if (endpoint !== 'session/control') return originalOpenStream(endpoint, args, options)
+    attempts += 1
+    if (attempts === 1) throw Object.assign(new Error('forbidden'), { code: 'auth/forbidden-scope' })
+    const queue = createQueue()
+    queue.push({ type: 'baseline', value: { projections: {} } })
+    return queue
+  }
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const baseline = (await nextFrame(source, 'merged baseline after refusal')).value
+  assert.equal(baseline.type, 'baseline')
+  const waitFor = async (expected) => {
+    const deadline = Date.now() + 1500
+    while (Date.now() < deadline) {
+      if (attempts >= expected) return true
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    return false
+  }
+  assert.equal(await waitFor(1), true, 'the refusal was observed')
+
+  // Remove the host from BOTH connected hosts and knownHosts, then re-add the
+  // same connection object: the old marker must have been pruned on removal.
+  harness.remotes.length = 0
+  harness.disconnect('hostB')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  harness.remotes.push(hostB)
+  harness.connect('hostB')
+  assert.equal(await waitFor(2), true, 'a Host re-added after removal is not suppressed')
+  control.abort()
 })
 
 test('a provider tagged for another host is refused instead of being rerouted', async () => {
