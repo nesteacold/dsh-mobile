@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- DSH Orbit — concept C "Orbit ring O".
+       Intent: the strongest shape of the three — one heavy ring read as the word "Orbit" (and an O),
+       with a spark riding it. Built for a launcher grid seen at a glance: one element, one
+       silhouette, nothing inside that can turn to mush at 60 px.
+       Geometry: ring centre 512, outer r=448 — inside the iOS rounded-square corners, and 0.13 of
+       the radius inside the Android adaptive 66% circle. Ring stroke 110 is heavy on purpose so the
+       icon holds its mass when every other icon on the screen is a dense glyph.
+       Palette (src/ui/theme.ts brand): navy #06172B field, mist #BFD6FF ring, ocean #2E6BE6 spark. -->
+  <circle cx="512" cy="512" r="393" stroke="#BFD6FF" stroke-width="110" fill="none"/>
+  <!-- Spark: four-point star riding the ring at about 4:30, turned upright (points up) so it reads as
+       a spark, not a pinwheel, and a navy gap keeps it from merging into the ring. -->
+  <g transform="rotate(42 512 512)">
+    <circle cx="512" cy="884" r="110" fill="#06172B"/>
+    <path d="M 512 808 C 533 872 574 902 610 904 C 574 906 533 936 512 1000 C 491 936 450 906 414 904 C 450 902 491 872 512 808 Z"
+          fill="#2E6BE6"/>
+  </g>
+</svg>
