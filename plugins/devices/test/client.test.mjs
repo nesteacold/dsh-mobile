@@ -21,7 +21,7 @@ const source = fs.readFileSync(path.join(here, '../lib/client.js'), 'utf8')
 
 console.log('client')
 
-function load({ locale = 'en-US', status, devices = [], remotes = [], pending, fail = {}, sessions, listenFailure, controlPersists, uploads, menu = false } = {}) {
+function load({ locale = 'en-US', status, devices = [], remotes = [], pending, fail = {}, sessions, listenFailure, controlPersists, uploads, menu = false, source: sourceText = source } = {}) {
   let api
   const calls = []
   const state = {
@@ -202,7 +202,7 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
   const document = { baseURI: 'http://127.0.0.1:3080/',
     head: { appendChild: (node) => styles.push(node) },
     createElement: () => ({ dataset: {}, textContent: '', remove() {} }) }
-  vm.runInNewContext(source, { window, document, fetch, URL, console, setTimeout, clearTimeout,
+  vm.runInNewContext(sourceText, { window, document, fetch, URL, console, setTimeout, clearTimeout,
     navigator: { language: locale, clipboard: { writeText: async (text) => { clipboard.push(text) } } } })
   const disposers = []
   // The shell's context-menu registry (client-ui-context-menu), with the one rule that
@@ -1220,6 +1220,90 @@ await check('OTP offer asks for every desktop scope the kind can hold — never 
   assert.equal(scopesForKind('mobile').includes('web:unlock'), true, 'a web/phone device still gets it')
   page.unmount()
 })
+
+// The measured bug this block exists for (2026-11-16): every code the page made was kind
+// `desktop`, so a phone or PWA that paired with one received a desktop device — no `web:unlock`
+// — and could never register or assert the passkey that unlocks its own session
+// (`scope refused: type=passkey-assert-options … scope=web:unlock` on the gateway).
+// The measured bug this block exists for (2026-11-16): every code the page made was kind
+// `desktop`, so a phone or PWA that paired with one received a desktop device — no `web:unlock`
+// — and could never register or assert the passkey that unlocks its own session
+// (`scope refused: type=passkey-assert-options … scope=web:unlock` on the gateway).
+await check('OPT pairing kind: the page offers a phone/PWA seat and a computer seat, defaults to the computer (old behaviour), and a phone offer asks for web:unlock', async () => {
+  const ui = load({ status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: ['wss://10.0.0.5:3081/ws/mobile'] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const { DICT, scopesForKind, gatewayScopesFor } = ui.api.testing
+  const radios = () => find(page, (node) => node.type === 'input' && node.props.type === 'radio')
+  // Two choices, the phone seat named first, and real vi/en sentences for both.
+  assert.deepEqual(radios().map((node) => node.props.value), ['mobile', 'desktop'])
+  const shown = text(page)
+  for (const key of ['otpKindMobile', 'otpKindDesktop']) assert.ok(shown.includes(DICT.en[key]), `en: ${key}`)
+  for (const key of ['otpKindLabel', 'otpKindMobile', 'otpKindMobileHint', 'otpKindDesktop', 'otpKindDesktopHint']) {
+    assert.equal(typeof DICT.vi[key], 'string', `${key} (vi)`)
+    assert.notEqual(DICT.vi[key], DICT.en[key], `${key}: a real translation, not a copy`)
+  }
+  // The one sentence that explains the difference: the default (computer) hint is stated with
+  // "passkey" in it, and picking a seat swaps in that seat's own sentence.
+  assert.ok(shown.includes(DICT.en.otpKindDesktopHint), 'the computer hint is stated')
+  assert.notEqual(DICT.en.otpKindMobileHint, DICT.en.otpKindDesktopHint, 'two different sentences')
+  // Default: the computer seat, so a code made without touching anything is the old one.
+  assert.equal(radios().filter((node) => node.props.checked).map((node) => node.props.value).join(''), 'desktop')
+  // A radio has no onClick, so drive the choice the way the page does.
+  const pick = async (kind) => {
+    await act(async () => { radios().find((node) => node.props.value === kind).props.onChange({ target: { checked: true, value: kind } }) })
+  }
+  await pick('mobile')
+  assert.equal(radios().find((node) => node.props.value === 'mobile').props.checked, true, 'the phone seat is selected')
+  const body = () => ui.calls.filter((call) => call.route === '/mgw/pair').pop().body
+  await click(button(page, 'Generate pairing code'))
+  const mobile = body()
+  const observed = JSON.stringify(mobile)
+  assert.equal(mobile.mode, 'otp', observed)
+  assert.equal(mobile.kind, 'mobile', observed)
+  // The never-default scope the whole bug is about: asked for explicitly, listed once.
+  assert.ok(mobile.scopes.includes('web:unlock'), observed)
+  assert.equal(mobile.scopes.join(','), scopesForKind('mobile').join(','), `EQUAL actual=${observed}`)
+  // Nowhere wider than the kind allows: no desktop-only scope in a phone offer.
+  const wider = mobile.scopes.filter((scope) => !scopesForKind('mobile').includes(scope))
+  assert.deepEqual(wider, [], `WIDER actual=${observed}`)
+  // The computer seat is exactly what this page always sent.
+  await click(find(page, (node) => node.type === 'button' && node.props['aria-label'] === 'Close')[0])
+  await pick('desktop')
+  await click(button(page, 'Generate pairing code'))
+  assert.deepEqual(body(), { mode: 'otp', kind: 'desktop', scopes: DESKTOP_ALL })
+  // The helper is a straight repeat of the kind's own list — it never mints a scope of its own
+  // (review M1: the older version appended `web:unlock`, which was fail-open). Measured here, so
+  // a kind table that ever lost the scope fails in this file instead of at a PWA's passkey.
+  assert.deepEqual(gatewayScopesFor('desktop'), scopesForKind('desktop'))
+  assert.deepEqual(gatewayScopesFor('mobile'), scopesForKind('mobile'))
+  assert.equal(scopesForKind('mobile').includes('web:unlock'), true, 'the phone list itself carries it')
+  assert.equal(scopesForKind('desktop').includes('web:unlock'), false, 'the desktop list never does')
+  for (const kind of ['mobile', 'desktop']) {
+    const allowed = scopesForKind(kind)
+    for (const scope of gatewayScopesFor(kind)) assert.ok(allowed.includes(scope), `${kind} offer: ${scope}`)
+  }
+  // Regression for the fail-open branch (review M1): a kind table WITHOUT `web:unlock` must not
+  // gain it from the offer helper. The helper is the identity on its kind, so this states both
+  // halves: it names no scope of its own, and it answers exactly the kind's list — a build that
+  // still appended `web:unlock` for `mobile` fails the second assertion below, and one whose list
+  // lost the scope would have it re-minted by the first.
+  const offered = gatewayScopesFor('mobile')
+  const allowedMobile = scopesForKind('mobile')
+  assert.equal(allowedMobile.includes('web:unlock'), true, 'the phone list carries it today')
+  assert.deepEqual(offered, allowedMobile, 'the offer is the kind list, never a widened one')
+  assert.equal(offered.filter((scope) => scope === 'web:unlock').length, 1, 'listed once, not appended')
+  // A table without the scope yields a list without it: nothing is added back to fill the gap.
+  assert.equal(allowedMobile.filter((scope) => scope === 'web:unlock').length, 1)
+  assert.deepEqual(allowedMobile.filter((scope) => scope !== 'web:unlock'), offered.filter((scope) => scope !== 'web:unlock'))
+  // Review m2: the dialog is keyed by nothing — `kind` lives at `pairing.kind` (and the offer
+  // answers carry an `otp`), so the old `key: otpOffer.kind` was always undefined anyway. The
+  // offer's own reply proves the dialog rendered from a server answer without a page-side key.
+  assert.equal(ui.calls.some((call) => call.route === '/mgw/pair'), true)
+
+  page.unmount()
+})
+
 
 await check('Advanced (Allow tab): shows remoteBridgeLimits read-only, 0 = unlimited; never writes the limits', async () => {
   const limits = { maxConnectionsPerDevice: 0, maxStreamsPerDevice: 32, maxInflightPerDevice: 0, callsPerSecond: 20, maxResultBytes: 0 }

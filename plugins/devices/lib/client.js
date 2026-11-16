@@ -137,6 +137,14 @@ window.__ModuleLoader__.load({
         working: 'Working…',
         sent: 'Sent',
         enableFirst: 'Turn on "Allow connections" first.',
+        // Which kind of device a pairing code is for. A code's kind is fixed when it is made,
+        // and it decides both the scopes the offer can carry and whether a passkey lock applies,
+        // so it is a choice next to the button, not a guess.
+        otpKindLabel: 'This code is for',
+        otpKindMobile: 'Phone / PWA (passkey)',
+        otpKindMobileHint: 'The phone or web client registers a passkey right after you approve, which is what unlocks its session. Includes "Unlock the web client".',
+        otpKindDesktop: 'Computer (Desktop Remote)',
+        otpKindDesktopHint: 'The Remote tab on another computer; it never registers a passkey.',
         'scope.harness:remote': 'Use this host remotely (sessions, prompts, approvals)',
         'scope.commands:execute': 'Run slash commands',
         'scope.workspace:manage': 'Manage workspaces and any path',
@@ -483,6 +491,11 @@ window.__ModuleLoader__.load({
         working: 'Đang xử lý…',
         sent: 'Đã gửi',
         enableFirst: 'Hãy bật "Cho phép kết nối" trước.',
+        otpKindLabel: 'Mã này dành cho',
+        otpKindMobile: 'Điện thoại / PWA (passkey)',
+        otpKindMobileHint: 'Điện thoại hoặc web đăng ký passkey ngay sau khi bạn duyệt — đó là bước mở khóa phiên. Có kèm quyền "Mở khóa web".',
+        otpKindDesktop: 'Máy tính (Desktop Remote)',
+        otpKindDesktopHint: 'Tab Remote trên máy khác; không đăng ký passkey.',
         'scope.harness:remote': 'Dùng host này từ xa (phiên, prompt, phê duyệt)',
         'scope.commands:execute': 'Chạy lệnh slash',
         'scope.workspace:manage': 'Quản lý workspace và mọi đường dẫn',
@@ -1209,6 +1222,24 @@ window.__ModuleLoader__.load({
     const MOBILE_ONLY_SCOPES = new Set(['web:unlock'])
     const scopesForKind = (kind) => ALL_SCOPES.filter((scope) => (kind === 'desktop'
       ? !MOBILE_ONLY_SCOPES.has(scope) : !DESKTOP_ONLY_SCOPES.has(scope)))
+    // What a PAIRING OFFER of this kind asks the gateway for: exactly what its kind may hold.
+    // `web:unlock` needs no special case here — `MOBILE_ONLY_SCOPES` above already keeps it off
+    // a desktop and in a phone/web list (spec 021 rev 15), so `scopesForKind('mobile')` carries
+    // it and an offer simply repeats that list. Restated as its own name because the OFFER is
+    // the one place the never-default scope must actually be sent: an offer made for the phone
+    // seat without it left the approved PWA unable to register or assert its passkey (gateway
+    // log: `scope refused: type=passkey-assert-options … scope=web:unlock`, measured 2026-11-16
+    // on a code this page had always made as `desktop`). Deliberately NOT fail-open: if a kind's
+    // list ever lost the scope, the offer must lose it too rather than mint it here, because who
+    // may hold `web:unlock` is the kind tables' (and the contract's) call, not this page's.
+    const gatewayScopesFor = (kind) => scopesForKind(kind)
+    // The two seats a pairing code can be made for, in the order the page offers them: the
+    // phone/PWA seat (passkey after approval, so its offer carries `web:unlock`) and the old
+    // default, a Remote tab on another computer (never a passkey, never `web:unlock`).
+    const OTP_KINDS = [
+      { kind: 'mobile', labelKey: 'otpKindMobile', hintKey: 'otpKindMobileHint' },
+      { kind: 'desktop', labelKey: 'otpKindDesktop', hintKey: 'otpKindDesktopHint' },
+    ]
 
     // The checkbox list + the two preset buttons, shared by Approve and Edit permissions.
     // `allowed` (Approve only): the scopes the pairing request offered. The gateway
@@ -1686,6 +1717,9 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false)
       const [pairing, setPairing] = React.useState(null)
       const [otpOffer, setOtpOffer] = React.useState(null)
+      // `desktop` keeps the behaviour this page always had (a Remote tab on another computer);
+      // `mobile` is the phone/PWA seat, which also asks for `web:unlock` — see `gatewayScopesFor`.
+      const [otpKind, setOtpKind] = React.useState('desktop')
       // The Host's own served origin, learned from the QR route the moment a pairing
       // code is generated (see `OtpDialog.onQr`). `null` = the Host never said it serves
       // anything, which is why no route line is drawn: that is the honest answer, and
@@ -1746,8 +1780,10 @@ window.__ModuleLoader__.load({
           setPairing(null)
           // The offer asks for every scope its KIND can hold (spec 021 rev 15: a desktop never
           // gets `web:unlock`) so the Host user can choose at Approve (which defaults to
-          // Standard); nothing is granted until then.
-          setOtpOffer(await post('/mgw/pair', { mode: 'otp', kind: 'desktop', scopes: scopesForKind('desktop') }))
+          // Standard); nothing is granted until then. The kind is the one picked next to the
+          // button: a code made as `desktop` left every phone/PWA pair locked out of its own
+          // passkey (`scope refused: type=passkey-assert-options … scope=web:unlock`).
+          setOtpOffer(await post('/mgw/pair', { mode: 'otp', kind: otpKind, scopes: gatewayScopesFor(otpKind) }))
         } catch (cause) { setError(cause.message) } finally { setBusy(false) }
       }
 
@@ -1809,6 +1845,20 @@ window.__ModuleLoader__.load({
           h('div', { className: 'dshdev-row' },
             h('h3', { className: 'dshdev-grow' }, tr('pairingCode')),
             h('button', { type: 'button', className: 'dshdev-btn primary', disabled: busy || !on, onClick: generateOtp }, tr('generate'))),
+          // The code's KIND, chosen before the code exists: a code is bound to one kind for its
+          // whole life, so picking it afterwards would mean making a second code.
+          h('div', { className: 'dshdev-row', style: { marginTop: 10, flexWrap: 'wrap' } },
+            h('span', { className: 'dshdev-muted' }, tr('otpKindLabel')),
+            OTP_KINDS.map((entry) => h('label', {
+              key: entry.kind, className: 'dshdev-row', title: tr(entry.hintKey),
+              'data-testid': `otp-kind-${entry.kind}`,
+            },
+              h('input', {
+                type: 'radio', name: 'otp-kind', value: entry.kind, checked: otpKind === entry.kind,
+                disabled: busy || !on, onChange: () => setOtpKind(entry.kind),
+              }),
+              h('span', null, tr(entry.labelKey))))),
+          h('div', { className: 'dshdev-muted' }, tr(`otpKind${otpKind === 'mobile' ? 'Mobile' : 'Desktop'}Hint`)),
           !on ? h('div', { className: 'dshdev-muted' }, tr('enableFirst')) : null),
         otpOffer ? h(OtpDialog, { offer: otpOffer, addresses, lanHost: status && status.lan ? status.lan.host : '',
           // Spec 029: the QR route's answer is the Host's own served origin, kept in the
@@ -3807,7 +3857,7 @@ window.__ModuleLoader__.load({
       FlowStrip, flowState, connectedCount, localName,
       // spec 008 P2b
       HostChip, SessionBanners, OfflineBanner, ModelStatusBanner, RemoteTerminalEntry,
-      SessionHostBadge, PermissionsEditor, scopesForKind,
+      SessionHostBadge, PermissionsEditor, scopesForKind, gatewayScopesFor,
       RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText, hostLinkOf,
       // The sidebar's two tabs: the component the `sidebar.session.action` layer renders,
       // the exact rule text each tab installs, and the tab store, so a test proves both
