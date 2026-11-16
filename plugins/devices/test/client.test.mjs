@@ -10,7 +10,7 @@ import vm from 'node:vm'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 
-import { check, finish, createFakeComposerDocument, createLivePage, installFileListStub, livePick, picked, pickFiles } from './helpers.mjs'
+import { check, finish, createFakeComposerDocument, createLivePage, installFileListStub, livePick, picked, pickFiles, refusePickerList } from './helpers.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const require = createRequire(import.meta.url)
@@ -177,7 +177,8 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     'main': 'keyed',
     // client-ui-plugin-manager README "Detail page extension points": a list slot keyed by id.
     'plugins.detail.section': 'list',
-    // The sidebar's session rows: the host-tabs strip sits above the New Task row here.
+    // A shell overlay: whichever sidebar layer this build of the plugin renders into.
+    'shell.overlay': 'list',
     'sidebar.session.action': 'list',
   }
   const occupants = new Map(Object.keys(SLOT_KINDS).map((slot) => [slot, []]))
@@ -303,7 +304,11 @@ await check('registers settings.section and settings.section.icon for the same i
   const ui = load()
   assert.equal(ui.api.id, '@dsh-ext/devices')
   assert.deepEqual([...ui.api.inject], ['slots', 'locale'])
-  assert.deepEqual(ui.injects, ['settings.section', 'settings.section.icon', 'sidebar.panellist', 'main', 'plugins.detail.section', 'sidebar.session.action'])
+  // The sidebar layer's seat differs between builds of this plugin (`shell.overlay` now,
+  // `sidebar.session.action` before): the page itself is what says which.
+  assert.deepEqual(ui.injects.slice(0, 5), ['settings.section', 'settings.section.icon', 'sidebar.panellist', 'main', 'plugins.detail.section'])
+  assert.ok(['shell.overlay', 'sidebar.session.action'].includes(ui.injects[5]), 'one sidebar seat, whichever it is')
+  assert.equal(ui.injects.length, 6)
   const [section, icon] = ui.registered
   // JSON round trip: the objects were created inside the vm realm.
   assert.deepEqual(JSON.parse(JSON.stringify(section.meta)), { name: 'settings.section', id: 'dsh-ext.devices', order: 80, label: 'Devices' })
@@ -633,7 +638,10 @@ await check('permissions editor (spec 025 R5): per-device in-place scope change,
   // Spec 021 rev 15: a desktop editor lists every scope BUT `web:unlock` (its kind cannot use it).
   assert.equal(boxes().length, DESKTOP_ALL.length)
   // The scope is not offered at all — so it can neither be granted here nor shown as tickable.
-  assert.doesNotMatch(text(page), /Unlock the web client/, 'a desktop list never shows the web unlock scope')
+  const offered = find(page, (node) => node.props && node.props['data-testid'] === 'permissions-scopes')[0]
+  const labels = offered.children.flatMap((row) => (row.children ?? []).flatMap((span) => span.children ?? []))
+    .map(String)
+  assert.ok(!labels.some((label) => /Unlock the web client/.test(label)), 'a desktop list never offers the web unlock scope')
   assert.deepEqual(boxes().filter((node) => node.props.checked).length, 2, 'the current grant is ticked')
   // A no-op save is refused by the page itself (no confirm, no request).
   assert.equal(button(page, 'Apply permissions').props.disabled, true)
@@ -2915,3 +2923,19 @@ await check('spec 033: a page whose preload names a path even for a constructed 
 })
 
 finish('client')
+await check('spec 033: a proven remote pick the picker refused says replace-failed in the page\'s own words', async () => {
+  const page = createLivePage({ ...SPEC033_PAGE })
+  const shell = await loadSpec033(page)
+  refusePickerList(page.composers[0].fileInput, 'ignored')
+  const bridge = page.holder.__DSH_HOST_PATHS__
+  const zip = picked(new File([new Uint8Array([7, 8])], 'refused.zip', { type: 'application/zip' }))
+  const answers = livePick(page.document, page.composers[0].fileInput, [zip], (file) => bridge.pathFor(file), () => {})
+  assert.deepEqual(answers.map((answer) => answer.kind), ['mention'], 'DSH mentions the controller path it kept')
+  assert.equal(shell.status().last.reason, 'replace-failed', 'and the page names the failure, not a local pick')
+  const renderer = create(React.createElement(shell.api.testing.RemoteAttachStatus))
+  const line = find(renderer, (node) => node.props && node.props['data-testid'] === 'remote-attach-last')[0]
+  assert.equal(line.props['data-state'], 'replace-failed', 'the Devices line names the replacement failure')
+  renderer.unmount()
+  shell.dispose()
+})
+
