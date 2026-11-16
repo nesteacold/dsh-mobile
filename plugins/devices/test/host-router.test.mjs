@@ -92,27 +92,36 @@ const workspaceView = (workspaceId, sessionIds, extra = {}) => ({
   createdAt: '2026-11-09T00:00:00.000Z', updatedAt: '2026-11-09T00:00:00.000Z', ...extra,
 })
 
-function createHarness({ remotes = [], dispatchRpc, baseline = { items: [], archivedSessionIds: [], pinnedSessionIds: [] } } = {}) {
+function createHarness({ remotes = [], dispatchRpc, connected: connectedIds, baseline = { items: [], archivedSessionIds: [], pinnedSessionIds: [] } } = {}) {
   const localCalls = []
   const localStreams = []
   const logs = []
   const gateway = {
     // rc.1 signatures: dispatchRpc(endpoint, payload, signal, peer) and
     // openWireStream(endpoint, payload, uplink, peer, signal, control, window).
+    // Both record the payload by REFERENCE (`payloadSeen`), so a test can tell the
+    // caller's own object from a copy or an envelope this module built.
     async dispatchRpc(endpoint, payload, signal, peer) {
-      localCalls.push({ endpoint, payload: clone(payload) })
+      localCalls.push({ endpoint, payload: clone(payload), payloadSeen: payload })
       return typeof dispatchRpc === 'function' ? dispatchRpc(endpoint, payload, peer) : { ok: true, value: { local: endpoint } }
     },
     async openWireStream(endpoint, payload, uplink, peer, signal, control, window) {
+      // A test (or a client) that aborts its stream and walks away models a carrier
+      // that is gone: the next harness installs a fresh router, so the previous one
+      // must not stay wrapped underneath it. Aborting therefore tears down exactly
+      // the router instances this harness installed — never an older one.
+      if (endpoint === 'workspace/follow') control?.addEventListener?.('abort', () => { for (const router of installed) router.uninstall() }, { once: true })
       const queue = createQueue()
-      localStreams.push({ endpoint, payload: clone(payload), window, queue })
+      localStreams.push({ endpoint, payload: clone(payload), payloadSeen: payload, window, queue })
       if (endpoint === 'workspace/follow') queue.push({ type: 'baseline', value: baseline })
       return queue
     },
   }
+  /** The routers this harness installed, torn down when their streams are aborted. */
+  const installed = []
   const cards = new Map()
   const listeners = new Set()
-  const connected = new Set(remotes.map((remote) => remote.hostId))
+  const connected = new Set(connectedIds ?? remotes.map((remote) => remote.hostId))
   const notify = () => { for (const listener of [...listeners]) listener() }
   const router = createHostRouter({
     gateway,
@@ -120,6 +129,9 @@ function createHarness({ remotes = [], dispatchRpc, baseline = { items: [], arch
     dshVersion: PINNED_DSH_VERSION,
     hosts: () => remotes.filter((remote) => connected.has(remote.hostId))
       .map((remote) => ({ hostId: remote.hostId, hostName: remote.hostName, connection: remote.connection, online: true })),
+    // Every remote this harness owns is PAIRED, connected or not — the production shape
+    // (`knownHosts` is what tells the router a host exists at all).
+    knownHosts: () => remotes.map((remote) => ({ hostId: remote.hostId, hostName: remote.hostName })),
     onHostsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener) },
     approvals: {
       card(hostId, ids) {
@@ -128,13 +140,17 @@ function createHarness({ remotes = [], dispatchRpc, baseline = { items: [], arch
         }
         return undefined
       },
+      // The merged `$events` stream seeds every connected host's buffered cards.
+      pending: () => [],
     },
     mergeBaselineTimeoutMs: 100,
     log: (line) => logs.push(line),
   })
   const status = router.install()
+  installed.push(router)
   return {
     gateway, router, status, localCalls, localStreams, remotes, cards, logs,
+    pair(remote) { remotes.push(remote) },
     connect(hostId) { connected.add(hostId); notify() },
     disconnect(hostId) { connected.delete(hostId); notify() },
   }
@@ -782,6 +798,152 @@ test('workspace/follow merges Local plus each host: baseline, renamed upsert, re
   assertNoNamespacedId(hostC)
 })
 
+// Owner defect (owner 2026-11-16, zero PAIRED hosts): "New chat → choose workspace" came back
+// as "Choose workspace". With nothing paired the wrapper had no host to route, rename or hold
+// back for, yet it still stood between the UI and Local: Local's re-baselined `replace` was
+// swallowed, a Local frame type it did not model was dropped, and a `session/list` payload with
+// no `args` was answered from `{args:{}}` in a rewritten envelope. These pin the zero-host
+// carrier as the pure call it wraps — the SAME stream and the SAME reply Local gave — and pin
+// that one paired host still gets the merge.
+const WORKSPACE_ID = 'ea6ef60e-f343-4517-a00b-7b9a1cbc879a'
+const firstName = (value) => value.items.map((item) => item.workspaceId)
+
+/** Read the frame the stream delivers next, or `null` when it delivers none within `ms`. */
+async function frameWithin(iterator, ms = 50) {
+  let timer
+  const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), ms); timer.unref?.() })
+  const result = await Promise.race([iterator.next(), timeout])
+  clearTimeout(timer)
+  return result === 'timeout' ? null : result
+}
+
+test('zero hosts: workspace/follow is Local\'s own stream — baseline, upsert, replace, order, unknown type, in order', async () => {
+  // Zero PAIRED hosts, the production shape (`knownHosts` is supplied and empty): the carrier
+  // is the pure Local call it wrapped.
+  const harness = createHarness({ remotes: [] })
+  const control = new AbortController()
+  const payload = { args: {} }
+  const source = await harness.gateway.openWireStream('workspace/follow', payload, undefined, {}, control.signal, control, 64)
+  const local = harness.localStreams.at(-1)
+  assert.equal(local.payloadSeen, payload, 'the payload reaches Local as the caller own object')
+  assert.equal(source, local.queue, 'Local own stream is handed back, not a merged one')
+  const iterator = source[Symbol.asyncIterator]()
+  // The harness Local carrier has already put its opening baseline on the stream: a
+  // passthrough forwards it as it is, never a merged re-baseline.
+  const opening = await nextFrame(iterator, 'local baseline')
+  assert.equal(opening.value.type, 'baseline', 'Local baseline is the first frame')
+
+  // Every shape the merge rewrote, swallowed or never modelled: an upsert, Local re-baselined
+  // `replace`, a reorder, and a frame type this router has never been taught. Each must arrive
+  // exactly once, in order, byte-identical.
+  const frames = [
+    { type: 'upsert', workspace: workspaceView(WORKSPACE_ID, ['s1', 's2']) },
+    { type: 'replace', value: { items: [workspaceView(WORKSPACE_ID, ['s1', 's2'])], archivedSessionIds: [], pinnedSessionIds: ['s2'] } },
+    { type: 'order', workspaceIds: [WORKSPACE_ID] },
+    { type: 'workspace/unknown-to-this-router', workspaceId: WORKSPACE_ID },
+  ]
+  for (const frame of frames) local.queue.push(frame)
+  for (const frame of frames) {
+    const next = await nextFrame(iterator, frame.type)
+    assert.equal(next.done, false)
+    assert.equal(JSON.stringify(next.value), JSON.stringify(frame), frame.type + ' is forwarded byte-identically, in order')
+  }
+  assert.equal(await frameWithin(iterator), null, 'nothing else is delivered, nothing is invented')
+  control.abort()
+  await iterator.return()
+})
+
+test('zero hosts: session/list returns Local reply as it is, an empty-args payload included', async () => {
+  const harness = createHarness({ remotes: [] })
+  // The exact shape that used to come back rewritten: the payload carries no `args`, and the
+  // merge answered Local with `{args:{}}` and wrapped the reply.
+  const payloads = [{}, { args: {} }, { args: { cursor: 'page-2' } }]
+  for (const payload of payloads) {
+    const answer = await harness.gateway.dispatchRpc('session/list', payload, undefined, {})
+    assert.equal(harness.localCalls.at(-1).payloadSeen, payload,
+      JSON.stringify(payload) + ': Local receives the caller own payload, never an `{args:{}}` rewrite')
+    assert.deepEqual(answer, { ok: true, value: { local: 'session/list' } },
+      JSON.stringify(payload) + ': the reply is Local, unwrapped')
+  }
+})
+
+test('zero hosts: a tagged id or a host hint still reaches the routing, which refuses it', async () => {
+  // Passthrough is for calls that name NO host. One that names a host this controller does
+  // not have keeps its clear refusal instead of being answered by Local.
+  const harness = createHarness({ remotes: [] })
+  const tagged = await harness.gateway.dispatchRpc('session/prompt', { args: { sessionId: 'h:hostB:s1' } }, undefined, {})
+  assert.equal(tagged.ok, false)
+  assert.equal(tagged.error.code, 'remote/host-offline')
+  const hinted = await harness.gateway.dispatchRpc('llm/list', { args: { [HOST_HINT]: 'hostB' } }, undefined, {})
+  assert.equal(hinted.ok, false)
+  assert.equal(hinted.error.code, 'remote/host-offline')
+  assert.deepEqual(harness.localCalls, [], 'Local was never asked')
+})
+
+test('one PAIRED host (offline) is not a passthrough: the same calls merge and keep its rows', async () => {
+  // The switch is "no host at all", not "no connected host": a paired-but-offline host has
+  // retained rows the merged list must carry. `createHarness` pairs exactly the remotes it is
+  // given, and `disconnect` takes one offline without forgetting it.
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/list': { items: [session('sb1', 200)] } } })
+  const harness = createHarness({ remotes: [hostB] })
+  // First with the link up, so the host lists its row and the controller retains it.
+  const payload = { args: {} }
+  const listed = await harness.gateway.dispatchRpc('session/list', payload, undefined, {})
+  assert.deepEqual(listed.value.items.map((row) => row.sessionId), ['h:hostB:sb1'])
+  harness.disconnect('hostB')
+  assert.equal(harness.router.status().disconnected.length, 1, 'the host is still paired')
+  const answer = await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+  assert.deepEqual(answer.value.items.map((row) => row.sessionId), ['h:hostB:sb1'],
+    'the offline host\'s retained rows are still merged in — a passthrough would answer Local only')
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('workspace/follow', { args: {} }, undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const first = await nextFrame(iterator, 'merged baseline')
+  assert.equal(first.value.type, 'baseline', 'a paired host keeps the merged follow stream')
+  control.abort()
+  await iterator.return()
+  harness.router.uninstall()
+})
+
+test('with a remote: the local replace reaches the UI as the merged state, host rows included, after the remote baseline', async () => {
+  // Order, end to end: the merged baseline (Local + the remote, renamed), the remote's
+  // baseline re-baselined as a `replace`, then Local's `replace` — which must carry the
+  // remote's rows too, because the UI applies it whole.
+  const hostB = createFakeRemote('hostB', 'Host B', { workspaces: [workspaceView('wb1', ['sb1'])] })
+  const harness = createHarness({ remotes: [hostB], baseline: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('workspace/follow', { args: {} }, undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const first = await nextFrame(iterator, 'merged baseline')
+  assert.equal(first.value.type, 'baseline')
+  // Frames are `{type, value}` envelopes; a baseline's `value` is the merged picture, not a
+  // row list, so `firstName` takes it.
+  assert.deepEqual(firstName(first.value.value), ['h:hostB:wb1'], 'the remote row is in the opening baseline')
+  // The merge publishes its opening baseline as soon as ONE side has re-baselined it (Local's
+  // own baseline, or a host's when Local's has not arrived yet), and the host side always
+  // re-publishes when it folds in. So here Local re-baselines next: its picture is empty.
+  harness.localStreams.at(-1).queue.push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  const rehosted = await nextFrame(iterator, 'the local baseline folded in')
+  assert.equal(rehosted.value.type, 'replace', 'a re-baseline after ready re-publishes the merged state')
+  assert.deepEqual(firstName(rehosted.value.value), ['h:hostB:wb1'])
+
+  const pick = { items: [workspaceView(WORKSPACE_ID, ['s1'])], archivedSessionIds: [], pinnedSessionIds: [] }
+  harness.localStreams.at(-1).queue.push({ type: 'replace', value: pick })
+  const emitted = await nextFrame(iterator, 'the local replace')
+  assert.equal(emitted.value.type, 'replace')
+  assert.deepEqual(firstName(emitted.value.value), [WORKSPACE_ID, 'h:hostB:wb1'], 'Local first, then the host')
+  assert.deepEqual(emitted.value.value.items[0], pick.items[0], 'the Local Workspace keeps its own id and sessionIds')
+  assert.equal(emitted.value.value.items[1].hostId, 'hostB', 'the remote row stays marked for its host')
+  assert.deepEqual(emitted.value.value.items[1].sessionIds, ['h:hostB:sb1'])
+  assert.equal(await frameWithin(iterator), null, 'one replace, not a second frame')
+  control.abort()
+  await iterator.return()
+  // A previous test's router may still be wrapped underneath this one (the suite runs
+  // in one process); tearing this harness down restores the carrier it installed.
+  harness.router.uninstall()
+  assertNoNamespacedId(hostB)
+})
+
 test('a merged remote workspace title carries its host name, and the default sentinel stays readable', async () => {
   // The native sidebar renders merged rows as they arrive (no replacement browser),
   // so the host name has to ride on the title. `default-workspace` is the one title
@@ -1334,6 +1496,30 @@ test('a tagged provider on a Local session is refused: it would run on another m
   assert.equal(harness.localCalls.length, 0, 'the Local carrier never saw the call')
 })
 
+test('a tagged provider is refused even with zero hosts: the zero-host passthrough is not a route', async () => {
+  // The passthrough that lets a purely Local call reach Local byte for byte must
+  // not swallow a provider tag: the tag IS the route, and forwarding it would run
+  // another machine's model here.
+  const harness = createHarness({ remotes: [] })
+  const both = [
+    { args: { sessionId: 's1', provider: 'r9-fallback@hostB', model: 'm' } },
+    // The nested `request` shape the gateway also accepts.
+    { args: { request: { sessionId: 's1', provider: 'r9-fallback@hostB', model: 'm' } } },
+  ]
+  for (const payload of both) {
+    const answer = await harness.gateway.dispatchRpc('session/selectModel', payload, undefined, {})
+    assert.equal(answer.ok, false, JSON.stringify(payload))
+    assert.equal(answer.error.code, 'model/wrong-host')
+    assert.equal(answer.error.details.hostId, 'hostB')
+  }
+  assert.equal(harness.localCalls.length, 0, 'nothing ran locally, with no host paired or connected')
+  // The semantic survives: with no host at all, a Local selection is still untouched.
+  const local = await harness.gateway.dispatchRpc('session/selectModel',
+    { args: { sessionId: 's1', provider: 'deepseek-official', model: 'm' } }, undefined, {})
+  assert.deepEqual(local, { ok: true, value: { local: 'session/selectModel' } })
+  assert.equal(harness.localCalls.length, 1)
+})
+
 test('two hosts offering the same provider stay two sections, in host order after Local', async () => {
   // The one thing the old merge did was collapse remote groups: same provider id
   // meant "the same selection". With the host in the id they are two selections on
@@ -1415,11 +1601,20 @@ test('a remote model selection reaches the picker tagged, in every payload that 
 })
 
 test('a host joining or leaving the connected set asks the picker to reload the catalog; a flap does not', async () => {
-  const hostB = createFakeRemote('hostB', 'Host B')
-  const hostC = createFakeRemote('hostC', 'Host C')
-  const harness = createHarness({ remotes: [hostB, hostC] })
-  // hostC is paired but not connected yet, so the connected set starts as {hostB}.
-  harness.disconnect('hostC')
+  // The rule is the catalog's COVERAGE of the connected set (`#catalogHostKey`), not
+  // the connect/disconnect edge: a reload racing a host's link used to leave the
+  // picker Local-only with no further edge to repair it (see the race test below).
+  const catalogOf = catalog([providerGroup('r9-fallback', 'R9 Fallback', ['ds41-cmc-ccsonnet'])])
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/modelCatalog': catalogOf } })
+  const hostC = createFakeRemote('hostC', 'Host C', { replies: { 'session/modelCatalog': catalogOf } })
+  const harness = createHarness({
+    remotes: [hostB, hostC],
+    // hostC is paired but not connected yet, so the connected set starts as {hostB}. It is
+    // withheld HERE, not with `disconnect` below: that emits a host change before the
+    // `$events` sink exists, and the sink would then announce the shrunk set at open.
+    connected: ['hostB'],
+    dispatchRpc: localCatalog([providerGroup('r9-fallback', 'R9 Fallback', ['ds41-cmc-ccsonnet'])]),
+  })
   const control = new AbortController()
   const source = await harness.gateway.openWireStream('$events', { args: {} }, undefined, {}, control.signal, control, 64)
   const iterator = source[Symbol.asyncIterator]()
@@ -1429,26 +1624,194 @@ test('a host joining or leaving the connected set asks the picker to reload the 
   assert.equal((await ready).value.type, 'ready')
 
   // A notify that leaves the SET unchanged is silent: the marker pushed through the
-  // Local stream is the very next frame.
+  // Local stream is the very next frame. No catalog has been merged yet, so nothing
+  // is known about the picker's catalog and only a change of set is announced.
   harness.connect('hostB')
   harness.connect('hostB')
   harness.localStreams[0].queue.push({ type: 'emit', event: 'local/marker', args: [] })
   assert.deepEqual((await nextFrame(iterator, 'local marker')).value, { type: 'emit', event: 'local/marker', args: [] })
 
-  // A host joining the set asks the picker to reload the one catalog it caches. The
-  // frame carries exactly the three keys the client's `$events` parser accepts.
+  // The catalog the picker loaded while hostC was still linking covers {hostB} only.
+  // hostC then joins: the connected set is no longer that key, so the picker is told
+  // to reload. The frame carries exactly the three keys the client's `$events`
+  // parser accepts.
+  await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})
   harness.connect('hostC')
   const refresh = (await nextFrame(iterator, 'catalog refresh')).value
   assert.deepEqual(refresh, { type: 'emit', event: 'llm/models-updated', args: [] })
   assert.deepEqual(Object.keys(refresh).sort(), ['args', 'event', 'type'])
 
-  // Leaving the set is announced the same way.
+  // The answer that now covers both hosts, then a re-identify flap that leaves the
+  // set exactly as it was: the picker already holds these hosts, so the SAME set says
+  // nothing — even though a connect/disconnect edge happened.
+  await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})
+  harness.disconnect('hostC')
+  harness.connect('hostC')
+  harness.localStreams[0].queue.push({ type: 'emit', event: 'local/marker', args: [] })
+  assert.deepEqual((await nextFrame(iterator, 'local marker after a re-identified set')).value,
+    { type: 'emit', event: 'local/marker', args: [] }, 'no reload when the catalog already includes every connected host')
+
+  // hostC leaves while the catalog still names it: the picker holds a section whose
+  // Host is gone, so the connected set no longer equals the key and the picker is told.
+  // (`#catalogHostKey` records what the last answer covered. A disconnect updates the
+  // picker only through this frame, so there is no answer to re-key against first.)
   harness.disconnect('hostC')
   assert.deepEqual((await nextFrame(iterator, 'catalog refresh after disconnect')).value,
     { type: 'emit', event: 'llm/models-updated', args: [] })
 
+  // hostC reconnects while its catalog FAILS, so the merged answer leaves it out: a
+  // reload racing that failure is what used to strand the picker with Local only, so
+  // the next answer says so instead of keeping it quiet.
+  hostC.connection.call = async () => { throw Object.assign(new Error('no catalog'), { code: 'auth/forbidden-scope' }) }
+  harness.connect('hostC')
+  const short = (await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})).value
+  assert.deepEqual(short.groups.map((group) => group.id), ['r9-fallback', 'r9-fallback@hostB'],
+    'a host that fails twice contributes no section')
+  assert.deepEqual((await nextFrame(iterator, 'catalog refresh after a short answer')).value,
+    { type: 'emit', event: 'llm/models-updated', args: [] },
+    'a catalog shorter than the connected set asks for a reload')
+
   control.abort()
   await iterator.return()
+})
+
+// -- model catalog: what the picker is holding --------------------------------
+//
+// The picker caches ONE merged catalog per Host generation and reloads it only on
+// `llm/models-updated`. A catalog loaded before a remote Host linked — or answered
+// while that Host's own catalog call was failing — therefore lists Local only, and
+// every remote pick from it is refused by `routedProvider` (`remote/wrong-host`).
+// So the router keeps `#catalogHostKey`, the hosts the last answer really included,
+// and reloads whenever the connected set is not that key.
+
+test('a catalog loaded before the host linked is repaired when $events opens', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: {
+    'session/modelCatalog': catalog([providerGroup('r9-fallback', 'R9 Fallback', ['ds41-cmc-ccsonnet'])]),
+  } })
+  const harness = createHarness({
+    remotes: [hostB],
+    dispatchRpc: localCatalog([providerGroup('deepseek-official', 'DeepSeek', ['deepseek-chat'])]),
+  })
+  harness.disconnect('hostB')
+  // The UI's own load, while hostB is still linking: Local's sections only.
+  const early = (await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})).value
+  assert.deepEqual(early.groups.map((group) => group.id), ['deepseek-official'])
+
+  // The host links; the picker is not reloaded (no `$events` stream yet).
+  harness.connect('hostB')
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('$events', { args: {} }, undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const ready = iterator.next()
+  await new Promise((resolve) => setImmediate(resolve))
+  harness.localStreams[0].queue.push({ type: 'ready', clientId: 'c1', host: { home: '/home/owner' } })
+  assert.equal((await ready).value.type, 'ready')
+  // No edge can repair that catalog any more: hostB connected before the stream
+  // opened, so the reload is owed at `ready`, where it can actually reach the UI.
+  assert.deepEqual((await nextFrame(iterator, 'catalog refresh after ready')).value,
+    { type: 'emit', event: 'llm/models-updated', args: [] })
+  const reloaded = (await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})).value
+  assert.deepEqual(reloaded.groups.map((group) => group.id), ['deepseek-official', 'r9-fallback@hostB'])
+  harness.localStreams[0].queue.push({ type: 'emit', event: 'local/marker', args: [] })
+  assert.deepEqual((await nextFrame(iterator, 'marker after the reload')).value, { type: 'emit', event: 'local/marker', args: [] },
+    'the covering answer asks for nothing further')
+  control.abort()
+  await iterator.return()
+})
+
+test('a host whose catalog keeps failing is announced exactly once, then recovers', async () => {
+  let reply = Object.assign(new Error('no catalog'), { code: 'auth/forbidden-scope', scope: 'prompt:send' })
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { get 'session/modelCatalog'() { return reply } } })
+  const harness = createHarness({
+    remotes: [hostB],
+    dispatchRpc: localCatalog([providerGroup('deepseek-official', 'DeepSeek', ['deepseek-chat'])]),
+  })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('$events', { args: {} }, undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const ready = iterator.next()
+  await new Promise((resolve) => setImmediate(resolve))
+  harness.localStreams[0].queue.push({ type: 'ready', clientId: 'c1', host: { home: '/home/owner' } })
+  assert.equal((await ready).value.type, 'ready')
+  const short = await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})
+  assert.deepEqual(short.value.groups.map((group) => group.id), ['deepseek-official'])
+  assert.equal(hostB.calls.length, 2, 'the failing host is asked once, then retried once')
+  // One frame, then quiet: the picker reloading again would find the same short
+  // catalog, so a second emit per failure would only cost a round trip.
+  assert.deepEqual((await nextFrame(iterator, 'catalog refresh')).value,
+    { type: 'emit', event: 'llm/models-updated', args: [] })
+  await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})
+  harness.localStreams[0].queue.push({ type: 'emit', event: 'local/marker', args: [] })
+  assert.deepEqual((await nextFrame(iterator, 'local marker while still failing')).value,
+    { type: 'emit', event: 'local/marker', args: [] })
+
+  // The Host answers again: the answer covers the set, so the picker needs nothing.
+  reply = catalog([providerGroup('r9-fallback', 'R9 Fallback', ['ds41-cmc-ccsonnet'])])
+  const healed = (await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})).value
+  assert.deepEqual(healed.groups.map((group) => group.id), ['deepseek-official', 'r9-fallback@hostB'])
+  harness.localStreams[0].queue.push({ type: 'emit', event: 'local/marker', args: [] })
+  assert.deepEqual((await nextFrame(iterator, 'local marker after recovery')).value,
+    { type: 'emit', event: 'local/marker', args: [] })
+  control.abort()
+  await iterator.return()
+})
+
+test('a catalog call that fails once is retried: the section is there and nothing is announced', async () => {
+  const refusal = Object.assign(new Error('no catalog yet'), { code: 'remote/not-ready' })
+  let calls = 0
+  const reply = catalog([providerGroup('r9-fallback', 'R9 Fallback', ['ds41-cmc-ccsonnet'])])
+  const connection = {
+    state: 'online',
+    async call() { calls += 1; if (calls === 1) throw refusal; return structuredClone(reply) },
+    async openStream() { throw new Error('not used in this test') },
+    // The merged `$events` watcher only listens on a live connection object.
+    on() {},
+    off() {},
+  }
+  const hostB = { hostId: 'hostB', hostName: 'Host B', connection }
+  const harness = createHarness({
+    remotes: [hostB],
+    dispatchRpc: localCatalog([providerGroup('deepseek-official', 'DeepSeek', ['deepseek-chat'])]),
+  })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('$events', { args: {} }, undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const ready = iterator.next()
+  await new Promise((resolve) => setImmediate(resolve))
+  harness.localStreams[0].queue.push({ type: 'ready', clientId: 'c1', host: { home: '/home/owner' } })
+  assert.equal((await ready).value.type, 'ready')
+
+  // The retry lands inside the one answer: the picker gets the section without a
+  // reload, and the host's refused call leaves no error on its row.
+  const value = (await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})).value
+  assert.deepEqual(value.groups.map((group) => group.id), ['deepseek-official', 'r9-fallback@hostB'])
+  assert.equal(calls, 2, 'one failure, one retry')
+  assert.equal(harness.router.status().hosts[0].error, undefined)
+  harness.localStreams[0].queue.push({ type: 'emit', event: 'local/marker', args: [] })
+  assert.deepEqual((await nextFrame(iterator, 'local marker')).value, { type: 'emit', event: 'local/marker', args: [] },
+    'a retried answer that covers the set needs no reload')
+  control.abort()
+  await iterator.return()
+})
+
+test('a Local provider on a new remote session is still refused: repairing the catalog adds routes, it does not invent one', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: {
+    'session/modelCatalog': catalog([providerGroup('r9-fallback', 'R9 Fallback', ['ds41-cmc-ccsonnet'])]),
+  } })
+  const harness = createHarness({
+    remotes: [hostB],
+    dispatchRpc: localCatalog([providerGroup('deepseek-official', 'DeepSeek', ['deepseek-chat'])]),
+  })
+  // The repaired catalog offers Local's provider only as a LOCAL section, so the
+  // same pick on hostB's session is a refusal, never a cross-host run.
+  await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})
+  const answer = await harness.gateway.dispatchRpc('session/selectModel',
+    { args: { sessionId: 'h:hostB:new', provider: 'deepseek-official', model: 'deepseek-chat' } }, undefined, {})
+  assert.equal(answer.ok, false)
+  assert.equal(answer.error.code, 'model/wrong-host')
+  assert.equal(answer.error.details.hostId, 'hostB')
+  assert.equal(hostB.calls.length, 1, 'only the catalog call crossed the wire')
+  assertNoNamespacedId(hostB)
 })
 
 // -- transport: remote streams --------------------------------------------
@@ -1522,8 +1885,9 @@ test('session/create with no remote host reaches Local unchanged and its session
 
   const payload = { args: { workspaceId: 'ea6ef60e-f343-4517-a00b-7b9a1cbc879a' } }
   const answer = await harness.gateway.dispatchRpc('session/create', payload, undefined, {})
-  assert.deepEqual(harness.localCalls.at(-1), { endpoint: 'session/create', payload },
-    'the Local call keeps the exact payload: no hint, no strip, no tag')
+  assert.equal(harness.localCalls.at(-1).payloadSeen, payload,
+    'the Local call keeps the caller\'s exact payload object: no hint, no strip, no tag, no copy')
+  assert.deepEqual(harness.localCalls.at(-1), { endpoint: 'session/create', payload, payloadSeen: payload })
   assert.deepEqual(answer, verdict, 'the {sessionId} reply is returned untouched')
 
   // The same rule for the two workspaces the owner reported, one on another volume.

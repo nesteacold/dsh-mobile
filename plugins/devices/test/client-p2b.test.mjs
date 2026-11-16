@@ -82,6 +82,12 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
     'conversation.input.right': 'list',
     'sidebar.session.row.trailing': 'list',
     'sidebar.session.row.hover': 'list',
+    // dsh-client-ui-layout declares `shell.overlay` in the `root` slot's children, a
+    // root-scope `list` slot: it carries the sidebar tab strip's placement helper (a
+    // component that renders nothing and inserts the strip into the sidebar's DOM). The
+    // sidebar's own `sidebar.session.action` seat is NOT asked for any more — the owner
+    // decision of 2026-11-16 keeps the New Session button exactly as it ships.
+    'shell.overlay': 'list',
   }
   const occupants = new Map(Object.keys(SLOT_KINDS).map((slot) => [slot, []]))
   // The stock sidebar browser, registered by the shell itself before any plugin runs.
@@ -104,7 +110,8 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
     setTimeout: (fn) => { fn(); return 0 },
     confirm: () => { confirmations += 1; return true },
   }
-  const document = { baseURI: 'http://127.0.0.1:3080/', head: { appendChild() {} }, createElement: () => ({ remove() {} }) }
+  const document = { baseURI: 'http://127.0.0.1:3080/', head: { appendChild() {} },
+    createElement: () => ({ dataset: {}, textContent: '', remove() {} }) }
   vm.runInNewContext(source, { window, document, fetch, URL, console, setTimeout, clearTimeout, Date,
     navigator: { language: locale, clipboard: { writeText: async () => {} } } })
   // Fake host: the slot ledger (inject waits for a declaration, register returns a
@@ -125,8 +132,12 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
       const out = fn(scope)
       return typeof out === 'function' ? out : () => {}
     },
+    // No `shortcuts` registry here: this fake is a shell without one, which the tab
+    // strip copes with (it is clickable either way); its keys are covered by
+    // test/client-host-tabs.test.mjs.
     slots: {
       inject(slot, factory) {
+        if (!SLOT_KINDS[slot]) return () => {}
         const registration = factory()
         const entry = { slot, meta: registration.meta, component: registration.component }
         entries.push(entry)
@@ -147,11 +158,14 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
         // checked BEFORE any collision (a `list` entry with no id throws on an empty
         // slot too), the collision key is that option paired with the priority — so
         // two entries at one priority are legal when their ids differ and the same id
-        // at the same priority throws — and `chain` is keyed by its own `select` with
-        // no collision seat at all.
+        // at the same priority throws — `hoc` layers are keyed by their `id`, and
+        // `chain` is keyed by its own `select` with no collision seat at all.
         let taken
         if (kind === 'single') {
           taken = held.find((occupant) => (occupant.meta.priority ?? 0) === priority)
+        } else if (kind === 'hoc') {
+          if (meta.id === undefined) throw new Error(`hoc slot "${meta.name}" requires options.id`)
+          taken = held.find((occupant) => (occupant.meta.priority ?? 0) === priority && occupant.meta.id === meta.id)
         } else if (kind === 'list' || kind === 'keyed') {
           const option = kind === 'list' ? 'id' : 'key'
           if (meta[option] === undefined) throw new Error(`${kind} slot "${meta.name}" requires options.${option}`)
@@ -219,12 +233,17 @@ test('the stock sidebar keeps its seat in every routing state; the plugin only f
       assert.ok(ui.entryOf(slot), `${label}: ${slot} is registered`)
     }
   }
-  // What the Devices page reads: the badge seats are in, and an off routing says so.
-  // No connected host is not a failure — the seats are still there.
+  // The Devices page reads: the badge seats are in, and an off routing says so.
+  // No connected host is not a failure — the seats are still there. The tab strip is
+  // its own half of the same line (`tabs`/`tabsReason`): with this fake document there
+  // is no sidebar to place it in and no root renderer to draw it, so it reports the
+  // same `no-tabs` a shell without the placement seat would — the strip's own placement
+  // is proven in test/client-host-tabs.test.mjs, against a fake sidebar.
+  const TABS = { tabs: false, tabsReason: 'no-tabs' }
   assert.deepEqual({ ...off.api.testing.remoteUI.getSnapshot() },
-    { grouped: false, reason: 'multi-host routing is off: disabled', hosts: 0 })
-  assert.deepEqual({ ...noHost.api.testing.remoteUI.getSnapshot() }, { grouped: true, reason: null, hosts: 0 })
-  assert.deepEqual({ ...live.api.testing.remoteUI.getSnapshot() }, { grouped: true, reason: null, hosts: 1 })
+    { grouped: false, reason: 'multi-host routing is off: disabled', hosts: 0, ...TABS })
+  assert.deepEqual({ ...noHost.api.testing.remoteUI.getSnapshot() }, { grouped: true, reason: null, hosts: 0, ...TABS })
+  assert.deepEqual({ ...live.api.testing.remoteUI.getSnapshot() }, { grouped: true, reason: null, hosts: 1, ...TABS })
 })
 
 test('the host badge fills both native session-row seats under the plugin id, and stays when the host drops', async () => {

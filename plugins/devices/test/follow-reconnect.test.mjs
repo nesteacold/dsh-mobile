@@ -26,8 +26,17 @@ function createQueue() {
   const waiters = []
   let closed = false
   let error = null
-  const settle = (value, done) => { for (const waiter of waiters.splice(0)) waiter({ value, done }) }
-  return {
+  /** True while a reader is waiting: a mid-stream failure only exists once a read is pending. */
+  let readingFlag = false
+  const settle = () => { for (const waiter of waiters.splice(0)) waiter({ value: undefined, done: true }) }
+  const failWaiters = (cause) => {
+    // The real client's reader throws the code from the read that is already pending: a
+    // `done` here instead would end the `for await` cleanly and the pump would just re-open.
+    for (const waiter of waiters.splice(0)) waiter({ error: cause })
+  }
+  const queue = {
+    /** How many reads this stream has answered: a failed stream throws from the NEXT one. */
+    readCount: 0,
     push(value) {
       const waiter = waiters.shift()
       if (waiter) waiter({ value, done: false })
@@ -38,25 +47,44 @@ function createQueue() {
       if (closed) return
       error = Object.assign(new Error(`the connection closed (${code})`), { closeCode: code })
       closed = true
-      settle(undefined, true)
+      failWaiters(error)
+      settle()
     },
-    close() { if (closed) return; closed = true; settle(undefined, true) },
+    /** Fail with the exact error the real client raises (a stream-protocol error, no close code). */
+    failWith(cause) {
+      if (closed) return
+      error = cause
+      closed = true
+      failWaiters(cause)
+      settle()
+    },
+    close() { if (closed) return; closed = true; settle() },
+    /** Whether a reader is waiting on this stream right now (the client's state mid-stream). */
+    set reading(value) { readingFlag = value },
+    get reading() { return readingFlag },
     [Symbol.asyncIterator]() {
       return {
         async next() {
-          if (items.length > 0) return { value: items.shift(), done: false }
+          if (items.length > 0) { queue.readCount += 1; return { value: items.shift(), done: false } }
           if (closed) { if (error) throw error; return { value: undefined, done: true } }
-          return new Promise((resolve) => waiters.push(resolve))
+          readingFlag = true
+          try {
+            const result = await new Promise((resolve) => waiters.push(resolve))
+            if (result.error) throw result.error
+            queue.readCount += 1
+            return result
+          } finally { readingFlag = false }
         },
         async return() {
           closed = true
           error = null
-          settle(undefined, true)
+          settle()
           return { value: undefined, done: true }
         },
       }
     },
   }
+  return queue
 }
 
 const snapshot = (throughSeq, extra = {}) => {
@@ -81,10 +109,18 @@ const increment = (seq) => ({ type: 'event', event: { seq, type: 'assistant/mess
  * A remote Host whose every `session/follow` opens on `snapshot(throughSeq)`: that
  * is what a real Host answers, because a follow always opens on a fresh snapshot of
  * everything already committed.
+ *
+ * It also refuses to hold two subscriptions at once (`overlaps` records the attempt):
+ * a re-open that happened while the previous stream was still open is exactly the leak
+ * the DESYNC cancel fix exists to prevent, so here it is a loud failure, not a count.
  */
 function createFakeRemote() {
   const streams = []
   const calls = []
+  const overlaps = []
+  const openedAt = []
+  /** The streamId the REAL client announced for each open (a stub connection has none). */
+  const announced = []
   const connection = {
     state: 'online',
     async call(endpoint, args) {
@@ -92,12 +128,22 @@ function createFakeRemote() {
       return {}
     },
     async openStream(endpoint, args, options) {
-      const queue = createQueue()
-      streams.push({ endpoint, args, options, queue })
-      return queue
+      // The subscription the Host holds until its reader lets go of it (or it fails).
+      if (streams.some((stream) => !stream.released)) overlaps.push(streams.length)
+      const base = createQueue()
+      streams.push({ endpoint, args, options, queue: base, released: false })
+      openedAt.push(Date.now())
+      return base
     },
   }
-  return { hostId: HOST, hostName: 'Host B', connection, streams, calls }
+  return { hostId: HOST, hostName: 'Host B', connection, streams, calls, overlaps, openedAt, announced,
+    /** The subscription the reader is on right now (or was, after a desync ended it). */
+    old() { return streams.at(-1) },
+    /** The client's own streamId: the live client announces it on the socket. */
+    streamIdOf(stream) { return announced[streams.indexOf(stream)] ?? null },
+    release(stream) { stream.released = true },
+    /** Subscriptions the Host is still holding: what the gateway's per-device cap counts. */
+    live() { return streams.filter((stream) => !stream.released).length } }
 }
 
 function createHarness() {
@@ -258,6 +304,257 @@ test('abandoning the iterator also stops the retries', async () => {
   await new Promise((resolve) => setTimeout(resolve, 150))
   assert.equal(harness.remote.streams.length, opens, 'an abandoned follow is never retried')
 })
+
+test('a stream DESYNC re-opens the follow once, with no duplicate and no gap', async () => {
+  // Measured defect: a plain Error from the out-of-order guard in the client ended the follow for
+  // the rest of the session (opens=1, a frozen transcript) while prompts kept working. A desync is
+  // a broken frame ORDER on this connection, not an answer from the Host, so the follow it feeds
+  // must re-open from the last durable sequence exactly as a dropped link does.
+  const harness = createHarness()
+  const control = new AbortController()
+  try {
+    const source = await harness.gateway.openWireStream('session/follow', followPayload(),
+      undefined, {}, control.signal, control, 64)
+    const iterator = source[Symbol.asyncIterator]()
+    harness.remote.streams[0].queue.push(snapshot(2))
+    assert.equal((await nextFrame(iterator, 'opening snapshot')).value.cursor, 2)
+    harness.remote.streams[0].queue.push(increment(3))
+    assert.equal((await nextFrame(iterator, 'first increment')).value.event.seq, 3)
+
+    // The client's own out-of-order guard: an Error carrying only the resumable code.
+    harness.remote.streams.at(-1).queue.failWith(
+      Object.assign(new Error('the remote stream arrived out of order'), { code: 'remote/stream-desync' }))
+
+    // One re-open, on the same follow, in the host's namespace.
+    await until(() => harness.remote.streams.length === 2, 'the follow to re-open after a desync')
+    assert.equal(harness.remote.streams.at(-1).endpoint, 'session/follow')
+    assert.deepEqual(harness.remote.streams.at(-1).args,
+      { request: { address: { kind: 'session', sessionId: SESSION } } })
+
+    // The re-opened follow answers with a snapshot through seq 6: seqs 4-6 are the stretch the
+    // reader missed. It gets exactly those, in order, once each — no second snapshot, no repeat
+    // of 2-3 (already delivered), and then the stream is live again.
+    harness.remote.streams.at(-1).queue.push(snapshot(6))
+    for (const seq of [4, 5, 6]) {
+      const frame = (await nextFrame(iterator, `resumed seq ${seq}`)).value
+      assert.equal(frame.type, 'event', 'a resumed opening is not a second snapshot')
+      assert.equal(frame.event.seq, seq, `the gap is filled exactly: ${seq}`)
+      assert.equal(frame.event.data.sessionId, `h:${HOST}:${SESSION}`)
+    }
+    harness.remote.streams.at(-1).queue.push(increment(7))
+    assert.equal((await nextFrame(iterator, 'live again')).value.event.seq, 7)
+
+    assert.equal(harness.remote.streams.length, 2, 'exactly one re-open for one desync')
+    assert.deepEqual(harness.remote.calls, [], 'nothing was replayed against the host')
+  } finally { control.abort() }
+})
+
+/** The client's own out-of-order guard: an Error carrying only the resumable code. */
+const desync = () => Object.assign(new Error('the remote stream arrived out of order'),
+  { code: 'remote/stream-desync' })
+
+/**
+ * The Host side of a follow whose every attempt answers the open and then delivers nothing
+ * (a Host that accepts the connection and has no frames for it yet). It strictly refuses to
+ * hold two subscriptions at once (`overlaps` records the attempt), so a re-open that lands
+ * while the previous stream is still open - the leak this fix exists to prevent - is a
+ * failing test here, not a count.
+ */
+function createStrictRemote() {
+  const streams = []
+  const overlaps = []
+  const openedAt = []
+  const releases = []
+  const connection = {
+    state: 'online',
+    async call() { return {} },
+    async openStream(endpoint, args, options) {
+      if (streams.some((stream) => !stream.released)) overlaps.push(streams.length)
+      const queue = createQueue()
+      const stream = { endpoint, args, options, queue, released: false }
+      streams.push(stream)
+      openedAt.push(Date.now())
+      return queue
+    },
+  }
+  return { hostId: HOST, hostName: 'Host B', connection, streams, overlaps, openedAt, releases,
+    /** The attempt the reader is on (its queue failed or the reader let go: it is over). */
+    old() { return streams.at(-1) },
+    /** The reader let go of this subscription (the DESYNC path, at the router fakes' level). */
+    release(stream) { stream.released = true; releases.push(stream) },
+    live() { return streams.filter((stream) => !stream.released).length } }
+}
+
+/**
+ * A harness over `createStrictRemote`, which is the same router wiring as `createHarness`
+ * but with a Host that accounts for its subscriptions.
+ */
+function createStrictHarness() {
+  const remote = createStrictRemote()
+  const logs = []
+  const gateway = {
+    // rc.1 arity: the wrapper's self-test probes both (>= 4 and >= 5 parameters).
+    async dispatchRpc(endpoint, payload, signal, peer) { // eslint-disable-line no-unused-vars
+      return { ok: true, value: {} }
+    },
+    async openWireStream(endpoint, payload, uplink, peer, signal, control, window) {
+      void [endpoint, payload, uplink, peer, signal, control, window]
+      return createQueue()
+    },
+  }
+  const router = createHostRouter({
+    gateway,
+    dshVersion: PINNED_DSH_VERSION,
+    hosts: () => [{ hostId: HOST, hostName: 'Host B', connection: remote.connection, online: true }],
+    onHostsChanged: () => () => {},
+    log: (line) => logs.push(line),
+  })
+  const installed = router.install()
+  assert.equal(installed.remote, true, `the carrier must be wrapped for this test (${installed.reason})`)
+  return { router, gateway, remote, logs }
+}
+
+/** Open the follow through the router's wrapper, as the native UI does. */
+async function strictFollow(harness, control) {
+  assert.deepEqual(harness.remote.openedAt.length, 0, 'the Host has opened nothing yet')
+  const source = await harness.gateway.openWireStream('session/follow', followPayload(),
+    undefined, {}, control.signal, control, 64)
+  return source[Symbol.asyncIterator]()
+}
+
+test('a DESYNC ends the old subscription and the router opens the follow exactly once more', async () => {
+  // Reviewer finding (review-webunlock, Major): the DESYNC guard deleted the stream from
+  // `wireStreams` BEFORE failing its reader, so the iterator's `finally` cancel found nothing
+  // to release and NO `remote-stream-cancel` reached the Host. The old subscription stayed
+  // alive on credit while re-opens piled up until the gateway's per-device cap made a
+  // recoverable desync terminal. The frame itself is pinned in test/stream-open.test.mjs;
+  // what is checked here is the router's half: one attempt at a time, never overlapping.
+  const harness = createStrictHarness()
+  const control = new AbortController()
+  try {
+    const iterator = await strictFollow(harness, control)
+    harness.remote.old().queue.push(snapshot(2))
+    assert.equal((await nextFrame(iterator, 'opening snapshot')).value.cursor, 2)
+
+    for (const round of [1, 2, 3]) {
+      const before = harness.remote.openedAt.length
+      const old = harness.remote.old()
+      // The Host holds the old stream right now: a replacement must not overlap it.
+      assert.equal(harness.remote.live(), 1, `round ${round}: one subscription before the desync`)
+      old.queue.failWith(desync())
+      // The reader's iterator ends on the failure: in the client that is the exactly-once
+      // cancel for this stream name (test/stream-open.test.mjs), and it runs before the throw
+      // reaches this pump, so the re-open below can never overtake it.
+      harness.remote.release(old)
+      await until(() => harness.remote.openedAt.length === before + 1, `round ${round}: the follow to re-open`)
+      assert.deepEqual(harness.remote.overlaps, [], `round ${round}: no open overlapped a live subscription`)
+      assert.equal(harness.remote.live(), 1, `round ${round}: exactly one subscription after the re-open`)
+      assert.equal(harness.remote.openedAt.length, before + 1, `round ${round}: one replacement, no duplicate open`)
+    }
+    // Each re-open is a real follow: a frame from the current attempt reaches the reader.
+    harness.remote.old().queue.push(increment(3))
+    assert.equal((await nextFrame(iterator, 'live again')).value.event.seq, 3)
+    assert.deepEqual(harness.remote.overlaps, [], 'the Host never held two subscriptions at once')
+    assert.equal(harness.remote.openedAt.length, 4, 'the opening and exactly three re-opens, one per desync')
+  } finally { control.abort() }
+})
+
+test('consecutive DESYNCs back off, then stop the follow with remote/stream-desync-repeated', async () => {
+  const harness = createStrictHarness()
+  const control = new AbortController()
+  try {
+    const iterator = await strictFollow(harness, control)
+    harness.remote.old().queue.push(snapshot(2))
+    assert.equal((await nextFrame(iterator, 'opening snapshot')).value.cursor, 2)
+    const opening = harness.remote.openedAt[0]
+
+    // Every attempt after the first: the open succeeds and its reader is failed with the
+    // DESYNC code. A Host like this answers 'open ok' forever, so the open alone resets
+    // nothing; the cap needs four re-opens on the 100/200/300/400 ms schedule (~1 s).
+    let ended
+    const watch = iterator.next().then((result) => { ended = result }, (error) => { ended = { done: true, error } })
+    watch.catch(() => {})
+    // Fail the attempt the reader is on, once per open, as soon as it exists.
+    let watched = harness.remote.openedAt.length
+    const desyncCurrent = () => {
+      const stream = harness.remote.old()
+      stream.queue.failWith(desync())
+      harness.remote.release(stream)
+    }
+    desyncCurrent()
+    for (let tick = 0; tick < 400 && !ended; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      if (ended || harness.remote.openedAt.length === watched) continue
+      watched = harness.remote.openedAt.length
+      desyncCurrent()
+    }
+
+    assert.ok(ended, 'the follow ends instead of looping forever')
+    assert.equal(ended.done, true, 'the end is not a frame')
+
+    // The cap decided, not the reader: the opening plus five DESYNC attempts (the fifth is
+    // the one that reaches MAX_CONSECUTIVE_DESYNCS), each opened only after the previous
+    // stream was released, each waiting longer than the one before.
+    assert.equal(harness.remote.openedAt.length, 6,
+      `the opening plus five desync attempts, then the cap (saw ${harness.remote.openedAt.length}, logs: ${JSON.stringify(harness.logs)})`)
+    const attempts = harness.remote.openedAt.slice(1)
+    const gaps = attempts.slice(1).map((at, index) => at - attempts[index])
+    for (const [index, gap] of gaps.entries()) {
+      // Generous bounds: the pump's timer is the schedule under test, the poll is only noise.
+      assert.ok(gap >= 100 * (index + 1) - 40, `gap ${index + 1} waited >= ${100 * (index + 1)} ms (saw ${gap} ms)`)
+    }
+    assert.ok(attempts[0] - opening >= 50, 'the first re-open waited the minimum delay')
+    assert.deepEqual(harness.remote.overlaps, [], 'no re-open ever overlapped a live subscription')
+    assert.equal(harness.logs.filter((line) => line.includes('remote/stream-desync-repeated')).length, 1,
+      'the visible terminal code is logged exactly once')
+  } finally { control.abort() }
+})
+test('a DESYNC followed by healthy frames starts the counter over', async () => {
+  const harness = createStrictHarness()
+  const control = new AbortController()
+  try {
+    const iterator = await strictFollow(harness, control)
+    harness.remote.old().queue.push(snapshot(2))
+    assert.equal((await nextFrame(iterator, 'opening snapshot')).value.cursor, 2)
+
+    // Four consecutive desyncs: one short of the cap.
+    for (let round = 1; round <= 4; round += 1) {
+      const before = harness.remote.openedAt.length
+      const old = harness.remote.old()
+      old.queue.failWith(desync())
+      harness.remote.release(old)
+      await until(() => harness.remote.openedAt.length === before + 1, `desync ${round} to re-open`)
+    }
+    // Then an attempt that delivers: that, not the open, is what resets the counter.
+    harness.remote.old().queue.push(increment(3))
+    assert.equal((await nextFrame(iterator, 'a healthy frame')).value.event.seq, 3)
+    harness.remote.old().queue.push(increment(4))
+    assert.equal((await nextFrame(iterator, 'another healthy frame')).value.event.seq, 4)
+    const progressedAt = Date.now()
+
+    // Four more desyncs right after: without the reset the fifth would have been the cap.
+    for (let round = 1; round <= 4; round += 1) {
+      const before = harness.remote.openedAt.length
+      const old = harness.remote.old()
+      old.queue.failWith(desync())
+      harness.remote.release(old)
+      await until(() => harness.remote.openedAt.length === before + 1, `second series desync ${round}`)
+    }
+    assert.equal(harness.logs.filter((line) => line.includes('remote/stream-desync-repeated')).length, 0,
+      'no terminal error: the counter started over after the frames')
+    // The backoff restarted too: the first re-open after progress waited the minimum delay
+    // (the fourth desync of the first series had waited ~400 ms).
+    const firstGap = harness.remote.openedAt.at(-4) - progressedAt
+    assert.ok(firstGap < 300, `the first re-open after progress waited the short delay (saw ${firstGap} ms)`)
+
+    // The follow is still repairing itself, one subscription at a time.
+    harness.remote.old().queue.push(increment(5))
+    assert.equal((await nextFrame(iterator, 'live after the second series')).value.event.seq, 5)
+    assert.deepEqual(harness.remote.overlaps, [], 'the Host never held two subscriptions at once')
+    assert.equal(harness.remote.live(), 1, 'exactly one subscription is held while the follow runs')
+  } finally { control.abort() }
+})
+
 
 test('a refusal from the host ends the follow instead of retrying it', async () => {
   const harness = createHarness()

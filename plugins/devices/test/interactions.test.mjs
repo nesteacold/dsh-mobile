@@ -360,7 +360,11 @@ test('a remote question card is answered through the bridge userQuestions/answer
       event: 'user-questions/request',
       eventId: namespaceId(HOST, 'q-1'),
       agentId: namespaceId(HOST, 's1'),
-      request: { questions },
+      // `wait.callId` is the ONLY field DSH consults to key a question card
+      // (`dsh-client-ui-user-questions` client/index.ts: `request.wait?.callId`).
+      // Without it the card is unnameable: DSH tears it down in the request's
+      // `finally` rather than when the projection drops the answered call.
+      request: { questions, wait: { callId: 'call-42' } },
     })
 
     const answers = [{ id: 'q1', selected: ['B'] }]
@@ -378,8 +382,16 @@ test('a remote question card is answered through the bridge userQuestions/answer
     assert.deepEqual(result.value, { kind: 'question-response', rpcId: namespaceId(HOST, 'q-1'),
       sessionId: namespaceId(HOST, 's1'), action: 'answer', accepted: true })
     assert.deepEqual([...hostIdsIn(remote.calls[0].args)], [])
+    // Accepted ⇒ the card is CLEARED on this controller: the same eventId no longer
+    // binds, so a duplicate cannot reach the Host a second time.
+    const replay = await harness.gateway.dispatchRpc('$events/result',
+      answer(namespaceId(HOST, 'q-1'), { answers }), undefined, {})
+    assert.equal(replay.ok, false, 'an accepted card is dropped, not left answerable')
+    assert.equal(replay.error.code, 'remote/approval-unbound')
+    assert.equal(remote.calls.length, 1, 'the accepted answer crossed the wire exactly once')
     // A Host that answers `false` (the question is no longer continuable) leaves
-    // the card addressable and the receipt says so.
+    // the card addressable and the receipt says so — and NOTHING is emitted on the
+    // native stream: a refusal must not read to the UI as "answered, now close".
     const stale = createFakeRemote(HOST, 'Host B', { replies: { 'userQuestions/answer': false } })
     const second = createHarness({ remotes: [stale] })
     const opened = await openEvents(second)
@@ -391,6 +403,16 @@ test('a remote question card is answered through the bridge userQuestions/answer
       assert.equal(refused.ok, true)
       assert.equal(refused.value.accepted, false)
       assert.equal(refused.value.reason, 'not-accepted')
+      // The card is still tracked, so the same draft can be retried: a second
+      // attempt reaches the Host again instead of being unbindable.
+      assert.equal((await nextEvent(opened.iterator, () => true, { ms: 150 })).frame, null,
+        'a refusal emits no cancel/result frame onto the native stream')
+      const retried = await second.gateway.dispatchRpc('$events/result',
+        answer(namespaceId(HOST, 'q-2'), { answers }), undefined, {})
+      assert.equal(retried.ok, true, JSON.stringify(retried))
+      assert.equal(retried.value.reason, 'not-accepted')
+      assert.equal(stale.calls.filter((call) => call.endpoint === 'userQuestions/answer').length, 2,
+        'the refused card stayed tracked, so the retry reached the Host')
     } finally {
       opened.control.abort()
       await opened.iterator.return()
@@ -401,19 +423,57 @@ test('a remote question card is answered through the bridge userQuestions/answer
   }
 })
 
+test('a Host that throws REPLY_QUEUED/BAD_ANSWER reports it and the card stays open', async () => {
+  const questions = [{ id: 'q1', header: 'Pick', options: [{ label: 'A' }, { label: 'B' }] }]
+  const answers = [{ id: 'q1', selected: ['A'] }]
+  // `answer()` does not return false for these two: it throws, with a `code`. Both
+  // mean "nothing was applied", so the card must survive exactly like a `false`.
+  for (const code of ['REPLY_QUEUED', 'BAD_ANSWER']) {
+    const thrown = Object.assign(new Error(`the Host refused: ${code}`), { name: 'UserQuestionError', code })
+    const remote = createFakeRemote(HOST, 'Host B', { replies: { 'userQuestions/answer': thrown } })
+    const harness = createHarness({ remotes: [remote] })
+    const { control, iterator } = await openEvents(harness)
+    try {
+      remote.card({ kind: 'question-requested', rpcId: `q-${code}`, sessionId: 's1', callId: `call-${code}`, questions })
+      await nextFrame(iterator, 'question card')
+      const refused = await harness.gateway.dispatchRpc('$events/result',
+        answer(namespaceId(HOST, `q-${code}`), { answers }), undefined, {})
+      assert.equal(refused.ok, true, `${code} must be a receipt, not a transport failure: ${JSON.stringify(refused)}`)
+      assert.equal(refused.value.accepted, false)
+      assert.equal(refused.value.reason, code)
+      // Not closed as answered, and still bindable: the next attempt reaches the Host.
+      assert.equal((await nextEvent(iterator, () => true, { ms: 150 })).frame, null)
+      await harness.gateway.dispatchRpc('$events/result',
+        answer(namespaceId(HOST, `q-${code}`), { answers }), undefined, {})
+      assert.equal(remote.calls.filter((call) => call.endpoint === 'userQuestions/answer').length, 2,
+        `${code} left the card tracked so a retry still binds`)
+    } finally {
+      control.abort()
+      await iterator.return()
+    }
+  }
+})
+
 test('a question card without a tool-call id is refused instead of guessed', async () => {
   const remote = createFakeRemote(HOST, 'Host B', { replies: { 'userQuestions/answer': true } })
   const harness = createHarness({ remotes: [remote] })
   const { control, iterator } = await openEvents(harness)
   try {
     // An older Host may not publish the tool-call id; nothing can be answered then.
+    // The refusal is a normal receipt (like an approval refusal), never a guessed id
+    // AND never a closed dialog: the card stays on screen with its reason.
     remote.card({ kind: 'question-requested', rpcId: 'q-3', sessionId: 's1', questions: [{ id: 'q1', header: 'Pick' }] })
-    await nextFrame(iterator, 'question card')
+    const card = (await nextFrame(iterator, 'question card')).value
+    assert.deepEqual(card.request, { questions: [{ id: 'q1', header: 'Pick' }] },
+      'an un-bound question publishes no wait.callId rather than inventing one')
     const result = await harness.gateway.dispatchRpc('$events/result',
       answer(namespaceId(HOST, 'q-3'), { answers: [{ id: 'q1', selected: ['A'] }] }), undefined, {})
-    assert.equal(result.ok, false)
-    assert.equal(result.error.code, 'remote/question-unbound')
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.value.accepted, false)
+    assert.equal(result.value.reason, 'unbound')
     assert.equal(remote.calls.length, 0, 'nothing was sent to the Host')
+    assert.equal((await nextEvent(iterator, () => true, { ms: 150 })).frame, null,
+      'no cancel reaches the native stream: the card is not closed as answered')
   } finally {
     control.abort()
     await iterator.return()
@@ -847,7 +907,10 @@ test('real gateway: a question card reaches an approval:respond device and is an
     assert.equal(card.event, 'user-questions/request')
     assert.ok(card.eventId.startsWith(namespaceId(HOST, '')), `eventId must be host-tagged (${card.eventId})`)
     assert.equal(card.agentId, namespaceId(HOST, 's1'))
-    assert.deepEqual(card.request, { questions })
+    // The card reaches the owner UI keyed by the Host's own tool-call id, in the one
+    // field DSH reads (`wait.callId`). Without it the UI cannot bind the question to
+    // its call, and its answer never lands.
+    assert.deepEqual(card.request, { questions, wait: { callId: 'call-77' } })
     // Bindable: the card addresses the Host's own pending question, so answering
     // the eventId the UI shows cannot miss it.
     const pendingRequests = gatewayLogSince(logOffset).filter((line) => line.includes('question requested: rpcId='))

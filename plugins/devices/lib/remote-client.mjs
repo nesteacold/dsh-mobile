@@ -324,6 +324,19 @@ const nextRequestId = () => `dev-${Date.now().toString(36)}-${(++requestCounter)
 // result streams) and accepts 1..64 of [A-Za-z0-9._-].
 const nextStreamId = () => `dev-s-${Date.now().toString(36)}-${(++requestCounter).toString(36)}`
 const REMOTE_STREAM_CREDIT = 64
+/**
+ * Contract §6's in-band lock refusal (`auth/locked`). A literal because this module may not
+ * load the protocol package at import time — `loadProtocol()` is async and only the browser
+ * channel needs it. test/stream-open.test.mjs pins it to the code the gateway really sends.
+ */
+const LOCKED_ERROR_CODE = 'auth/locked'
+/**
+ * A stream whose frames arrived out of order. Distinct from a refusal: the Host said nothing
+ * against the request, this connection's frame numbering broke. `host-router` re-opens the
+ * follow from the last durable sequence for it (a re-opened follow carries a snapshot, so the
+ * reader resumes with no gap and no duplicate).
+ */
+const STREAM_DESYNC_CODE = 'remote/stream-desync'
 
 /**
  * Stop the bounded open wait of a `remote-stream-open`. It runs from the send
@@ -774,6 +787,17 @@ export class RemoteConnection extends EventEmitter {
       this.#onStreamFrame(frame)
       return
     }
+    // Spec 021 rev 15: the Host can refuse a remote-bridge frame BEFORE the bridge (a
+    // `web:unlock` socket that has not asserted its passkey is answered `auth/locked`), and
+    // that refusal carries no reply the stream/request machinery reads. Left here it was an
+    // open that waited out `remote/stream-open-timeout`. It is now the answer: settle the
+    // stream named by the frame's `streamId`, and any connection-wide in-flight request,
+    // with the Host's own code so the UI can say "locked". Rate-limited too, since `reason`
+    // names it; the timeout stays as the fallback for a Host that says nothing at all.
+    if (frame.kind === 'error' && typeof frame.code === 'string'
+      && (frame.requestType === 'remote-stream-open' || frame.code === LOCKED_ERROR_CODE)) {
+      if (this.#failRefusedLocked(frame)) return
+    }
     if (typeof frame.requestId === 'string' && this.waiters.has(frame.requestId)) {
       const waiter = this.waiters.get(frame.requestId)
       this.waiters.delete(frame.requestId)
@@ -915,6 +939,9 @@ export class RemoteConnection extends EventEmitter {
       if (error) state.reader.fail(error)
       else state.reader.close()
     }
+    // A frame path that fails this stream (a DESYNC, a lock refusal) uses the same cancel,
+    // so the Host hears about the dead stream even if the consumer never re-iterates it.
+    state.cancel = cancel
     const onAbort = () => cancel(Object.assign(new Error('the remote stream was cancelled'), { code: 'cancelled' }))
     if (signal?.aborted) {
       onAbort()
@@ -944,6 +971,44 @@ export class RemoteConnection extends EventEmitter {
   }
 
   /**
+   * Settle whatever the Host's lock refusal (`auth/locked`) was answering: the open stream its
+   * `streamId` names, and every in-flight request still waiting on this connection (a refusal
+   * carries no per-request reply, and the request that caused it is the only one it can mean).
+   * Returns false when there was nothing to settle, so the frame then takes the ordinary path.
+   */
+  #failRefusedLocked(frame) {
+    const error = Object.assign(
+      new Error(frame.reason === 'rate-limited'
+        ? 'the remote Host is locked and refusing attempts for now; unlock it on the Host first'
+        : 'the remote Host is locked; it needs a passkey unlock before it answers'),
+      { code: frame.code, requestType: frame.requestType, reason: frame.reason })
+    let settled = false
+    const streamId = typeof frame.streamId === 'string' ? frame.streamId : undefined
+    for (const [id, state] of this.wireStreams) {
+      if (streamId !== undefined && id !== streamId) continue
+      // Through the stream's own cancel: the Host is told the stream is over exactly once.
+      if (state.cancel) { state.cancel(error); settled = true; continue }
+      clearOpenTimer(state)
+      this.wireStreams.delete(id)
+      state.reader.fail(error)
+      settled = true
+    }
+    for (const [id, waiter] of this.waiters) {
+      clearTimeout(waiter.timer)
+      this.waiters.delete(id)
+      waiter.reject(error)
+      settled = true
+    }
+    for (const [id, collector] of this.streams) {
+      clearTimeout(collector.timer)
+      this.streams.delete(id)
+      collector.reject(error)
+      settled = true
+    }
+    return settled
+  }
+
+  /**
    * Frames of a `remote-stream-open`. Returns false when the id belongs to a
    * one-shot result stream (`res.N`), which `call` collects.
    */
@@ -959,8 +1024,17 @@ export class RemoteConnection extends EventEmitter {
       return true
     }
     if (frame.seq !== state.next) {
-      this.wireStreams.delete(frame.streamId)
-      state.reader.fail(new Error('the remote stream arrived out of order'))
+      // Spec 008 defect fix: a DESYNC is not a refusal. The stream is out of order, so this
+      // iterator cannot continue — but the follow it feeds can be re-opened from the last
+      // durable sequence and land exactly where the reader stopped. `remote/stream-desync` is
+      // the code host-router treats as resumable; without it a plain Error ended the follow
+      // for the rest of the session (measured: opens=1 and a frozen transcript).
+      // It goes through `cancel` and not a bare `reader.fail`: that path is what sends the
+      // one `remote-stream-cancel` for this streamId. Deleting the entry here instead left
+      // the iterator's own cancel a no-op, so every broken Host's subscription stayed alive
+      // on the wire, stalled on credit, while re-opens piled up behind the gateway's cap.
+      state.cancel?.(Object.assign(new Error('the remote stream arrived out of order'),
+        { code: STREAM_DESYNC_CODE }))
       return true
     }
     state.next += 1

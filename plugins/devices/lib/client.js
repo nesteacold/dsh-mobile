@@ -31,6 +31,28 @@ window.__ModuleLoader__.load({
       // shell that simply has no chunk loader, and the failure is already visible.
       : Promise.resolve(null)
 
+    // The sidebar host tabs need an imperative React root: the strip is placed in the
+    // sidebar's DOM, outside this bundle's own React tree. `react` carries no
+    // `createRoot` (React 19), so the root renderer comes from the shell's module loader
+    // the same way every surface in this file gets React — `react-dom/client` first, and
+    // `react-dom` for a shell whose mapping exposes only the package root. Resolved ONCE,
+    // lazily, and only when the strip is actually installed; a shell that cannot hand it
+    // over gets no strip and the Devices page says so — never a hand-built second strip.
+    let reactRootCache
+    const reactRoot = () => {
+      if (reactRootCache !== undefined) return reactRootCache
+      reactRootCache = null
+      for (const id of ['react-dom/client', 'react-dom']) {
+        try {
+          const loaded = typeof require === 'function' ? require(id) : null
+          if (typeof loaded?.createRoot !== 'function') continue
+          reactRootCache = loaded.createRoot
+          break
+        } catch { /* the next id may be the one this shell maps */ }
+      }
+      return reactRootCache
+    }
+
     // ---------------------------------------------------------------- i18n
     // vi/en; Vietnamese when the DSH locale is vi*, English otherwise (the
     // gateway reads the same ctx.locale snapshot: `getSnapshot().active`).
@@ -332,7 +354,7 @@ window.__ModuleLoader__.load({
         tabSwitchRemote: 'Show remote workspaces',
         tabShortcutLocal: 'Ctrl+Alt+1',
         tabShortcutRemote: 'Ctrl+Alt+2',
-        sidebarReasonNoTabs: 'This shell declares no sidebar tab strip.',
+        sidebarReasonNoTabs: 'This shell renders no sidebar workspace header to place the tabs under.',
         sidebarReasonShortcut: 'The sidebar tabs are on, but Ctrl+Alt+1 / 2 could not be registered',
         // --- spec 033 (A1.2): a file picked for a remote session reaches that Host as bytes ---
         attachTitle: 'Remote file attach',
@@ -668,7 +690,7 @@ window.__ModuleLoader__.load({
         tabSwitchRemote: 'Xem workspace từ xa',
         tabShortcutLocal: 'Ctrl+Alt+1',
         tabShortcutRemote: 'Ctrl+Alt+2',
-        sidebarReasonNoTabs: 'Giao diện này không khai báo dải thẻ cho thanh bên.',
+        sidebarReasonNoTabs: 'Giao diện này không dựng tiêu đề danh sách workspace để đặt thẻ bên dưới.',
         sidebarReasonShortcut: 'Thẻ thanh bên đang bật, nhưng không đăng ký được Ctrl+Alt+1 / 2',
         // --- spec 033 (A1.2): tệp chọn cho phiên từ xa đến host đó dưới dạng byte ---
         attachTitle: 'Đính kèm tệp từ xa',
@@ -872,10 +894,11 @@ window.__ModuleLoader__.load({
 .dshdev-seg button{background:transparent;border:0;color:inherit;font:inherit;padding:5px 14px;cursor:pointer}
 .dshdev-seg button[aria-pressed=true]{background:${colors.accent};color:${colors.accentText}}
 .dshdev-seg button:disabled{opacity:.5;cursor:default}
-/* The sidebar's host tabs sit above the New Task row inside the sidebar.session.action */
-/* layer: display:contents so the layer adds no box of its own, and only the strip is styled. */
-.dshdev-hosttabs{display:contents}
-.dshdev-hosttabs-strip{display:flex;gap:2px;margin:0 6px 6px;padding:2px;border:1px solid ${colors.border};border-radius:999px;background:${colors.hover}}
+/* The sidebar's host tabs are ONE box inserted between the sidebar's own section header */
+/* and the scrolling list area (never inside it, never over it), so the strip is a plain */
+/* block in the sidebar's flow: no position, no size or scroll container of its own. */
+.dshdev-hosttabs{display:block;flex:none;margin:2px 10px 8px}
+.dshdev-hosttabs-strip{display:flex;gap:2px;margin:0;padding:2px;border:1px solid ${colors.border};border-radius:999px;background:${colors.hover}}
 .dshdev-hosttabs-strip button{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* spec 008 P2b: the host seat on a native session row, the composer chip/popover
    and the session notices. The seat is a sibling of the row's own timestamp, so
@@ -3002,7 +3025,23 @@ window.__ModuleLoader__.load({
     // tags workspace ids that way too, so one prefix decides both directions: a row is
     // remote iff its key carries the `:h:` tag after the kind.
     const HOST_TABS_STYLE_ID = 'dsh-ext.devices.host-tabs'
-    const HOST_TABS_SLOT = 'sidebar.session.action'
+    // Placement (owner decision 2026-11-16): the New Session button keeps its exact
+    // position and size, so the strip is NOT a layer around it any more. It is a box
+    // INSERTED below the sidebar's own `Workspaces` section header and directly above
+    // the scrolling list area — see `installSidebarTabStrip` for the anchor and the
+    // contract it must not break. `shell.overlay` is where the render helper lives: the
+    // one root-scope `list` seat `dsh-client-ui-layout` declares, so this plugin asks no
+    // new seat of the sidebar, and the seat says nothing about where the box goes.
+    const HOST_TABS_SLOT = 'shell.overlay'
+    // The two shipped markers this placement rests on (dsh-client-ui-workspace, read
+    // from source): the section header div and the scrolling area `bindScrollerRef` is
+    // bound to — the element that owns the sidebar's `100cqh` scroll contract.
+    const HOST_TABS_HEADER = '[data-sidebar-workspace-header]'
+    const HOST_TABS_LIST = '[data-sidebar-list-area]'
+    const HOST_TABS_TESTID = 'sidebar-host-tabs'
+    // The observer waits this long after a mutation before looking for the header: the
+    // sidebar re-renders in bursts and one look per burst is enough.
+    const HOST_TABS_DEBOUNCE_MS = 80
     // What the THIS-COMPUTER tab hides: every row tagged for a remote host, and nothing
     // else — the untagged `workspace:`/`overflow:` ungrouped headers stay, since local
     // loose sessions may live there.
@@ -3069,25 +3108,143 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The `sidebar.session.action` layer: the shell's New Task row, wrapped. The strip
-     * is drawn ABOVE `children` and the wrapped row is rendered unchanged, once.
+     * The strip itself: the two segmented buttons, nothing else. It is a real box in
+     * the sidebar's flow, inserted by `installSidebarTabStrip`, so it takes no children
+     * and wraps nothing of the shell's — the New Session button stays exactly where and
+     * as big as it ships.
      */
-    function SidebarHostTabs({ wide, children }) {
+    function SidebarHostTabs() {
       useLang()
       const tab = useHostTab()
-      // On the collapsed rail there is no room for a strip and no list to filter
-      // either: `sidebar.workspaces` is not dispatched (client-ui-sidebar draws the
-      // region only in the wide state), so the layer passes the row through.
-      if (!wide) return children ?? null
       const choose = (next) => { publishHostTab(next) }
-      return h('div', { className: 'dshdev-hosttabs', 'data-testid': 'sidebar-host-tabs' },
+      return h('div', { className: 'dshdev-hosttabs', 'data-testid': HOST_TABS_TESTID },
         h('div', { className: 'dshdev-hosttabs-strip dshdev-seg', role: 'tablist', 'aria-label': tr('hostTabs') },
           [['local', 'tabThisComputer', 'tabSwitchLocal', 'tabShortcutLocal'],
             ['remote', 'tabRemoteWorkspace', 'tabSwitchRemote', 'tabShortcutRemote']].map(([id, label, title, keys]) =>
             h('button', { key: id, type: 'button', role: 'tab', 'data-tab': id, 'aria-selected': tab === id, 'aria-pressed': tab === id,
               title: `${tr(title)} (${tr(keys)})`,
-              onClick: () => choose(id) }, tr(label)))),
-        children ?? null)
+              onClick: () => choose(id) }, tr(label)))))
+    }
+
+    /**
+     * Where the strip goes, and the one rule that keeps it from breaking the sidebar:
+     * it is the header's NEXT SIBLING (the list area's previous sibling), so it never
+     * sits inside the scrolling area that owns the sidebar's `100cqh` scroll contract,
+     * and it never floats over anything.
+     *
+     * Wide-only: the header is drawn by the wide workspace browser only (the collapsed
+     * rail draws no header at all), so "header present" IS the wide state and no other
+     * collapsed-state signal is read. Two rules, both idempotent:
+     *  - nothing to do while the header's next sibling is already our node (that is what
+     *    stops an observer feedback loop: our own insert must not schedule another one);
+     *  - otherwise exactly one node per header: a second copy is removed, ours is placed.
+     * @returns {boolean} whether our node is now the header's next sibling
+     */
+    function placeHostTabsNode(doc, node) {
+      const header = doc.querySelector(HOST_TABS_HEADER)
+      const parent = header === null ? null : header.parentNode
+      if (!parent) return false
+      const strays = [...doc.querySelectorAll(`[data-testid="${HOST_TABS_TESTID}"]`)].filter((found) => found !== node)
+      // Nothing to move and nothing to remove: this pass changes no DOM, so it raises no
+      // observer record of its own — which is what keeps a feedback loop impossible.
+      if (strays.length === 0 && header.nextElementSibling === node) return false
+      // The copies go first (one node per header), and the insertion point is then read
+      // from the header: `remove()` rewires parents, so anything captured before it can be
+      // stale, while `header.nextSibling` always describes the tree as it is NOW.
+      for (const stray of strays) { try { stray.remove() } catch { /* a copy already gone needs nothing */ } }
+      parent.insertBefore(node, header.nextSibling)
+      return true
+    }
+
+    /**
+     * The invisible `shell.overlay` helper: the seat is an ordinary root-scope `list`
+     * entry, so it renders inside the app frame — the box it must produce is the
+     * sidebar's, though, which no overlay can reach. So it renders nothing, and a
+     * MutationObserver on the document places a React root of `SidebarHostTabs` between
+     * the sidebar's section header and its list area. One debounced pass per burst of
+     * mutations; the observer stays on because the sidebar re-renders (a re-render that
+     * drops our node is re-inserted, and every one of those re-inserts is skipped while
+     * ours is already in place, so the loop cannot run away). A shell whose header never
+     * appears simply gets no strip — the Devices page says so.
+     *
+     * `deps` is a test seam only: production passes nothing, so the document is the
+     * page's own.
+     * @returns {{ status: () => string, dispose: () => void }}
+     */
+    function installHostTabPlacement(deps = {}) {
+      const doc = 'doc' in deps ? deps.doc : (typeof document === 'undefined' ? null : document)
+      const Observer = 'MutationObserver' in deps ? deps.MutationObserver : (typeof MutationObserver === 'undefined' ? null : MutationObserver)
+      const delay = 'setTimeout' in deps ? deps.setTimeout : (typeof setTimeout === 'function' ? setTimeout : null)
+      const cancel = 'clearTimeout' in deps ? deps.clearTimeout : (typeof clearTimeout === 'function' ? clearTimeout : null)
+      // The renderer hands over the root renderer it read from the module loader (React 19
+      // carries none itself); `deps.createRoot` is the test seam. There is no hand-built
+      // DOM fallback on purpose: a second rendering path would lose the tab store, the
+      // locale subscription and React's own event ownership, so a shell without a root
+      // renderer is REPORTED instead.
+      const createRoot = deps.createRoot ?? deps.reactRoot ?? null
+      // What a shell without a document, an observer or a root renderer gets: nothing is
+      // installed, and the Devices page prints the same reason as a missing header.
+      if (!doc || typeof doc.querySelector !== 'function') return { status: () => 'no-tabs', dispose() {} }
+      if (typeof Observer !== 'function' || !delay) return { status: () => 'no-tabs', dispose() {} }
+      if (typeof createRoot !== 'function') return { status: () => 'no-tabs', dispose() {} }
+      const node = doc.createElement('div')
+      // The node is found by a test id, and the sidebar re-renders through React, which
+      // may drop a sibling it never rendered: the id goes on the container the root
+      // owns, the same way the plugin's other elements name themselves (`setAttribute`,
+      // else `dataset`, else the attribute map — whichever the element offers).
+      if (typeof node.setAttribute === 'function') node.setAttribute('data-testid', HOST_TABS_TESTID)
+      else if (node.dataset) node.dataset.testid = HOST_TABS_TESTID
+      else node.attrs = { ...(node.attrs ?? {}), 'data-testid': HOST_TABS_TESTID }
+      const root = createRoot(node)
+      let placed = false
+      let timer = null
+      let disposed = false
+      const place = () => {
+        if (disposed) return
+        try {
+          const inserted = placeHostTabsNode(doc, node)
+          // `placed` is a fact about the DOM, not about this pass: a pass with nothing to
+          // do still leaves our node exactly where the contract wants it.
+          if (inserted) placed = true
+          else placed = doc.querySelector(HOST_TABS_HEADER)?.nextElementSibling === node
+        } catch { /* a document mid-teardown: the next pass retries */ }
+      }
+      const schedule = () => {
+        if (disposed) return
+        if (timer !== null && cancel) cancel(timer)
+        timer = delay(() => { timer = null; place() }, HOST_TABS_DEBOUNCE_MS)
+      }
+      let observer = null
+      try {
+        // Every BATCH of records schedules one debounced pass — and the batch that carries
+        // only our own node is skipped: that is the one our insertion caused, and a pass
+        // run for it would find the node already in place and insert nothing. The batch
+        // after it is the sidebar's own re-render, and that one does reach the DOM.
+        observer = new Observer((entries) => {
+          const foreign = (entries ?? []).filter((entry) => !(entry.addedNodes ?? []).every((added) => added === node))
+          if (foreign.length === 0) return
+          schedule()
+        })
+        observer.observe(doc.body, { childList: true, subtree: true })
+      } catch {
+        observer = null
+      }
+      root.render(h(SidebarHostTabs))
+      // The first pass runs now: a sidebar that is already drawn must not wait 80ms.
+      place()
+      return {
+        status: () => (placed ? 'placed' : 'no-tabs'),
+        dispose() {
+          disposed = true
+          if (timer !== null && cancel) cancel(timer)
+          timer = null
+          // A shell that refused the observer took nothing to disconnect, and one that
+          // refused it also has no re-insert to lose: the box it holds is final.
+          try { observer?.disconnect() } catch { /* a disconnected observer needs nothing */ }
+          try { root.unmount() } catch { /* already unmounted */ }
+          try { node.remove() } catch { /* already gone */ }
+        },
+      }
     }
 
     /**
@@ -3126,30 +3283,47 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // One effect owns the style and the two Ctrl+Alt+1 / 2 commands, so a reload
-    // removes exactly what this installed. A shell that declares no
-    // `sidebar.session.action` seat degrades to "no tabs" with the reason on the
-    // Devices page — the native sidebar is then exactly as shipped.
-    function installSidebarTabStrip(ctx) {
+    // One effect owns the strip, the style and the two Ctrl+Alt+1 / 2 commands, so a
+    // reload removes exactly what this installed. A shell that declares no
+    // `shell.overlay` seat — or renders no sidebar header to place the strip under —
+    // degrades to "no tabs" with the reason on the Devices page, and the native sidebar
+    // is then exactly as shipped.
+    function installSidebarTabStrip(ctx, options = {}) {
       const disposers = []
       toggles.tab = storedHostTab()
-      // Structure first: the layer is this feature's only switch, so a shell that does
-      // not declare it gets no filter at all (a filter with no way back would hide half
-      // the list) and the Devices page states the reason. The factory is the countable
-      // fact: an undeclared seat may still hand back an inert disposer.
+      // Structure first: the strip is this feature's only switch, so a shell that does
+      // not declare its seat gets no filter at all (a filter with no way back would hide
+      // half the list) and the Devices page states the reason. The factory is the
+      // countable fact: an undeclared seat may still hand back an inert disposer.
       let declared = false
       let seat = null
       try {
         seat = ctx.slots.inject(HOST_TABS_SLOT, () => {
+          // An invisible render helper: the seat is a root-scope list entry, and the box
+          // the user sees is the sidebar's, placed by `installHostTabPlacement`. The
+          // helper renders nothing, so nothing of this plugin floats over the shell.
           const registration = ctx.slots.register(
-            { name: HOST_TABS_SLOT, id: 'dsh-ext.devices.tabs', order: 100 }, SidebarHostTabs)
+            { name: HOST_TABS_SLOT, id: 'dsh-ext.devices.tabs', order: 100 }, () => null)
           declared = true
           return registration
         })
       } catch (cause) {
         declared = false
       }
-      if (!declared) {
+      let placement = null
+      if (declared) {
+        // The root renderer: the seam the shell's renderer supplies, else the module
+        // loader's `react-dom/client`.
+        const createRoot = options.createRoot ?? reactRoot()
+        try { placement = installHostTabPlacement({ reactRoot: createRoot }) } catch { placement = null }
+        // A helper with no header to stand under is no better than a refused seat: the
+        // strip cannot be reached, so it is not installed and the page says why.
+        if (placement !== null && placement.status() !== 'placed') {
+          try { placement.dispose() } catch { /* nothing was installed */ }
+          placement = null
+        }
+      }
+      if (!declared || placement === null) {
         toggles.registered = false
         toggles.reason = 'no-tabs'
         // An inert injector at an undeclared seat is usually not invoked at all, so a
@@ -3158,9 +3332,12 @@ window.__ModuleLoader__.load({
         return null
       }
       toggles.registered = true
-      if (typeof seat === 'function') disposers.push(seat)
       toggles.reason = null
+      if (typeof seat === 'function') disposers.push(seat)
+      disposers.push(() => placement.dispose())
       let filter = null
+      // The strip is a second subscriber to the same store, so a click on it and a key
+      // press land on the same writer and the same persisted choice.
       const overlay = () => { if (filter) filter.write(toggles.tab) }
       if (typeof document !== 'undefined' && document && document.head) {
         filter = hostTabsStyleWriter(document, toggles.tab)
@@ -3191,7 +3368,9 @@ window.__ModuleLoader__.load({
       }
       if (filter) disposers.push(subscribeHostTab(overlay))
       return () => {
-        for (const entry of disposers.splice(0)) {
+        // Reverse order: the strip goes before the seat that hosts its helper, so a
+        // teardown never leaves a placed node behind a released seat.
+        for (const entry of disposers.splice(0).reverse()) {
           try { entry?.() } catch { /* teardown must not throw */ }
         }
         if (filter) filter.remove()
@@ -3760,7 +3939,12 @@ window.__ModuleLoader__.load({
     const isMobileBundleSubject = (subject) => !!subject && subject.kind === 'bundle' && !!subject.pkg && subject.pkg.name === MOBILE_BUNDLE
 
     const inject = ['slots', 'locale']
-    function apply(ctx) {
+    /**
+     * `options` is a renderer-supplied seam, not a public API: it carries the root
+     * renderer (`createRoot`) the shell's module loader would otherwise be asked for. The
+     * renderer passes it; nothing else does.
+     */
+    function apply(ctx, options = {}) {
       ctx.effect(() => {
         const sync = () => setHostLanguage(ctx.locale.getSnapshot().active)
         sync()
@@ -3821,17 +4005,18 @@ window.__ModuleLoader__.load({
         remoteUI.set({ grouped: false, reason: 'the shell provides no client services' })
       }
 
-      // The sidebar's two tabs: a display filter plus one layer over the New Task row.
-      // It owns the same `remoteUI` snapshot as the surfaces above, so it is installed
-      // AFTER them and reports the tab half of it; a seat this shell refuses is stated
-      // on the Devices page instead of ending the whole bundle.
+      // The sidebar's two tabs: a display filter plus one box placed between the
+      // sidebar's section header and its list area. It owns the same `remoteUI` snapshot
+      // as the surfaces above, so it is installed AFTER them and reports the tab half of
+      // it; a seat this shell refuses, or a shell with no header to stand under, is
+      // stated on the Devices page instead of ending the whole bundle.
       if (typeof ctx.slots === 'object' && ctx.slots !== null) {
         // The injector draw runs now, so the measurable disposition is read after it,
         // not only after the effect: a shell that hands back an inert injector gets no
         // filter at all (a filter whose only switch is missing would hide half the list).
         let register = null
         ctx.effect(() => {
-          const dispose = installSidebarTabStrip(ctx)
+          const dispose = installSidebarTabStrip(ctx, { createRoot: options.createRoot })
           register = dispose
           return () => {
             if (register === dispose) register = null
@@ -3859,11 +4044,13 @@ window.__ModuleLoader__.load({
       HostChip, SessionBanners, OfflineBanner, ModelStatusBanner, RemoteTerminalEntry,
       SessionHostBadge, PermissionsEditor, scopesForKind, gatewayScopesFor,
       RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText, hostLinkOf,
-      // The sidebar's two tabs: the component the `sidebar.session.action` layer renders,
-      // the exact rule text each tab installs, and the tab store, so a test proves both
-      // filters, the untouched children, and the small data surface (one <style>).
+      // The sidebar's two tabs: the component the placement helper renders, the exact
+      // rule text each tab installs, and the tab store, so a test proves both filters,
+      // the insertion point, and the small data surface (one <style>).
       SidebarHostTabs, hostTabsStyle, HOST_TABS_STYLE, HOST_TABS_STYLE_ID, HOST_TABS_SELECTORS,
-      installSidebarTabStrip, hostTabsStyleWriter, publishHostTab, storedHostTab, HOST_TABS_STORAGE,
+      installSidebarTabStrip, installHostTabPlacement, placeHostTabsNode, hostTabsStyleWriter,
+      publishHostTab, storedHostTab, HOST_TABS_STORAGE, HOST_TABS_SLOT, HOST_TABS_HEADER, HOST_TABS_LIST,
+      HOST_TABS_TESTID, HOST_TABS_DEBOUNCE_MS,
       hostTabsStore: { getSnapshot: hostTabSnapshot, subscribe: subscribeHostTab },
       // Spec 033 (A1.2): the wrap's measured state, the page line, and the installer (so a
       // test proves install-on-start / restore-on-dispose without a live window).

@@ -90,8 +90,7 @@ const DEFAULT_WORKSPACE_LABEL = 'Default'
  *             frame `{type:'snapshot', header:{version, id}}`, so a payload that
  *             merely happens to call something a `header` is left alone)
  * Anything not listed here is copied structurally and kept verbatim, so an
- * unknown payload field keeps its value (never invent a rename for a field that
- * might not be an id: `callId`, `attachmentId` … are opaque). `provider` is the one
+ * unknown payload field keeps its value (never invent a rename for a field that * might not be an id: `callId`, `attachmentId` … are opaque). `provider` is the one
  * field handled outside this table: it is not an id but it does name a Host, so it
  * is tagged by shape wherever it labels a model selection (see `namespaceIds`).
  */
@@ -104,19 +103,25 @@ export const ID_FIELDS = Object.freeze({
   // `workspaceFiles/*` (`list`, `changes`, `read`, `readBytes`, `stat`) and
   // `officeToPdf/render` name their scope with this field instead of `sessionId`:
   // it is the wire name of their `workspaceFileScope` lookup parameter, and its
-  // value IS a SessionId (the Host resolves the workspace root from that session's
-  // header). Without the entry a tagged scope fell through to Local, so a remote
+  // value IS a SessionId (the Host resolves the workspace root from that session's // header). Without the entry a tagged scope fell through to Local, so a remote
   // session's Workspace files tab listed THIS machine's files.
   workspaceFileScopeId: 'id',
   // Approval/question correlation ids: the card the local UI decides on carries
   // the same id, so tagging it is what lets `$events/result` route to the host
   // that issued it (and keeps two hosts' ids from colliding in one UI).
+  // EXCEPTION (`source: 'source'`, see `rewriteIds`): a message's `source` object is
+  // walked as a unit so its `rpcId` can be judged by `kind`. On `kind:'user'` that
+  // `rpcId` is NOT the Host's id — it is the `requestId` THIS controller minted for
+  // the prompt, and the native controller settles the optimistic user bubble by
+  // looking that value up (`submissionSettlements.get(source.rpcId)`). Tagging it
+  // made every remote prompt render twice: the echo never matched the durable
+  // `user/message`. An approval/question card's `rpcId` is namespaced as before.
+  source: 'source',
   rpcId: 'id',
   eventId: 'id',
   approvalId: 'id',
   // The ANCHOR of a reorder: the row the moved one lands before
-  // (`workspace/insertBefore` → `beforeWorkspaceId`, `workspace/insertSessionBefore`
-  // → `beforeSessionId`). It is an id like any other, and the merged sidebar is what
+  // (`workspace/insertBefore` → `beforeWorkspaceId`, `workspace/insertSessionBefore` // → `beforeSessionId`). It is an id like any other, and the merged sidebar is what
   // makes that matter: the anchor it hands back belongs to the list the user sees, so
   // for a remote row it is `h:<hostId>:<id>`. Without these two entries the anchor was
   // the one id the table never rewrote, so moving a remote Workspace reached its Host
@@ -124,8 +129,7 @@ export const ID_FIELDS = Object.freeze({
   // answered `workspace/not-found` — the drag simply did nothing.
   beforeWorkspaceId: 'id',
   beforeSessionId: 'id',
-  // Remote agent-browser handles. A follow-up browser call (`close {tabId}`, a
-  // frame-scoped op …) need not carry a sessionId or `__dshHost`, so `#route`
+  // Remote agent-browser handles. A follow-up browser call (`close {tabId}`, a // frame-scoped op …) need not carry a sessionId or `__dshHost`, so `#route`
   // could only send it to the right Host if the handle itself is tagged. Without
   // these entries an untagged `{tabId}` fell through to Local.
   targetId: 'id',
@@ -137,8 +141,10 @@ export const ID_FIELDS = Object.freeze({
   workspaceIds: 'ids',
   // `projections.values.subagentCatalog` — one record per direct child session.
   subagentCatalog: 'items:id',
-  // `session/follow` / `session/events` opening frame.
-  header: 'id@version',
+  // `session/follow` / `session/events` opening frame. The id is on the record's OWN
+  // `id`, guarded by its `version` (`id@.id:version`): a payload that merely happens
+  // to call a record a `header` is not an opening frame and stays untouched.
+  header: 'id@.id:version',
 })
 
 /** Endpoints the wrapper answers with a merged view instead of routing. */
@@ -146,8 +152,7 @@ export const MERGED_ENDPOINTS = Object.freeze(['session/list', 'workspace/follow
 
 /**
  * The two reorder endpoints and the argument that anchors them. Both take the row
- * being moved plus an optional "land before this one" (`dsh-workspace`
- * `insertBefore` / `insertSessionBefore`); the anchor is the id the merged sidebar
+ * being moved plus an optional "land before this one" (`dsh-workspace` * `insertBefore` / `insertSessionBefore`); the anchor is the id the merged sidebar
  * produces from the row it was dropped on, so it is the one that has to be checked
  * for a cross-list drop (see `#assertSameReorderList`).
  */
@@ -191,8 +196,7 @@ function comparePre(a, b) {
 }
 
 /**
- * True when version satisfies DSH_ENGINES_RANGE (>=0.2.2-rc.3, same 0.2 minor,
- * no 0.3 prerelease). Dependency-free so the devices plugin stays dep-less.
+ * True when version satisfies DSH_ENGINES_RANGE (>=0.2.2-rc.3, same 0.2 minor, * no 0.3 prerelease). Dependency-free so the devices plugin stays dep-less.
  */
 export function dshVersionInRange(version) {
   const m = typeof version === 'string' ? SEMVER.exec(version.trim()) : null
@@ -228,6 +232,12 @@ function rootOriginal(fn) {
 // well past 32; 256 recursive frames stay far below the stack limit.
 const MAX_ID_DEPTH = 256
 /**
+ * How many durable events a re-opened follow's snapshot may hold that the reader
+ * has NOT seen yet — the stretch the link lost — before a repair replay is refused
+ * instead of turned into a whole second window (see `resumeOpeningFrames`).
+ */
+const MAX_RESUME_GAP = 4096
+/**
  * Keys a payload may never carry. `JSON.parse` turns them into own properties, and
  * one plain assignment of `__proto__` rebuilds the prototype of the renamed copy
  * instead of copying a field. No DSH wire payload has a field with these names.
@@ -260,16 +270,14 @@ const REMOTE_PROVIDER_SEPARATOR = ' — '
  *
  * `@` cannot occur in a real provider id, so the tag is unambiguous: the only
  * path that mints a new route is the custom-provider card, which validates it
- * against `/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/` (dsh-client-ui-settings-models,
- * `ROUTE_PATTERN`: lowercase letters, digits, single hyphens), and every shipped
+ * against `/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/` (dsh-client-ui-settings-models, * `ROUTE_PATTERN`: lowercase letters, digits, single hyphens), and every shipped
  * route (`deepseek-account`, `deepseek-official`, …) has the same shape.
  */
 const PROVIDER_HOST_SEPARATOR = '@'
 /** The one endpoint that writes a session's model selection. */
 const MODEL_SELECT_ENDPOINT = 'session/selectModel'
 /**
- * The local event the native picker reloads the catalog on (one of the four it
- * subscribes to). It is an `emit` frame, forwarded to the client verbatim.
+ * The local event the native picker reloads the catalog on (one of the four it * subscribes to). It is an `emit` frame, forwarded to the client verbatim.
  */
 const MODEL_CATALOG_REFRESH_EVENT = 'llm/models-updated'
 /** The two waterfall events whose cards the native UI renders and answers. */
@@ -280,11 +288,42 @@ const MAX_TRACKED_CARDS = 128
 /** How many per-host refusals the status keeps for the Devices page (bounded). */
 const MAX_HOST_ERRORS = 32
 /**
+ * How long two host-set announcements must be apart (`#announceHostSet`). A link
+ * supervisor retries a failing host on its own backoff, so a flapping host could
+ * otherwise make the picker reload the merged catalog on every retry; one emit per
+ * window still corrects the catalog within a second of the set actually settling.
+ */
+const MODEL_CATALOG_ANNOUNCE_INTERVAL_MS = 1000
+/**
  * How many hosts keep their last-known session list while they are disconnected.
  * Bounded like every other per-host table here: a paired set is small, and a
  * forgotten host is dropped from the retention entirely (see `#knownHostIds`).
  */
 const MAX_RETAINED_HOSTS = 32
+/**
+ * The frame-ordering failure `lib/remote-client.mjs` raises on a stream whose frames
+ * arrived out of `seq` order. A literal because that module does not export it and
+ * this one must not import it: the code IS the contract between the two (the tests * pin both sides to it).
+ */
+const STREAM_DESYNC_CODE = 'remote/stream-desync'
+/** The terminal code a follow ends on when DESYNCs keep repeating with no progress. */
+const STREAM_DESYNC_REPEATED_CODE = 'remote/stream-desync-repeated'
+/**
+ * How many consecutive DESYNCs a follow tolerates with no frame delivered between
+ * them. A DESYNC is resumable (the re-opened follow carries a snapshot), but a Host
+ * that accepts every open and immediately sends out-of-order frames would otherwise
+ * be re-opened forever at the minimal delay. Five attempts still ride the normal
+ * backoff (100…500 ms) and is well under the gateway's per-device stream cap, so a
+ * recoverable desync still repair it; a persistent one becomes visible instead of
+ * piling subscriptions up against that cap.
+ */
+const MAX_CONSECUTIVE_DESYNCS = 5
+/**
+ * The terminal code a follow ends on when a re-joined page holds more of the lost
+ * stretch than `MAX_RESUME_GAP`: repairing it would replay a whole session as rows,
+ * so the page is refused VISIBLY (see `resumeOverflowError`) instead of dropped.
+ */
+const STREAM_RESUME_OVERFLOW_CODE = 'remote/stream-resume-overflow'
 
 /** A refusal this module produced; `code` rides the Gateway failure vocabulary. */
 export class HostRouterError extends Error {
@@ -302,6 +341,14 @@ const isPlainObject = (value) => {
   return prototype === Object.prototype || prototype === null
 }
 
+/**
+ * The hosts one merged catalog included, as one comparable key (sorted, so the
+ * host order of a list can never matter). Shared by the merge that records it
+ * (`#mergeModelCatalog`) and the announcement that compares against it.
+ * @param {{hostId: string}[]} hosts
+ */
+const catalogKey = (hosts) => hosts.map((host) => host.hostId).sort().join('\u0000')
+
 /** `h:<hostId>:<rawId>` -> `<hostId>`, anything else -> null. */
 export function hostIdOfId(value) {
   if (typeof value !== 'string' || !value.startsWith(HOST_PREFIX)) return null
@@ -317,8 +364,7 @@ export function hostIdOfId(value) {
  * An id that arrives from a remote Host is OPAQUE: it is always wrapped in the
  * authenticated source host's namespace, so a compromised Host cannot make its own
  * row or card look like another host's by sending an id that is already tagged. An
- * already-tagged id therefore never reaches this function; when one does (a second
- * pass, a replayed cache, a hostile frame) it is refused instead of trusted.
+ * already-tagged id therefore never reaches this function; when one does (a second * pass, a replayed cache, a hostile frame) it is refused instead of trusted.
  */
 export function namespaceId(hostId, value) {
   if (typeof value !== 'string' || value === '') return value
@@ -340,8 +386,7 @@ export function namespaceId(hostId, value) {
  */
 function rewriteIds(value, transform, seen = new Map(), depth = 0, selection) {
   if (depth > MAX_ID_DEPTH) {
-    throw new HostRouterError('remote/payload-too-deep',
-      `refusing a payload nested deeper than ${MAX_ID_DEPTH} levels`, { depth: MAX_ID_DEPTH })
+    throw new HostRouterError('remote/payload-too-deep', `refusing a payload nested deeper than ${MAX_ID_DEPTH} levels`, { depth: MAX_ID_DEPTH })
   }
   if (Array.isArray(value)) {
     if (seen.has(value)) return seen.get(value)
@@ -369,10 +414,36 @@ function rewriteIds(value, transform, seen = new Map(), depth = 0, selection) {
           ? { ...rewriteIds(entry, transform, seen, depth + 1, selection), id: transform(entry.id) }
           : rewriteIds(entry, transform, seen, depth + 1, selection)))
         : item
+    } else if (typeof rule === 'string' && rule.startsWith('id@.')) {
+      // Nested alias (`header: 'id@.id:version'`): the id sits on the record's OWN
+      // `<inner>` field, guarded by a sibling `<guard>` of the same record, so a
+      // payload that merely happens to use the key stays untouched. Checked before
+      // the outer `id@<guard>` form, which would otherwise read `id:version` as a
+      // property of the outer object and never rename the value.
+      const [inner, guard] = rule.slice(4).split(':')
+      out[key] = !isPlainObject(item) ? rewriteIds(item, transform, seen, depth + 1, selection)
+        : Object.hasOwn(item, guard) && typeof item[inner] === 'string'
+          ? { ...rewriteIds(item, transform, seen, depth + 1, selection), [inner]: transform(item[inner]) }
+          : rewriteIds(item, transform, seen, depth + 1, selection)
     } else if (typeof rule === 'string' && rule.startsWith('id@')) {
-      const guard = rule.slice('id@'.length)
-      out[key] = isPlainObject(item) && typeof item.id === 'string' && Object.hasOwn(item, guard)
+      // The `id@` form guards a record whose own `id` is a session id.
+      const guarded = isPlainObject(item) && typeof item.id === 'string' && Object.hasOwn(item, rule.slice(4))
+      out[key] = guarded
         ? { ...rewriteIds(item, transform, seen, depth + 1, selection), id: transform(item.id) }
+        : rewriteIds(item, transform, seen, depth + 1, selection)
+      // The rule names THIS field, so the value carried here is transformed too: an
+      // untransformed one left a tagged `rpcId` on the way to its Host (and a raw id
+      // on the way to the UI).
+      if (typeof item === 'string') out[key] = transform(item)
+    } else if (rule === 'source') {
+      // A message's `source` is walked as a unit ONLY when it is the object an
+      // approval/question card carries, so its `rpcId` can be judged by `kind`; a
+      // `source` that is anything else (a bare string in another payload) is left to
+      // the walker exactly as before. On `kind:'user'` the `rpcId` is the `requestId`
+      // THIS controller minted (see `ID_FIELDS`), so it is kept; every other id is
+      // renamed as usual, and an approval/question card's `rpcId` is namespaced.
+      out[key] = isPlainObject(item) && typeof item.rpcId === 'string' && item.kind === 'user'
+        ? { ...rewriteIds({ ...item, rpcId: undefined }, transform, seen, depth + 1, selection), rpcId: item.rpcId }
         : rewriteIds(item, transform, seen, depth + 1, selection)
     } else {
       out[key] = rewriteIds(item, transform, seen, depth + 1, selection)
@@ -464,14 +535,12 @@ function routedProvider(provider, hostId) {
  * Rewrite the provider of every model selection in a call's arguments.
  *
  * A selection is the `{provider, model}` pair the picker compares against the
- * catalog. It is not in the id table (`provider` is a routing label, not an id
- * this controller mints), so it is found by shape anywhere in the arguments — the
+ * catalog. It is not in the id table (`provider` is a routing label, not an id * this controller mints), so it is found by shape anywhere in the arguments — the
  * flat shape and the nested `request` shape the gateway also accepts.
  */
 function retargetSelections(value, hostId, depth = 0) {
   if (depth > MAX_ID_DEPTH) {
-    throw new HostRouterError('remote/payload-too-deep',
-      `refusing a payload nested deeper than ${MAX_ID_DEPTH} levels`, { depth: MAX_ID_DEPTH })
+    throw new HostRouterError('remote/payload-too-deep', `refusing a payload nested deeper than ${MAX_ID_DEPTH} levels`, { depth: MAX_ID_DEPTH })
   }
   if (Array.isArray(value)) return value.map((item) => retargetSelections(item, hostId, depth + 1))
   if (!isPlainObject(value)) return value
@@ -509,8 +578,7 @@ function workspaceTitle(title, hostName) {
  * remote path would therefore enable a menu that opens THIS machine's file manager
  * at a directory belonging to another machine. The key is omitted — never replaced
  * with a path of ours — exactly the shape the core produces for a session whose
- * working directory is unknown (`{...entry.cwd !== void 0 ? {cwd: entry.cwd} : {}}`
- * in dsh-api-session-controller), which keeps the item disabled. Every other field
+ * working directory is unknown (`{...entry.cwd !== void 0 ? {cwd: entry.cwd} : {}}` * in dsh-api-session-controller), which keeps the item disabled. Every other field
  * (ids, title, projections) is left exactly as `#ingress` renamed it.
  */
 function withoutRemoteCwd(row) {
@@ -555,8 +623,24 @@ function visitIds(value, visit, seen = new Set(), depth = 0) {
           visitIds(entry, visit, seen, depth + 1)
         }
       }
+    } else if (rule === 'source') {
+      // Matches `rewriteIds`: a user message's source `rpcId` is neither renamed nor
+      // inspected (the controller minted it), while every other id inside the source
+      // — and any card's `rpcId` — is still walked, so the egress/refusal checks
+      // agree with the table exactly.
+      if (isPlainObject(item) && item.kind === 'user' && typeof item.rpcId === 'string') {
+        visitIds({ ...item, rpcId: undefined }, visit, seen, depth + 1)
+      } else visitIds(item, visit, seen, depth + 1)
+    } else if (typeof rule === 'string' && rule.startsWith('id@.')) {
+      // Matches `rewriteIds`' nested alias (`header: 'id@.id:version'`).
+      const [inner, guard] = rule.slice(4).split(':')
+      if (isPlainObject(item) && Object.hasOwn(item, guard) && typeof item[inner] === 'string') visit(item[inner])
+      visitIds(item, visit, seen, depth + 1)
     } else if (typeof rule === 'string' && rule.startsWith('id@')) {
-      if (isPlainObject(item) && Object.hasOwn(item, rule.slice('id@'.length)) && typeof item.id === 'string') visit(item.id)
+      // Matches `rewriteIds`: an outer guard, and the field's own value when it is
+      // the id itself.
+      if (isPlainObject(item) && Object.hasOwn(item, rule.slice(4)) && typeof item.id === 'string') visit(item.id)
+      if (typeof item === 'string') visit(item)
       visitIds(item, visit, seen, depth + 1)
     } else {
       visitIds(item, visit, seen, depth + 1)
@@ -610,11 +694,9 @@ export function hasPseudoTaggedCallId(value, seen = new Set(), depth = 0) {
  * `callId` were copied straight out of the frame. A compromised Host could send
  * `approvalId: 'h:<anotherHost>:<id>'`, have the value parked in the controller's
  * card table and approval buffer, and be handed it back on the decision. The WHOLE
- * card is therefore validated against the rename table (every id-bearing field,
- * nested ones included) before either buffer is touched.
+ * card is therefore validated against the rename table (every id-bearing field, * nested ones included) before either buffer is touched.
  *
- * `callId` is opaque to the table (it is the Host's own tool-call id and is
- * forwarded unchanged), so the table walk cannot see it; it must still never
+ * `callId` is opaque to the table (it is the Host's own tool-call id and is * forwarded unchanged), so the table walk cannot see it; it must still never
  * impersonate a tag this controller minted. The value itself is never logged.
  *
  * @param {string} hostId the host the card arrived from
@@ -641,6 +723,33 @@ export function hostHintOf(payload) {
 /** A payload's `args`, the only field the Gateway carrier forwards. */
 const payloadArgs = (payload) => (isPlainObject(payload) && isPlainObject(payload.args) ? payload.args : {})
 
+/**
+ * Whether a model selection anywhere in `payload` is tagged `<provider>@<hostId>`.
+ *
+ * A tag IS a route: it names the machine the model must run on (see
+ * `routedProvider`). Anything that forwards a payload without routing it — the
+ * zero-host passthrough — must therefore look for it, or a remote selection runs
+ * on Local. Only the endpoint that carries a selection is walked, and the walk
+ * mirrors `retargetSelections`, so the two agree on what a selection is.
+ * @param {string} endpoint the call being dispatched
+ * @param {object} payload the call as the local UI issued it
+ */
+function carriesTaggedProvider(endpoint, payload) {
+  if (endpoint !== MODEL_SELECT_ENDPOINT) return false
+  return hasTaggedSelection(payloadArgs(payload))
+}
+
+function hasTaggedSelection(value, depth = 0) {
+  if (depth > MAX_ID_DEPTH) return false
+  if (Array.isArray(value)) return value.some((item) => hasTaggedSelection(item, depth + 1))
+  if (!isPlainObject(value)) return false
+  // Same shape test `retargetSelections` uses, so no selection is missed or invented.
+  if (typeof value.provider === 'string' && value.provider !== ''
+    && typeof value.model === 'string' && value.model !== ''
+    && providerHostOf(value.provider) !== null) return true
+  return Object.entries(value).some(([key, item]) => !UNSAFE_KEYS.has(key) && hasTaggedSelection(item, depth + 1))
+}
+
 /** Drop the client-side hint before anything is sent to a remote. */
 function withoutHint(args) {
   if (!isPlainObject(args) || !Object.hasOwn(args, HOST_HINT)) return args
@@ -661,6 +770,11 @@ function isLinkFailure(error) {
   const code = typeof error?.code === 'string' ? error.code : ''
   return error?.closeCode !== undefined || code === 'remote/host-offline'
     || code === 'remote/unreachable' || code === 'remote/stream-open-timeout' || code === 'cancelled'
+    // Spec 008 defect fix: a DESYNC is not a refusal the Host produced, it is this
+    // connection's frame numbering breaking. Re-opening the follow from the last durable
+    // sequence is exactly the repair, so it belongs here and not with the terminal errors
+    // (`auth/forbidden-scope`, `auth/locked`, an endpoint denial) that must end the follow.
+    || code === 'remote/stream-desync'
     || code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'EPIPE'
 }
 
@@ -676,42 +790,334 @@ function followSeqOf(value) {
 }
 
 /**
- * What a RE-OPENED follow contributes to a stream the user is still reading.
+ * The durable events a RE-JOINED follow's page carries that this reader does not hold,
+ * deduplicated by `seq` and handed over OLDEST FIRST.
  *
- * A follow always opens with a fresh snapshot, but this reader already has one: a
- * second snapshot mid-stream is rejected by the consumer, and an event it has already
- * seen is a duplicate row. So the snapshot contributes only the durable events the
- * reader has not seen (`seq > lastSeq`), as plain `event` frames — which is exactly
- * how the missed stretch of the transcript is filled in. Assistant-stream frames are
- * dropped on a resumed attempt: their revision counter restarts with the snapshot, so
- * a resumed one reads as a revision gap, while the committed message still arrives as
- * a durable event.
+ * The Host answers a re-join from the cursor in the request, and it splits that answer
+ * into two regions in one order: its OWN events past that cursor (newest first) and then
+ * `records`, which reach back over the page up to its last event. Both regions are the
+ * same journal, so delivering one region first hands the newest reply over before the
+ * prompt that triggered it, and delivering both hands the overlapping turn over twice.
+ * The native chat draws rows in the order they arrive, keyed by the Host's `seq`
+ * (`ui-chat` `observedInputs`/`anchorSeq`), so they are merged here: every seq above
+ * `lastSeq` once, in `seq` order, as plain `event` frames (a second snapshot would * replace the journal the reader already holds).
+ *
+ * The SECOND region reaches this router as `events`, and it is not always shaped like
+ * `records`: the gateway builds its own page with `historyPage`
+ * (plugins/mobile-gateway/lib/query-handlers.mjs:211-224), whose `events` are
+ * `value.events.map(entry => entry.event)` (line 212) — BARE session events. The remote
+ * bridge then forwards the carrier's snapshot values unchanged
+ * (plugins/mobile-gateway/lib/remote-bridge.mjs:865-878, `pump`), so both a bare event and
+ * the shaped `{type: 'event', event}` record can arrive here for the same region. Both
+ * are accepted below, so neither upstream shape is silently dropped; only an entry that
+ * carries a usable `seq` (its own, or its inner event's) joins the merge.
+ *
+ * A seq that appears in no region entry at all is a dense stretch the Host summarised
+ * rather than sent (a `created` record stands for the seqs it covers, and that fill is * never replayed on the wire), so `followFrames` fills it from its `firstLiveSeq`/`end`
+ * instead: a gap in the reader's journal is worse than an event without a payload.
+ * @param {unknown} value the raw snapshot the Host sent
+ * @param {number|null} lastSeq the durable sequence already delivered (`null`: none)
+ * @returns {{type: 'event', event: object}[]} the unseen durable events, in `seq` order
+ */
+function unseenSnapshotEvents(value, lastSeq) {
+  // `null` means the reader has no durable position yet: every event is unseen.
+  const seen = lastSeq ?? -1
+  const bySeq = new Map()
+  const add = (event) => {
+    if (!isPlainObject(event) || !Number.isSafeInteger(event.seq) || event.seq <= seen || bySeq.has(event.seq)) return
+    bySeq.set(event.seq, { type: 'event', event })
+  }
+  // Regions are collected oldest-first; the page's own `cursor` is not needed here
+  // because every per-event region is already deduplicated against the reader.
+  for (const record of Array.isArray(value.records) ? value.records : []) {
+    if (record?.type === 'event') add(record.event)
+  }
+  // The gateway-built page (`historyPage`) lists its own region as bare events; a
+  // shaped `{type: 'event', event}` entry (the `records` shape) is accepted too.
+  for (const entry of Array.isArray(value.events) ? value.events : []) {
+    if (!isPlainObject(entry)) continue
+    add(entry.event)
+    add(entry)
+  }
+  const out = [...bySeq.values()].sort((left, right) => left.event.seq - right.event.seq)
+  return out
+}
+
+/** The durable `seq` a frame owns, seeing through a snapshot record or its history page. */
+function durableSeqOf(value) {
+  const own = followSeqOf(value)
+  if (own !== null) return own
+  if (!isPlainObject(value)) return null
+  const eventSeq = isPlainObject(value.event) && Number.isSafeInteger(value.event.seq) ? value.event.seq : null
+  return eventSeq ?? rangeEndOf(value)
+}
+
+/**
+ * The `end` of a frame that stands for a seq RANGE (a `created` record), or null. The
+ * snapshot's own `end` is not one of those: it is keyed by `cursor` (see * `isSnapshotFrame`), and a snapshot's value is its cursor, not a page record's cut.
+ */
+function rangeEndOf(value) {
+  return isPlainObject(value) && isCreatedRecordFrame(value) ? value.end : null
+}
+
+/**
+ * Whether a frame is the snapshot itself, however it is framed, rather than a part of
+ * it. The snapshot is the only frame that says where a page ENDS (`cursor`) or carries
+ * the session `header`; the one other frame with an integer `end` is a range-covered
+ * `created` record (`firstLiveSeq`/`end`), which is a part of the page (see * `isCreatedRecordFrame`) and must never be taken for a second opening.
+ */
+const isSnapshotFrame = (value) => Number.isSafeInteger(value.cursor) || isPlainObject(value.header)
+
+/**
+ * What a LIVE frame of an already-open follow contributes. Only a durable event is
+ * de-duplicated (by `seq`, the identity the Host commits it under — never its text, * so the same prompt sent twice stays two rows); every other frame is the Host's
+ * own live traffic and is delivered as-is. Assistant-stream frames in particular are
+ * process-local presentation frames with their own revision counter, and the field
+ * must forward them: they are what draws the streaming text of a remote turn.
  * @param {unknown} value the raw frame the Host sent
- * @param {number} lastSeq the durable sequence already delivered
+ * @param {number|null} lastSeq the durable sequence already delivered
  * @returns {object[]} the raw frames to deliver
  */
-function resumedFollowFrames(value, lastSeq) {
+function liveFollowFrames(value, lastSeq) {
   if (!isPlainObject(value)) return []
-  if (value.type === 'snapshot') {
-    const out = []
-    for (const record of Array.isArray(value.records) ? value.records : []) {
-      if (record?.type !== 'event' || !isPlainObject(record.event)) continue
-      const seq = record.event.seq
-      if (Number.isSafeInteger(seq) && seq > lastSeq) out.push({ type: 'event', event: record.event })
+  const seq = isPlainObject(value.event) && Number.isSafeInteger(value.event.seq) ? value.event.seq : null
+  if (seq !== null && lastSeq !== null && seq <= lastSeq) return []
+  return [value]
+}
+
+/**
+ * The Host's assistant-stream baseline (`snapshot.assistantStream`), kept for the LIVE
+ * frames that follow it on the same attempt: it names the attempt the Host already
+ * has open and the revision the stream continues at.
+ */
+function followBaseline(value) {
+  const baseline = isPlainObject(value?.assistantStream) ? value.assistantStream : null
+  if (!baseline) return undefined
+  return {
+    revision: Number.isSafeInteger(baseline.revision) ? baseline.revision : null,
+    attemptId: isPlainObject(baseline.activeAttempt) && typeof baseline.activeAttempt.attemptId === 'string'
+      ? baseline.activeAttempt.attemptId
+      : null,
+    // The chunk ordinal the attempt's next chunk carries; absent when the Host does
+    // not publish it, and then only the first chunk of a run can be checked by shape.
+    nextIndex: isPlainObject(baseline.activeAttempt) && Number.isSafeInteger(baseline.activeAttempt.nextIndex)
+      ? baseline.activeAttempt.nextIndex
+      : null,
+  }
+}
+
+/**
+ * A page record that STANDS FOR a dense stretch of the journal its page folded in
+ * without sending it: a `created` record names the first seq of its page
+ * (`firstLiveSeq`) and the last seq it covers (`end`), and neither that fill nor those
+ * events are ever replayed on the wire.
+ */
+const isCreatedRecordFrame = (value) => Number.isSafeInteger(value.firstLiveSeq) && Number.isSafeInteger(value.end)
+
+/**
+ * The `{seq}` an uncovered `created` record contributes: the open fill exactly as many.
+ * Bounded by MAX_RESUME_GAP like every other resumed page: a record that stands for
+ * more than the lost stretch is a page this repair must not fold in, so the fill is
+ * REFUSED (`OVERFLOW_MARKER`, which ends the follow visibly in the pump) instead of
+ * replaying a whole second window of rows — and never dropped, which would let later
+ * live events carry the reader past seqs it never saw.
+ */
+function coveredCreatedSeq(value, lastSeq) {
+  const start = Number.isSafeInteger(value.firstLiveSeq) ? value.firstLiveSeq : -1
+  const end = Number.isSafeInteger(value.end) ? value.end : -1
+  if (end < start) return null
+  if (end - Math.max(start, lastSeq + 1) + 1 > MAX_RESUME_GAP) return [{ ...OVERFLOW_MARKER, count: end - Math.max(start, lastSeq + 1) + 1 }]
+  const out = []
+  for (let seq = Math.max(start, lastSeq + 1); seq <= end; seq += 1) out.push({ type: 'event', event: { seq } })
+  return out
+}
+
+/**
+ * The frame `followFrames` hands the pump when a repair would deliver more than
+ * `MAX_RESUME_GAP` unseen events at once. It never reaches a reader: the pump ends the
+ * follow on `STREAM_RESUME_OVERFLOW_CODE` (`resumeOverflowError`), so the stretch is
+ * reported to the user rather than skipped silently — `lastSeq` does not move past it,
+ * and no later live event can be accepted across it.
+ */
+const OVERFLOW_MARKER = { type: 'resume-overflow' }
+
+/** The terminal error one refused repair ends its follow on. */
+function resumeOverflowError(hostId, count) {
+  return new HostRouterError(STREAM_RESUME_OVERFLOW_CODE,
+    `the remote Host's re-joined page holds ${count} events this window has not seen, more than ${MAX_RESUME_GAP}; the follow was stopped instead of skipping them`, { hostId, unseen: count, limit: MAX_RESUME_GAP })
+}
+
+/**
+ * What a follow delivers to its reader, given what the reader already holds.
+ *
+ * A FIRST open is a pass-through: the Host's frames, then whatever the link sends,
+ * unchanged (`liveFollowFrames` de-duplicates a re-sent durable event by `seq`).
+ *
+ * A RE-OPEN (any attempt after the first) is a resume, and it is repaired rather than
+ * passed through. The reader's journal already holds the opening snapshot — a second
+ * one replaces the whole window, and an assistant-stream baseline on a journal that is
+ * not being replaced collides with the attempt on screen (dsh-api-session-controller, * `ClientAssistantStream.replace`) — while the re-opened follow always opens with one.
+ * So a re-opened attempt delivers, ONCE, a repaired replacement:
+ *
+ *  - its `snapshot` becomes the durable events the reader has not seen (`seq > *    lastSeq`): the missed stretch, in order, as plain `event` frames;
+ *  - the history page's `records` (older than the snapshot's own events) are never
+ *    delivered, and an assistant-stream `notification` that precedes the baseline is
+ *    the Host replaying the prefix of the attempt the baseline describes, which this
+ *    reader may already show — it is held back;
+ *  - a `created` record whose seq the reader has not covered is delivered as the
+ *    `seq`s it stands for, so the gap is closed rather than dropped;
+ *  - a page whose unseen stretch exceeds `MAX_RESUME_GAP` is REFUSED, never trimmed
+ *    and never dropped: it is returned as `OVERFLOW_MARKER`, and the pump ends this
+ *    follow on `STREAM_RESUME_OVERFLOW_CODE` before any later live frame is accepted;
+ *  - everything after is the live stream: `liveFollowFrames`, except the attempt this
+ *    resume landed in the middle of, which is walked forward from the revision the
+ *    baseline named rather than replayed (`openingAttemptStep`).
+ *
+ * A snapshot may arrive in PARTS, so the first attempt reads only the target id the
+ * Host names, and each region is recognised by its own key rather than by `type`
+ * alone: a snapshot by `cursor`, its records by `event`, a `created` record by
+ * `firstLiveSeq`/`end`, an event by `event.seq`, a presentation frame by `frame`.
+ * @param {unknown} value the raw frame the Host sent
+ * @param {{resumed: boolean, expected?: number|null, lastSeq: number|null,
+ *   opening: {baseline?: object, lineage?: object, lastSeq: number}}} state the pump keeps for this follow
+ * @returns {object[]} the raw frames to deliver
+ */
+function followFrames(value, state) {
+  if (!isPlainObject(value)) return []
+  const { resumed, expected, lastSeq, opening } = state
+  // Before this attempt's opening snapshot has been seen there is nothing to repair
+  // and no attempt boundary to read a baseline from: the Host's own frame passes
+  // through, so a snapshot arriving in parts is never mistaken for a part of the page.
+  if (opening === null || opening === undefined) {
+    // An overflow marker is the repair's own refusal, not a part of the page: it must
+    // reach the pump (which ends the follow on it) however this attempt is still waiting
+    // for its snapshot, or the refusal is dropped and the unseen stretch is skipped.
+    if (value.type === OVERFLOW_MARKER.type) return [value]
+    const end = rangeEndOf(value)
+    if (expected === null || durableSeqOf(value) === expected || end === expected) return [value]
+    return []
+  }
+  if (isSnapshotFrame(value)) {
+    opening.cursor = Number.isSafeInteger(value.cursor) ? value.cursor : (Number.isSafeInteger(value.end) ? value.end : null)
+    if (!resumed) return [value]
+    const baseline = followBaseline(value)
+    if (baseline) {
+      opening.baseline = baseline
+      // A new page starts a new lineage: nothing of this attempt has been delivered
+      // yet, so whatever its baseline named is the last revision the reader holds.
+      opening.lineage = newAttemptLineage(baseline)
     }
-    return out
+    // The snapshot page is the newest N events: beyond the lost stretch it is a whole
+    // second window, which a repair must never fold into the reader's journal. It is
+    // refused VISIBLY (marker below) and never dropped: a page dropped here leaves
+    // `lastSeq` behind it, and the live events of this very connection (the pump // advances `lastSeq` past them) would carry the reader over the stretch forever.
+    const resumedEvents = unseenSnapshotEvents(value, lastSeq)
+    if (resumedEvents.length > MAX_RESUME_GAP) return [{ ...OVERFLOW_MARKER, count: resumedEvents.length }]
+    return resumedEvents
   }
-  if (value.type === 'event') {
-    const seq = value.event?.seq
-    return Number.isSafeInteger(seq) && seq <= lastSeq ? [] : [value]
+  // A durable event is de-duplicated by what the reader already holds (`lastSeq`).
+  // The snapshot's cursor bounds only the events INSIDE that snapshot page (above):
+  // a live event after the opening is covered by `lastSeq` alone, or the stretch
+  // the Host replays live would be dropped as "already in the page".
+  if (isPlainObject(value.event) && Number.isSafeInteger(value.event.seq)) return liveFollowFrames(value, lastSeq)
+  // A `created` record is a part of the page, not a second snapshot: the re-opened
+  // follow's dense fill reaches the reader as the seqs it stands for (`resumed` // bounded by MAX_RESUME_GAP), and a first open's is the Host's own frame.
+  if (isCreatedRecordFrame(value)) return resumed ? coveredCreatedSeq(value, lastSeq ?? -1) ?? [] : [value]
+  if (isPlainObject(value.frame)) {
+    if (!resumed) return [value]
+    // Before the baseline there is no attempt boundary: what precedes it on this
+    // attempt is the Host's replay of an attempt the reader may already show.
+    if (opening.baseline === undefined) return []
+    if (openingAttemptStep(opening, value.frame)) return []
   }
-  return []
+  return liveFollowFrames(value, lastSeq)
+}
+
+/**
+ * The assistant stream the reader holds for ONE attempt of a resumed follow: the
+ * revisions it has already received and the chunk ordinal the attempt's next chunk
+ * carries (`ClientAssistantStream`, `acceptFrame`, holds both and refuses anything
+ * else with `rebaseline`, which for a chunk of an open attempt it cannot re-fetch
+ * leaves that attempt frozen until the commit).
+ */
+function newAttemptLineage(baseline) {
+  return {
+    revision: Number.isSafeInteger(baseline.revision) ? baseline.revision : null,
+    index: Number.isSafeInteger(baseline.nextIndex) ? baseline.nextIndex : null,
+    pinned: Number.isSafeInteger(baseline.nextIndex),
+  }
+}
+
+/**
+ * Is this live assistant-stream frame of a resumed follow worth delivering?
+ *
+ * The Host's baseline names the attempt still open at the reconnect (`activeAttempt`)
+ * and the revision its stream continues at. A frame of THAT attempt (the one the Host * had open when the reader's journal was replaced) is its residue: the reader showed
+ * its text before the gap and the Host does not re-send it, so the WHOLE attempt
+ * reads as a revision gap and makes the consumer re-baseline.
+ *
+ * The attempt itself is still live, though, and re-joining it mid-stream is exactly
+ * the repair: the resume landed at revision R, so the attempt ran R+1, R+2, … and
+ * every frame from R+1 on is one the reader has NOT seen — the chunks to draw and the
+ * `end` that closes it. Those are delivered in ONE unbroken revision run (the carrier * throws a desync on any other revision), and each delivered revision is remembered so
+ * the step after it continues the run instead of waiting for the commit. A revision
+ * the reader already holds (`≤ R`) is its residue and is dropped. A gap (`revision === * R` after the run started, which only the consumer's own re-baseline makes safe) is
+ * dropped rather than drawn into a run the reader cannot finish.
+ *
+ * The chunk ordinal can only be CHECKED, never repaired: the consumer's count starts at
+ * whatever the baseline pinned (`activeAttempt.nextIndex`) or at the run's first chunk,
+ * so the first chunk after the resume always belongs to the run, and only a mismatch
+ * inside it means the consumer's own count diverged — that attempt freezes instead of
+ * drawing through it. An `end` without a chunk index (the shape before revisions were * introduced) can close no run the consumer would finish, so it is the one frame the
+ * durable event closes the turn for.
+ *
+ * A `start` is always a new turn: the Host restarts its counter for a fresh attempt.
+ * @param {{baseline: {revision: number|null, attemptId: string|null},
+ *   lineage?: {revision: number|null, index: number|null}}} opening the attempt state
+ * @param {object} wire the frame inside an `assistant-stream` entry
+ * @returns {boolean} whether to hold the frame back
+ */
+function openingAttemptStep(opening, wire) {
+  if (wire.type === 'start') return false
+  const { baseline } = opening
+  if (baseline.attemptId === null || wire.attemptId !== baseline.attemptId) return false
+  if (!Number.isSafeInteger(wire.revision)) return true
+  if (!opening.lineage) opening.lineage = newAttemptLineage(baseline)
+  const lineage = opening.lineage
+  // Only the run that has already started advances here; a first chunk of the run is
+  // accepted whatever ordinal it carries, because it either continues the ordinal the
+  // baseline pinned (`nextIndex`) or starts the run where the consumer's count starts.
+  const inRun = lineage.revision !== baseline.revision && lineage.revision !== null
+  const ordinalOk = !inRun || !lineage.pinned || lineage.index === null || wire.index === lineage.index
+  if (lineage.revision !== null && Number.isSafeInteger(wire.revision) && wire.revision > lineage.revision
+    && ordinalOk && wire.type !== 'end') {
+    lineage.revision = wire.revision
+    // After this chunk the consumer's own count is one past the ordinal it just drew.
+    lineage.index = Number.isSafeInteger(wire.index) ? wire.index + 1 : null
+    return false
+  }
+  if (wire.type === 'end' && !Number.isSafeInteger(wire.index)) return true
+  if (!Number.isSafeInteger(lineage.revision)) return true
+  if (wire.revision === lineage.revision + 1 && ordinalOk) {
+    lineage.revision = wire.revision
+    lineage.index = Number.isSafeInteger(wire.index) ? wire.index + 1 : null
+    return false
+  }
+  return true
+}
+
+/** The target id a follow's opening names: the snapshot's `<header id>`, however it is framed. */
+function openingTargetId(value) {
+  if (!isPlainObject(value)) return null
+  const own = isPlainObject(value.header) ? value.header.id : null
+  const folded = isPlainObject(value.event) && isPlainObject(value.event.header) ? value.event.header.id : null
+  const id = own ?? folded
+  return typeof id === 'string' && id !== '' ? id : null
 }
 
 /**
  * The single session a `session/follow` request is about (its `request.address`),
- * or null for anything else (a subagent address names two sessions, so it is not
- * cached: the cache is keyed by exactly one id).
+ * or null for anything else (a subagent address names two sessions, so it is not * cached: the cache is keyed by exactly one id).
  */
 function followSessionId(args) {
   if (!isPlainObject(args)) return null
@@ -804,9 +1210,12 @@ class ValueQueue {
 
 /**
  * The merged workspace map. Local workspaces keep their ids and titles; a remote
- * workspace is stored already renamed (`hostId` + `hostName` added, ids tagged, and
- * the host name in the title) so the baseline, an upsert and the sidebar all agree
+ * workspace is stored already renamed (`hostId` + `hostName` added, ids tagged, and * the host name in the title) so the baseline, an upsert and the sidebar all agree
  * on identity and on which Host owns the row.
+ *
+ * It is a DATA store only: which side the sidebar shows is a display decision
+ * (owner 2026-11-15 — the sidebar's two tabs never filter what is merged, because
+ * DSH itself reads `workspace/follow` to resolve a workspace).
  */
 class MergeState {
   constructor() {
@@ -854,7 +1263,11 @@ class MergeState {
       this.local.pinned = [...frame.pinnedSessionIds]
       return this.#emit([{ type: 'pinned', pinnedSessionIds: this.#union('pinned') }])
     }
-    return []
+    // A Local frame type this merge does not model is Local's own increment (the
+    // stream contract grows without this wrapper). Local owns no namespace, so it is
+    // forwarded exactly as it came; dropping it would silently withhold an increment
+    // the UI is waiting on.
+    return this.#emit([frame])
   }
 
   /** A remote baseline (initial or after a re-subscribe) replaces that host only. */
@@ -957,8 +1370,7 @@ class MergeState {
 }
 
 /**
- * The multi-host wrapper. `deps.hosts()` is read fresh on every call (a host can
- * go offline mid-session), `deps.onHostsChanged` is the only subscription.
+ * The multi-host wrapper. `deps.hosts()` is read fresh on every call (a host can * go offline mid-session), `deps.onHostsChanged` is the only subscription.
  *
  * @param {object} deps
  * @param {object} deps.gateway the Host `typertGateway` instance to patch
@@ -1004,8 +1416,31 @@ export class HostRouter {
   #followStops = new Map()
   /** Push functions of the `$events` streams currently open in the native UI. */
   #eventSinks = new Set()
-  /** The connected-host set last announced (`#connectedKey`), so flapping stays quiet. */
+  /**
+   * The connected-host set last announced (`#connectedKey`), so an unchanged SET
+   * stays quiet. It is bookkeeping about this stream's own notifications; what the
+   * picker is actually told is decided against `#catalogHostKey`.
+   */
   #lastHostSet = null
+  /**
+   * The hosts — sorted, joined — whose `session/modelCatalog` answer the last merged
+   * catalog actually included. It is the ONLY record of what the native picker is
+   * holding: the picker reloads the catalog it caches on `llm/models-updated`, and a
+   * reload that races a host's link, or a host whose catalog call failed, leaves a
+   * catalog with the host silently missing. A connect/disconnect notification alone
+   * cannot tell whether that history already cost the user a section.
+   */
+  #catalogHostKey = null
+  /** When the picker was last told to reload (`#announceHostSet`, rate-limited). */
+  #lastAnnounceAt = 0
+  /**
+   * A reload the picker is still owed: the rule asked for one, but the rate limit
+   * held the frame back (or the last `$events` stream was superseded before it was
+   * sent). The next merged answer, and the next merge that opens, retry it.
+   */
+  #catalogRefreshPending = false
+  /** The one retry timer for a rate-limited announcement (`#scheduleCatalogRefresh`). */
+  #catalogTimer = null
   /**
    * Remote cards the native stream knows about, keyed `hostId\u0000<rpcId>`, with
    * the original ids and the Host's `argsHash`: the answer is routed back with
@@ -1036,8 +1471,7 @@ export class HostRouter {
    * under the alias the user already had.
    *
    * Rows are stored already renamed and already `cwd`-stripped, so replaying them here
-   * never runs `namespaceId` twice (a second pass would refuse its own tag as
-   * `remote/id-leak`) and never re-adds this machine's `cwd`.
+   * never runs `namespaceId` twice (a second pass would refuse its own tag as * `remote/id-leak`) and never re-adds this machine's `cwd`.
    *
    * Cleared only by an explicit forget/revoke (`forgetHost`) or eviction once
    * MAX_RETAINED_HOSTS paired hosts are remembered — never by a transient drop.
@@ -1069,8 +1503,7 @@ export class HostRouter {
       return this.status()
     }
     const gateway = this.#gateway
-    // Restore target: exactly what was there before us (another router's
-    // wrapper, on a reload). Local calls target the ROOT DSH original instead,
+    // Restore target: exactly what was there before us (another router's // wrapper, on a reload). Local calls target the ROOT DSH original instead,
     // so a stacked wrapper can never route our own local call back into us.
     const dispatchRpc = gateway.dispatchRpc
     const openWireStream = gateway.openWireStream
@@ -1115,6 +1548,13 @@ export class HostRouter {
     // router must not replay them out of its own state on the next install.
     this.#retainedRows.clear()
     this.#lastHostSet = null
+    this.#catalogHostKey = null
+    this.#lastAnnounceAt = 0
+    this.#catalogRefreshPending = false
+    if (this.#catalogTimer !== null) {
+      clearTimeout(this.#catalogTimer)
+      this.#catalogTimer = null
+    }
     if (!this.#installed) return
     const gateway = this.#gateway
     const dispatchOurs = gateway.dispatchRpc === this.#wrapped.dispatchRpc
@@ -1127,8 +1567,7 @@ export class HostRouter {
     // The originals are never nulled. A reload can stack a new router on top of
     // ours, and Cordis disposes the old one first; that old wrapper is then
     // still in the call chain and must keep working. Nulling these made every
-    // such call die with "Cannot read properties of null (reading
-    // 'dispatchRpc')" (measured live on 0.2.2-rc.1, spec 008). The retained
+    // such call die with "Cannot read properties of null (reading // 'dispatchRpc')" (measured live on 0.2.2-rc.1, spec 008). The retained
     // references are two functions and a flag — the cost is negligible.
   }
 
@@ -1195,6 +1634,42 @@ export class HostRouter {
     return (Array.isArray(hosts) ? hosts : []).filter((host) => host && typeof host.hostId === 'string' && host.online !== false)
   }
 
+  /**
+   * Whether this controller has NO host at all — none connected and none paired
+   * (`deps.knownHosts`, which a caller that omits it reports as none).
+   *
+   * A pairing is a different product: with one, a connected host's rows are merged
+   * and a disconnected one's rows are retained, so both carriers have work to do.
+   * With none, the carrier wrapper has nothing to route, rename or hold back, and
+   * standing between the UI and Local only lets the merge's own shapes — the
+   * `{args:…}` envelope, a re-baselined `replace`, an increment it does not model —
+   * differ from the Local call the UI made (owner, 2026-11-16, zero hosts: "New
+   * chat → choose workspace" bounced back to "Choose workspace").
+   */
+  #noPairedHosts() {
+    if (this.#connectedHosts().length > 0) return false
+    return this.#disconnectedHosts().length === 0
+  }
+
+  /**
+   * Whether a call is purely Local and may therefore pass the carrier untouched
+   * (see `#noPairedHosts`). True only when the controller has no paired host AND
+   * the payload names no remote route of any kind: no host id, no host hint, and
+   * no provider tagged `<provider>@<hostId>`.
+   *
+   * The provider tag is checked because it names a host on its own: a selection
+   * tagged for `hostB` says "run this on hostB", so passing it through would run
+   * it here instead. `routedProvider` must get the chance to refuse it
+   * (`model/wrong-host`) or route it, exactly as with a pairing present.
+   * @param {string} endpoint the call being dispatched
+   * @param {object} payload the call as the local UI issued it
+   */
+  #isPurelyLocal(endpoint, payload) {
+    if (!this.#noPairedHosts()) return false
+    if (hostIdsIn(payload).size > 0 || hostHintOf(payload) !== null) return false
+    return !carriesTaggedProvider(endpoint, payload)
+  }
+
   #hostById(hostId) {
     return this.#connectedHosts().find((host) => host.hostId === hostId)
   }
@@ -1205,25 +1680,96 @@ export class HostRouter {
   }
 
   /**
-   * Tell the native UI to reload the merged model catalog when the SET of
-   * connected hosts changes. The picker keeps one catalog per Host generation
-   * (`ModelCatalogDirectory`, no session argument) and reloads it on
-   * `llm/models-updated`, so without this frame a host that connects later keeps
-   * its models — and the selection of its sessions — out of the picker until the
-   * page reloads. A state flap that leaves the set unchanged emits nothing.
+   * Tell the native UI to reload the merged model catalog when the catalog it is
+   * holding does not already cover the connected hosts.
    *
-   * Called from the merged `$events` handler, after that host's cards are
-   * withdrawn: the frame can only reach the UI through that stream anyway, and the
-   * cards stay the first thing a disconnect delivers.
+   * The picker keeps one catalog per Host generation (`ModelCatalogDirectory`, no
+   * session argument) and reloads it on `llm/models-updated`, so the decision may
+   * not rest on a connect/disconnect edge alone: a catalog loaded while a host was
+   * still linking, or one answered while that host's catalog call was failing, has
+   * the host missing with no further edge ever coming — the picker stayed
+   * Local-only and every remote pick was then refused by `routedProvider`
+   * (`remote/wrong-host`) from a section that should not have been offered. So the
+   * rule is state, not edge: compare the connected hosts against `#catalogHostKey`,
+   * the hosts the last merged catalog actually included, and reload only when they
+   * differ. An equal key means the picker already has every section, and a flap
+   * that leaves the set unchanged still emits nothing.
+   *
+   * `withdraw` tells the caller that leaving hosts have already been dropped from
+   * the merged answers (cards withdrawn, rows replayed). Their sections are only
+   * correct in that caller's hands: it announces its own decision first, so a frame
+   * queued for a stream this change is about to end is not ported into the next one.
    */
-  #announceHostSet() {
+  #announceHostSet({ withdraw = false } = {}) {
     const key = this.#connectedKey()
-    if (key === this.#lastHostSet) return
+    const changed = key !== this.#lastHostSet
     this.#lastHostSet = key
-    // The emit frame's exact three keys are what the client's `$events` parser
-    // accepts; `args` is a list, empty here because every listener takes no
-    // argument that matters for a full reload.
+    // A joining host changes the key by construction (see `#catalogStale`).
+    if (withdraw) {
+      if (changed) this.#emitCatalogRefresh()
+      return
+    }
+    if (key !== '' && !this.#catalogStale()) this.#catalogRefreshPending = false
+    else this.#catalogRefreshPending = !this.#emitCatalogRefresh()
+  }
+
+  /**
+   * Whether the merge of `connected` left the last merged catalog short of any
+   * connected host (`#catalogHostKey`). A missing key means no merge has answered
+   * since the router was installed, so nothing about the picker's catalog is known.
+   * An empty set needs no section, whatever the key says.
+   */
+  #catalogStale(connected = this.#connectedHosts()) {
+    if (connected.length === 0 || this.#catalogHostKey === null) return false
+    return catalogKey(connected) !== this.#catalogHostKey
+  }
+
+  /**
+   * Whether the picker must be told to reload before the merged answers are trusted:
+   * the connected set is not what the last answer included, or an earlier attempt was
+   * held back by the rate limit.
+   */
+  #catalogRefreshDue(connected = this.#connectedHosts()) {
+    return this.#catalogRefreshPending || this.#catalogStale(connected)
+  }
+
+  /**
+   * Ask the picker to reload: at most once per `MODEL_CATALOG_ANNOUNCE_INTERVAL_MS`.
+   * The frame's exact three keys are what the client's `$events` parser accepts;
+   * `args` is a list, empty here because every listener takes no argument that
+   * matters for a full reload.
+   * @returns {boolean} whether the frame was sent (a rate limit is false, so the
+   *   caller knows the picker was NOT told and its next chance is not a frame it
+   *   queued for a stream this one superseded)
+   */
+  #emitCatalogRefresh() {
+    const now = Date.now()
+    const waited = now - this.#lastAnnounceAt
+    if (waited < MODEL_CATALOG_ANNOUNCE_INTERVAL_MS) {
+      // The picker is still owed this frame. A rate limit that is never retried would
+      // lose it for good — a host leaving inside the window left the picker showing a
+      // section whose Host is gone, and nothing else would ever say so.
+      this.#scheduleCatalogRefresh(MODEL_CATALOG_ANNOUNCE_INTERVAL_MS - waited)
+      return false
+    }
+    this.#lastAnnounceAt = now
     this.#publishEvent({ type: 'emit', event: MODEL_CATALOG_REFRESH_EVENT, args: [] })
+    return true
+  }
+
+  /**
+   * Retry a rate-limited announcement once the window has passed. One timer at a
+   * time; it is cleared when the router uninstalls, so nothing fires after teardown.
+   * @param {number} delayMs
+   */
+  #scheduleCatalogRefresh(delayMs) {
+    if (this.#catalogTimer !== null || typeof setTimeout !== 'function') return
+    this.#catalogTimer = setTimeout(() => {
+      this.#catalogTimer = null
+      if (!this.#catalogRefreshDue()) return
+      this.#catalogRefreshPending = !this.#emitCatalogRefresh()
+    }, Math.max(1, delayMs))
+    this.#catalogTimer?.unref?.()
   }
 
   /**
@@ -1290,8 +1836,7 @@ export class HostRouter {
   #route(payload) {
     const named = hostIdsIn(payload)
     if (named.size > 1) {
-      throw new HostRouterError('remote/host-conflict',
-        'this call names more than one remote host; a call must belong to one host', { hosts: [...named] })
+      throw new HostRouterError('remote/host-conflict', 'this call names more than one remote host; a call must belong to one host', { hosts: [...named] })
     }
     let hostId = named.size === 1 ? [...named][0] : null
     // Global endpoints (llm/*, skills/list, settings/…) have no id to route by,
@@ -1300,8 +1845,7 @@ export class HostRouter {
     if (hostId === null) return { kind: 'local' }
     const host = this.#hostById(hostId)
     if (!host || typeof host.connection !== 'object' || host.connection === null) {
-      throw new HostRouterError('remote/host-offline',
-        `remote host ${hostId} is not connected; reconnect it in Settings → Devices`, { hostId })
+      throw new HostRouterError('remote/host-offline', `remote host ${hostId} is not connected; reconnect it in Settings → Devices`, { hostId })
     }
     return { kind: 'remote', hostId, hostName: host.hostName ?? hostId, connection: host.connection }
   }
@@ -1356,9 +1900,14 @@ export class HostRouter {
   }
 
   async #dispatchRpc(endpoint, payload, signal, peer) {
+    // Zero PAIRED hosts is the plain local product: there is nothing to route to,
+    // rename for or hold back, so the carrier is the pure call it wrapped. Local's
+    // own reply and payload therefore reach the UI byte for byte.
+    if (this.#isPurelyLocal(endpoint, payload)) {
+      return this.#localDispatch(endpoint, payload, signal, peer)
+    }
     // A merged endpoint answers for Local plus every connected host at once; the
-    // client-side hint does not narrow it (each row carries its own hostId, the
-    // page filters there). Only a tagged id could name one host — a list request
+    // client-side hint does not narrow it (each row carries its own hostId, the // page filters there). Only a tagged id could name one host — a list request
     // never carries one.
     if (endpoint === 'session/list' && hostIdsIn(payload).size === 0) return this.#mergeSessionList(payload, signal, peer)
     // The picker loads this one globally (no session id, no host hint), so it is
@@ -1366,8 +1915,7 @@ export class HostRouter {
     if (endpoint === MODEL_CATALOG_ENDPOINT && hostIdsIn(payload).size === 0) return this.#mergeModelCatalog(payload, signal, peer)
     let target
     try {
-      // A drag that spans two lists cannot be stored by any one Host (the merged
-      // sidebar draws them as one list; the durable orders are separate). Refused
+      // A drag that spans two lists cannot be stored by any one Host (the merged // sidebar draws them as one list; the durable orders are separate). Refused
       // before routing, so neither a Host nor Local is asked to place a foreign row.
       this.#assertSameReorderList(endpoint, payload)
       target = this.#route(payload)
@@ -1432,8 +1980,7 @@ export class HostRouter {
    * The bridge never forwards `$events/result` raw: it maps the call onto its
    * hash-bound approval decision. The hash must be the one the Host issued for
    * that card — a decision the UI cannot bind is refused here, not silently
-   * applied (the request stays pending on the Host, which is what a mismatching
-   * hash gets from the bridge as a normal `accepted:false` receipt).
+   * applied (the request stays pending on the Host, which is what a mismatching * hash gets from the bridge as a normal `accepted:false` receipt).
    *
    * @param {object} args the decision with local ids already stripped
    * @param {object|null} card the card this router injected, when it knows it
@@ -1444,8 +1991,7 @@ export class HostRouter {
       const buffered = this.#approvals?.card?.(target.hostId, args)
       const binding = card ?? buffered
       if (!binding || typeof binding.argsHash !== 'string' || !APPROVAL_HASH.test(binding.argsHash)) {
-        throw new HostRouterError('remote/approval-unbound',
-          'the approval card for this decision is not available on this host; the decision was not sent')
+        throw new HostRouterError('remote/approval-unbound', 'the approval card for this decision is not available on this host; the decision was not sent')
       }
       decision = { ...args, argsHash: binding.argsHash }
       if (decision.eventId === undefined && binding.rpcId !== undefined) decision.eventId = binding.rpcId
@@ -1453,8 +1999,7 @@ export class HostRouter {
       if (decision.approvalId === undefined && binding.approvalId !== undefined) decision.approvalId = binding.approvalId
       if (decision.sessionId === undefined && binding.sessionId !== undefined) decision.sessionId = binding.sessionId
     } else if (card) {
-      // The UI echoed a hash: keep it verbatim (the Host is the authority on
-      // whether it still matches) but complete the ids the Host needs.
+      // The UI echoed a hash: keep it verbatim (the Host is the authority on // whether it still matches) but complete the ids the Host needs.
       decision = { ...args }
       if (decision.rpcId === undefined) decision.rpcId = card.rpcId
       if (decision.sessionId === undefined) decision.sessionId = card.sessionId
@@ -1482,18 +2027,36 @@ export class HostRouter {
     const value = isPlainObject(outcome.value) ? outcome.value : {}
     const answers = Array.isArray(value.answers) ? value.answers : (Array.isArray(outcome.answers) ? outcome.answers : null)
     if (outcome.kind !== 'result' || answers === null) {
-      return this.#ingress(target.hostId, { kind: 'question-response', rpcId: card.rpcId, sessionId: card.sessionId,
-        action: 'answer', accepted: false, reason: 'no-answer' }, QUESTION_ANSWER_ENDPOINT)
+      return this.#ingress(target.hostId, { kind: 'question-response', rpcId: card.rpcId, sessionId: card.sessionId, action: 'answer', accepted: false, reason: 'no-answer' }, QUESTION_ANSWER_ENDPOINT)
     }
     // The tool-call id the Host's question service keys the question by. It comes
-    // from the card the Host pushed; without it nothing can be answered.
+    // from the card the Host pushed; without it nothing can be answered — and that is
+    // a RECEIPT (`accepted:false, reason:'unbound'`), not a transport failure: the
+    // native card must stay on screen with its reason instead of being torn down as if
+    // the answer had been delivered.
     if (typeof card.callId !== 'string' || card.callId === '') {
-      throw new HostRouterError('remote/question-unbound',
-        'the question card carries no tool-call id on this controller; the answer was not sent')
+      this.#log(`question answer for ${target.hostId} not sent: the card carries no tool-call id`)
+      return this.#ingress(target.hostId, { kind: 'question-response', rpcId: card.rpcId, sessionId: card.sessionId,
+        action: 'answer', accepted: false, reason: 'unbound' }, QUESTION_ANSWER_ENDPOINT)
     }
-    const answered = await target.connection.call(QUESTION_ANSWER_ENDPOINT, {
-      agentId: card.sessionId, callId: card.callId, answer: { answers },
-    }, { signal })
+    let answered
+    try {
+      answered = await target.connection.call(QUESTION_ANSWER_ENDPOINT, {
+        agentId: card.sessionId, callId: card.callId, answer: { answers },
+      }, { signal })
+    } catch (error) {
+      // The Host's question service signals "nothing was applied" with these two codes
+      // (a queued reply, a malformed answer). They are refusals the user can retry, not
+      // link failures: reported as the normal receipt so the card stays tracked and a
+      // second attempt still binds.
+      const code = typeof error?.code === 'string' ? error.code : ''
+      if (code === 'REPLY_QUEUED' || code === 'BAD_ANSWER') {
+        this.#log(`question answer for ${target.hostId} not accepted by the Host: ${code}`)
+        return this.#ingress(target.hostId, { kind: 'question-response', rpcId: card.rpcId, sessionId: card.sessionId,
+          action: 'answer', accepted: false, reason: code }, QUESTION_ANSWER_ENDPOINT)
+      }
+      throw error
+    }
     const accepted = answered === true
     if (accepted) this.#forgetCard(card, false)
     else this.#log(`question answer for ${target.hostId} not accepted by the Host`)
@@ -1502,14 +2065,17 @@ export class HostRouter {
   }
 
   /**
-   * `session/list`: Local plus every connected host, newest activity first. The
+   * `session/list` for the sidebar's two tabs: "This Computer" is Local alone, "Remote
+   * Workspace" is every paired host alone. Neither view merges the other. The
    * client-side host hint does not narrow it (each row carries its own hostId).
    *
-   * The merged list is not paginated — the rc.1 `session/list` result carries no
+   * The list is not paginated — the rc.1 `session/list` result carries no
    * cursor and a page cursor minted by one Host cannot be resumed against the
    * merged view, so the request's `cursor` is dropped for both sides and the
    * complete merged list is returned. A failing remote contributes nothing (a
-   * dead host must not break the local list); it is logged and shown by `status()`.
+   * dead host must not break the list); it is logged and shown by `status()`. Its
+   * half is still read while "This Computer" is showing, so the rows of a paired
+   * host are retained and switching to it is instant.
    *
    * A remote row is also stripped of its `cwd` (`withoutRemoteCwd`): the native
    * "Show in folder" item is enabled by that field and would open this machine's
@@ -1578,8 +2144,7 @@ export class HostRouter {
    *
    * A transport failure (`remote/host-offline`, a closed socket, a timeout) leaves the
    * rows it last listed intact: they are the user's sessions and their host is only
-   * momentarily away. A refusal the Host itself produced (`auth/forbidden-scope`, a
-   * protocol error) means the answer is "nothing for you", so the retained rows are
+   * momentarily away. A refusal the Host itself produced (`auth/forbidden-scope`, a * protocol error) means the answer is "nothing for you", so the retained rows are
    * dropped rather than shown behind a permission that no longer exists.
    * @returns {object[]} the rows this failing host still contributes
    */
@@ -1610,13 +2175,11 @@ export class HostRouter {
 
   /**
    * Drop everything retained for one host: the one caller is an explicit
-   * forget/revoke. A transient disconnect keeps the rows (that is the point of the
-   * retention), so this must never be reached from a state change.
+   * forget/revoke. A transient disconnect keeps the rows (that is the point of the * retention), so this must never be reached from a state change.
    *
    * The host's follow pumps are ended here too: a forgot/revoked host can never
    * come back, so a pump waiting for it would keep the reader's stream open with
-   * nothing coming. Ending them lets each stream close normally (or with the
-   * refusal it was holding) instead of stalling.
+   * nothing coming. Ending them lets each stream close normally (or with the * refusal it was holding) instead of stalling.
    * @returns {boolean} whether anything was retained for `hostId`
    */
   forgetHost(hostId) {
@@ -1672,13 +2235,14 @@ export class HostRouter {
    * on its Devices row by `status()`.
    *
    * Nothing here is renamed as an id: the rename table covers DSH ids, and a
-   * catalog carries none (a provider/model id is a routing label, never an id this
-   * controller mints).
+   * catalog carries none (a provider/model id is a routing label, never an id this * controller mints).
    *
-   * A failing remote contributes nothing (a dead host must not break the local
-   * catalog); it is logged and shown by `status()`. The same holds for a remote
-   * whose catalog carries an id that already names a host namespace: the payload
-   * is refused (`remote/id-leak`) and that host contributes nothing.
+   * A failing remote is asked once more (`#hostCatalog`) and then contributes
+   * nothing (a dead host must not break the local catalog); it is logged and shown
+   * by `status()`. The same holds for a remote whose catalog carries an id that
+   * already names a host namespace: the payload is refused (`remote/id-leak`) and
+   * that host contributes nothing. An answer that leaves a connected host out is
+   * recorded in `#catalogHostKey`, so a picker that caches it is told to reload.
    */
   async #mergeModelCatalog(payload, signal, peer) {
     const args = withoutHint({ ...payloadArgs(payload) })
@@ -1689,7 +2253,44 @@ export class HostRouter {
       .filter((group) => isPlainObject(group))
       .map((group) => ({ ...group, models: Array.isArray(group.models) ? [...group.models] : [] }))
     const hosts = this.#connectedHosts()
-    const answered = await Promise.all(hosts.map(async (host) => {
+    const asked = new Map()
+    const answered = await Promise.all(hosts.map((host) => this.#hostCatalog(host, args, signal, asked)))
+    // Labelled in host order after every host answered, so the sections always
+    // follow the same host order. Two hosts offering the same provider/model stay
+    // two entries: they are two different selections.
+    for (const entry of answered) groups.push(...this.#labelledGroups(entry.host, entry.value))
+    const routableProviders = [...new Set(groups.map((group) => String(group.id)))]
+    // What this answer actually covers, for the announcement that compares it with
+    // the connected set: a host whose catalog failed (after its retry) is absent,
+    // and the picker must be told to reload once it can answer.
+    const included = answered.filter((entry) => isPlainObject(entry.value)).map((entry) => entry.host)
+    this.#catalogHostKey = catalogKey(included)
+    if (this.#catalogRefreshDue(hosts) && this.#eventSinks.size > 0) this.#catalogRefreshPending = !this.#emitCatalogRefresh()
+    else this.#catalogRefreshPending = false
+    return { ...local, value: { ...localValue, groups, routableProviders } }
+  }
+
+  /**
+   * One host's `session/modelCatalog` answer, for a merge that answers the picker.
+   *
+   * A host that is connected but whose catalog call fails would otherwise be
+   * silently missing from the merged answer, and the picker caches that answer: its
+   * sessions then show a selection from a section that no longer exists. One retry,
+   * bounded, is enough for the usual cause — a catalog asked while the host's link
+   * was still coming up — and costs a failing host one extra call per load, not a
+   * loop. `asked` makes the calls of one merge idempotent per host, so a catalog
+   * asked for a second time while the first is still running is answered by it
+   * instead of sending a third call to that host.
+   * @param {object} host the connected host
+   * @param {object} args the catalog args, forwarded as-is
+   * @param {AbortSignal|undefined} signal the caller's signal
+   * @param {Map<string, Promise<{host: object, value: unknown}>>} asked this merge's
+   *   own calls, keyed by host
+   */
+  #hostCatalog(host, args, signal, asked) {
+    const pending = asked.get(host.hostId)
+    if (pending) return pending
+    const attempt = async () => {
       try {
         const value = await host.connection.call(MODEL_CATALOG_ENDPOINT, args, { signal })
         // An id that already names a namespace is a leak, never a rename target:
@@ -1702,19 +2303,20 @@ export class HostRouter {
         this.#log(`session/modelCatalog from ${host.hostId} failed: ${error?.code ?? 'error'}`)
         return { host, value: null }
       }
-    }))
-    // Labelled in host order after every host answered, so the sections always
-    // follow the same host order. Two hosts offering the same provider/model stay
-    // two entries: they are two different selections.
-    for (const entry of answered) groups.push(...this.#labelledGroups(entry.host, entry.value))
-    const routableProviders = [...new Set(groups.map((group) => String(group.id)))]
-    return { ...local, value: { ...localValue, groups, routableProviders } }
+    }
+    const promise = (async () => {
+      const first = await attempt()
+      if (isPlainObject(first.value)) return first
+      this.#log(`session/modelCatalog from ${host.hostId}: one retry before answering without it`)
+      return attempt()
+    })()
+    asked.set(host.hostId, promise)
+    return promise
   }
 
   /**
    * One host's catalog groups, ready to merge: every group kept, its id tagged with
-   * the owning host and its header naming that host (`Remote · Sigma-DSH — R9
-   * Fallback`). A group with no usable model is dropped, so the menu never shows an
+   * the owning host and its header naming that host (`Remote · Sigma-DSH — R9 * Fallback`). A group with no usable model is dropped, so the menu never shows an
    * empty provider.
    *
    * The header is the only field the picker renders for a provider and it has no
@@ -1761,6 +2363,11 @@ export class HostRouter {
 
   #openWireStream(endpoint, payload, uplink, peer, signal, control, uplinkWindow) {
     // Every branch returns a promise, like the rc.1 opener the caller probed.
+    // Zero PAIRED hosts: the untouched opener, stream and all (a pairing later
+    // applies to the streams opened after it, never to one already handed out).
+    if (this.#isPurelyLocal(endpoint, payload)) {
+      return this.#localOpen(endpoint, payload, uplink, peer, signal, control, uplinkWindow)
+    }
     if (endpoint === 'workspace/follow') {
       return Promise.resolve(this.#mergeFollow({ payload, uplink, peer, signal, control, uplinkWindow }))
     }
@@ -1825,14 +2432,18 @@ export class HostRouter {
    * until the whole page was reopened. The only way back was to restart DSH.
    *
    * So the follow is a pump rather than a pass-through: when the link drops it waits
-   * for that host to come back (`onHostsChanged`, which the link supervisor already
-   * fires on every state change) and re-opens the SAME follow. A follow re-opened on a
+   * for that host to come back (`onHostsChanged`, which the link supervisor already * fires on every state change) and re-opens the SAME follow. A follow re-opened on a
    * live session opens with a fresh snapshot holding everything committed meanwhile,
    * so the reader gets the missed stretch as `event` frames and nothing it already
-   * showed (`resumedFollowFrames`): no duplicate row and no gap.
+   * showed (`followFrames`): no duplicate row and no gap.
    *
-   * The reader's guarantee is unchanged: `signal` ending (or the caller abandoning the
-   * iterator) stops the pump for good, retry included, and no attempt outlives it.
+   * Only the REOPENED attempt's opening is repaired that way. Once its snapshot has
+   * reached the cursor it names, the connection is the reader's live stream again
+   * (`liveFollowFrames`): a new turn's assistant-stream frames cross, and the durable
+   * events stay de-duplicated by the Host's `seq`. Holding the whole attempt back
+   * after a reconnect dropped every new turn's streaming text.
+   *
+   * The reader's guarantee is unchanged: `signal` ending (or the caller abandoning the * iterator) stops the pump for good, retry included, and no attempt outlives it.
    * Cancelling during the offline wait does not have to wait for the host either.
    */
   async #openRemoteFollow(target, payload, signal) {
@@ -1855,6 +2466,18 @@ export class HostRouter {
     let lastSeq = null
     /** Whether a frame ever reached the reader: a later opening is a RESUME. */
     let opened = false
+    /**
+     * The durable sequence the FIRST opening snapshot named: from then on a snapshot
+     * must reach exactly that cursor (and only the first one is the reader's opening).
+     */
+    let openingCursor = null
+    /**
+     * Per-ATTEMPT opening state (`followFrames`): `null` until the re-open's snapshot
+     * has named its cursor and the Host's assistant-stream baseline, then the attempt
+     * boundary every later live frame of that attempt is read against.
+     * @type {{baseline?: {revision: number|null, attemptId: string|null}, lastSeq: number|null} | undefined}
+     */
+    let opening = null
     // The first attempt is awaited like a plain open always was: a caller that got a
     // stream from here has one open, and a refusal it can never retry still rejects.
     let settleFirst
@@ -1862,28 +2485,83 @@ export class HostRouter {
     firstAttempt.catch(() => {})
     void (async () => {
       let attempt = 0
+      /** Consecutive attempts that ended in a DESYNC without delivering a frame. */
+      let desyncs = 0
       let first = true
       while (!lifetime.signal.aborted) {
+        /** Did this attempt put a frame in front of the reader? That, not the open, is progress. */
+        let progressed = false
         try {
           // The host is connected when this pump starts; if it drops in between, the
           // wait below is bounded by the reader, not by a fixed timeout.
           const host = this.#hostById(hostId)
           if (!host) { await this.#awaitHost(hostId, lifetime.signal); continue }
-          const source = await host.connection.openStream(SESSION_FOLLOW_ENDPOINT, args,
-            { signal: lifetime.signal })
-          attempt = 0
+          const source = await host.connection.openStream(SESSION_FOLLOW_ENDPOINT, args, { signal: lifetime.signal })
+          // The attempt counter is NOT reset here: a Host that accepts the open and then
+          // immediately DESYNCs would answer "open succeeded" every time and be retried
+          // at the minimum 100 ms forever. Only a delivered frame (`progressed` below, // handled after the attempt) counts as the link working.
           if (first) { first = false; settleFirst.resolve() }
+          // Whether THIS attempt resumes a stream the reader already holds. A re-open
+          // replaces only the replayed opening (`followFrames`); everything after it
+          // stays the Host's live traffic, so a new turn streams on that connection too.
+          const resumes = opened
+          // Both attempts start BEFORE their opening snapshot is identified (`null`),
+          // so the frames of a snapshot arriving in parts pass through untouched; the
+          // snapshot's own cursor names the end of the opening (below).
+          opening = null
+          /** The cursor this attempt's opening snapshot must reach, once it is known. */
+          let expected = resumes ? null : openingCursor
+          // The unseen stretch this RE-OPENED page has asked for so far: its parts (a
+          // snapshot arriving in pieces, and the `created` records that stand for a
+          // dense fill) each arrive on their own, so the bound is the PAGE's, not one
+          // frame's — a page refused once it crosses MAX_RESUME_GAP (`followFrames`
+          // refuses a single part that crosses it by itself).
+          let pageUnseen = 0
           for await (const value of source) {
             if (lifetime.signal.aborted) break
+            // The OPENING is the snapshot: the frame that reaches the cursor `expected`
+            // names ends it, and every frame after it is the connection's live traffic.
+            if (opening === null && isSnapshotFrame(value)) {
+              // A `header`-keyed snapshot names no cursor, so it is complete on arrival:
+              // leaving `expected` null would make the gate below drop it (and every
+              // frame after it) as "not the page yet" — the reader would get nothing.
+              expected = Number.isSafeInteger(value.cursor) ? value.cursor : (Number.isSafeInteger(value.end) ? value.end : null)
+              opening = { lastSeq }
+            }
+            if (!resumes && openingCursor === null && opening !== null) openingCursor = expected
+            // The cursor names the snapshot, not the stream: once it has been delivered,
+            // the connection is live traffic and no seq is "expected" any more.
+            if (expected !== null && durableSeqOf(value) === expected) expected = null
             // Refuse before anything is cached: a frame that names a namespace must
             // never reach the UI, and it must not survive in the local copy either.
-            const frames = opened ? resumedFollowFrames(value, lastSeq ?? -1) : [value]
+            const frames = followFrames(value, { resumed: resumes, expected, lastSeq, opening })
+            // The unseen stretch a part of the page names, counted toward the page's own
+            // bound (see `pageUnseen`). An event's fill is already deduplicated against
+            // the reader (`lastSeq`), and a snapshot's cursor is never counted: its value
+            // is the page's cut, not a fill this reader lacks.
+            if (resumes && isCreatedRecordFrame(value)) {
+              pageUnseen += Math.max(0, value.end - Math.max(value.firstLiveSeq, (lastSeq ?? -1) + 1) + 1)
+            } else if (resumes && isSnapshotFrame(value)) {
+              pageUnseen += unseenSnapshotEvents(value, lastSeq).length
+            }
+            // A repair this window cannot take is refused VISIBLY and ends the follow
+            // here, before a later live frame of this connection is accepted: `lastSeq`
+            // stays exactly where the reader is, so nothing can be skipped silently.
+            const overflow = pageUnseen > MAX_RESUME_GAP ? { count: pageUnseen } : frames.find((frame) => frame?.type === 'resume-overflow')
+            if (overflow) {
+              const terminal = resumeOverflowError(hostId, overflow.count)
+              this.#log(`session/follow for ${hostId} stopped (${STREAM_RESUME_OVERFLOW_CODE}): ${overflow.count} unseen events in one page`)
+              if (first) { first = false; settleFirst.reject(terminal) }
+              queue.fail(terminal)
+              return
+            }
             for (const frame of frames) {
               const renamed = this.#ingress(hostId, frame, SESSION_FOLLOW_ENDPOINT)
               if (sessionId) cache?.append(hostId, sessionId, frame)
               const seq = followSeqOf(frame)
               if (seq !== null) lastSeq = seq
               opened = true
+              progressed = true
               queue.push(renamed)
             }
           }
@@ -1896,10 +2574,32 @@ export class HostRouter {
             queue.fail(error)
             return
           }
+          if (error?.code === STREAM_DESYNC_CODE) {
+            // Counted only while the reader got nothing: a desync AFTER a delivered frame
+            // is the first of a new series, not a continuation of a stuck one.
+            desyncs = progressed ? 1 : desyncs + 1
+            if (desyncs >= MAX_CONSECUTIVE_DESYNCS) {
+              // Visible and terminal: a Host that cannot send ordered frames is not a
+              // link this follow can repair, and re-opening it again would only replace
+              // a stalled subscription with another one.
+              const terminal = Object.assign(new HostRouterError(STREAM_DESYNC_REPEATED_CODE,
+                `the remote Host's session stream keeps arriving out of order (${desyncs} times without a frame); the follow was stopped`, { hostId }),
+                { cause: error })
+              this.#log(`session/follow for ${hostId} stopped (${STREAM_DESYNC_REPEATED_CODE}) after ${desyncs} out-of-order streams with no frame`)
+              if (first) { first = false; settleFirst.reject(terminal) }
+              queue.fail(terminal)
+              return
+            }
+          } else {
+            desyncs = 0
+          }
           this.#log(`session/follow for ${hostId} stopped (${error?.code ?? error?.closeCode ?? 'link'}); it resumes with the link`)
           if (first) { first = false; settleFirst.resolve() }
         }
         if (lifetime.signal.aborted) break
+        // A frame reached the reader: the link works, so the next interruption starts over
+        // at the shortest delay. Anything else keeps growing the backoff.
+        if (progressed) { attempt = 0; desyncs = 0 }
         // The link went away (or the Host closed the stream): wait for it and re-open.
         // `attempt` only paces the loop so a host that greets and drops cannot spin it.
         attempt += 1
@@ -1933,8 +2633,7 @@ export class HostRouter {
    * passes — whichever is first. The subscription is what makes this exact: the link
    * supervisor notifies on every state change, so nothing here polls the host.
    *
-   * The delay is always honoured, even for a host that is still connected (its stream
-   * ended on its own): re-opening at once would spin the pump against a host that
+   * The delay is always honoured, even for a host that is still connected (its stream * ended on its own): re-opening at once would spin the pump against a host that
    * greets and drops.
    */
   #awaitHost(hostId, signal, delayMs = 0) {
@@ -2039,7 +2738,14 @@ export class HostRouter {
         ...(frame.displayReason !== undefined ? { displayReason: frame.displayReason } : {}),
         ...(typeof frame.argsPreview === 'string' ? { argsPreview: frame.argsPreview } : {}),
       }
-      : { questions: Array.isArray(frame.questions) ? frame.questions : [] }
+      // `wait.callId` is the ONLY field DSH consults to key a question card
+      // (`dsh-client-ui-user-questions`: `request.wait?.callId`). Without it the card
+      // is unnameable and DSH tears it down in the request's `finally` instead of when
+      // the projection drops the answered call, so the answer can no longer route back.
+      : {
+        questions: Array.isArray(frame.questions) ? frame.questions : [],
+        ...(typeof frame.callId === 'string' && frame.callId !== '' ? { wait: { callId: frame.callId } } : {}),
+      }
     return {
       type: 'waterfall',
       event: approval ? APPROVAL_EVENT : QUESTION_EVENT,
@@ -2083,6 +2789,10 @@ export class HostRouter {
     this.#merges.add(stop)
     const sink = (frame) => queue.push(frame)
     this.#eventSinks.add(sink)
+    // A reload the picker is still owed may have been queued for the stream this
+    // one replaces; a stale window is no override, and the rule reports `true`.
+    const dueAtOpen = this.#catalogRefreshDue()
+    if (dueAtOpen && this.#lastAnnounceAt === 0) this.#lastAnnounceAt = Date.now() - MODEL_CATALOG_ANNOUNCE_INTERVAL_MS
     /** @type {Map<string, () => void>} hostId -> detach its card listeners */
     const watching = new Map()
 
@@ -2115,8 +2825,7 @@ export class HostRouter {
         connection.off('questionResolved', onResolved)
         connection.off('state', onState)
       })
-      // Cards the Host pushed before this stream opened (a reload, a second
-      // window) are still answerable: seed them in the order they arrived.
+      // Cards the Host pushed before this stream opened (a reload, a second // window) are still answerable: seed them in the order they arrived.
       for (const card of this.#approvals?.pending?.(host.hostId) ?? []) onCard(card)
     }
 
@@ -2132,8 +2841,7 @@ export class HostRouter {
       const localControl = control ?? new AbortController()
       const localSource = await this.#localOpen(EVENTS_ENDPOINT, payload, uplink, peer, localSignal, localControl, uplinkWindow)
       const iterator = localSource[Symbol.asyncIterator]()
-      // The stream must begin with the Local `ready` frame (the client rejects a
-      // card that arrives before it), so it is read before any card is queued.
+      // The stream must begin with the Local `ready` frame (the client rejects a // card that arrives before it), so it is read before any card is queued.
       const first = await iterator.next()
       if (!first.done) queue.push(first.value)
       void (async () => {
@@ -2150,9 +2858,13 @@ export class HostRouter {
         }
       })()
       for (const host of this.#connectedHosts()) watch(host)
-      // The picker caches the merged catalog for this Host generation; a host
-      // appearing or leaving while the UI is up is announced below.
+      // The picker caches the merged catalog for this Host generation, and it loads
+      // that catalog on its own once the stream is up — possibly before a host it
+      // should include has linked, and this frame can reach it only through this
+      // sink. So the comparison happens here, not at the host-change callback:
+      // `#catalogHostKey` says what the last answer really covered.
       this.#lastHostSet = this.#connectedKey()
+      this.#announceHostSet()
       unsubscribe = this.#onHostsChanged(() => {
         const hosts = this.#connectedHosts()
         const connected = new Set(hosts.map((host) => host.hostId))
@@ -2163,7 +2875,11 @@ export class HostRouter {
           watching.get(hostId)?.()
           watching.delete(hostId)
         }
-        this.#announceHostSet()
+        // A host that leaves takes its sections with it and asks the picker to
+        // reload; one that arrives only asks when the catalog it is holding did not
+        // include it — a reload racing that host's link is exactly the miss this
+        // frame repairs.
+        this.#announceHostSet({ withdraw: watching.size < connected.size })
       })
       for await (const frame of queue) yield frame
     } finally {
@@ -2187,8 +2903,10 @@ export class HostRouter {
     const state = new MergeState()
     const lifetime = new AbortController()
     const stop = () => { lifetime.abort(); queue.close() }
-    this.#merges.add(stop)
     const forward = (frames) => { for (const frame of frames) queue.push(frame) }
+    // Which side the sidebar shows is a DISPLAY decision (client.js), never a filter
+    // of this stream: DSH resolves a new chat's workspace from what is merged here.
+    this.#merges.add(stop)
     /** @type {Map<string, AbortController>} */
     const pumps = new Map()
     const drop = (hostId) => {
@@ -2248,7 +2966,17 @@ export class HostRouter {
           for await (const frame of localSource) {
             if (lifetime.signal.aborted) break
             const type = frame?.type
-            if (type === 'baseline' || type === 'replace') { state.setLocal(frame.value); settleLocal.resolve(); continue }
+            if (type === 'baseline' || type === 'replace') {
+              state.setLocal(frame.value)
+              settleLocal.resolve()
+              // The first baseline is the merged one below. A LATER local replace is an
+              // ordinary increment (Local's filtered re-baseline), and the merged state
+              // is the only copy the UI sees: republish it or the client keeps its old
+              // rows and a new chat's Workspace never resolves (owner, zero hosts:
+              // "New chat → choose workspace bounces to Choose workspace").
+              if (state.ready) forward([{ type: 'replace', value: state.baseline() }])
+              continue
+            }
             forward(state.applyLocal(type, frame))
           }
         } catch (error) {

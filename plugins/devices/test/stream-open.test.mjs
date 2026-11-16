@@ -156,6 +156,100 @@ test('a Host that answers the open with nothing rejects with remote/stream-open-
   assert.equal(connection.wireStreams.size, 0, 'the timed-out stream is released')
 })
 
+test('a locked Host refuses the open with auth/locked on its stream id: no timeout wait', async () => {
+  // Spec 021 rev 15, the measured bug: a `web:unlock` socket that has not asserted its passkey is
+  // refused `auth/locked` for `remote-stream-open` BEFORE the bridge, and that refusal is an
+  // `error` frame, not a `remote-stream-closed`. The client used to have no branch for it, so the
+  // consumer waited out `remote/stream-open-timeout` — an empty sidebar and no reason.
+  // The gateway itself is real here; only the Host carrier is fake, so the refusal below is
+  // delivered on the wire exactly as the gateway sends it (framed, addressed to the streamId).
+  const lockedFrame = { kind: 'error', code: 'auth/locked', requestType: 'remote-stream-open',
+    streamId: 'k-1', reason: 'unregistered', message: 'this device is locked; unlock with a passkey first' }
+  const originalSend = connection.ws.send
+  connection.ws.send = function refuse(data, callback) {
+    let frame
+    try { frame = JSON.parse(String(data)) } catch { frame = undefined }
+    if (frame?.type === 'remote-stream-open') {
+      // Answer the open the way the locked gateway does: same streamId, no requestId.
+      const reply = JSON.stringify({ ...lockedFrame, streamId: frame.streamId })
+      setImmediate(() => { try { connection.ws.emit('message', Buffer.from(reply)) } catch { /* closed */ } })
+      return originalSend.call(this, data, callback)
+    }
+    return originalSend.call(this, data, callback)
+  }
+  const started = Date.now()
+  const source = await connection.openStream('workspace/follow', {})
+  await assert.rejects(() => drain(source), (error) => error.code === 'auth/locked' && error.requestType === 'remote-stream-open')
+  const elapsed = Date.now() - started
+  assert.ok(elapsed < OPEN_TIMEOUT_MS, `a locked refusal must not wait for the open timeout (took ${elapsed} ms)`)
+  assert.equal(connection.wireStreams.size, 0, 'the refused stream is released, not left pending')
+  connection.ws.send = originalSend
+  // The same for a one-shot call, matched by its requestId: it fails with the Host's code too.
+  const reply = { kind: 'error', code: 'auth/locked', requestType: 'remote-call', requestId: 'r-1' }
+  connection.ws.send = function refuseCall(data, callback) {
+    let frame
+    try { frame = JSON.parse(String(data)) } catch { frame = undefined }
+    if (frame?.type === 'remote-call') {
+      const answer = JSON.stringify({ ...reply, requestId: frame.requestId })
+      setImmediate(() => { try { connection.ws.emit('message', Buffer.from(answer)) } catch { /* closed */ } })
+    }
+    return originalSend.call(this, data, callback)
+  }
+  await assert.rejects(() => connection.call('session/list', {}), (error) => error.code === 'auth/locked')
+  connection.ws.send = originalSend
+})
+
+test('an out-of-order stream fails exactly once, AFTER the one cancel that names it', async () => {
+  // Reviewer finding (review-webunlock, Major): the DESYNC guard deleted the stream from
+  // `wireStreams` BEFORE failing its reader, so the iterator's own `finally` cancel found
+  // nothing to release and the Host never heard `remote-stream-cancel`. Every re-opened follow
+  // then stacked a second subscription on the gateway's per-device cap while the old one stayed
+  // alive and stalled on credit. The frames below are what the client itself receives from a
+  // broken Host: the open succeeds and a frame arrives on the wrong `seq`.
+  let hostSignal
+  gateway.host.open = (endpoint, payload, uplink, peer, signal) => {
+    hostSignal = signal
+    return new Promise(() => {}) // an open that answers nothing: the stream stays live
+  }
+  const originalSend = connection.ws.send
+  // This test's own record: the shared `sent` below already holds the earlier tests' frames.
+  const mine = []
+  let openFrame
+  connection.ws.send = function catchOpen(data, callback) {
+    try {
+      const frame = JSON.parse(String(data))
+      mine.push(frame)
+      if (frame?.type === 'remote-stream-open') openFrame = frame
+    } catch { /* not ours */ }
+    return originalSend.call(this, data, callback)
+  }
+  const source = await connection.openStream('workspace/follow', {})
+  const streamId = openFrame.streamId
+  const cancelsOf = () => mine.filter((frame) => frame.type === 'remote-stream-cancel' && frame.streamId === streamId)
+  const iterator = source[Symbol.asyncIterator]()
+  const pending = iterator.next()
+  // `seq` 1 where 0 is expected: the first frame of this stream is already out of order.
+  const desync = JSON.stringify({ kind: 'remote-frame', streamId, seq: 1, value: { type: 'upsert', value: {} } })
+  connection.ws.emit('message', Buffer.from(desync))
+  await assert.rejects(() => pending, (error) => error.code === 'remote/stream-desync')
+  // Exactly one cancel, naming the stream the Host is still holding — and it was sent BEFORE
+  // the reader was failed, so a re-open that starts right after can never overlap it.
+  assert.equal(cancelsOf().length, 1, 'exactly one cancel names the out-of-order stream')
+  assert.equal(mine.filter((frame) => frame.type === 'remote-stream-cancel').length, 1, 'no cancel for any other stream')
+  assert.equal(connection.wireStreams.size, 0, 'the out-of-order stream is released')
+  // The cancel is idempotent: a late frame on the dead id, then abandoning the iterator,
+  // produce no second frame on the wire (the reader has already failed, so it ends).
+  connection.ws.emit('message', Buffer.from(desync))
+  assert.deepEqual(await iterator.next(), { value: undefined, done: true }, 'the reader stays failed and ends')
+  await iterator.return()
+  assert.equal(mine.filter((frame) => frame.type === 'remote-stream-cancel').length, 1,
+    'one cancel per stream, however many roads lead out of it')
+  // The Host-side carrier was really cancelled, not just addressed.
+  for (let attempt = 0; attempt < 100 && !hostSignal?.aborted; attempt += 1) await delay(10)
+  assert.equal(hostSignal?.aborted, true, 'the Host-side carrier was cancelled')
+  connection.ws.send = originalSend
+})
+
 test('a normal stream still streams and closes cleanly', async () => {
   gateway.host.open = async () => (async function* () {
     yield { type: 'baseline', value: { items: [{ workspaceId: 'w1' }], archivedSessionIds: [] } }

@@ -304,10 +304,11 @@ await check('registers settings.section and settings.section.icon for the same i
   const ui = load()
   assert.equal(ui.api.id, '@dsh-ext/devices')
   assert.deepEqual([...ui.api.inject], ['slots', 'locale'])
-  // The sidebar layer's seat differs between builds of this plugin (`shell.overlay` now,
-  // `sidebar.session.action` before): the page itself is what says which.
+  // The sidebar tab strip's seat is the root-scope overlay, not one of the sidebar's:
+  // its box goes into the sidebar's DOM by placement (test/client-host-tabs.test.mjs),
+  // so the New Session button keeps its exact position and size.
   assert.deepEqual(ui.injects.slice(0, 5), ['settings.section', 'settings.section.icon', 'sidebar.panellist', 'main', 'plugins.detail.section'])
-  assert.ok(['shell.overlay', 'sidebar.session.action'].includes(ui.injects[5]), 'one sidebar seat, whichever it is')
+  assert.equal(ui.injects[5], 'shell.overlay', 'one sidebar seat: the layout\'s root overlay')
   assert.equal(ui.injects.length, 6)
   const [section, icon] = ui.registered
   // JSON round trip: the objects were created inside the vm realm.
@@ -2969,6 +2970,22 @@ await check('spec 033: the Devices page line states what was measured, and the l
   shell.dispose()
 })
 
+await check('spec 033: a proven remote pick the picker refused says replace-failed in the page\'s own words', async () => {
+  const page = createLivePage({ ...SPEC033_PAGE })
+  const shell = await loadSpec033(page)
+  refusePickerList(page.composers[0].fileInput, 'ignored')
+  const bridge = page.holder.__DSH_HOST_PATHS__
+  const zip = picked(new File([new Uint8Array([7, 8])], 'refused.zip', { type: 'application/zip' }))
+  const answers = livePick(page.document, page.composers[0].fileInput, [zip], (file) => bridge.pathFor(file), () => {})
+  assert.deepEqual(answers.map((answer) => answer.kind), ['mention'], 'DSH mentions the controller path it kept')
+  assert.equal(shell.status().last.reason, 'replace-failed', 'and the page names the failure, not a local pick')
+  const renderer = create(React.createElement(shell.api.testing.RemoteAttachStatus))
+  const line = find(renderer, (node) => node.props && node.props['data-testid'] === 'remote-attach-last')[0]
+  assert.equal(line.props['data-state'], 'replace-failed', 'the Devices line names the replacement failure')
+  renderer.unmount()
+  shell.dispose()
+})
+
 await check('spec 033: activation is the install — a page whose source reads have not landed is never held back', async () => {
   const page = createLivePage({ ...SPEC033_PAGE })
   // The page no longer fetches DSH sources: they are not served, and a feature that waited on
@@ -3007,19 +3024,3 @@ await check('spec 033: a page whose preload names a path even for a constructed 
 })
 
 finish('client')
-await check('spec 033: a proven remote pick the picker refused says replace-failed in the page\'s own words', async () => {
-  const page = createLivePage({ ...SPEC033_PAGE })
-  const shell = await loadSpec033(page)
-  refusePickerList(page.composers[0].fileInput, 'ignored')
-  const bridge = page.holder.__DSH_HOST_PATHS__
-  const zip = picked(new File([new Uint8Array([7, 8])], 'refused.zip', { type: 'application/zip' }))
-  const answers = livePick(page.document, page.composers[0].fileInput, [zip], (file) => bridge.pathFor(file), () => {})
-  assert.deepEqual(answers.map((answer) => answer.kind), ['mention'], 'DSH mentions the controller path it kept')
-  assert.equal(shell.status().last.reason, 'replace-failed', 'and the page names the failure, not a local pick')
-  const renderer = create(React.createElement(shell.api.testing.RemoteAttachStatus))
-  const line = find(renderer, (node) => node.props && node.props['data-testid'] === 'remote-attach-last')[0]
-  assert.equal(line.props['data-state'], 'replace-failed', 'the Devices line names the replacement failure')
-  renderer.unmount()
-  shell.dispose()
-})
-

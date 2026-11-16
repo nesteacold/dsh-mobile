@@ -24,10 +24,12 @@ const OPAQUE = Object.freeze({
   clientDeviceId: 'pairing device identity, local to the gateway',
   clientMsgId: 'client-generated message correlation, echoed verbatim',
   callId: 'opaque tool-call id (see ID_FIELDS doc comment)',
+  attemptId: 'process-local assistant-attempt identity; its revision restarts on a resumed follow',
   attachmentId: 'opaque (see ID_FIELDS doc comment)',
   uploadId: 'upload handle scoped to the routed request',
   commandId: 'opaque command correlation',
   requestId: 'opaque request correlation',
+  streamId: 'client-generated transport correlation for one remote-stream-open (dev-s-…), not a DSH entity',
   receiptId: 'opaque receipt correlation',
   providerId: 'model provider name, handled by shape outside ID_FIELDS',
 })
