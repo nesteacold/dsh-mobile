@@ -11,7 +11,8 @@ window.__ModuleLoader__.load({
     const module = { exports: {} }
     const exports = module.exports
 
-    // Spec 033 (A1.2): the remote file-attach wrap (`__DSH_HOST_PATHS__.pathFor`) is a
+    // Spec 033 (A1.2): remote file attach — a pick in a remote composer is handed to DSH
+    // as path-free `File` objects — is a
     // second client file of this package — `lib/client.remote-file-attach.js`, a
     // package-local chunk — and one IMPLEMENTATION, not a copy. That file ships in DSH's
     // own chunk envelope (`window.__ModuleLoader__.load({id, chunk, factory})`, measured in
@@ -19,11 +20,11 @@ window.__ModuleLoader__.load({
     // verbatim and its loader refuses a bundle that did not register
     // (`dsh-client-modules` `importChunk`). `require.async` is how DSH requests such a
     // chunk, and its answer is the factory's return value — the very object
-    // `test/remote-file-attach.test.mjs` exercises. A shell that cannot hand it over gets NO
-    // wrap and the page says so (`bridge-module-missing`), which is the A1.2 failure mode
-    // rather than a silent second path. A request that answers late is re-published when
-    // `installRemoteFileAttach` attaches, which is why this is one shared promise rather
-    // than a per-effect request.
+    // `test/remote-file-attach.test.mjs` exercises. A shell that cannot hand it over leaves
+    // every pick to DSH and the page says so (`bridge-module-missing`), which is the A1.2
+    // failure mode rather than a silent second path. A request that answers late is
+    // re-published when `installRemoteFileAttach` attaches, which is why this is one shared
+    // promise rather than a per-effect request.
     const remoteFileAttach = typeof require.async === 'function'
       ? require.async('./client.remote-file-attach.js')
       // Settled, never rejected: a rejection here would be an unhandled promise for a
@@ -92,6 +93,8 @@ window.__ModuleLoader__.load({
         'permsErr.scope-not-for-kind': 'That permission does not apply to this kind of device.',
         'permsErr.forbidden': 'Permissions can only be changed from this machine.',
         'permsErr.not-found': 'That device is no longer paired. Reload the page.',
+        // Spec 021 rev 15: a record holding a scope its kind cannot use (desktop + web:unlock).
+        permsNotForKeyKind: 'This device holds a permission its kind cannot use (web unlock, which only a web or phone device can satisfy). Applying permissions removes it.',
         cancel: 'Cancel',
         'scope.sessions:read': 'See sessions and history',
         'scope.prompt:send': 'Send prompts',
@@ -238,6 +241,7 @@ window.__ModuleLoader__.load({
         pendingTitle: 'Pending requests',
         pendingNone: 'No device is asking to connect.',
         pendingHelp: 'Check that the code below is the same one shown on the other device before you approve.',
+        unnamedDevice: 'Unnamed device',
         verifyCode: 'Verification code',
         approve: 'Approve',
         rejectRequest: 'Reject',
@@ -309,21 +313,31 @@ window.__ModuleLoader__.load({
         sidebarReasonNoHost: 'No remote host is connected.',
         sidebarReasonNoActions: 'This shell provides no workspace actions.',
         sidebarReasonRoutingOff: 'Multi-host routing is off',
+        // The sidebar's two tabs (Qoder's This Computer / Remote Workspace). They
+        // filter the LIST the native browser draws; no stream is asked twice.
+        hostTabs: 'Sidebar tabs',
+        hostTabsOn: 'two tabs, filtering the sidebar list',
+        hostTabsOff: 'not installed',
+        tabThisComputer: 'This Computer',
+        tabRemoteWorkspace: 'Remote Workspace',
+        tabSwitchLocal: 'Show this computer’s sessions',
+        tabSwitchRemote: 'Show remote workspaces',
+        tabShortcutLocal: 'Ctrl+Alt+1',
+        tabShortcutRemote: 'Ctrl+Alt+2',
+        sidebarReasonNoTabs: 'This shell declares no sidebar tab strip.',
+        sidebarReasonShortcut: 'The sidebar tabs are on, but Ctrl+Alt+1 / 2 could not be registered',
         // --- spec 033 (A1.2): a file picked for a remote session reaches that Host as bytes ---
         attachTitle: 'Remote file attach',
         attachOn: 'Files picked for a remote session are sent to that host as bytes',
         attachNoBridge: 'This shell has no local file path, so every picked file already uploads',
         attachOffUnknown: 'Files picked for a remote session are NOT sent to that host',
         attachReason: 'Reason',
-        attachNoModule: 'this shell did not hand over the wrap',
-        attachNoWindow: 'no window to wrap',
-        attachNotInstalled: 'the wrap did not run',
-        attachFrozen: 'the local file-path bridge cannot be replaced',
-        attachShape: 'the local file-path bridge is not the one DSH exposes',
-        attachKeys: 'the local file-path bridge has unexpected keys',
-        attachPathFor: 'the local file-path bridge has no pathFor function',
-        attachReplaced: 'another writer replaced the local file-path bridge',
-        attachLast: 'Last pick not uploaded',
+        attachNoModule: 'this shell did not hand over the attach module',
+        attachNoWindow: 'this page has no window',
+        attachNotInstalled: 'the attach did not run',
+        attachBrowserUnavailable: 'this browser cannot build the file list a remote pick needs',
+        attachMeasured: 'the attach is on: each remote pick is checked on the spot before it is handed over',
+        attachLast: 'Last pick sent as DSH\'s own',
         attachPickLocal: 'it belongs to a local session, so DSH keeps its own behaviour',
         attachPickAmbiguous: 'its session could not be known for certain, so DSH kept its own behaviour',
         attachPickNoComposer: 'no composer was open',
@@ -334,6 +348,9 @@ window.__ModuleLoader__.load({
         attachPickUncertain: 'its composer could not be identified',
         attachPickStale: 'its composer changed before the pick finished',
         attachPickPassthrough: 'another bridge answered this pick',
+        attachPickPathNamed: 'the file path is still attached to the pick, so DSH keeps its own behaviour',
+        attachPickUnverified: 'the replaced file list could not be confirmed, so DSH kept its own behaviour',
+        attachPickReplaceFailed: 'this pick belongs to a remote session, but the composer would not take the uploaded copies, so DSH kept its own behaviour for it',
         attachPickUnknown: 'its session is unknown',
         'reason.dsh-version-mismatch': 'this DSH version is not the pinned one',
         'reason.dsh-version-unknown': 'the DSH version is unknown',
@@ -425,6 +442,7 @@ window.__ModuleLoader__.load({
         'permsErr.scope-not-for-kind': 'Quyền đó không áp dụng cho loại thiết bị này.',
         'permsErr.forbidden': 'Chỉ đổi được quyền từ máy này.',
         'permsErr.not-found': 'Thiết bị đó không còn ghép đôi. Hãy tải lại trang.',
+        permsNotForKeyKind: 'Thiết bị này đang giữ một quyền mà loại của nó không dùng được (mở khóa web — chỉ thiết bị web hoặc điện thoại đáp ứng được). Bấm Áp dụng quyền sẽ gỡ quyền đó.',
         cancel: 'Hủy',
         'scope.sessions:read': 'Xem phiên và lịch sử',
         'scope.prompt:send': 'Gửi prompt',
@@ -557,6 +575,7 @@ window.__ModuleLoader__.load({
         pendingTitle: 'Yêu cầu đang chờ',
         pendingNone: 'Không có thiết bị nào đang xin kết nối.',
         pendingHelp: 'Hãy kiểm tra mã bên dưới trùng với mã hiển thị trên thiết bị kia trước khi phê duyệt.',
+        unnamedDevice: 'Thiết bị chưa đặt tên',
         verifyCode: 'Mã xác minh',
         approve: 'Phê duyệt',
         rejectRequest: 'Từ chối',
@@ -625,21 +644,31 @@ window.__ModuleLoader__.load({
         sidebarReasonNoHost: 'Chưa có host từ xa nào kết nối.',
         sidebarReasonNoActions: 'Giao diện này không cung cấp thao tác với workspace.',
         sidebarReasonRoutingOff: 'Định tuyến đa host đang tắt',
+        // Hai thẻ của thanh bên (như Qoder). Chúng lọc DANH SÁCH do trình duyệt gốc vẽ;
+        // không luồng dữ liệu nào bị hỏi lại.
+        hostTabs: 'Thẻ trên thanh bên',
+        hostTabsOn: 'hai thẻ, lọc danh sách thanh bên',
+        hostTabsOff: 'chưa cài đặt',
+        tabThisComputer: 'Máy này',
+        tabRemoteWorkspace: 'Workspace từ xa',
+        tabSwitchLocal: 'Xem phiên trên máy này',
+        tabSwitchRemote: 'Xem workspace từ xa',
+        tabShortcutLocal: 'Ctrl+Alt+1',
+        tabShortcutRemote: 'Ctrl+Alt+2',
+        sidebarReasonNoTabs: 'Giao diện này không khai báo dải thẻ cho thanh bên.',
+        sidebarReasonShortcut: 'Thẻ thanh bên đang bật, nhưng không đăng ký được Ctrl+Alt+1 / 2',
         // --- spec 033 (A1.2): tệp chọn cho phiên từ xa đến host đó dưới dạng byte ---
         attachTitle: 'Đính kèm tệp từ xa',
         attachOn: 'Tệp chọn cho phiên từ xa được gửi tới host đó dưới dạng byte',
         attachNoBridge: 'Giao diện này không có đường dẫn tệp cục bộ, nên mọi tệp chọn đều đã được tải lên',
         attachOffUnknown: 'Tệp chọn cho phiên từ xa KHÔNG được gửi tới host đó',
         attachReason: 'Lý do',
-        attachNoModule: 'giao diện này không cung cấp phần bọc',
-        attachNoWindow: 'không có cửa sổ để bọc',
-        attachNotInstalled: 'phần bọc chưa chạy',
-        attachFrozen: 'không thay thế được cầu nối đường dẫn tệp cục bộ',
-        attachShape: 'cầu nối đường dẫn tệp cục bộ không phải loại DSH cung cấp',
-        attachKeys: 'cầu nối đường dẫn tệp cục bộ có khóa bất thường',
-        attachPathFor: 'cầu nối đường dẫn tệp cục bộ không có hàm pathFor',
-        attachReplaced: 'thành phần khác đã thay cầu nối đường dẫn tệp cục bộ',
-        attachLast: 'Lần chọn gần nhất không được tải lên',
+        attachNoModule: 'giao diện này không cung cấp mô-đun đính kèm',
+        attachNoWindow: 'trang này không có cửa sổ',
+        attachNotInstalled: 'phần đính kèm chưa chạy',
+        attachBrowserUnavailable: 'trình duyệt này không dựng được danh sách tệp mà lượt chọn từ xa cần',
+        attachMeasured: 'phần đính kèm đang bật: mỗi lượt chọn từ xa được kiểm tra ngay tại chỗ trước khi chuyển đi',
+        attachLast: 'Lần chọn gần nhất được xử lý như DSH vẫn làm',
         attachPickLocal: 'tệp thuộc một phiên cục bộ nên DSH giữ nguyên cách xử lý của nó',
         attachPickAmbiguous: 'không xác định chắc chắn được phiên nên DSH giữ nguyên cách xử lý của nó',
         attachPickNoComposer: 'không có ô soạn nào đang mở',
@@ -650,6 +679,9 @@ window.__ModuleLoader__.load({
         attachPickUncertain: 'không xác định được ô soạn của tệp',
         attachPickStale: 'ô soạn của tệp đã thay đổi trước khi lượt chọn xong',
         attachPickPassthrough: 'cầu nối khác đã trả lời lượt chọn này',
+        attachPickPathNamed: 'đường dẫn tệp vẫn gắn với lượt chọn nên DSH giữ nguyên cách xử lý của nó',
+        attachPickUnverified: 'không xác nhận được danh sách tệp đã thay nên DSH giữ nguyên cách xử lý của nó',
+        attachPickReplaceFailed: 'lượt chọn này thuộc một phiên từ xa, nhưng ô soạn không nhận bản sao để tải lên, nên DSH giữ nguyên cách xử lý của nó',
         attachPickUnknown: 'không rõ phiên của tệp',
         'reason.dsh-version-mismatch': 'phiên bản DSH không đúng bản đã ghim',
         'reason.dsh-version-unknown': 'chưa rõ phiên bản DSH',
@@ -711,6 +743,9 @@ window.__ModuleLoader__.load({
       const name = status && typeof status.gatewayName === 'string' ? status.gatewayName.trim() : ''
       return name || tr('thisDevice')
     }
+    // The gateway stores '' for a device that reported no name (it never invents one), so
+    // every row that shows a name substitutes this label instead of an empty line.
+    const deviceName = (record) => record.displayName || record.name || tr('unnamedDevice')
 
     // ------------------------------------------------------------- helpers
     // Same-origin only; honours the <base> prefix the way the gateway does.
@@ -824,6 +859,11 @@ window.__ModuleLoader__.load({
 .dshdev-seg button{background:transparent;border:0;color:inherit;font:inherit;padding:5px 14px;cursor:pointer}
 .dshdev-seg button[aria-pressed=true]{background:${colors.accent};color:${colors.accentText}}
 .dshdev-seg button:disabled{opacity:.5;cursor:default}
+/* The sidebar's host tabs sit above the New Task row inside the sidebar.session.action */
+/* layer: display:contents so the layer adds no box of its own, and only the strip is styled. */
+.dshdev-hosttabs{display:contents}
+.dshdev-hosttabs-strip{display:flex;gap:2px;margin:0 6px 6px;padding:2px;border:1px solid ${colors.border};border-radius:999px;background:${colors.hover}}
+.dshdev-hosttabs-strip button{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* spec 008 P2b: the host seat on a native session row, the composer chip/popover
    and the session notices. The seat is a sibling of the row's own timestamp, so
    it stays small and quiet and never pushes the title. */
@@ -1162,22 +1202,33 @@ window.__ModuleLoader__.load({
     // `scopesForKind` filters by.
     const DESKTOP_ONLY_SCOPES = new Set(['harness:remote', 'commands:execute', 'workspace:manage',
       'credentials:write', 'plugins:manage', 'schedule:write', 'terminal'])
-    const scopesForKind = (kind) => ALL_SCOPES.filter((scope) => kind === 'desktop' || !DESKTOP_ONLY_SCOPES.has(scope))
+    // Spec 021 rev 15 (the mirror of the set above): `web:unlock` arms a passkey lock that only a
+    // web/`mobile` device can satisfy — a `desktop` never runs a ceremony, so holding it left
+    // every desktop frame refused `auth/locked` (measured 2026-11-14, an OTP offer of kind
+    // desktop carrying "Full control"). No desktop offer, preset or Approve list may carry it.
+    const MOBILE_ONLY_SCOPES = new Set(['web:unlock'])
+    const scopesForKind = (kind) => ALL_SCOPES.filter((scope) => (kind === 'desktop'
+      ? !MOBILE_ONLY_SCOPES.has(scope) : !DESKTOP_ONLY_SCOPES.has(scope)))
 
     // The checkbox list + the two preset buttons, shared by Approve and Edit permissions.
     // `allowed` (Approve only): the scopes the pairing request offered. The gateway
     // refuses an Approve that is wider than the offer, so the rest stay listed but
-    // disabled and the presets are cut to the offer.
-    function ScopePicker({ scopes, onChange, allowed }) {
+    // disabled and the presets are cut to the offer. `kind` is the OFFER's kind, so the LIST and
+    // the presets are cut by it (spec 021 rev 15): a desktop offer neither shows nor ticks
+    // `web:unlock` — the gateway drops it anyway, but the page must not offer it in the first place.
+    function ScopePicker({ scopes, onChange, allowed, kind }) {
       useLang()
-      const can = (scope) => !allowed || allowed.includes(scope)
-      const preset = (name) => onChange(keepKnown(SCOPE_PRESETS[name].filter(can)))
+      const listed = scopesForKind(kind)
+      const allowedByKind = allowed ? allowed.filter((scope) => listed.includes(scope)) : undefined
+      const can = (scope) => !allowedByKind || allowedByKind.includes(scope)
+      const presetScopes = (name) => SCOPE_PRESETS[name].filter((scope) => listed.includes(scope))
+      const preset = (name) => onChange(keepKnown(presetScopes(name).filter(can)))
       return h('div', { 'data-testid': 'scope-picker' },
         h('div', { className: 'dshdev-row', style: { margin: '6px 0' } },
           h('span', { className: 'dshdev-muted' }, tr('presets')),
           h('button', { type: 'button', className: 'dshdev-btn', onClick: () => preset('standard') }, tr('presetStandard')),
           h('button', { type: 'button', className: 'dshdev-btn danger', title: tr('presetFullHint'), onClick: () => preset('full') }, tr('presetFull'))),
-        ALL_SCOPES.map((scope) => h('label', { key: scope, className: 'dshdev-row', style: { alignItems: 'flex-start', opacity: can(scope) ? 1 : 0.5 } },
+        listed.map((scope) => h('label', { key: scope, className: 'dshdev-row', style: { alignItems: 'flex-start', opacity: can(scope) ? 1 : 0.5 } },
           h('input', {
             type: 'checkbox', checked: scopes.includes(scope), disabled: !can(scope),
             onChange: (event) => onChange(keepKnown(event.target.checked ? [...scopes, scope] : scopes.filter((value) => value !== scope))),
@@ -1228,11 +1279,20 @@ window.__ModuleLoader__.load({
     // `POST /mgw/devices/:id/scopes`. The page sends the DIFF (`add`/`remove`), not the whole
     // list: the route reads the record itself, so a page that went stale cannot resurrect a
     // permission someone else removed. Only the scopes this device's kind can hold are listed,
-    // and `web:unlock` is not tickable here at all — the passkey flow owns it.
+    // and `web:unlock` is not tickable here at all — the passkey flow owns it. That was the hole
+    // the 2026-11-14 desktop offer fell through: a desktop record listing `web:unlock` filtered it
+    // out of `allowed`, so it was neither listed nor removable. The record is repaired by the
+    // gateway (`scopesForKind`, once it restarts and reloads the store); until that restart the
+    // editor both says so and offers the ONE action that fixes it: drop it.
     const UNSETTABLE_SCOPES = new Set(['web:unlock'])
     function PermissionsEditor({ device, onClose, onApplied }) {
       useLang()
-      const granted = Array.isArray(device.scopes) ? device.scopes : []
+      const notForKind = (Array.isArray(device.scopes) ? device.scopes : []).filter((scope) => !scopesForKind(device.kind).includes(scope))
+      // `web:unlock` on a desktop is the only kind-mismatch the owner can see today; it is
+      // removable for that kind alone (the route still refuses to ADD it, and a web/`mobile`
+      // record keeps the passkey flow's sole ownership).
+      const droppable = notForKind.includes('web:unlock') && device.kind === 'desktop' ? ['web:unlock'] : []
+      const granted = (Array.isArray(device.scopes) ? device.scopes : []).filter((scope) => !droppable.includes(scope))
       const allowed = scopesForKind(device.kind)
       // `baseline` is the grant the ROUTE last reported, `ticked` what the owner wants: the diff is
       // computed between them, so after a save the button goes quiet instead of re-sending the same
@@ -1250,6 +1310,7 @@ window.__ModuleLoader__.load({
       }
       const add = ticked.filter((scope) => !baseline.includes(scope))
       const remove = baseline.filter((scope) => !ticked.includes(scope) && allowed.includes(scope))
+        .concat(droppable)
       const save = async () => {
         if (busy || (add.length === 0 && remove.length === 0)) return
         // Explicit confirm: the change closes the device's live connections (spec 025 R3), so it
@@ -1270,8 +1331,12 @@ window.__ModuleLoader__.load({
         } catch (cause) { setRefusal(cause) } finally { setBusy(false) }
       }
       return h('div', { className: 'dshdev-card', 'data-testid': 'permissions-editor' },
-        h('h3', null, `${tr('permissions')} — ${device.displayName || device.name}`),
+        h('h3', null, `${tr('permissions')} — ${deviceName(device)}`),
         h('div', { className: 'dshdev-muted', style: { marginBottom: 8 } }, tr('permsHelp')),
+        // The record holds a scope its kind cannot use (a desktop with `web:unlock`): say it, and
+        // offer the removal the Save button below then sends.
+        droppable.length > 0
+          ? h('div', { className: 'dshdev-err', 'data-testid': 'permissions-not-for-kind' }, tr('permsNotForKeyKind')) : null,
         h('div', { 'data-testid': 'permissions-scopes' }, allowed.map((scope) => h('label', {
           key: scope, className: 'dshdev-row', style: { alignItems: 'flex-start' },
         },
@@ -1318,9 +1383,12 @@ window.__ModuleLoader__.load({
         return () => { mounted.current = false; window.clearInterval(timer) }
       }, [refresh, active])
       // Approve defaults to the Standard preset, limited to what the device asked
-      // for (the gateway refuses anything wider). Anything dangerous is opt-in.
+      // for (the gateway refuses anything wider) AND to what its kind may hold
+      // (spec 021 rev 15: a desktop offer may not keep `web:unlock`). Anything dangerous
+      // is opt-in.
       const scopesOf = (item) => picked[item.id]
-        || keepKnown(SCOPE_PRESETS.standard.filter((scope) => item.requestedScopes.includes(scope)))
+        || keepKnown(SCOPE_PRESETS.standard.filter((scope) => scopesForKind(item.kind).includes(scope)
+          && item.requestedScopes.includes(scope)))
       const pickScopes = (item, scopes) => setPicked({ ...picked, [item.id]: scopes })
       const decide = async (item, action) => {
         try {
@@ -1335,12 +1403,13 @@ window.__ModuleLoader__.load({
         list.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('pendingNone'))
           : h('div', { className: 'dshdev-list' }, list.map((item) => h('div', { key: item.id, 'data-testid': 'pending-item' },
             h('div', { className: 'dshdev-grow' },
-              h('div', { className: 'dshdev-row' }, h('strong', null, item.name), h('span', { className: 'dshdev-badge' }, item.kind)),
+              h('div', { className: 'dshdev-row' }, h('strong', null, deviceName(item)), h('span', { className: 'dshdev-badge' }, item.kind)),
               h('div', { className: 'dshdev-muted' }, `${tr('fromIp')}: ${item.clientIp} · ${tr('requestedAt')}: ${new Date(item.createdAt).toLocaleTimeString()}`),
               h('div', { className: 'dshdev-muted', style: { marginTop: 8 } }, tr('verifyCode')),
               h('div', { className: 'dshdev-vcode', 'data-testid': 'verification-code' }, String(item.verificationCode).replace(/^(\d{3})(\d{3})$/, '$1 $2')),
-              // All desktop scopes are listed; the gateway refuses what the device did not request.
-              h('div', { style: { marginTop: 6 } }, h(ScopePicker, { scopes: scopesOf(item), allowed: item.requestedScopes, onChange: (scopes) => pickScopes(item, scopes) }))),
+              // Every scope the KIND may hold is listed; the gateway refuses what the device
+              // did not request, and the page cuts the presets by kind as well.
+              h('div', { style: { marginTop: 6 } }, h(ScopePicker, { scopes: scopesOf(item), allowed: item.requestedScopes, kind: item.kind, onChange: (scopes) => pickScopes(item, scopes) }))),
             h('button', { type: 'button', className: 'dshdev-btn primary', onClick: () => decide(item, 'approve') }, tr('approve')),
             h('button', { type: 'button', className: 'dshdev-btn danger', onClick: () => decide(item, 'reject') }, tr('rejectRequest'))))),
         list.length ? h('div', { className: 'dshdev-muted', style: { marginTop: 6 } }, tr('pendingHelp')) : null)
@@ -1675,9 +1744,10 @@ window.__ModuleLoader__.load({
         setBusy(true); setError('')
         try {
           setPairing(null)
-          // The offer asks for every desktop scope so the Host user can choose at
-          // Approve (which defaults to Standard); nothing is granted until then.
-          setOtpOffer(await post('/mgw/pair', { mode: 'otp', kind: 'desktop', scopes: [...ALL_SCOPES] }))
+          // The offer asks for every scope its KIND can hold (spec 021 rev 15: a desktop never
+          // gets `web:unlock`) so the Host user can choose at Approve (which defaults to
+          // Standard); nothing is granted until then.
+          setOtpOffer(await post('/mgw/pair', { mode: 'otp', kind: 'desktop', scopes: scopesForKind('desktop') }))
         } catch (cause) { setError(cause.message) } finally { setBusy(false) }
       }
 
@@ -1686,7 +1756,9 @@ window.__ModuleLoader__.load({
         if (busy) return
         setBusy(true); setError('')
         try {
-          const body = { kind: 'desktop', ...(scopes ? { scopes } : {}) }
+          // Spec 021 rev 15: the re-pair offer carries only scopes a `desktop` may hold; the
+          // ticked list is already cut by kind, this is the belt to that braces.
+          const body = { kind: 'desktop', ...(scopes ? { scopes: scopes.filter((scope) => scopesForKind('desktop').includes(scope)) } : {}) }
           setPairing(await post('/mgw/pair', body))
           setEditing(null)
         } catch (cause) { setError(cause.message) } finally { setBusy(false) }
@@ -1770,7 +1842,7 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'dshdev-tile' }, deviceIcon(device.kind)),
                 h('div', { className: 'dshdev-item-main' },
                   h('div', { className: 'dshdev-item-head' },
-                    h('strong', { className: 'dshdev-item-name' }, device.displayName || device.name),
+                    h('strong', { className: 'dshdev-item-name' }, deviceName(device)),
                     h('span', { className: 'dshdev-badge' }, device.kind || 'mobile'),
                     device.online ? h('span', { className: 'dshdev-badge ok' }, tr('connectedHere')) : null)),
                 h('div', { className: 'dshdev-item-actions' },
@@ -1789,9 +1861,9 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'dshdev-muted' }, tr('lastUsed')),
                   h('span', { 'data-testid': 'last-used' }, stampWhen(device.lastSeenAt)))))))),
         editing ? h('div', { className: 'dshdev-card', 'data-testid': 'edit-permissions' },
-          h('h3', null, `${tr('edit')} — ${editing.device.displayName || editing.device.name}`),
+          h('h3', null, `${tr('edit')} — ${deviceName(editing.device)}`),
           h('div', { className: 'dshdev-muted', style: { marginBottom: 8 } }, tr('editHelp')),
-          h(ScopePicker, { scopes: editing.scopes, onChange: (scopes) => setEditing({ ...editing, scopes }) }),
+          h(ScopePicker, { scopes: editing.scopes, kind: editing.device.kind, onChange: (scopes) => setEditing({ ...editing, scopes }) }),
           h('div', { className: 'dshdev-row', style: { marginTop: 10 } },
             h('button', { type: 'button', className: 'dshdev-btn primary', disabled: busy, onClick: () => generate(editing.scopes) }, tr('editSave')),
             h('button', { type: 'button', className: 'dshdev-btn', onClick: () => setEditing(null) }, tr('cancel')))) : null,
@@ -2499,7 +2571,7 @@ window.__ModuleLoader__.load({
     // Why the grouped sidebar is (not) installed. The Devices page shows this line:
     // a replacement that quietly failed to install must be visible, not guessed at.
     const remoteUI = (() => {
-      let snapshot = { grouped: false, reason: 'not installed', hosts: 0 }
+      let snapshot = { grouped: false, reason: 'not installed', hosts: 0, tabs: false, tabsReason: null }
       const listeners = new Set()
       return {
         getSnapshot: () => snapshot,
@@ -2515,12 +2587,13 @@ window.__ModuleLoader__.load({
     const useRemoteUI = () => React.useSyncExternalStore(remoteUI.subscribe, remoteUI.getSnapshot, remoteUI.getSnapshot)
 
     // Spec 033 (A1.2): whether a FILE picked in a remote session's composer is sent to
-    // that Host as BYTES. `wrapped`/`reason` are the wrap's own MEASURED answer
+    // that Host as BYTES. `active`/`reason` are the module's own MEASURED answer
     // (`lib/client.remote-file-attach.js` `status()`), never this page's assumption, and
-    // `last` is the state of the last pick the wrap did not upload (spec R6: a pick it
-    // cannot attribute keeps DSH's behaviour, and the page says which state that was).
+    // `last` is the state of the last pick it did NOT upload (spec R6: a pick it cannot
+    // attribute keeps DSH's behaviour, and the page says which state that was). No DSH
+    // object is wrapped: a remote pick's file list is replaced in the picker's capture phase.
     const attachUI = (() => {
-      let snapshot = { state: 'idle', wrapped: null, reason: null, surface: null, shape: null, calls: 0, claims: 0, last: null }
+      let snapshot = { state: 'idle', active: null, reason: null, surface: null, shape: null, picks: 0, uploaded: 0, last: null }
       const listeners = new Set()
       const publish = (patch) => {
         snapshot = { ...snapshot, ...patch }
@@ -2838,6 +2911,8 @@ window.__ModuleLoader__.load({
       if (value === 'the shell provides no client services') return tr('sidebarReasonNoServices')
       if (value === 'no remote host is connected') return tr('sidebarReasonNoHost')
       if (value === 'the shell provides no workspace actions') return tr('sidebarReasonNoActions')
+      if (value === 'no-tabs') return tr('sidebarReasonNoTabs')
+      if (value === 'shortcuts') return tr('sidebarReasonShortcut')
       const routing = /^multi-host routing is off(?:: (.*))?$/.exec(value)
       if (routing) {
         return routing[1] ? `${tr('sidebarReasonRoutingOff')} (${reasonText(routing[1])})` : tr('sidebarReasonRoutingOff')
@@ -2850,34 +2925,264 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'dshdev-card', 'data-testid': 'sidebar-grouping' },
         h('h3', null, tr('sidebarGrouping')),
         h('div', { className: 'dshdev-muted', 'data-testid': 'sidebar-grouping-state' },
-          status.grouped ? `${tr('sidebarOn')} (${status.hosts})` : `${tr('sidebarOffState')} — ${groupingReasonText(status.reason)}`))
+          status.grouped ? `${tr('sidebarOn')} (${status.hosts})` : `${tr('sidebarOffState')} — ${groupingReasonText(status.reason)}`),
+        h('div', { className: 'dshdev-muted', 'data-testid': 'sidebar-tabs-state' },
+          `${tr('hostTabs')}: ${status.tabs
+            ? `${tr('hostTabsOn')}${status.tabsReason ? ` — ${groupingReasonText(status.tabsReason)}` : ''}`
+            : tr('hostTabsOff')}`))
+    }
+
+    // ------------------------------- the sidebar's two tabs (This Computer / Remote)
+    // Qoder's split, done the only way that costs no data: both tabs show the SAME
+    // native browser and one injected stylesheet hides the rows the other tab owns.
+    // Nothing is re-requested, re-merged or re-ordered — `workspace/follow` and
+    // `session/list` stay exactly the streams the shell already asked for, and a tab
+    // change writes one <style> and nothing else.
+    //
+    // THE FILTER (measured on the live DSH window, owner, 2026-11-16; row order is flat
+    // in document order): a local workspace row is `workspace:<uuid>` (UNTAGGED), a
+    // local session row `session:session-<uuid>`, a remote workspace `workspace:h:<hostId>:<uuid>`,
+    // a remote session `session:h:<hostId>:<uuid>`, a remote hidden-sessions button
+    // `overflow:h:<hostId>:<uuid>`, plus the UNGROUPED group header `workspace:` and its
+    // `overflow:` — observed holding only remote sessions in that group on the live
+    // window. The empty state is the literal `empty` — never hidden, because an empty
+    // workspace is still a fact of whichever tab you are on.
+    // Every id minted through this plugin's multi-host router is `h:<hostId>:<id>`
+    // (`lib/host-router.mjs` namespaceId, mirrored by HOST_TAG above), and the shell
+    // tags workspace ids that way too, so one prefix decides both directions: a row is
+    // remote iff its key carries the `:h:` tag after the kind.
+    const HOST_TABS_STYLE_ID = 'dsh-ext.devices.host-tabs'
+    const HOST_TABS_SLOT = 'sidebar.session.action'
+    // What the THIS-COMPUTER tab hides: every row tagged for a remote host, and nothing
+    // else — the untagged `workspace:`/`overflow:` ungrouped headers stay, since local
+    // loose sessions may live there.
+    const HOST_TABS_LOCAL_HIDES = [
+      '[data-row-key^="workspace:h:"]',
+      '[data-row-key^="session:h:"]',
+      '[data-row-key^="overflow:h:"]',
+    ]
+    // What the REMOTE tab hides: every row NOT tagged for a remote host, plus
+    // `workspace:` — the ungrouped header is hidden by the same `:not` already
+    // (`workspace:` does not start with `workspace:h:`).
+    const HOST_TABS_REMOTE_HIDES = [
+      '[data-row-key^="workspace:"]:not([data-row-key^="workspace:h:"])',
+      '[data-row-key^="session:"]:not([data-row-key^="session:h:"])',
+      '[data-row-key^="overflow:"]:not([data-row-key^="overflow:h:"])',
+    ]
+    // What each tab hides, as the selectors themselves (what `hostTabsStyle` writes).
+    const HOST_TABS_SELECTORS = { local: HOST_TABS_LOCAL_HIDES, remote: HOST_TABS_REMOTE_HIDES }
+    const hostTabsHide = (selectors) => `${selectors.join(',')}{display:none!important}`
+    /**
+     * What each tab hides. `value` only names the tab; the selectors come from the
+     * tables above. No `:has()` mixed-case rules: the measured keys are reliably
+     * tagged, and a case-matching rule risks hiding a remote workspace that holds
+     * sessions.
+     * @returns {string} the stylesheet text for that tab
+     */
+    function hostTabsStyle(value) {
+      return hostTabsHide(value === 'remote' ? HOST_TABS_REMOTE_HIDES : HOST_TABS_LOCAL_HIDES)
+    }
+    const HOST_TABS_STYLE = { local: hostTabsStyle('local'), remote: hostTabsStyle('remote') }
+    const HOST_TABS_STORAGE = 'dsh-ext.devices.sidebar-tab'
+    const HOST_TABS_DEFAULT = 'local'
+    // Declared in `apply` so `installRemoteSurfaces` can report it on the Devices page.
+    // `tabs: false` means "not installed"; `tabsReason` explains a partial install
+    // ('shortcuts') or a refused seat ('no-tabs').
+    const syncHostTabsStatus = () => remoteUI.set({
+      tabs: toggles.registered,
+      tabsReason: toggles.reason || null,
+    })
+    const toggles = {
+      registered: false,
+      reason: null,
+      // Read synchronously by the one layer component, written only by the disposer.
+      tab: HOST_TABS_DEFAULT,
+      listeners: new Set(),
+    }
+    const subscribeHostTab = (listener) => { toggles.listeners.add(listener); return () => toggles.listeners.delete(listener) }
+    const hostTabSnapshot = () => toggles.tab
+    const useHostTab = () => React.useSyncExternalStore(subscribeHostTab, hostTabSnapshot, hostTabSnapshot)
+    const storedHostTab = () => {
+      try {
+        const value = window.localStorage.getItem(HOST_TABS_STORAGE)
+        return value === 'local' || value === 'remote' ? value : HOST_TABS_DEFAULT
+      } catch { return HOST_TABS_DEFAULT /* a shell without storage starts local; the tab still works */ }
+    }
+    const publishHostTab = (tab) => {
+      if (tab !== 'local' && tab !== 'remote') return false
+      toggles.tab = tab
+      try { window.localStorage.setItem(HOST_TABS_STORAGE, tab) } catch { /* in-memory only */ }
+      for (const listener of [...toggles.listeners]) {
+        try { listener() } catch { /* one surface must not stop the others */ }
+      }
+      return true
     }
 
     /**
-     * Spec 033 (A1.2): install the `__DSH_HOST_PATHS__.pathFor` wrap on this renderer and
-     * return its disposer.
+     * The `sidebar.session.action` layer: the shell's New Task row, wrapped. The strip
+     * is drawn ABOVE `children` and the wrapped row is rendered unchanged, once.
+     */
+    function SidebarHostTabs({ wide, children }) {
+      useLang()
+      const tab = useHostTab()
+      // On the collapsed rail there is no room for a strip and no list to filter
+      // either: `sidebar.workspaces` is not dispatched (client-ui-sidebar draws the
+      // region only in the wide state), so the layer passes the row through.
+      if (!wide) return children ?? null
+      const choose = (next) => { publishHostTab(next) }
+      return h('div', { className: 'dshdev-hosttabs', 'data-testid': 'sidebar-host-tabs' },
+        h('div', { className: 'dshdev-hosttabs-strip dshdev-seg', role: 'tablist', 'aria-label': tr('hostTabs') },
+          [['local', 'tabThisComputer', 'tabSwitchLocal', 'tabShortcutLocal'],
+            ['remote', 'tabRemoteWorkspace', 'tabSwitchRemote', 'tabShortcutRemote']].map(([id, label, title, keys]) =>
+            h('button', { key: id, type: 'button', role: 'tab', 'data-tab': id, 'aria-selected': tab === id, 'aria-pressed': tab === id,
+              title: `${tr(title)} (${tr(keys)})`,
+              onClick: () => choose(id) }, tr(label)))),
+        children ?? null)
+    }
+
+    /**
+     * The one <style> that filters the list, swapped (never stacked) on a tab change so
+     * the element under `[data-plugin]` is always the whole rule set. Idempotent: a
+     * second call with the same tab writes nothing. The default is the tab the store
+     * already holds; only `installSidebarTabStrip`, which owns the store, passes one.
+     * @returns {{ write: (tab: string) => void, remove: () => void }}
+     */
+    function hostTabsStyleWriter(doc, tab = toggles.tab) {
+      let style = null
+      let written = null
+      const write = (next) => {
+        const text = HOST_TABS_STYLE[next] || HOST_TABS_STYLE[HOST_TABS_DEFAULT]
+        if (text === written) return
+        if (style === null) {
+          style = doc.createElement('style')
+          // `data-plugin` is the element's own contract (and what a test finds it by);
+          // the attribute goes through whichever of the two the element offers.
+          if (typeof style.setAttribute === 'function') style.setAttribute('data-plugin', HOST_TABS_STYLE_ID)
+          else if (style.dataset) style.dataset.plugin = HOST_TABS_STYLE_ID
+          doc.head.appendChild(style)
+        }
+        style.textContent = text
+        written = text
+      }
+      write(tab)
+      return {
+        write,
+        remove() {
+          const element = style
+          style = null
+          written = null
+          try { element?.remove() } catch { /* an element already gone needs nothing */ }
+        },
+      }
+    }
+
+    // One effect owns the style and the two Ctrl+Alt+1 / 2 commands, so a reload
+    // removes exactly what this installed. A shell that declares no
+    // `sidebar.session.action` seat degrades to "no tabs" with the reason on the
+    // Devices page — the native sidebar is then exactly as shipped.
+    function installSidebarTabStrip(ctx) {
+      const disposers = []
+      toggles.tab = storedHostTab()
+      // Structure first: the layer is this feature's only switch, so a shell that does
+      // not declare it gets no filter at all (a filter with no way back would hide half
+      // the list) and the Devices page states the reason. The factory is the countable
+      // fact: an undeclared seat may still hand back an inert disposer.
+      let declared = false
+      let seat = null
+      try {
+        seat = ctx.slots.inject(HOST_TABS_SLOT, () => {
+          const registration = ctx.slots.register(
+            { name: HOST_TABS_SLOT, id: 'dsh-ext.devices.tabs', order: 100 }, SidebarHostTabs)
+          declared = true
+          return registration
+        })
+      } catch (cause) {
+        declared = false
+      }
+      if (!declared) {
+        toggles.registered = false
+        toggles.reason = 'no-tabs'
+        // An inert injector at an undeclared seat is usually not invoked at all, so a
+        // disposer it returned must still be released here.
+        if (typeof seat === 'function') { try { seat() } catch { /* nothing was installed */ } }
+        return null
+      }
+      toggles.registered = true
+      if (typeof seat === 'function') disposers.push(seat)
+      toggles.reason = null
+      let filter = null
+      const overlay = () => { if (filter) filter.write(toggles.tab) }
+      if (typeof document !== 'undefined' && document && document.head) {
+        filter = hostTabsStyleWriter(document, toggles.tab)
+      }
+      // The shortcuts are an accelerator, never the only way to switch: the strip is
+      // always clickable, so a shell without `ctx.shortcuts` simply has no keys.
+      if (toggles.registered && ctx.shortcuts && typeof ctx.shortcuts.register === 'function') {
+        const keys = [['local', 'Key1', 'tabSwitchLocal'], ['remote', 'Key2', 'tabSwitchRemote']]
+        try {
+          for (const [tab, code, label] of keys) {
+            disposers.push(ctx.shortcuts.register({
+              id: `dsh-ext.devices.sidebar-tab-${tab}`,
+              label: () => tr(label),
+              aliases: [tr(tab === 'local' ? 'tabThisComputer' : 'tabRemoteWorkspace')],
+              defaults: {
+                'desktop:macos': { code, modifiers: ['primary', 'alt'] },
+                'desktop:windows': { code, modifiers: ['primary', 'alt'] },
+                'desktop:linux': { code, modifiers: ['primary', 'alt'] },
+                'web:macos': { code, modifiers: ['primary', 'alt'] },
+                'web:windows': { code, modifiers: ['primary', 'alt'] },
+              },
+              regions: ['page', 'editable'],
+              modals: [],
+              resolve: () => ({ status: 'handled', run: () => { publishHostTab(tab) } }),
+            }))
+          }
+        } catch { toggles.reason = 'shortcuts' /* the tabs still work; the page says the keys did not */ }
+      }
+      if (filter) disposers.push(subscribeHostTab(overlay))
+      return () => {
+        for (const entry of disposers.splice(0)) {
+          try { entry?.() } catch { /* teardown must not throw */ }
+        }
+        if (filter) filter.remove()
+        filter = null
+        toggles.registered = false
+        toggles.reason = null
+        toggles.tab = HOST_TABS_DEFAULT
+      }
+    }
+
+    /**
+     * Spec 033 (A1.2, revised 2026-11-16): switch on the remote file attach for this
+     * renderer and return its disposer. No DSH object is wrapped — the preload's
+     * `__DSH_HOST_PATHS__` is a frozen contextBridge copy, so a wrap could never have
+     * worked. What this installs is ONE delegated listener: the picker's `change` in the
+     * CAPTURE phase, before DSH's own handler reads `e.target.files` (its first statement).
+     * The listener asks which composer the picker sits in and, for a remote session with a
+     * non-image file among the picks, replaces that file list with path-free copies — all
+     * of the deciding lives in `lib/client.remote-file-attach.js`. Everything it cannot
+     * attribute, or refuses, keeps DSH's own behaviour (R6) and the page says why.
      *
-     * What it adds to the wrap (which lives in `lib/client.remote-file-attach.js` and
-     * does all of the deciding): the per-PICK certainty the attribution needs. A
-     * `pathFor` wrapper cannot be told which session it answers for — the composer calls
-     * it with one argument — so a delegated capture listener claims the pick when DSH's
-     * own hidden `input[type=file]` fires `change`. Capture, because DSH's own handler
-     * drains `e.target.files` and then sets `e.target.value=''` before it hands the files
-     * on, so by the time `pathFor` runs the picker is already empty; the listener reads
-     * neither `.files` nor `value`, only which composer the picker sits in. Everything the
-     * wrap cannot attribute then keeps DSH's own behaviour (R6), and `notice` tells the
-     * page why.
+     * ACTIVATION IS THE INSTALL (review 2026-11-16). This page fetches NOTHING to decide:
+     * an installed Electron shell does not serve DSH's package `src` tree, so a source read
+     * from the page could only ever have been a gap — and a gap that kept the first picks of
+     * every page (and every pick of a shell that never served the sources) as DSH's own.
+     * What the mechanism rests on is proven per pick by the module itself — the composer
+     * region and session attribute, the `File`/`DataTransfer` round trip, `answersNoPath` for
+     * the page-built copy and the readback of the replaced list — and the DSH contract the
+     * mechanism assumes is asserted against the INSTALLED sources on disk by the tests
+     * (`test/remote-file-attach.test.mjs`, `test/client.test.mjs`), never fetched at runtime.
      *
-     * `deps` is a test seam only: production passes nothing, so the host is `window` and
-     * its own `document`. One `effect` owns both halves, so a reload restores exactly
-     * what it installed and removes its listener first.
+     * `deps` is a test seam only: production passes nothing, so the host is `window` and its
+     * own `document`. One `effect` owns the listener and the module, so a reload removes
+     * exactly what it installed.
      * @returns {() => void} disposer
      */
     function installRemoteFileAttach(deps = {}) {
       const host = deps.global ?? (typeof window === 'undefined' ? null : window)
       const doc = 'doc' in deps ? deps.doc : (host && host.document) || null
       if (host === null || typeof host !== 'object') {
-        attachUI.set({ state: 'ready', wrapped: false, reason: 'no-window' })
+        attachUI.set({ state: 'ready', active: false, reason: 'no-window' })
         return () => {}
       }
       const wrap = typeof deps.wrapper === 'function' ? deps.wrapper() : remoteFileAttach
@@ -2889,8 +3194,8 @@ window.__ModuleLoader__.load({
         const status = attach.status()
         const last = attach.takeNotice()
         attachUI.set({
-          state: 'ready', wrapped: status.wrapped, reason: status.reason,
-          surface: status.surface, shape: status.shape, calls: status.calls, claims: attach.claimedPicks,
+          state: 'ready', active: status.state === 'active', reason: status.reason,
+          surface: status.surface, shape: status.shape, picks: status.picks, uploaded: status.uploaded,
           last: last === null ? attachUI.getSnapshot().last : { reason: last.reason, sessionId: last.sessionId },
         })
       }
@@ -2898,16 +3203,19 @@ window.__ModuleLoader__.load({
         if (disposed) return
         // The chunk's factory return value; a shell that hands back the registration
         // instead of the exports (`{id, chunk, factory}`) is read the same way the
-        // loader would read it, so a wrapper built around either answers the same.
+        // loader would read it, so a module built around either answers the same.
         let loaded = module
         if (typeof loaded?.remoteFileIntakeFor !== 'function' && typeof loaded?.factory === 'function') {
           loaded = loaded.factory(() => { throw new Error('the remote file attach chunk must stay a leaf module') })
         }
         if (loaded === null || typeof loaded !== 'object' || typeof loaded.remoteFileIntakeFor !== 'function') {
-          attachUI.set({ state: 'ready', wrapped: false, reason: 'bridge-module-missing' })
+          attachUI.set({ state: 'ready', active: false, reason: 'bridge-module-missing' })
           return
         }
         const chunk = loaded
+        // Synchronous, on purpose: `install()` measures the realm (the `File`/`DataTransfer`
+        // round trip), so the state the page shows is never a guess the first pick could then
+        // contradict. Nothing is fetched and nothing waits: the mechanism is on from here.
         attach = chunk.remoteFileIntakeFor({
           global: host, doc,
           log: () => { /* the reason travels on `status()`, never into a console */ },
@@ -2915,16 +3223,18 @@ window.__ModuleLoader__.load({
         })
         attach.install()
         publish()
-        // The pick signal: claim the batch the moment DSH's picker reports its files, binding
-        // the claim to exactly those files. Its turn ends one task after this dispatch, which
-        // is after DSH's own loop over the batch has asked its bridge.
+        // The pick signal: the capture phase, where `e.target.files` is still what the user
+        // picked and DSH's own handler (bubble, React's root delegate) has not read it yet.
         if (doc !== null && typeof doc.addEventListener === 'function') {
-          listener = (event) => { if (chunk.adoptPickerFrom(attach, event) !== null) publish() }
+          listener = (event) => {
+            if (chunk.adoptPickerFrom(attach, event) === null) return
+            publish()
+          }
           doc.addEventListener(chunk.PICK_EVENT ?? 'change', listener, true)
         }
       }, () => {
-        // A shell that cannot hand the chunk over: no wrap, and the page shows it.
-        attachUI.set({ state: 'ready', wrapped: false, reason: 'bridge-module-missing' })
+        // A shell that cannot hand the chunk over: every pick stays DSH's, and the page shows it.
+        attachUI.set({ state: 'ready', active: false, reason: 'bridge-module-missing' })
       })
       return () => {
         disposed = true
@@ -2933,17 +3243,18 @@ window.__ModuleLoader__.load({
         }
         listener = null
         if (attach !== null) attach.uninstall()
-        const after = attach === null ? { wrapped: false, reason: 'not-installed' } : attach.status()
-        attachUI.set({ state: 'ready', wrapped: after.wrapped, reason: after.reason, calls: 0 })
+        const after = attach === null ? { state: 'unavailable', reason: 'not-installed' } : attach.status()
+        attachUI.set({ state: 'ready', active: after.state === 'active', reason: after.reason, picks: 0, uploaded: 0 })
       }
     }
 
-    // The Devices page's own line about the wrap, so a failed install is visible in the UI
-    // instead of only in a log (A1.2). Same honesty rule as the upload note: it states what
-    // was MEASURED, names the reason, and claims nothing while the module is still arriving.
+    // The Devices page's own line about the remote file attach, so a refused mechanism is
+    // visible in the UI instead of only in a log (A1.2). Same honesty rule as the upload
+    // note: it states what was MEASURED, names the reason, and claims nothing while the
+    // module is still arriving. No DSH object is wrapped: the state is about replacing a
+    // remote pick's file list in the picker, nothing else.
     const ATTACH_REASON_KEYS = {
-      'no-bridge': 'attachNoBridge', 'bridge-frozen': 'attachFrozen', 'bridge-shape': 'attachShape',
-      'bridge-keys': 'attachKeys', 'bridge-pathFor': 'attachPathFor', 'bridge-replaced': 'attachReplaced',
+      'browser-unavailable': 'attachBrowserUnavailable',
       'bridge-module-missing': 'attachNoModule', 'not-installed': 'attachNotInstalled', 'no-window': 'attachNoWindow',
     }
     const attachReasonText = (reason) => {
@@ -2951,33 +3262,39 @@ window.__ModuleLoader__.load({
       const key = ATTACH_REASON_KEYS[value]
       return key ? tr(key) : value
     }
-    // The state of the last pick the wrap did NOT upload, per R6. `certain` here means
-    // "attributed exactly, and the answer DSH itself would give (a local session)".
+    // The state of the last pick that was NOT re-materialized, per R6. `certain` here means
+    // "attributed exactly, and the pick needed nothing changed" (a local session, images).
+    // `replace-failed` is its opposite kind of row: a PROVEN remote non-image pick whose
+    // copies the picker would not take — never shown as a local pick (review 2026-11-16).
     const ATTACH_STATE_KEYS = {
       certain: 'attachPickLocal', 'ambiguous': 'attachPickAmbiguous', 'no-composer': 'attachPickNoComposer',
       'no-document': 'attachPickNoDocument', 'no-session': 'attachPickNoSession', 'picker-elsewhere': 'attachPickElsewhere',
       'picker-document': 'attachPickBrowser', 'composer-uncertain': 'attachPickUncertain',
-      'stale-batch': 'attachPickStale', 'bridge-passthrough': 'attachPickPassthrough',
-      'browser-chrome': 'attachPickBrowser',
+      'stale-batch': 'attachPickStale', 'browser-chrome': 'attachPickBrowser',
+      // The pick itself proved the page cannot hand DSH a path-free file (that pick stayed DSH's).
+      'path-unavailable': 'attachPickPathNamed', unverified: 'attachPickUnverified',
+      // Proven remote, and the composer refused the page-built copies.
+      'replace-failed': 'attachPickReplaceFailed',
     }
     function RemoteAttachStatus() {
       useLang()
       const attach = useAttachUI()
       if (attach.state !== 'ready') return null
       const reason = attach.reason ? attachReasonText(attach.reason) : ''
-      const line = attach.wrapped === true
-        ? (attach.reason === 'no-bridge' ? tr('attachNoBridge') : `${tr('attachOn')}${attach.shape ? ` (${attach.shape})` : ''}`)
+      const active = attach.active === true
+      const line = active
+        ? (attach.shape === 'no-bridge' ? tr('attachNoBridge') : tr('attachOn'))
         : `${tr('attachOffUnknown')} — ${reason}`
       const last = attach.last
-      return h('div', { className: attach.wrapped === true ? 'dshdev-card' : 'dshdev-card dshdev-warn',
-        'data-testid': 'remote-attach', 'data-wrapped': attach.wrapped === true ? 'yes' : 'no',
+      return h('div', { className: active ? 'dshdev-card' : 'dshdev-card dshdev-warn',
+        'data-testid': 'remote-attach', 'data-active': active ? 'yes' : 'no',
         'data-reason': attach.reason || '', role: 'status' },
       h('strong', null, tr('attachTitle')),
       h('div', { className: 'dshdev-muted', 'data-testid': 'remote-attach-state' }, line),
-      attach.wrapped === true && attach.reason !== 'no-bridge' && attach.surface
-        ? h('div', { className: 'dshdev-muted', 'data-testid': 'remote-attach-surface' }, `${attach.surface}.pathFor`)
+      active && attach.shape === 'measured'
+        ? h('div', { className: 'dshdev-muted', 'data-testid': 'remote-attach-surface' }, tr('attachMeasured'))
         : null,
-      attach.wrapped !== true && attach.reason
+      active !== true && attach.reason
         ? h('div', { className: 'dshdev-muted', 'data-testid': 'remote-attach-reason' }, tr('attachReason') + ': ' + reason)
         : null,
       last === null || last === undefined ? null
@@ -3434,14 +3751,14 @@ window.__ModuleLoader__.load({
         { name: 'plugins.detail.section', id: 'dsh-mobile-self-update', order: 10 },
         (props) => (isMobileBundleSubject(props && props.subject)
           ? h('div', { className: 'dshdev', 'data-testid': 'bundle-self-update' }, h(SelfUpdate)) : null)))
-      // Spec 033 (A1.2): remote file attach. One effect owns the wrap AND the pick
-      // listener, so a reload restores exactly what it installed (A1.2: "exact restore
-      // on dispose", never wrap what it did not install) and a shell without
-      // `ctx.effect` simply keeps DSH's own behaviour, which the page states.
+      // Spec 033 (A1.2): remote file attach. One effect owns the capture listener and the
+      // module, so a reload removes exactly what it installed (and no DSH object is ever
+      // wrapped); a shell without `ctx.effect` simply keeps DSH's own behaviour, which the
+      // page states.
       if (typeof ctx.effect === 'function') {
         ctx.effect(() => installRemoteFileAttach(), 'devices: remote file attach')
       } else {
-        attachUI.set({ state: 'ready', wrapped: false, reason: 'not-installed' })
+        attachUI.set({ state: 'ready', active: false, reason: 'not-installed' })
       }
 
       // Spec 008 P2b. Gated on the client context's own capability (`ctx.inject` is
@@ -3452,6 +3769,33 @@ window.__ModuleLoader__.load({
         ctx.effect(() => installRemoteSurfaces(ctx), 'devices: remote session surfaces')
       } else {
         remoteUI.set({ grouped: false, reason: 'the shell provides no client services' })
+      }
+
+      // The sidebar's two tabs: a display filter plus one layer over the New Task row.
+      // It owns the same `remoteUI` snapshot as the surfaces above, so it is installed
+      // AFTER them and reports the tab half of it; a seat this shell refuses is stated
+      // on the Devices page instead of ending the whole bundle.
+      if (typeof ctx.slots === 'object' && ctx.slots !== null) {
+        // The injector draw runs now, so the measurable disposition is read after it,
+        // not only after the effect: a shell that hands back an inert injector gets no
+        // filter at all (a filter whose only switch is missing would hide half the list).
+        let register = null
+        ctx.effect(() => {
+          const dispose = installSidebarTabStrip(ctx)
+          register = dispose
+          return () => {
+            if (register === dispose) register = null
+            if (typeof dispose === 'function') dispose()
+            syncHostTabsStatus()
+          }
+        }, 'devices: sidebar host tabs')
+        if (register === null) {
+          remoteUI.set({ tabs: false, tabsReason: 'no-tabs' })
+        } else {
+          syncHostTabsStatus()
+        }
+      } else {
+        remoteUI.set({ tabs: false, tabsReason: 'no-tabs' })
       }
     }
 
@@ -3465,6 +3809,12 @@ window.__ModuleLoader__.load({
       HostChip, SessionBanners, OfflineBanner, ModelStatusBanner, RemoteTerminalEntry,
       SessionHostBadge, PermissionsEditor, scopesForKind,
       RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText, hostLinkOf,
+      // The sidebar's two tabs: the component the `sidebar.session.action` layer renders,
+      // the exact rule text each tab installs, and the tab store, so a test proves both
+      // filters, the untouched children, and the small data surface (one <style>).
+      SidebarHostTabs, hostTabsStyle, HOST_TABS_STYLE, HOST_TABS_STYLE_ID, HOST_TABS_SELECTORS,
+      installSidebarTabStrip, hostTabsStyleWriter, publishHostTab, storedHostTab, HOST_TABS_STORAGE,
+      hostTabsStore: { getSnapshot: hostTabSnapshot, subscribe: subscribeHostTab },
       // Spec 033 (A1.2): the wrap's measured state, the page line, and the installer (so a
       // test proves install-on-start / restore-on-dispose without a live window).
       attachUI, RemoteAttachStatus, installRemoteFileAttach, attachReasonText, ATTACH_REASON_KEYS,

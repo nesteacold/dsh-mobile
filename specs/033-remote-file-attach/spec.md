@@ -28,15 +28,21 @@ Cause (read from installed DSH 0.2.2-rc.3, `%TEMP%\hostpaths-findings.md`):
 - R2. Local sessions, images, and every other DSH behaviour are unchanged.
 - R3. A directory picked for a remote session is refused visibly (DSH's existing
   `attachment.pathUnavailable` path), never sent as a controller path.
-- R4. Mechanism preference:
-  1. a DSH-provided hook if one is reachable by the plugin (e.g. the composer slot's
-     `registerFileIntake`), checked first;
-  2. otherwise the A1.2 wrap of `__DSH_HOST_PATHS__.pathFor`: on the live object if writable,
-     else by replacing the global binding with a delegating object if configurable.
-- R5. A1.2 conditions: structural self-test (global present, exactly `{pathFor}` function,
-  writability/configurability measured at runtime); on mismatch no wrap and a visible reason in the
-  Devices page; exact restore on dispose (only if the current value is ours); never wrap what it
-  did not install; README lists the wrapped surface; reviewer pass.
+- R4. Mechanism: **no DSH object is wrapped.** In the capture phase of the composer picker's
+  `change` event, a pick proven to belong to a remote session's composer has its `input.files`
+  replaced with page-built `File` copies. A page-built `File` has no backing path, so
+  `webUtils.getPathForFile` answers `''` and DSH takes its own byte-upload path.
+  - Why not wrap `__DSH_HOST_PATHS__.pathFor` (the original A1.2 idea): the preload hands the page a
+    `contextBridge` copy whose members are frozen, so no wrap is possible in Electron. Measured live
+    on 2026-11-16 ("the local file-path bridge cannot be replaced").
+  - The replacement must be verified on the spot (bridge answers `''` for a page-built `File`, the
+    replaced list reads back path-free); a pick that cannot be verified is left to DSH.
+- R5. Conditions: the structural check reads DSH's own contract at runtime and is bounded to the
+  composer's DOM (region, session view, picker ancestry); it must never become a prerequisite for
+  activation — an unreadable source means "no change for this pick", not "feature disabled".
+  Nothing of DSH is mutated, so dispose only removes the capture listener. A failure to replace is
+  reported with its own reason, never as "this is a local pick". README lists the mechanism;
+  reviewer pass.
 - R6. Session attribution must be the composer's session, not a guess. If the wrap cannot know the
   session for a pick with certainty, it must fail safe: keep DSH's behaviour for that pick AND warn
   (never upload a local-session file to a remote Host, never send a remote session a controller path
@@ -44,11 +50,13 @@ Cause (read from installed DSH 0.2.2-rc.3, `%TEMP%\hostpaths-findings.md`):
 
 ## Acceptance
 
-- Unit tests with a fake bridge: remote session + zip → `''`; local session → original path; image
-  → original behaviour; directory → original; frozen bridge → no wrap + reason; dispose restores the
-  exact original reference/descriptor; foreign value at dispose → left alone.
+- Unit tests with a fake bridge: remote session + zip → page-built copies with no path; local
+  session → original `File` objects untouched; image → original behaviour; directory → original; a
+  bridge that names even a page-built `File` → no change + `path-unavailable`; an unreadable DSH
+  contract → no change for that pick (never "feature off"); a proven remote pick whose list
+  replacement fails → `replace-failed` shown; dispose removes the capture listener only.
 - Live (owner, remote client DNLP25-IT09): the same zip in a Sigma-Remote session reaches the Host
   (gateway log shows the upload; Host store gains an 11 917-byte object; the Host turn shows an
   attachment, not `@"C:\Users\remote\…"`). A local session still mentions the path as before.
-- Self-test result (wrapped / not wrapped + reason) is visible on the Devices page, so a frozen
-  bridge is diagnosable without a debugger.
+- Self-test result (active / not active + reason) is visible on the Devices page, so a page whose
+  preload names a page-built `File` is diagnosable without a debugger.

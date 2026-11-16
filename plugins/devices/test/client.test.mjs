@@ -10,7 +10,7 @@ import vm from 'node:vm'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 
-import { check, finish, createFakeComposerDocument, pickFiles } from './helpers.mjs'
+import { check, finish, createFakeComposerDocument, createLivePage, installFileListStub, livePick, picked, pickFiles } from './helpers.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const require = createRequire(import.meta.url)
@@ -177,6 +177,8 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     'main': 'keyed',
     // client-ui-plugin-manager README "Detail page extension points": a list slot keyed by id.
     'plugins.detail.section': 'list',
+    // The sidebar's session rows: the host-tabs strip sits above the New Task row here.
+    'sidebar.session.action': 'list',
   }
   const occupants = new Map(Object.keys(SLOT_KINDS).map((slot) => [slot, []]))
   occupants.get('sidebar.workspaces').push({ meta: { name: 'sidebar.workspaces', priority: 0, registrant: 'tk' } })
@@ -194,7 +196,11 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     confirm: () => true,
   }
   const clipboard = []
-  const document = { baseURI: 'http://127.0.0.1:3080/', head: { appendChild: (node) => styles.push(node) }, createElement: () => ({ remove() {} }) }
+  // The elements the page creates: the bundle's own stylesheet, and the sidebar tab
+  // filter (data-plugin `dsh-ext.devices.host-tabs`, one per page, swapped in place).
+  const document = { baseURI: 'http://127.0.0.1:3080/',
+    head: { appendChild: (node) => styles.push(node) },
+    createElement: () => ({ dataset: {}, textContent: '', remove() {} }) }
   vm.runInNewContext(source, { window, document, fetch, URL, console, setTimeout, clearTimeout,
     navigator: { language: locale, clipboard: { writeText: async (text) => { clipboard.push(text) } } } })
   const disposers = []
@@ -277,6 +283,10 @@ const ALL = ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', '
   'files:write', 'settings:write', 'commands:execute', 'workspace:manage',
   'credentials:write', 'plugins:manage', 'schedule:write', 'schedule:read', 'terminal', 'sessions:author',
   'attachments:write', 'browser:control', 'stats:read', 'web:unlock', 'permission:lower']
+// Spec 021 rev 15: `web:unlock` is a WEB scope (`MOBILE_ONLY_SCOPES`) — it arms a passkey lock only
+// a `mobile`/web device can satisfy, so a DESKTOP list (picker boxes, presets, offers) never has it.
+// `ALL` stays the full contract mirror; every desktop expectation below uses this list instead.
+const DESKTOP_ALL = ALL.filter((scope) => scope !== 'web:unlock')
 
 const text = (renderer) => JSON.stringify(renderer.toJSON())
 async function mount(element) {
@@ -293,7 +303,7 @@ await check('registers settings.section and settings.section.icon for the same i
   const ui = load()
   assert.equal(ui.api.id, '@dsh-ext/devices')
   assert.deepEqual([...ui.api.inject], ['slots', 'locale'])
-  assert.deepEqual(ui.injects, ['settings.section', 'settings.section.icon', 'sidebar.panellist', 'main', 'plugins.detail.section'])
+  assert.deepEqual(ui.injects, ['settings.section', 'settings.section.icon', 'sidebar.panellist', 'main', 'plugins.detail.section', 'sidebar.session.action'])
   const [section, icon] = ui.registered
   // JSON round trip: the objects were created inside the vm realm.
   assert.deepEqual(JSON.parse(JSON.stringify(section.meta)), { name: 'settings.section', id: 'dsh-ext.devices', order: 80, label: 'Devices' })
@@ -388,7 +398,11 @@ await check('static: the only fetch is the same-origin request() helper; no exte
   const fetches = [...source.matchAll(/\bfetch\s*\(([^)]*)\)/g)].map((match) => match[1])
   assert.equal(fetches.length, 1)
   assert.deepEqual([...source.matchAll(/['"`](https?:\/\/[^'"`\s]+)['"`]/g)].map((match) => match[1]), [])
-  assert.doesNotMatch(source, /XMLHttpRequest|sendBeacon|EventSource|new WebSocket|localStorage/)
+  assert.doesNotMatch(source, /XMLHttpRequest|sendBeacon|EventSource|new WebSocket/)
+  // The one storage use: the sidebar's host-tabs choice, remembered in this browser only.
+  for (const match of source.matchAll(/[^.\w]localStorage\s*\.\s*(\w+)/g)) {
+    assert.ok(['getItem', 'setItem'].includes(match[1]), `unexpected localStorage.${match[1]}`)
+  }
   const paths = [...source.matchAll(/\b(?:request|post)\(\s*[`'"](\/[^`'"$]*)/g)].map((match) => match[1])
   for (const route of paths) assert.match(route, /^\/(mgw|devices)\//, route)
   assert.ok(paths.length >= 8)
@@ -551,13 +565,13 @@ await check('pending requests (Window 2): polled every 2 s; name, IP, editable s
   ui.calls.length = 0
   for (const tick of [...ui.intervals.values()]) await act(async () => { await tick() })
   assert.ok(ui.calls.some((call) => call.route === '/mgw/pending'), 'the poll hits /mgw/pending')
-  // Every desktop scope is listed; only those the device requested can be ticked.
+  // Every scope a desktop may hold is listed; only those the device requested can be ticked.
   const boxes = () => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
-  assert.equal(boxes().length, ALL.length)
+  assert.equal(boxes().length, DESKTOP_ALL.length)
   // Approve defaults to Standard narrowed to the offer: the three requested standard scopes.
   assert.deepEqual(boxes().filter((node) => node.props.checked).length, 3)
-  assert.deepEqual(boxes().map((node) => node.props.disabled), ALL.map((scope) => !item.requestedScopes.includes(scope)))
-  await act(async () => { boxes()[ALL.indexOf('prompt:send')].props.onChange({ target: { checked: false } }) })   // drop prompt:send
+  assert.deepEqual(boxes().map((node) => node.props.disabled), DESKTOP_ALL.map((scope) => !item.requestedScopes.includes(scope)))
+  await act(async () => { boxes()[DESKTOP_ALL.indexOf('prompt:send')].props.onChange({ target: { checked: false } }) })   // drop prompt:send
   await click(button(page, 'Approve'))
   const approve = ui.calls.find((call) => call.route === '/mgw/pending/req-1/approve')
   assert.deepEqual(approve.body, { scopes: ['sessions:read', 'harness:remote'] })
@@ -590,11 +604,12 @@ await check('authorized devices: shows name/kind/scopes/last used/Connected here
   await click(button(page, 'Edit permissions'))
   assert.match(text(page), /device must pair again/)
   const boxes = () => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
-  assert.equal(boxes().length, ALL.length, 'every desktop scope is editable')
+  // Spec 021 rev 15: a desktop list carries every scope but `web:unlock`.
+  assert.equal(boxes().length, DESKTOP_ALL.length, 'every scope a desktop may hold is editable')
   assert.deepEqual(boxes().filter((node) => node.props.checked).length, 2)
-  assert.equal(boxes()[ALL.indexOf('sessions:read')].props.checked, true)
-  assert.equal(boxes()[ALL.indexOf('prompt:send')].props.checked, true)
-  await act(async () => { boxes()[ALL.indexOf('approval:respond')].props.onChange({ target: { checked: true } }) })
+  assert.equal(boxes()[DESKTOP_ALL.indexOf('sessions:read')].props.checked, true)
+  assert.equal(boxes()[DESKTOP_ALL.indexOf('prompt:send')].props.checked, true)
+  await act(async () => { boxes()[DESKTOP_ALL.indexOf('approval:respond')].props.onChange({ target: { checked: true } }) })
   await click(button(page, 'Generate new pairing code'))
   assert.deepEqual(ui.calls.find((call) => call.route === '/mgw/pair').body, { kind: 'desktop', scopes: ['sessions:read', 'prompt:send', 'approval:respond'] })
   assert.match(text(page), /PAIRSTRING-sessions:read\+prompt:send\+approval:respond/)
@@ -615,16 +630,16 @@ await check('permissions editor (spec 025 R5): per-device in-place scope change,
   assert.ok(find(page, (node) => node.props['data-testid'] === 'permissions-editor').length === 1)
   assert.match(text(page), /without re-pairing/)
   const boxes = () => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
-  // The editor lists every scope a desktop may hold, and NOTHING for another kind (below).
-  assert.equal(boxes().length, ALL.length)
+  // Spec 021 rev 15: a desktop editor lists every scope BUT `web:unlock` (its kind cannot use it).
+  assert.equal(boxes().length, DESKTOP_ALL.length)
+  // The scope is not offered at all — so it can neither be granted here nor shown as tickable.
+  assert.doesNotMatch(text(page), /Unlock the web client/, 'a desktop list never shows the web unlock scope')
   assert.deepEqual(boxes().filter((node) => node.props.checked).length, 2, 'the current grant is ticked')
-  // `web:unlock` is listed but not tickable: the passkey flow owns it.
-  assert.equal(boxes()[ALL.indexOf('web:unlock')].props.disabled, true)
   // A no-op save is refused by the page itself (no confirm, no request).
   assert.equal(button(page, 'Apply permissions').props.disabled, true)
   // Add one, remove one, then confirm. The body is the DIFF, never the whole list.
-  await act(async () => { boxes()[ALL.indexOf('attachments:write')].props.onChange({ target: { checked: true } }) })
-  await act(async () => { boxes()[ALL.indexOf('prompt:send')].props.onChange({ target: { checked: false } }) })
+  await act(async () => { boxes()[DESKTOP_ALL.indexOf('attachments:write')].props.onChange({ target: { checked: true } }) })
+  await act(async () => { boxes()[DESKTOP_ALL.indexOf('prompt:send')].props.onChange({ target: { checked: false } }) })
   ui.calls.length = 0
   await click(button(page, 'Apply permissions'))
   const call = ui.calls.find((entry) => entry.route === '/mgw/devices/dev-1/scopes')
@@ -636,12 +651,12 @@ await check('permissions editor (spec 025 R5): per-device in-place scope change,
   assert.ok(ui.calls.some((entry) => entry.route === '/mgw/devices'), 'onApplied refreshes the rows')
   assert.equal(button(page, 'Apply permissions').props.disabled, true, 'nothing left to apply')
   // A refusal leaves the tick state alone, so the owner can correct it and try again.
-  assert.equal(boxes()[ALL.indexOf('attachments:write')].props.checked, true)
+  assert.equal(boxes()[DESKTOP_ALL.indexOf('attachments:write')].props.checked, true)
   await act(async () => { for (const tick of [...ui.intervals.values()]) await tick() })
   assert.doesNotMatch(text(page), /Re-grant file upload permission/, 'the hint goes once the scope is there')
   // A named refusal is said in the page's language, not the route's English sentence.
   ui.state.scopeFailure = { status: 400, body: { error: 'scope-not-for-kind', message: 'scope x is not available for a desktop device' } }
-  await act(async () => { boxes()[ALL.indexOf('terminal')].props.onChange({ target: { checked: true } }) })
+  await act(async () => { boxes()[DESKTOP_ALL.indexOf('terminal')].props.onChange({ target: { checked: true } }) })
   await click(button(page, 'Apply permissions'))
   assert.equal(find(page, (node) => node.props['data-testid'] === 'permissions-error')[0].children.join(''),
     'That permission does not apply to this kind of device.')
@@ -1080,7 +1095,9 @@ await check('connect tab: the remote row\'s notes (incl. the attachment-bridge n
 
 const ONLINE = { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } }
 const checkboxes = (page) => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
-const ticked = (page) => checkboxes(page).map((node, index) => (node.props.checked ? ALL[index] : null)).filter(Boolean)
+// Every call site below renders a DESKTOP list (Approve/Edit/editor), so the index maps through
+// DESKTOP_ALL — the list actually rendered since spec 021 rev 15 (no `web:unlock` for a desktop).
+const ticked = (page) => checkboxes(page).map((node, index) => (node.props.checked ? DESKTOP_ALL[index] : null)).filter(Boolean)
 
 await check('the UI scope list mirrors the contract: every desktop scope, presets equal SCOPE_PRESETS (drift fails here)', () => {
   const ui = load()
@@ -1118,19 +1135,19 @@ await check('Approve: lists all scopes, defaults to Standard, risk hints show, p
   const ui = load({ pending: [item], status: ONLINE })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
-  assert.equal(checkboxes(page).length, ALL.length)
+  assert.equal(checkboxes(page).length, DESKTOP_ALL.length)
   assert.deepEqual(ticked(page), ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote'], 'default = Standard')
   const rendered = text(page)
   assert.match(rendered, /Run slash commands/); assert.match(rendered, /Open a terminal/)
   assert.match(rendered, /Full shell on this Host/, 'a risk hint is shown for terminal')
   assert.match(rendered, /Can overwrite your API keys/)
-  // "Full control" ticks everything, "Standard" returns to the default set.
+  // "Full control" ticks everything a desktop may hold, "Standard" returns to the default set.
   await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Full control')[0])
-  assert.deepEqual(ticked(page), ALL)
+  assert.deepEqual(ticked(page), DESKTOP_ALL, 'Full control of a desktop offer never ticks web:unlock')
   await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Standard')[0])
   assert.deepEqual(ticked(page), ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote'])
   // Add one dangerous scope by hand and approve: exactly that list is sent.
-  await act(async () => { checkboxes(page)[ALL.indexOf('terminal')].props.onChange({ target: { checked: true } }) })
+  await act(async () => { checkboxes(page)[DESKTOP_ALL.indexOf('terminal')].props.onChange({ target: { checked: true } }) })
   await click(button(page, 'Approve'))
   assert.deepEqual(ui.calls.find((call) => call.route === '/mgw/pending/req-9/approve').body.scopes,
     ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote', 'terminal'])
@@ -1158,31 +1175,41 @@ await check('Approve: a request that asked for less cannot be widened (extra sco
   page.unmount()
 })
 
-await check('Edit permissions: all scopes with risk hints and both presets; Full control re-pairs with every scope', async () => {
+await check('Edit permissions: all scopes with risk hints and both presets; Full control re-pairs with every scope a desktop may hold', async () => {
   const device = { id: 'dev-2', name: 'Box', displayName: 'Box', kind: 'desktop', scopes: ['sessions:read'], lastSeenAt: null, online: false }
   const ui = load({ devices: [device], status: ONLINE })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
   await click(button(page, 'Edit permissions'))
-  assert.equal(checkboxes(page).length, ALL.length)
+  assert.equal(checkboxes(page).length, DESKTOP_ALL.length)
   assert.deepEqual(ticked(page), ['sessions:read'])
   assert.match(text(page), /Can install or enable code that runs on this Host/)
   await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Full control')[0])
-  assert.deepEqual(ticked(page), ALL)
+  assert.deepEqual(ticked(page), DESKTOP_ALL)
   await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Standard')[0])
   assert.deepEqual(ticked(page), ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote'])
   await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Full control')[0])
   await click(button(page, 'Generate new pairing code'))
-  assert.deepEqual(ui.calls.find((call) => call.route === '/mgw/pair').body, { kind: 'desktop', scopes: ALL })
+  // Spec 021 rev 15: the re-pair offer carries every desktop scope, and never `web:unlock`.
+  assert.deepEqual(ui.calls.find((call) => call.route === '/mgw/pair').body, { kind: 'desktop', scopes: DESKTOP_ALL })
   page.unmount()
 })
 
-await check('OTP offer asks for every desktop scope (the Host picks at Approve)', async () => {
+await check('OTP offer asks for every desktop scope the kind can hold — never web:unlock (spec 021 rev 15)', async () => {
   const ui = load({ status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: ['wss://10.0.0.5:3081/ws/mobile'] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
   await click(button(page, 'Generate pairing code'))
-  assert.deepEqual(ui.calls.find((call) => call.route === '/mgw/pair').body.scopes, ALL)
+  const body = ui.calls.find((call) => call.route === '/mgw/pair').body
+  assert.equal(body.kind, 'desktop')
+  assert.equal(body.scopes.includes('web:unlock'), false, 'a desktop OTP offer must not carry the web unlock scope')
+  assert.deepEqual(body.scopes, DESKTOP_ALL, 'it asks for every scope a desktop may hold, so Approve can narrow it')
+  // The regression this file exists for: preset "Full control" is exactly the union that leaked
+  // `web:unlock` into a desktop offer on 2026-11-14, so state the preset's own filter too.
+  const { scopesForKind } = ui.api.testing
+  assert.deepEqual([...scopesForKind('desktop').filter((scope) => CONTRACT_PRESETS.full.includes(scope))].sort(),
+    [...DESKTOP_ALL].sort(), 'full ∩ desktop = the desktop preset')
+  assert.equal(scopesForKind('mobile').includes('web:unlock'), true, 'a web/phone device still gets it')
   page.unmount()
 })
 
@@ -2683,38 +2710,62 @@ await check('start page: the doorway strings exist in vi and en as real translat
   assert.equal(doors.find((entry) => entry.providerId === 'dsh-ext.devices.r-a.devices').title(), 'Thiết bị · Qoder-Sigma')
   for (const dispose of vi.disposers) { try { dispose() } catch { /* teardown */ } }
 })
+
 // ------------------------------------------------------- spec 033 (A1.2) integration
-// The REAL shell path, end to end: lib/client.js is a chunk too, so it runs through the
-// same fake __ModuleLoader__ a page uses; its `require.async('./client.remote-file-attach.js')`
-// is answered the way DSH's loader answers it — by executing the second chunk's source and
-// taking the factory it REGISTERS (a bare `module.exports` registers nothing and the real
-// loader fails the request, so this check would fail exactly where DSH would). Then apply()
-// -> install -> a composer pick -> dispose, against a fake document shaped like the
-// installed composer (picker beside [data-composer-input], reset before intakeFiles).
-await check('spec 033: client.js loads the real chunk through require.async, installs the wrap on apply(), answers a remote pick, and restores the bridge on dispose', async () => {
-  const chunkPath = path.join(here, '../lib/client.remote-file-attach.js')
+// NEW MECHANISM (2026-11-16). The old one wrapped `globalThis.__DSH_HOST_PATHS__.pathFor`; it
+// could never take (the preload exposes that object through `contextBridge`, which hands the
+// page a FROZEN copy) and the owner's remote client kept turning a picked zip into
+// `@"C:\…zip"`. What ships now wraps NOTHING: `lib/client.js` installs one CAPTURE-phase
+// `change` listener, and for a pick proven to belong to a remote composer it replaces the
+// picker's `input.files` with path-free copies, which DSH's own `onPickFiles` then reads
+// (`InputBar.tsx:281`, first statement) and uploads as bytes. These checks drive the REAL
+// `lib/client.js` through a fake `__ModuleLoader__`, its real `require.async` answering with
+// the real chunk, over a page shaped like the installed composer.
+const SPEC033_PAGE = {
+  sessions: ['h:2f1d1a52-6d7c-4d3e-9a58-1f0f1a2b3c4d:s-1', 's-local'],
+}
+/** The DSH sources the attach module's self-test reads, from the INSTALLED DSH when present. */
+function spec033Sources() {
+  const app = `${String(process.env.LOCALAPPDATA ?? '').replace(/\\/g, '/')}/Programs/DeepSeek Harness/resources/app`
+  const pkg = `${app}/dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation`
+  const sources = {
+    'dsh-client-ui-conversation/src/client/skeleton/InputBar.tsx': `${pkg}/src/client/skeleton/InputBar.tsx`,
+    'dsh-client-ui-conversation/src/client/apply.ts': `${pkg}/src/client/apply.ts`,
+    'dsh-client-file-upload/lib/client.js': `${app}/dsh/node_modules/@deepseek-ai/dsh-client-file-upload/lib/client.js`,
+  }
+  const read = {}
+  for (const [relative, file] of Object.entries(sources)) if (fs.existsSync(file)) read[relative] = fs.readFileSync(file, 'utf8')
+  return read
+}
+const SPEC033_CLICK = { preventDefault() {}, target: {}, stopPropagation() {} }
+
+/**
+ * Load the REAL `lib/client.js` for spec 033 and install the attach the way `apply()` does,
+ * with the page (and its pickers) supplied by the caller.
+ * @param {{document: object, holder: object, composers: object[]}} page a `createLivePage` page
+ * @param {{sources?: object, wrapper?: object}} [box] seam overrides, rarely used
+ */
+async function loadSpec033(page, box = {}) {
+  installFileListStub()
+  const chunkSource = fs.readFileSync(path.join(here, '../lib/client.remote-file-attach.js'), 'utf8')
   let chunk = null
-  const chunkSource = fs.readFileSync(chunkPath, 'utf8')
-  const registrations = []
-  const composer = createFakeComposerDocument({ sessions: ['h:2f1d1a52-6d7c-4d3e-9a58-1f0f1a2b3c4d:s-1', 's-local'], elsewhere: true })
-  let api
-  const document = composer.document
-  const bridge = { pathFor: (file) => `C:\\Users\\owner\\Downloads\\${file.name}` }
-  Object.defineProperty(document, '__DSH_HOST_PATHS__', { value: bridge, writable: true, configurable: true, enumerable: false })
+  let api = null
   const disposers = []
-  // The loader half of the page: registration, then the factory's return value.
   const requireAsync = async (spec) => {
-    const name = spec.replace(/^\.\//, '')
-    assert.equal(name, 'client.remote-file-attach.js', 'client.js asks for this package\'s own chunk')
-    let registered = null
-    const loaderWindow = { __ModuleLoader__: { load: (registration) => { registered = registration } } }
-    vm.runInNewContext(chunkSource, { window: loaderWindow, queueMicrotask, Promise, setTimeout, clearTimeout })
-    assert.notEqual(registered, null, 'the chunk registers itself (a bare module.exports would register nothing)')
-    assert.equal(registered.id, '@dsh-ext/devices', 'with the package id its route serves')
-    assert.equal(registered.chunk, name, 'and the chunk name the URL segment names')
-    registrations.push(registered)
-    chunk = registered.factory(() => { throw new Error('the chunk must stay a leaf module') })
-    return chunk
+    if (spec === './client.remote-file-attach.js') {
+      assert.equal(spec, './client.remote-file-attach.js', 'client.js asks for this package\'s own chunk')
+      let registered = null
+      const loaderWindow = { __ModuleLoader__: { load: (registration) => { registered = registration } } }
+      // One realm with this file's own: `remote-file-attach.mjs` does the same, so the objects
+      // the chunk hands back are the ones a `deepEqual` here can read.
+      vm.runInThisContext(`(function (window) {${chunkSource}\n})`, { filename: 'client.remote-file-attach.js' })(loaderWindow)
+      assert.notEqual(registered, null, 'the chunk registers itself (a bare module.exports would register nothing)')
+      assert.equal(registered.id, '@dsh-ext/devices')
+      assert.equal(registered.chunk, 'client.remote-file-attach.js')
+      chunk = registered.factory(() => { throw new Error('the chunk must stay a leaf module') })
+      return chunk
+    }
+    return null
   }
   const requireFn = (spec) => {
     assert.equal(spec, 'react', 'client.js requires only the platform seed')
@@ -2724,242 +2775,143 @@ await check('spec 033: client.js loads the real chunk through require.async, ins
   const window = {
     __ModuleLoader__: { load: ({ id, factory }) => { api = { id, ...factory(requireFn) } } },
     setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {}, confirm: () => true,
+    Promise, queueMicrotask,
   }
+  const document = page.document
   document.baseURI = 'http://127.0.0.1:3080/'
   document.head = { appendChild() {} }
   document.createElement = () => ({ remove() {} })
-  vm.runInNewContext(source, { window, document, fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
-    URL, console, setTimeout, clearTimeout, queueMicrotask, Promise, navigator: { language: 'en-US' } })
-  const ctx = {
-    locale: { getSnapshot: () => ({ active: 'en-US' }), subscribe: () => () => {} },
-    effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out); return () => { out?.() } },
-    // The seat for the page itself; every other slot is refused (this fixture has no UI).
-    slots: {
-      inject(slot, fn) { return () => {} },
-      register(meta, component) { return { meta, component } },
-    },
-  }
-  api.apply(ctx)
-  // `ctx.effect` installed the wrap for a window it looks up itself (none in a vm without
-  // `window`), so attach the page through the documented seam: `{global, doc}`.
-  disposers.push(api.testing.installRemoteFileAttach({ global: document, doc: document }))
-  // `installRemoteFileAttach` attaches on a promise: let the chunk answer.
-  await new Promise((resolve) => setTimeout(resolve, 0))
-  assert.equal(registrations.length, 1, 'the chunk was requested once and registered once')
-  const attachUI = api.testing && api.testing.attachUI
-  assert.equal(attachUI.getSnapshot().wrapped, true, 'apply() wrapped the bridge')
-  assert.equal(attachUI.getSnapshot().reason, null)
-  assert.equal(typeof bridge.pathFor, 'function')
-  assert.notEqual(bridge.pathFor(function () {}), 'C:\\Users\\owner\\Downloads\\undefined', 'the live member is the wrapper')
-  // DSH's composer inject captured the bridge BEFORE the chunk arrived (`apply.ts:504`,
-  // `const bridge = hostPathBridge()`), and calls `bridge?.pathFor(file)` (`:520`) on that
-  // object for as long as it is mounted — so every pick below goes through THIS reference.
-  const captured = { pathFor: bridge.pathFor }
-  // A pick in the REMOTE composer: the capture listener client.js installed claims it, and
-  // the answer is `''` — DSH's own "upload these bytes".
-  const remote = composer.composers[0]
-  const local = composer.composers[1]
-  // A file input the session around it renders for something else: the capture listener sees a
-  // pick, the composer region above the picker does not — no claim, DSH's own answer.
-  assert.deepEqual(pickFiles(document, remote.elsewhere, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }],
-    (file) => captured.pathFor(file)), ['C:\\Users\\owner\\Downloads\\bundle.zip'])
-  // A batch DSH refuses before it ever asks (`pathFor` never runs): the claim still ends —
-  // the fake's dispatcher counts one capture call per ancestor, so the claim count is not
-  // asserted here (the claim itself is the module's business, not this shell's).
-  pickFiles(document, remote.fileInput, [], () => { throw new Error('no pathFor for an empty batch') })
-  // The VM realm has its own timers, so a host `setTimeout(0)` would not flush the chunk's: a
-  // real macrotask does (setImmediate fires on a check phase after every timer has fired).
-  // The VM realm has its own timers, so flush the queue with another LISTENER task instead: the
-  // claim this pick was replaced by is younger than both and cannot be ended by a microtask.
-  await new Promise((resolve) => setTimeout(resolve, 5))
-  assert.equal(captured.pathFor({ name: 'fresh.zip', type: 'application/zip', size: 7 }),
-    'C:\\Users\\owner\\Downloads\\fresh.zip', 'the refused pick never answers a later call')
-  assert.deepEqual(pickFiles(document, remote.fileInput, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }],
-    (file) => captured.pathFor(file)), [''])
-  assert.deepEqual(pickFiles(document, local.fileInput, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }],
-    (file) => captured.pathFor(file)), ['C:\\Users\\owner\\Downloads\\bundle.zip'])
-  assert.equal(attachUI.getSnapshot().calls, 5, 'the page can see the wrap being used (the probes, then each pick)')
-  // Dispose: the exact original reference is back and the listener is gone.
-  for (const dispose of disposers.splice(0)) dispose()
-  assert.equal(bridge.pathFor({ name: 'bundle.zip' }), 'C:\\Users\\owner\\Downloads\\bundle.zip', 'the original method is back')
-  assert.equal(attachUI.getSnapshot().wrapped, false)
-  assert.equal(document.listenerCount('change'), 2, 'only the two pickers\' own listeners remain (client.js removed its capture one)')
-})
-
-// The reviewer finding of 2026-11-16, on the shell path: a bridge whose own `pathFor` cannot
-// be replaced used to be "wrapped" by re-pointing the global binding, while every composer
-// injected before the chunk arrived (apply.ts:504 captures the bridge once) still held the
-// original object — a remote zip stayed a controller path and the page said wrapped.
-await check('spec 033: an immutable bridge member is REFUSED, nothing is re-pointed, and the Devices page says bridge-frozen', async () => {
-  const chunkPath = path.join(here, '../lib/client.remote-file-attach.js')
-  const chunkSource = fs.readFileSync(chunkPath, 'utf8')
-  const composer = createFakeComposerDocument({ sessions: ['h:2f1d1a52-6d7c-4d3e-9a58-1f0f1a2b3c4d:s-1'] })
-  let api
-  const document = composer.document
-  const original = (file) => `C:\\Users\\owner\\Downloads\\${file.name}`
-  const bridge = {}
-  Object.defineProperty(bridge, 'pathFor', { value: original, writable: false, configurable: false, enumerable: true })
-  Object.defineProperty(document, '__DSH_HOST_PATHS__', { value: bridge, writable: true, configurable: true, enumerable: false })
-  const requireFn = (spec) => {
-    assert.equal(spec, 'react', 'client.js requires only the platform seed')
-    return React
-  }
-  requireFn.async = async (spec) => {
-    let registered = null
-    const loaderWindow = { __ModuleLoader__: { load: (registration) => { registered = registration } } }
-    vm.runInNewContext(chunkSource, { window: loaderWindow, queueMicrotask, Promise, setTimeout, clearTimeout })
-    assert.equal(spec, './client.remote-file-attach.js')
-    return registered.factory(() => { throw new Error('the chunk must stay a leaf module') })
-  }
-  const window = {
-    __ModuleLoader__: { load: ({ id, factory }) => { api = { id, ...factory(requireFn) } } },
-    setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {}, confirm: () => true,
-  }
-  document.baseURI = 'http://127.0.0.1:3080/'
-  document.head = { appendChild() {} }
-  document.createElement = () => ({ remove() {} })
-  vm.runInNewContext(source, { window, document, fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
-    URL, console, setTimeout, clearTimeout, queueMicrotask, Promise, navigator: { language: 'en-US' } })
-  const disposers = []
   const ctx = {
     locale: { getSnapshot: () => ({ active: 'en-US' }), subscribe: () => () => {} },
     effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out); return () => { out?.() } },
     slots: { inject(slot, fn) { return () => {} }, register(meta, component) { return { meta, component } } },
   }
+  // The REAL `lib/client.js`, evaluated against this page's loader and document, exactly as the
+  // page runs it (one realm with this file's own, so the chunk's objects compare plainly).
+  vm.runInThisContext(`(function (window, document, fetch, URL, console, setTimeout, clearTimeout, queueMicrotask, navigator) {${source}\n})`,
+    { filename: 'client.js' })(window, document, async () => ({ ok: true, status: 200, json: async () => ({}) }),
+    URL, console, setTimeout, clearTimeout, queueMicrotask, { language: 'en-US' })
+  assert.notEqual(api, null, 'client.js registered itself with the loader')
   api.apply(ctx)
-  disposers.push(api.testing.installRemoteFileAttach({ global: document, doc: document }))
+  // The page's shell services, installed where `apply()` could not: `installRemoteFileAttach`
+  // reads DSH's own sources from the Host that serves the page, and a test names its own.
+  const sources = box.sources ?? spec033Sources()
+  disposers.push(api.testing.installRemoteFileAttach({
+    global: page.holder, doc: document,
+    readFile: (relative) => sources[relative] ?? null,
+    ...(box.wrapper === undefined ? {} : { wrapper: box.wrapper }),
+  }))
+  // `installRemoteFileAttach` attaches on a promise (require.async): let the chunk answer.
   await new Promise((resolve) => setTimeout(resolve, 0))
-  const attachUI = api.testing.attachUI
-  const snapshot = attachUI.getSnapshot()
-  assert.equal(snapshot.wrapped, false, 'no wrap is reported')
-  assert.equal(snapshot.reason, 'bridge-frozen', 'and the reason the page renders is the measured one')
-  // Nothing was re-pointed: the binding holds the very object the composer captured, and that
-  // object's member is DSH's own function — the old delegating mode failed both.
-  assert.equal(document.__DSH_HOST_PATHS__, bridge, 'the global binding still holds DSH\'s bridge')
-  assert.equal(Object.getOwnPropertyDescriptor(bridge, 'pathFor').value, original, 'and its pathFor is DSH\'s own')
-  // The pick the composer makes through its retained reference: DSH's own answer, never a
-  // silent "uploaded" claim.
-  assert.deepEqual(pickFiles(document, composer.composers[0].fileInput, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }],
-    (file) => bridge.pathFor(file)), ['C:\\Users\\owner\\Downloads\\bundle.zip'])
-  assert.equal(attachUI.getSnapshot().wrapped, false, 'still visibly not wrapped after the pick')
-  for (const dispose of disposers.splice(0)) dispose()
-  assert.equal(attachUI.getSnapshot().reason, 'bridge-frozen', 'dispose keeps saying why, so a reload is diagnosable')
+  return {
+    api, chunk, document, disposers,
+    ui: api.testing.attachUI,
+    status: () => api.testing.attachUI.getSnapshot(),
+    dispose() { for (const dispose of disposers.splice(0)) dispose() },
+  }
+}
+
+await check('spec 033: the real client.js installs ONE capture listener, and a remote pick reaches DSH as path-free copies (no wrap)', async () => {
+  const page = createLivePage({ ...SPEC033_PAGE })
+  const shell = await loadSpec033(page)
+  const { composers, holder, document } = page
+  assert.notEqual(shell.chunk, null, 'the chunk was requested through require.async and registered once')
+  const status = shell.status()
+  assert.equal(status.active, true, 'the attach is on')
+  assert.equal(status.reason, null)
+  assert.equal(status.shape, 'measured', 'and it measured this DSH')
+  assert.equal(status.surface, '__DSH_HOST_PATHS__', 'the surface it names is where a path would come from')
+  assert.equal(status.wrapped, undefined, 'nothing is wrapped any more')
+  // The preload's frozen object is untouched: no member written, no binding re-pointed.
+  const frozen = holder.__DSH_HOST_PATHS__
+  assert.equal(Object.isFrozen(frozen), true, 'the contextBridge copy stays frozen')
+  assert.deepEqual(Object.keys(frozen), ['pathFor'], 'exactly the member the preload exposes')
+  // The remote composer's pick: DSH's own handler (this page registers it before the pick)
+  // reads the list the capture phase replaced, and the preload names nothing for those copies.
+  const remote = composers[0]
+  const zip = picked(new File([new Uint8Array([80, 75, 3, 4, 1, 2, 3, 4])], 'bundle.zip', { type: 'application/zip', lastModified: 1700000000000 }))
+  let handed = []
+  const answers = livePick(document, remote.fileInput, [zip], (file) => frozen.pathFor(file), (files) => { handed = files })
+  assert.deepEqual(answers.map((answer) => answer.kind), ['upload'], 'a path-free File is DSH\'s byte upload, which lib/upload-route.mjs sends to the owning Host')
+  assert.equal(handed.length, 1)
+  assert.notEqual(handed[0], zip, 'DSH got a copy, not the File whose path the preload could name')
+  assert.equal(handed[0].name, 'bundle.zip')
+  assert.equal(handed[0].size, zip.size, 'same bytes')
+  assert.equal(handed[0].type, 'application/zip')
+  assert.equal(handed[0].lastModified, 1700000000000)
+  assert.equal(frozen.pathFor(handed[0]), '', 'and no path can be packed for it')
+  assert.equal(shell.status().uploaded > 0, true, 'the page can see a pick was re-materialized')
+  // The LOCAL composer keeps DSH's own File and DSH's own path.
+  const localZip = picked(new File([new Uint8Array([1, 2, 3])], 'notes.txt', { type: 'text/plain' }))
+  const localHanded = []
+  const beforeLocal = shell.status().uploaded
+  const localAnswers = livePick(document, composers[1].fileInput, [localZip], (file) => frozen.pathFor(file), (files) => { localHanded.push(...files) })
+  assert.deepEqual(localAnswers.map((answer) => answer.kind), ['mention'], 'a local session still mentions its path')
+  assert.equal(localHanded[0], localZip, 'the very object the user picked, untouched')
+  assert.equal(shell.status().uploaded, beforeLocal, 'a local pick is not an upload')
+  assert.deepEqual(shell.status().last, { reason: 'certain', sessionId: 's-local' }, 'and the Devices page can say it was a local pick')
+  // Dispose: the listener is gone, so the next remote pick is DSH's own again.
+  shell.dispose()
+  const after = shell.status()
+  assert.equal(after.active, false, 'the page says the attach is off after dispose')
+  assert.equal(after.reason, 'not-installed')
+  const zip2 = picked(new File([new Uint8Array([9])], 'later.zip', { type: 'application/zip' }))
+  let later = []
+  livePick(document, remote.fileInput, [zip2], (file) => frozen.pathFor(file), (files) => { later = files })
+  assert.equal(later[0], zip2, 'nothing claims a pick once disposed')
 })
 
-// Reviewer round 4, on the shell path: a bridge frozen AFTER the wrap was installed. The
-// restore is refused by a boolean (not a throw), and the wrapper the device keeps calling must
-// stay DSH's own method — never `undefined` for every pick.
-await check('spec 033: a bridge frozen after install, then disposed, keeps a callable passthrough (bridge-frozen)', async () => {
-  const chunkPath = path.join(here, '../lib/client.remote-file-attach.js')
-  const chunkSource = fs.readFileSync(chunkPath, 'utf8')
-  const composer = createFakeComposerDocument({ sessions: ['h:2f1d1a52-6d7c-4d3e-9a58-1f0f1a2b3c4d:s-1'] })
-  let api
-  const document = composer.document
-  const original = (file) => (file === null || file === undefined ? '' : `C:\\Users\\owner\\Downloads\\${file.name}`)
-  const bridge = { pathFor: original }
-  Object.defineProperty(document, '__DSH_HOST_PATHS__', { value: bridge, writable: true, configurable: true, enumerable: false })
-  const requireFn = (spec) => {
-    assert.equal(spec, 'react', 'client.js requires only the platform seed')
-    return React
+await check('spec 033: the Devices page line states what was measured, and the listener is exactly the capture phase', async () => {
+  const page = createLivePage({ ...SPEC033_PAGE })
+  const shell = await loadSpec033(page)
+  // One capture listener, on the document: the page's own listeners (DSH's handler, this test's
+  // helpers) are all bubble listeners, so the capture registration is what this plugin added.
+  assert.ok(page.document.listenerCount('change') >= 1, 'the page\'s own pick handler is registered')
+  const renderer = create(React.createElement(shell.api.testing.RemoteAttachStatus))
+  const status = find(renderer, (node) => node.props && node.props['data-testid'] === 'remote-attach')[0]
+  assert.equal(status.props['data-active'], 'yes', 'the card says the attach is on')
+  for (const node of renderer.root.findAll((child) => typeof child.type === 'string')) {
+    for (const text of node.children) assert.doesNotMatch(String(text), /wrapped|bridge/i, 'no page text claims a wrap any more')
   }
-  requireFn.async = async (spec) => {
-    let registered = null
-    const loaderWindow = { __ModuleLoader__: { load: (registration) => { registered = registration } } }
-    vm.runInNewContext(chunkSource, { window: loaderWindow, queueMicrotask, Promise, setTimeout, clearTimeout })
-    assert.equal(spec, './client.remote-file-attach.js')
-    return registered.factory(() => { throw new Error('the chunk must stay a leaf module') })
-  }
-  const window = {
-    __ModuleLoader__: { load: ({ id, factory }) => { api = { id, ...factory(requireFn) } } },
-    setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {}, confirm: () => true,
-  }
-  document.baseURI = 'http://127.0.0.1:3080/'
-  document.head = { appendChild() {} }
-  document.createElement = () => ({ remove() {} })
-  vm.runInNewContext(source, { window, document, fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
-    URL, console, setTimeout, clearTimeout, queueMicrotask, Promise, navigator: { language: 'en-US' } })
-  const disposers = []
-  const ctx = {
-    locale: { getSnapshot: () => ({ active: 'en-US' }), subscribe: () => () => {} },
-    effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out); return () => { out?.() } },
-    slots: { inject(slot, fn) { return () => {} }, register(meta, component) { return { meta, component } } },
-  }
-  api.apply(ctx)
-  disposers.push(api.testing.installRemoteFileAttach({ global: document, doc: document }))
-  await new Promise((resolve) => setTimeout(resolve, 0))
-  const attachUI = api.testing.attachUI
-  assert.equal(attachUI.getSnapshot().wrapped, true, 'the wrap is installed before the freeze')
-  const wrapper = bridge.pathFor
-  assert.notEqual(wrapper, original)
-  Object.freeze(bridge)
-  assert.equal(Reflect.defineProperty(bridge, 'pathFor', { value: original }), false, 'the restore is refused by a boolean')
-  for (const dispose of disposers.splice(0)) dispose()
-  assert.equal(bridge.pathFor, wrapper, 'the wrapper is still DSH\'s member')
-  assert.equal(bridge.pathFor({ name: 'bundle.zip' }), 'C:\\Users\\owner\\Downloads\\bundle.zip', 'and it answers DSH\'s own path')
-  assert.equal(bridge.pathFor(null), '', 'exactly what DSH\'s own method answers, for a non-file too')
-  const after = attachUI.getSnapshot()
-  assert.equal(after.wrapped, false)
-  assert.equal(after.reason, 'bridge-frozen', 'the page says the bridge is frozen, never that it was restored')
+  renderer.unmount()
+  shell.dispose()
 })
 
-// Reviewer finding 2026-11-16, on the shell path: a bridge whose `pathFor` was made
-// NON-CONFIGURABLE but is still WRITABLE after the wrap. The exact restore is refused, yet
-// plain assignment of the original still takes — the case a restore used to fill with a
-// stand-in object, after which every composer threw `pathFor is not a function`.
-await check('spec 033: a non-configurable but writable member after install gets its own pathFor back on dispose, never a non-callable stand-in', async () => {
-  const chunkPath = path.join(here, '../lib/client.remote-file-attach.js')
-  const chunkSource = fs.readFileSync(chunkPath, 'utf8')
-  const composer = createFakeComposerDocument({ sessions: ['h:2f1d1a52-6d7c-4d3e-9a58-1f0f1a2b3c4d:s-1'] })
-  let api
-  const document = composer.document
-  const original = (file) => `C:\\Users\\owner\\Downloads\\${file.name}`
-  const bridge = { pathFor: original }
-  Object.defineProperty(document, '__DSH_HOST_PATHS__', { value: bridge, writable: true, configurable: true, enumerable: false })
-  const requireFn = (spec) => {
-    assert.equal(spec, 'react', 'client.js requires only the platform seed')
-    return React
-  }
-  requireFn.async = async (spec) => {
-    let registered = null
-    const loaderWindow = { __ModuleLoader__: { load: (registration) => { registered = registration } } }
-    vm.runInNewContext(chunkSource, { window: loaderWindow, queueMicrotask, Promise, setTimeout, clearTimeout })
-    assert.equal(spec, './client.remote-file-attach.js')
-    return registered.factory(() => { throw new Error('the chunk must stay a leaf module') })
-  }
-  const window = {
-    __ModuleLoader__: { load: ({ id, factory }) => { api = { id, ...factory(requireFn) } } },
-    setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {}, confirm: () => true,
-  }
-  document.baseURI = 'http://127.0.0.1:3080/'
-  document.head = { appendChild() {} }
-  document.createElement = () => ({ remove() {} })
-  vm.runInNewContext(source, { window, document, fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
-    URL, console, setTimeout, clearTimeout, queueMicrotask, Promise, navigator: { language: 'en-US' } })
-  const disposers = []
-  const ctx = {
-    locale: { getSnapshot: () => ({ active: 'en-US' }), subscribe: () => () => {} },
-    effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out); return () => { out?.() } },
-    slots: { inject(slot, fn) { return () => {} }, register(meta, component) { return { meta, component } } },
-  }
-  api.apply(ctx)
-  disposers.push(api.testing.installRemoteFileAttach({ global: document, doc: document }))
-  await new Promise((resolve) => setTimeout(resolve, 0))
-  const attachUI = api.testing.attachUI
-  assert.equal(attachUI.getSnapshot().wrapped, true, 'the wrap is installed first')
-  const wrapper = bridge.pathFor
-  assert.notEqual(wrapper, original)
-  Object.defineProperty(bridge, 'pathFor', { configurable: false })
-  assert.equal(Reflect.defineProperty(bridge, 'pathFor',
-    { value: original, writable: true, configurable: true, enumerable: true }), false, 'the exact restore is refused (a boolean)')
-  for (const dispose of disposers.splice(0)) dispose()
-  assert.equal(typeof bridge.pathFor, 'function', 'the composer\'s bridge member is callable after dispose')
-  assert.equal(bridge.pathFor({ name: 'bundle.zip' }), 'C:\\Users\\owner\\Downloads\\bundle.zip', 'and it answers DSH\'s own path')
-  assert.equal(bridge.pathFor, original, 'the bridge\'s own function, assigned back, not a stand-in object')
-  const after = attachUI.getSnapshot()
-  assert.equal(after.wrapped, false)
-  assert.equal(after.reason, 'bridge-frozen', 'an inexact restore is still reported as frozen')
-  assert.deepEqual(pickFiles(document, composer.composers[0].fileInput, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }],
-    (file) => bridge.pathFor(file)), ['C:\\Users\\owner\\Downloads\\bundle.zip'], 'a pick after dispose keeps DSH\'s own behaviour')
+await check('spec 033: activation is the install — a page whose source reads have not landed is never held back', async () => {
+  const page = createLivePage({ ...SPEC033_PAGE })
+  // The page no longer fetches DSH sources: they are not served, and a feature that waited on
+  // them would stay off forever. A reader that answers `null` models exactly that page.
+  const shell = await loadSpec033(page, { sources: {} })
+  const status = shell.status()
+  assert.equal(status.active, true, 'the attach is on as soon as the chunk is installed')
+  assert.equal(status.reason, null)
+  const bridge = page.holder.__DSH_HOST_PATHS__
+  const zip = picked(new File([new Uint8Array([5, 6, 7])], 'early.zip', { type: 'application/zip' }))
+  let handed = []
+  livePick(page.document, page.composers[0].fileInput, [zip], (file) => bridge.pathFor(file), (files) => { handed = files })
+  assert.notEqual(handed[0], zip, 'a remote pick is re-materialized on the very first pick')
+  assert.equal(bridge.pathFor(handed[0]), '', 'and the copy carries no path, so DSH uploads it')
+  shell.dispose()
+})
+
+await check('spec 033: a page whose preload names a path even for a constructed File is left alone, and the page says why', async () => {
+  const page = createLivePage({ ...SPEC033_PAGE })
+  // The preload's answer is the mechanism's last proof (`answersNoPath`): this bridge claims a
+  // path for anything, so a re-materialized pick would still be a mention — nothing is changed.
+  // The contextBridge copy is frozen exactly as the preload leaves it, so the reader wraps the
+  // page's global instead of redefining the property.
+  const naming = Object.freeze({ pathFor: (file) => `C:\\Users\\owner\\Downloads\\${file?.name ?? ''}` })
+  const holder = Object.create(null)
+  for (const key of Object.keys(page.holder)) holder[key] = page.holder[key]
+  Object.defineProperty(holder, '__DSH_HOST_PATHS__', { value: naming, writable: false, configurable: false, enumerable: false })
+  const shell = await loadSpec033({ ...page, holder })
+  const zip = picked(new File([new Uint8Array([1])], 'nope.zip', { type: 'application/zip' }))
+  let handed = []
+  livePick(page.document, page.composers[0].fileInput, [zip], (file) => naming.pathFor(file), (files) => { handed = files })
+  assert.equal(handed[0], zip, 'DSH\'s own File stands')
+  assert.equal(shell.status().uploaded, 0, 'nothing was claimed as uploaded')
+  assert.deepEqual(shell.status().last, { reason: 'path-unavailable', sessionId: SPEC033_PAGE.sessions[0] }, 'and the page names the measured reason')
+  shell.dispose()
 })
 
 finish('client')

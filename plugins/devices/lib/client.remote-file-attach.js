@@ -1,8 +1,8 @@
-// Remote file attach (spec 033, constitution amendment A1.2, owner 2026-11-15).
+// Remote file attach (spec 033, constitution amendment A1.2 as revised 2026-11-16).
 //
-// WHAT THIS FILE IS. This is the ONE implementation of the wrap, and it ships in the
-// format DSH's own package-local client chunks use — measured in the installed
-// 0.2.2-rc.3 `dsh-client-ui-sidebar-terminal/lib/client.terminal.js`:
+// WHAT THIS FILE IS. This is the ONE implementation, and it ships in the format DSH's own
+// package-local client chunks use — measured in the installed 0.2.2-rc.3
+// `dsh-client-ui-sidebar-terminal/lib/client.terminal.js`:
 //
 //   window.__ModuleLoader__.load({id:`<package>`,chunk:`client.<name>.js`,factory:require=>{…;return module.exports}});
 //
@@ -12,124 +12,118 @@
 // the loader then fails the request with `bundle <url> loaded without registering
 // "<id>/client.<name>.js" via __ModuleLoader__.load` unless the script called
 // `window.__ModuleLoader__.load` (installed `@deepseek-ai/dsh-client-modules/lib/client.js`
-// `importChunk` → `register`, which keys a chunk registration by
-// `<owner id>/<chunk>`). A bare `module.exports = …` at the top of a served script is
-// therefore not a module at all: nothing registers, every request fails, and the wrap
-// never arrived. `lib/remote-file-attach.mjs` loads this same text through a fake
+// `importChunk` → `register`, which keys a chunk registration by `<owner id>/<chunk>`). A
+// bare `module.exports = …` at the top of a served script is therefore not a module at
+// all. `lib/remote-file-attach.mjs` loads this same text through a fake
 // `__ModuleLoader__` and takes the factory's return value, so the Host-side tests run
 // the very code the renderer materializes. There is no second copy to drift.
 //
-// Why a chunk at all: the renderer's module table resolves a request only against the
-// platform seed, memoized records, boot-graph rows and registered factories
-// (`dsh-client-modules` built `makeRequire`), so a sibling source file cannot be
-// requested. A `client.<name>.js` file next to `client.js` is the one supported second
-// file, and the loader owns that name pattern (`^client\.[A-Za-z0-9][A-Za-z0-9._-]*\.js$`).
+// WHAT IT FIXES. In a session that lives on ANOTHER Host, a non-image file picked with the
+// composer's `+` became the mention `@"C:\…\file.zip"` — a path on THIS machine, packed
+// from the `File` the picker handed over. DSH computes it in its composer's
+// `addFiles` (installed `apply.ts:520` `const path = bridge?.pathFor(file) ?? ''`,
+// bridge = the preload's `globalThis.__DSH_HOST_PATHS__`): a non-empty answer becomes an
+// `@"path"` reference, an empty one sends the BYTES through
+// `POST /api/session/uploadFileBinary` — which `lib/upload-route.mjs` already routes to
+// the owning Host. Images upload whatever the answer says (`:522`).
 //
-// What it fixes: in a session that lives on ANOTHER Host, a non-image file picked with
-// the composer's `+` never reached that Host. DSH's composer asks
-// `globalThis.__DSH_HOST_PATHS__.pathFor(file)` for a local path and turns a non-empty
-// answer into an `@"C:\…\file.zip"` MENTION — a path on this machine, which the remote
-// Host cannot read — while an empty answer sends the bytes through
-// `POST /api/session/uploadFileBinary`, which `lib/upload-route.mjs` already routes to
-// the owning Host. So the upload route was already right; nothing ever gave it tagged
-// bytes for a FILE pick (the reported zip's 11 917 bytes never appeared on the Host).
+// THE FIRST MECHANISM FAILED, MEASURED LIVE (2026-11-16). A1.2 in its original text let
+// this plugin wrap `__DSH_HOST_PATHS__.pathFor` in place. It never can: the preload exposes
+// the object through `contextBridge.exposeInMainWorld` (installed `lib/preload-app.cjs`),
+// and contextBridge hands the page a FROZEN copy — every member non-writable and
+// non-configurable — so an in-place wrap is refused (`bridge-frozen`) and no re-pointing of
+// the global binding could help either (DSH captures the bridge once per composer inject,
+// `apply.ts:504` `const bridge = hostPathBridge()`). The owner's remote client (commit
+// 7edd03f, DSH fully restarted) still turned the picked zip into `@"C:\…zip"`: nothing was
+// uploaded.
 //
-// Mechanism (spec R4): the wrap of `__DSH_HOST_PATHS__.pathFor`, not the composer's
-// `registerFileIntake`. The hook is reachable — it is a member of the composer bar's
-// `inject` value (installed `dsh-client-ui-conversation/src/client/apply.ts`,
-// `return { registerFileIntake: fileIntake, … }`) — but it cannot answer the per-file
-// question: its `add` receives only the picked files. A remote session would then reach
-// DSH's `addFiles` with no path and be refused by `attachment.pathUnavailable` (the
-// "folders cannot be uploaded" rule) — R3's refusal applied to EVERY file, the opposite
-// of R1. It would also move drops and pastes off DSH's own intake. R4's order was
-// checked; the hook is real and unusable here.
+// THE MECHANISM NOW (no DSH object is wrapped, nothing is monkey-patched). The picker's own
+// `input[type=file]` is the one element in that flow the page owns end to end, and the
+// `File` objects it hands DSH are ours to decide. So:
 //
-// A1.2 conditions, all of them:
-//  - structural self-test, never a version equality: the global must be exactly DSH's
-//    `{pathFor}` — no other own key, enumerable, hidden or symbol — and whether it can be
-//    wrapped is MEASURED at runtime (`install`), never assumed;
-//  - a mismatch means NO wrap and `status().reason` for the Devices page; so does a
-//    `pathFor` that cannot be replaced in place (`bridge-frozen`): the global binding is
-//    never re-pointed, because composers already injected hold the original object
-//    (installed `apply.ts:504`,`:520`);
-//  - dispose puts back the exact `pathFor` descriptor it replaced, and only while the
-//    bridge's own member is still strictly the wrapper this instance installed;
-//  - never two wrappers: one instance per global, and the `ORIGINAL` marker carries the
-//    true method, so a reload finds it instead of wrapping a wrapper;
-//  - no authorization is touched: the wrapper answers a PATH STRING, never a request. The
-//    bytes travel through `lib/upload-route.mjs`, and the remote gateway stays the sole
-//    authority (`attachments:write`, size, session visibility);
-//  - session attribution (spec R6) is certainty or nothing — see the attribution block.
+//  1. `lib/client.js` keeps a CAPTURE-phase `change` listener on `document` and the same
+//     composer-region/session attribution (R6, below). Capture is necessary:
+//     DSH's own `onPickFiles` (installed `InputBar.tsx:280`, built
+//     `const onPickFiles=e=>{const picked=e.target.files===null?[]:[...e.target.files];…}`)
+//     reads `e.target.files` as its very FIRST statement, so the capture phase is the last
+//     moment that list can still be replaced.
+//  2. When a pick is proven to belong to a composer that shows a REMOTE session
+//     (`h:<hostId>:…`), and the picked set holds a non-image file, every picked file is
+//     RE-MATERIALIZED: `new File([original], original.name, {type, lastModified})`, added
+//     through a fresh `DataTransfer`, and `input.files` is replaced with it. A `File`
+//     built in page script has no backing filesystem path, so
+//     `webUtils.getPathForFile` answers `''` and DSH's OWN composer takes its byte path —
+//     no mention, no wrap, nothing else touched. Images are re-materialized in place like
+//     the rest (same type, so DSH still uploads them at `apply.ts:522`; their bytes,
+//     name and type are unchanged, and an image never consults a path for its outcome).
+//  3. A mixed batch is re-materialized as a WHOLE. DSH asks `pathFor` for the reference
+//     files of the batch first and creates the upload drafts only when the whole loop
+//     passed (`apply.ts:517-540`: a `return` inside the loop refuses the batch before ANY
+//     draft is created), so leaving an image's path intact would drag the re-materialized
+//     non-image files out of a batch DSH then refuses for the image — the pick would land
+//     nowhere at all.
+//  4. Every other pick — a local session, an unproven session, a file input outside the
+//     composer, a directory-only pick, browser chrome — is NOT touched: DSH's own
+//     behaviour, exactly as before.
+//  5. When `DataTransfer` or `File` cannot be constructed, nothing is changed and
+//     `status()` reports `browser-unavailable` with a sentence the Devices page shows.
+//  6. A re-materialized pick is verified on the spot, twice: the page-built `File` must
+//     answer `''` from the preload (`answersNoPath`) BEFORE the list is replaced, and the
+//     list must read back path-free AFTER it. A page where either check fails touches
+//     nothing and reports `path-unavailable`/`unverified` rather than an upload that never
+//     happened.
+//  7. ACTIVATION IS THE INSTALL, NOT A FETCH. An earlier revision made the module wait for
+//     DSH's own package sources, fetched from guessed same-origin URLs (`/__dsh/app/<pkg>/…`,
+//     then `/`), before it would touch a pick: the first picks of a page stayed DSH's own
+//     while those reads were in flight, and a page whose reads never landed (an installed
+//     Electron shell does not serve a package `src` tree at all) never switched on. The
+//     fetch is gone (reviewer finding, 2026-11-16): the module activates on install, and
+//     every per-pick proof above stays. The DSH contract the mechanism rests on is still
+//     checked — against the INSTALLED sources, from disk, in the tests
+//     (`test/remote-file-attach.test.mjs`, `test/client.test.mjs`), so an upgrade that moves
+//     the seam fails there instead of quietly turning remote picks back into mentions.
+//  8. If the picker refuses the replacement (`assign-failed`: a `files` setter that throws;
+//     `not-taken`: the list it kept is not the one that was handed over), the pick is a
+//     PROVEN remote non-image pick that could not be handed to DSH as bytes, and the page
+//     says exactly that (`replace-failed`) — never `certain`, which reads as a local pick.
 //
-// The decision, each row read from the installed `apply.ts` `addFiles`, not assumed:
+// Session attribution (R6) — certain or nothing. The capture phase asks WHICH composer
+// this pick was made in, from the DOM, and answers it once at pick time:
 //
-//  - **Non-image file, tagged session → `''`** — DSH's own "upload these bytes" answer.
-//    A relative path would not work either: `relativizeToCwd` only strips a workspace
-//    prefix, so a relative path becomes the mention `@bundle.zip`, which is the bug.
-//  - **Image → the original answer.** DSH uploads an image whatever the path says
-//    (`path === '' || (!directory && isImageMediaType(file.type))`).
-//  - **Directory, tagged session → `''`.** That is R3's own refusal,
-//    `attachment.pathUnavailable`, which DSH raises before any upload (`directory &&
-//    path === ''`). A path would render a folder chip for a Host that cannot read it.
-//  - **Local session, no bridge, unknown session → DSH's own answer**, from the method
-//    underneath the wrapper, whose `pathFor(file) ?? ''` decides: exactly today's answer.
-//    That is R6's fail-safe, and the page says why.
-//
-// Session attribution (R6). A `pathFor` wrapper cannot be told which session it answers
-// for: the composer reads `bridge?.pathFor(file)` with ONE argument and captures the
-// bridge once per slot inject, so nothing in the call names a composer. The picker can,
-// if it is observed at the right moment — which is why `lib/client.js` listens for the
-// file input's `change` event in the CAPTURE phase on `document`: DSH's own handler runs
-// in the bubble phase and, in the installed `onPickFiles`, drains `e.target.files` into
-// an array and then sets `e.target.value=''` BEFORE `intakeFiles(picked)`, so `.files` is
-// already empty by the time the first `pathFor` runs. The capture listener therefore
-// claims nothing about which file was picked; it asks which composer's pick this is:
-//
-//  - `[data-conversation-session]` is the per-session view root (`ConversationRoot`,
-//    `sessionId` on the content element; the anchor DSH's own stop shortcut walks to);
+//  - `[data-conversation-session]` is the per-session view root (`ConversationRoot`);
 //  - `[data-composer-input]` is each composer's own input element
 //    (`ComposerContentEditable`) — a SIBLING of the hidden `input[type=file]`: both live in
 //    the composer card, the picker inside the input bar's tools row (`InputBar`);
 //  - the composer container is the deepest element holding that input and the picker's form
 //    control (in the installed layout the card; a card that does not nest them answers its
 //    seat, the nearest ancestor carrying `[data-conversation-region="composer"]`);
-//  - that container and the session its view names are retained for the TURN the pick was made
-//    in: the capture queues one task (`#arm`), so every microtask that turn queues runs first —
-//    DSH's own loop over the batch (which awaits its first `readAttachmentPath` before it asks
-//    about the second file) or, when DSH refuses the batch before asking (locked, busy,
-//    denied, the image limit, an emptied picker), nothing at all. A later call never inherits
-//    the pick's session;
-//  - focus, "only one composer in the document" and the picker's `.files` are NOT proof. A
-//    drop, a paste or a call with no live claim keeps DSH's behaviour, and the page states
-//    the state (`no-document`, `picker-document`, `picker-elsewhere`, `no-session`,
-//    `composer-uncertain`, `stale-batch`).
+//  - the search never ascends past the composer region: a file input rendered elsewhere in
+//    the same session view (a panel, a dialog) is no claim, however many composer inputs
+//    sit above it;
+//  - focus, "only one composer in the document" and the picker's `.files` are NOT proof
+//    (the `.files` part changed under the old wrap: a pick is now attributed ONCE, in the
+//    capture phase, so there is no later call to bind a claim to).
 //
-// The claim BINDS THE FILES, not just the turn (reviewer round 4, 2026-11-16). A session
-// claim alone answers `''` for any file until it ends, which is wrong twice: an unrelated
-// `pathFor` call made in the same turn (a queued microtask, a second picker) as well as DSH's
-// own loop would be answered for somebody else's pick; and a batch DSH REFUSES before asking
-// (locked composer, image limit, an emptied picker) leaves a claim that a microtask then
-// spends on an unrelated file. So the capture phase — the last moment `.files` still holds
-// what the user picked, before DSH drains and resets it — snapshots the exact `File` objects
-// (identities, by hand: never `WeakSet#has`, whose TypeError on a non-object would turn a
-// drop's `pathFor(null)` into an error DSH never raises), and only those objects are
-// answered. Any other file in the turn gets DSH's own answer and a notice that says the
-// session is not known for it (`file-unclaimed`), never a guess.
+// No authorization is touched and no request is made from here: this module decides
+// whether a picked list keeps DSH's own `File` objects or gets byte-only copies. The
+// bytes travel through `lib/upload-route.mjs`, and the remote gateway stays the sole
+// authority (`attachments:write`, size, session visibility).
 //
-// A wrapper that cannot be restored stays a CALLABLE passthrough (reviewer round 4). The
-// restore's answer is `Reflect.defineProperty`'s BOOLEAN, not an exception: a slot that
-// refuses the original back did not throw, and the retained wrapper is the member DSH's
-// composers read. So it is never gutted: the bridge's original `pathFor` stays with it for
-// as long as it can be called (the wrapper carries it as `ORIGINAL`), it answers that
-// original alone (no upload, no attribution), and the page reports `bridge-frozen`.
-// A member made non-configurable but still writable is the one case a plain assignment
-// reaches, and the restore tries exactly that first: DSH's own function goes back, and if
-// it does not, the callable wrapper simply stays — nothing non-callable is ever written
-// into `pathFor` (reviewer finding 2026-11-16: a stand-in object there made every composer
-// throw `pathFor is not a function`). README's "Exact restore" says the same.
+// The decision, each row read from the installed sources and re-asserted by the
+// `composer` self-test:
+//
+//  - **Remote session, a non-image file among the picks → every pick re-materialized.**
+//    All of them have no path, so all of them upload; the non-image files carry the bytes.
+//  - **Remote session, images only → untouched.** DSH already uploaded images; nothing of
+//    their outcome would change, and a picker the page does not need to touch is not touched.
+//  - **A directory's `File`** (`inode/directory`) keeps its own object: a re-materialized
+//    copy carries no filesystem entry, and DSH's directory handling is not what this fixes.
+//  - **Local session, no session, unknown session → untouched**, and the page says why.
+//  - **The page cannot vouch for the pick** (path-unavailable, unverified, replace-failed,
+//    browser-unavailable) → untouched, and the page says which one.
 //
 // One body, two deliveries: this file holds every function in its factory, and
-// `lib/remote-file-attach.mjs` re-exports these names (`HOST_PATHS_GLOBAL`, …) from it.
+// `lib/remote-file-attach.mjs` re-exports these names from it.
 
 window.__ModuleLoader__.load({
   id: '@dsh-ext/devices',
@@ -162,16 +156,9 @@ window.__ModuleLoader__.load({
     const FILE_INPUT_SELECTOR = `[hidden] ${FILE_CONTROL}`
     /** `change` is what DSH's own `onPickFiles` listens to. */
     const PICK_EVENT = 'change'
-    /**
-     * Marks this module's wrapper with the method it replaced, so a reload that installs a
-     * second wrap finds the TRUE native pathFor instead of wrapping a wrapper. Same
-     * convention and symbol as lib/upload-route.mjs (which cannot be imported here without
-     * dragging a Node module into the browser bundle).
-     */
-    const ORIGINAL = Symbol.for('@dsh-ext/devices.uploadRouteOriginal')
     /** `h:<hostId>:<rawId>`, the shape `lib/upload-route.mjs#splitTaggedSessionId` accepts. */
     const TAGGED_SESSION = /^h:([0-9a-zA-Z-]{1,64}):([^:]{1,256}(?::.*)?)$/
-    /** The kind of a picked directory: it has no bytes, and no Host can read its path. */
+    /** The kind of a picked directory: it has no bytes, and DSH's directory rule is DSH's own. */
     const DIRECTORY_TYPE = 'inode/directory'
     /** Two independent references to one factory return. */
     const ONE_REFERENCE = 1
@@ -182,9 +169,6 @@ window.__ModuleLoader__.load({
     /** A picked file, about to be asked about: anything DSH may pass (a `File`, or `null`). */
     const isPassed = (file) => file !== undefined && file !== null
 
-    /** Are these one picked file? Identity, and no host call: `WeakSet#has` throws on a drop's `null`. */
-    const isSameFile = (one, other) => one === other
-
     /** A DOM-ish node: it answers its attributes and it has ancestors. */
     function isElement(value) {
       return isRecord(value) && typeof value.getAttribute === 'function' && typeof value.hasAttribute === 'function'
@@ -194,59 +178,6 @@ window.__ModuleLoader__.load({
     const DSH_BRIDGE = {
       isElement,
       isMarked: (node, attribute) => isElement(node) && node.hasAttribute(attribute) === true,
-    }
-
-    /**
-     * An own property that can be replaced at all: measured, never assumed, and measured
-     * NOW — a property that was a plain field at install may be an accessor afterwards
-     * (then the setter decides), and one that was an accessor may be a frozen field (then
-     * it cannot be replaced at all).
-     */
-    function canReplace(target, key) {
-      if (target === null || typeof target !== 'object') return false
-      const descriptor = Object.getOwnPropertyDescriptor(target, key)
-      if (descriptor === undefined) return false
-      if ('get' in descriptor || 'set' in descriptor) return typeof descriptor.set === 'function'
-      return descriptor.writable === true || descriptor.configurable === true
-    }
-
-    /**
-     * The structure of one own property, `"<kind> <value type>"`: `data function` for an
-     * ordinary value, `accessor get+set` / `accessor get` for a property pair, and the
-     * `undefined` type for an absent property.
-     */
-    function structureOf(descriptor) {
-      if (descriptor === undefined) return 'absent undefined'
-      if ('get' in descriptor || 'set' in descriptor) {
-        const pair = `${descriptor.get === undefined ? '' : 'get'}${descriptor.set === undefined ? '' : '+set'}`
-        return `accessor ${pair || 'neither'}`
-      }
-      return `data ${descriptor.value === null ? 'null' : typeof descriptor.value}`
-    }
-
-    /**
-     * The self-test (R5), pure and strict: is `value` exactly the object DSH's preload
-     * exposes — one own key, `pathFor`, whose value is a function?
-     *
-     * `undefined`/`null` is NOT a failure: the Web GUI has no bridge, and its composer
-     * already uploads every file (its own `?? ''`), so that surface needs no wrap. Every
-     * other shape is a reason the Devices page shows, and no wrap is installed:
-     *  - `bridge-shape`: not a plain non-array object (a string, an array, a function);
-     *  - `bridge-keys`: own keys other than a data `pathFor` — a hidden key, a symbol, or
-     *    anything else (removing a marker and calling that "the same object" is how a
-     *    wrapper ends up replacing a foreign bridge);
-     *  - `bridge-pathFor`: `pathFor` is absent, an accessor, or not a function.
-     * @param {unknown} value `globalThis[__DSH_HOST_PATHS__]`
-     * @returns {null|'bridge-shape'|'bridge-keys'|'bridge-pathFor'} null when it matches
-     */
-    function hostPathsSelfTest(value) {
-      if (value === undefined) return null
-      if (!isRecord(value)) return 'bridge-shape'
-      const keys = Reflect.ownKeys(value)
-      if (keys.length !== 1 || keys[0] !== HOST_PATHS_MEMBER) return 'bridge-keys'
-      const descriptor = Reflect.getOwnPropertyDescriptor(value, HOST_PATHS_MEMBER)
-      if (structureOf(descriptor) !== 'data function' || typeof value[HOST_PATHS_MEMBER] !== 'function') return 'bridge-pathFor'
-      return null
     }
 
     /**
@@ -261,10 +192,10 @@ window.__ModuleLoader__.load({
       return { hostId: match[1], sessionId: match[2] }
     }
 
-    /** A picked file that can be sent as bytes; a directory has none to send. */
-    const isUploadableFile = (file) => file !== null && typeof file === 'object' && file.type !== DIRECTORY_TYPE
+    /** A picked file DSH can upload as bytes; a directory is DSH's own case, not ours. */
+    const isUploadableFile = (file) => isRecord(file) && file.type !== DIRECTORY_TYPE
 
-    /** A picked image, which DSH uploads whatever pathFor answers. */
+    /** A picked image, which DSH uploads whatever the path would say. */
     const isImageFile = (file) => isString(file?.type) && file.type.startsWith('image/')
 
     /** The node itself and its ancestors, starting at `node` (a detached node answers just itself). */
@@ -346,10 +277,10 @@ window.__ModuleLoader__.load({
         if (card !== undefined) return card
         if (holdsComposerInput(seat)) return seat
       }
-      return composerCardAbove(picker, chain)
+      return composerCardAbove(picker, lineageOf(picker))
     }
 
-    /** The nearest ancestor-or-self marked `[data-conversation-region="composer"]`. */
+    /** The nearest ancestor-or-self marked `[data-conversation-region="composer"]`, between two nodes. */
     function nearestComposerSeat(chain) {
       return chain.find((node) => isElement(node) && node.getAttribute(COMPOSER_REGION_ATTR) === COMPOSER_REGION) ?? null
     }
@@ -368,47 +299,98 @@ window.__ModuleLoader__.load({
      * container of the view or of a neighbouring one. A page-level count of composer inputs
      * never decides.
      */
-    function composerCardAbove(picker, chain) {
+    function composerCardAbove(picker, line) {
       const view = nearestMarked(picker, SESSION_VIEW_ATTR)
       if (view === null || !isElement(view)) return null
-      const card = chain.find((node) => isElement(node) && node !== view && DSH_BRIDGE.isMarked(node, COMPOSER_CARD_ATTR))
-        ?? chain.find((node) => node !== view && holdsComposerInput(node))
+      // `line` is the picker's OWN ancestry (only a picker's ancestry can be its composer), and
+      // `isView` is a VIEW test, not a node test: the chain of a `[hidden]` file input holds a
+      // sibling `undefined` slot (the fake document's root); unrelated nodes fall away.
+      const isView = (node) => node === view || (isElement(node) && DSH_BRIDGE.isMarked(node, SESSION_VIEW_ATTR))
+      // Every NODE of the picker's ancestry — the `undefined` root slot of the fake document's
+      // chain included: supplied through `slice()`, `Array.prototype.find` hands its callback
+      // only the element (never the index), so a predicate that reads a second parameter cannot
+      // compare the element against its own position.
+      const nodes = Array.prototype.slice.call(line.filter((node) => !isView(node)))
+      const card = nodes.find((node) => DSH_BRIDGE.isMarked(node, COMPOSER_CARD_ATTR))
+        ?? nodes.find((node) => holdsComposerInput(node))
       if (card === undefined || !containsNode(view, card)) return null
-      const suite = chain.find((node) => node !== view && node !== card && containsNode(node, card))
+      // The composer seat that belongs to this card — the nearest one it does NOT contain (a
+      // seat between the card and its picker belongs to another composer: then there is none).
+      const seat = nodes.find((node) => isElement(node) && node.hasAttribute(COMPOSER_REGION_ATTR)
+        && node.getAttribute(COMPOSER_REGION_ATTR) === COMPOSER_REGION && !containsNode(node, card)) ?? null
+      // The suite the card renders into: its nearest ancestor below the view. A seat ABOVE that
+      // suite is the composer region `inSessionRegion` proves; a seat BELOW it (between the card
+      // and its input bar) is inside the suite and straddles the boundary: ambiguous. The seat
+      // is then passed to `inSessionRegion` as a hint, which confirms and never decides.
+      // Measured, not assumed: `Array.prototype.find` hands its callback `(node, index, array)`
+      // for EVERY node, and `[][0]` is `undefined` — in every lineage — so a callback that
+      // reads a second parameter would be comparing the node's INDEX against `undefined` and
+      // matching every position. The callback below takes the node alone.
+      const holdsCard = (node) => node !== null && node !== undefined && containsNode(node, card)
+      const suite = nodes.find(holdsCard)
       if (suite === undefined || !containsNode(view, suite)) return null
-      if (!inSessionRegion(view, suite)) return null
-      // A suite that also holds the seat would straddle a region boundary: ambiguous, not a claim.
-      const seat = nearestComposerSeat(chain)
       if (seat !== null && containsNode(suite, seat)) return null
-      return suite
+      return sessionRegionOf(view, suite, seat) === 'inside' ? suite : null
     }
 
     /**
      * Is `node` inside the region `view` breaks — from the view or its content down to the
      * composer seat, and no further (a container of the view, a list of views or a rail, is not)?
+     * Answers `'inside'`, `'ambiguous'` (a seat that could be the suite's is not above it), or
+     * `null` (outside). The ambiguity is a refusal, never a claim (R6).
+     * @param {Element} view the session view
+     * @param {Element} node the node to place
+     * @param {Element|null} [seat] the composer seat found beside `node`, if any
+     * @returns {'inside'|'ambiguous'|null}
      */
-    function inSessionRegion(view, node) {
+    function sessionRegionOf(view, node, seat = null) {
+      // `isKnown` guards every attribute read: an ancestry can end in a non-element slot.
+      const isKnown = (at) => at !== null && at !== undefined
       let held = false
-      for (let at = node; held === false && at !== null && at !== undefined; at = at.parentElement ?? null) {
+      for (let at = node; held === false && isKnown(at); at = at.parentElement ?? null) {
         if (at === view || DSH_BRIDGE.isMarked(at, CONTENT_ATTR)) held = true
       }
-      if (!held) return false
-      // Past the content: every ancestor up to the first that also holds another session view
-      // must be no composer seat.
-      for (let at = node; at !== null && at !== undefined; at = at.parentElement ?? null) {
-        if (at !== view && DSH_BRIDGE.isMarked(at, SESSION_VIEW_ATTR)) return false
-        if (at.getAttribute(COMPOSER_REGION_ATTR) === COMPOSER_REGION) return true
+      if (!held) return null
+      if (seat !== null) {
+        // A known seat, when it sits above the suite, is the composer region this proves. When
+        // it does NOT, the suite is beside a composer seat rather than inside one.
+        let above = false
+        for (let at = node; isKnown(at) && above === false; at = at.parentElement ?? null) {
+          if (at !== view && isElement(at) && DSH_BRIDGE.isMarked(at, SESSION_VIEW_ATTR)) return null
+          if (at === seat) above = true
+        }
+        if (above) return 'inside'
       }
-      return false
+      // Past the content: walking up may leave the suite's element (the region `view` breaks is
+      // itself allowed here — only another session VIEW in between is not), and a suite that
+      // sits directly in the view with no seat above it is ambiguous, not outside.
+      let at = node
+      while (isKnown(at)) {
+        if (isElement(at) && at !== view && at !== node && DSH_BRIDGE.isMarked(at, SESSION_VIEW_ATTR)) return 'ambiguous'
+        if (isElement(at) && at.getAttribute(COMPOSER_REGION_ATTR) === COMPOSER_REGION) return 'inside'
+        at = at.parentElement ?? null
+      }
+      // No seat above it at all, and a seat beside it: the region is not this pick's to claim.
+      return seat === null ? null : 'ambiguous'
     }
 
-    /** Does `outer` contain `inner`? A node that cannot answer is not trusted to contain. */
+    /** The boolean form of {@link sessionRegionOf}: only `'inside'` is a region this module uses. */
+    const inSessionRegion = (view, node, seat = null) => sessionRegionOf(view, node, seat) === 'inside'
+
+    /** Does `outer` contain `inner`? Only an ELEMENT of the page, or the document, can contain. */
     function containsNode(outer, inner) {
       if (outer === inner) return true
-      if (typeof outer?.contains === 'function') {
-        try { return outer.contains(inner) === true } catch { return false }
-      }
-      return lineageOf(inner).includes(outer)
+      if (outer === null || outer === undefined) return false
+      const answersContains = typeof outer.contains === 'function'
+      const lineage = isElement(inner) ? lineageOf(inner) : []
+      if (isElement(outer)) return answersContains ? safeContains(outer, inner) : lineage.includes(outer)
+      // Anything else (the document, or a chain's `undefined` slot) only counts by a real
+      // `contains` answer: `undefined` IS in every lineage and would contain everything.
+      return answersContains && isPassed(inner) ? safeContains(outer, inner) : false
+    }
+
+    const safeContains = (outer, inner) => {
+      try { return outer.contains(inner) === true } catch { return false }
     }
 
     /** Both chains in nearest-first order, each element once. */
@@ -460,8 +442,8 @@ window.__ModuleLoader__.load({
 
     /**
      * The picks still in a picker's `input.files` — read in the CAPTURE phase, the only moment
-     * they exist (`onPickFiles` drains and resets the picker before DSH asks its bridge). The
-     * objects are kept by identity; a picker that cannot answer, or has nothing in it, is empty.
+     * they exist (`onPickFiles` drains the picker in its first statement). The objects are kept
+     * as they are; a picker that cannot answer, or has nothing in it, is empty.
      * @returns {Array<object>} the picked files, in picker order
      */
     function pickedFilesOf(picker) {
@@ -477,72 +459,192 @@ window.__ModuleLoader__.load({
       return picked
     }
 
-    /** The states this module reports; the Devices page has a sentence for each. */
+    /**
+     * The states this module reports; the Devices page has a sentence for each.
+     * `active` rows are what the capture did (or deliberately did not do) with one pick;
+     * `not-active` rows are why nothing can be changed at all. `unmeasured` and
+     * `dsh-incompatible` are gone with the source-fetch gate: activation is the install, and
+     * the installed-DSH contract is asserted in the tests, from disk.
+     */
     const ATTRIBUTION_STATES = Object.freeze([
       'certain', 'no-document', 'picker-document', 'no-composer', 'picker-elsewhere', 'composer-uncertain',
-      'no-session', 'browser-chrome', 'ambiguous', 'stale-batch', 'bridge-passthrough',
-      'bridge-frozen', 'file-unclaimed',
+      'no-session', 'browser-chrome', 'ambiguous', 'stale-batch', 'file-unclaimed',
+      'path-unavailable', 'unverified', 'replace-failed', 'browser-unavailable', 'not-installed',
     ])
 
+    /** Realms whose `DataTransfer` accepted a file list AND a constructed `File`: measured once. */
+    const REMATERIALIZABLE = new WeakSet()
+
     /**
-     * The remote file-intake bridge for one renderer instance.
+     * Can this realm build a fresh `File` and put it in a `DataTransfer`? Measured, never
+     * assumed, and measured with an actual round trip: a realm that answers both constructors
+     * and still drops the item is no realm to change a picker in. The result is cached per
+     * global (a page measures once; a test realm that swaps the constructor re-measures by
+     * using a fresh global).
+     * @param {object} holder the global the constructors live on (`window`, or a test realm)
+     */
+    function canRematerialize(holder) {
+      if (isRecord(holder) && REMATERIALIZABLE.has(holder)) return true
+      const transfer = isRecord(holder) ? holder.DataTransfer : undefined
+      const FileCtor = isRecord(holder) ? holder.File : undefined
+      if (typeof transfer !== 'function' || typeof FileCtor !== 'function') return false
+      try {
+        const probe = new FileCtor([new Uint8Array([1, 2, 3])], 'probe.bin', { type: 'application/octet-stream' })
+        const list = new transfer()
+        list.items.add(probe)
+        if (list.files?.length !== ONE_REFERENCE) return false
+        if (isRecord(holder)) REMATERIALIZABLE.add(holder)
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    /**
+     * A copy of one picked file that carries no filesystem path: same bytes, name, type and
+     * timestamp, built by page script. `webUtils.getPathForFile` answers `''` for such a
+     * `File`, which is exactly DSH's own answer for "upload these bytes".
+     */
+    function rerawFile(holder, file) {
+      const FileCtor = holder.File
+      const options = { type: isString(file?.type) ? file.type : '' }
+      if (Number.isFinite(file?.lastModified)) options.lastModified = file.lastModified
+      const name = isString(file?.name) ? file.name : ''
+      return new FileCtor([file], name, options)
+    }
+
+    /**
+     * Put the given files into a picker's `input.files`, as ONE list: the whole batch, by
+     * picker order, or nothing. Answers null on success, or the reason it did not take
+     * (`list-build-failed`, `assign-failed`, `not-taken`) — the caller reports it as
+     * `replace-failed`, so a picker that refused the copies is never read as a local pick.
+     * @param {object} holder the global whose `DataTransfer` builds the list
+     * @param {object} picker DSH's own file input
+     * @param {Array<object>} files the copies to hand DSH, in pick order
+     */
+    function replacePickedFiles(holder, picker, files) {
+      let list
+      try {
+        list = new holder.DataTransfer()
+        for (const file of files) list.items.add(file)
+      } catch {
+        return 'list-build-failed'
+      }
+      try {
+        picker.files = list.files
+      } catch {
+        return 'assign-failed'
+      }
+      // Taken, not merely assigned: the picker must now hold a list of the same length in
+      // which every entry is the copy this page built. A browser's `input.files = dt.files`
+      // is exactly that — the list keeps the objects it was given — so a setter that throws,
+      // stores something else or keeps the previous list is the failure this catches.
+      let kept
+      try {
+        kept = picker.files
+      } catch {
+        return 'not-taken'
+      }
+      if (kept === null || typeof kept !== 'object' || kept.length !== files.length) return 'not-taken'
+      for (let at = 0; at < files.length; at += 1) {
+        if (kept[at] !== files[at]) return 'not-taken'
+      }
+      return null
+    }
+
+    /**
+     * The DSH contract this mechanism rests on, as a set of source patterns. IT NO LONGER
+     * GATES ACTIVATION: an installed Electron shell does not serve DSH's package `src` tree,
+     * so a page-side read could never be the thing that switches the mechanism on.
      *
-     * `deps.global` is the object that holds the bridge (`window` in DSH; a plain object in a
-     * test); `deps.doc` is the document its composer renders into (defaults to the global's
-     * own `document`); `deps.log` records what happened, never what was picked;
-     * `deps.onNotice(kind, notice)` receives the pick report the page shows.
+     *  - `InputBar.tsx` `onPickFiles` reads `e.target.files` as its first statement — the
+     *    capture phase's replacement is what DSH then sees (built form:
+     *    `const onPickFiles=e=>{const picked=e.target.files===null?[]:[...e.target.files];`);
+     *  - `apply.ts` `addFiles` maps an empty path to the byte upload (`path === ''` →
+     *    `uploads.push`), so a path-less `File` of a remote session uploads;
+     *  - `dsh-client-file-upload` posts `attachment.file` with no Blob/FormData/`size`
+     *    conversion, so a `File` built in page script uploads like a picked one.
+     *
+     * Patterns, not a version equality (standing rule 2026-11-13). The tests read the
+     * INSTALLED sources from disk and assert these very patterns, so a DSH upgrade that moves
+     * the seam fails the suite instead of silently turning remote picks back into mentions.
+     * @param {(path: string) => string|null} readFile a reader over DSH's own sources
+     * @returns {{composed: boolean, composer: boolean, upload: boolean, read: boolean}}
+     */
+    function dshContract(readFile) {
+      const read = (relative) => {
+        // A reader may answer with a promise of text: a promise is not text, and treating it
+        // as one would measure the wrong thing.
+        if (typeof readFile !== 'function') return null
+        try {
+          const text = readFile(relative)
+          return typeof text === 'string' ? text : null
+        } catch { return null }
+      }
+      const intake = read('dsh-client-ui-conversation/src/client/skeleton/InputBar.tsx')
+      const apply = read('dsh-client-ui-conversation/src/client/apply.ts')
+      const upload = read('dsh-client-file-upload/lib/client.js')
+      const against = (source, pattern) => (source === null ? null : pattern.test(source))
+      const composer = against(intake, /const picked = e\.target\.files === null \? \[\] : \[\.\.\.e\.target\.files\]/)
+      const bytes = against(apply, /if \(path === '' \|\| \(!directory && isImageMediaType\(file\.type\)\)\)/)
+      const posts = against(upload, /return this\.ctx\.remote\.fileUploads\.upload\(/)
+      return {
+        composed: composer !== false && bytes !== false,
+        composer: composer !== false && bytes !== false && posts !== false,
+        upload: posts !== false,
+        read: intake !== null && apply !== null && upload !== null,
+      }
+    }
+
+    /**
+     * Does the preload answer a path for THIS pick? Measured on the pick the user made, because
+     * it is the only fact the mechanism rests on that is not a source pattern: `pathFor` of a
+     * `File` this page built answers `''` (`webUtils.getPathForFile` has no entry for it). A
+     * page where even a constructed `File` gets an answer is a page where re-materializing
+     * would change nothing — it would still be a mention — so that pick is left to DSH and
+     * the state says so instead of claiming an upload.
+     * @param {object} holder the renderer's global (its `__DSH_HOST_PATHS__`)
+     * @param {object} file a path-free `File` built by this page
+     * @returns {boolean} true when the bridge declined to name it (the byte path)
+     */
+    function answersNoPath(holder, file) {
+      const bridge = isRecord(holder) ? holder[HOST_PATHS_GLOBAL] : undefined
+      const pathFor = isRecord(bridge) ? bridge[HOST_PATHS_MEMBER] : undefined
+      if (typeof pathFor !== 'function') return true
+      try { return (pathFor.call(bridge, file) ?? '') === '' } catch { return false }
+    }
+
+    /** A notice kind per outcome, so the page can say what happened without a log. */
+    const NOTICE_KINDS = Object.freeze({
+      upload: 'upload', untouched: 'untouched', refused: 'refused', passthrough: 'passthrough',
+    })
+
+    /**
+     * The remote file-intake for one renderer instance.
+     *
+     * `deps.global` is the object that holds the constructors and the bridge (`window` in DSH;
+     * a test realm otherwise); `deps.doc` is the document its composers render into (defaults
+     * to the global's own `document`); `deps.log` records what happened, never what was picked;
+     * `deps.onNotice(kind, notice)` receives the pick report the page shows. Nothing about
+     * DSH's sources is a dependency of this class: it activates on `install()`.
      */
     class RemoteFileIntake {
       #global
       #doc
       #log
       #noticeSink
-      /** The bridge we wrapped in place, its global binding, and its own `pathFor` descriptor. */
-      #found = null
-      #descriptor = null
-      #member = null
-      /** The method underneath us: the bridge's own original `pathFor`. */
-      #root = null
-      /** The exact wrapper this instance installed in the bridge's own `pathFor` — the value dispose compares against. */
-      #wrapper = null
-      /**
-       * The wrapper was frozen into the slot by a restore that could not write the original
-       * back: it is DSH's member now and may answer for as long as the page lives.
-       */
-      #frozen = false
-      /** What we installed: the bridge itself, in place (`in-place`). */
-      #ours = null
       #shape = null
       #installed = false
       #attempted = false
-      /**
-       * Why nothing is wrapped: a reason the bridge names (`bridge-shape`, `bridge-frozen`, …),
-       * `refused` when replacing its `pathFor` was attempted and refused, or the last pick's
-       * attribution state once the wrap is gone. Cleared by a successful install.
-       */
+      /** Why nothing can be changed: a `browser-…` reason, or null while active. */
       #refusal = null
-      /** The state of the last pick this wrap did not upload (null once a remote pick is uploaded). */
+      /** The state of the last pick this module did not upload (null once a remote pick is uploaded). */
       #last = null
       /** The pick report waiting to be read once (`takeNotice`). */
       #notice = null
-      /** pathFor calls the wrap has seen, so the page can tell "wrapped" from "wrapped and used". */
-      #calls = 0
-      /** The picker claim for the batch in flight, if any (see `claimPicker`/`#release`). */
-      #claim = null
-      /** Claimed picks and how many ended with the turn that made them or an explicit answer. */
+      /** Picks seen in the capture phase, and how many were re-materialized for their Host. */
       #claims = 0
       #ended = 0
-      /**
-       * Picked files a claim is bound to, from the CAPTURE phase (`#picks`): the exact `File`
-       * objects, by identity — never a `WeakSet#has`, whose TypeError on a drop's `null` would
-       * turn DSH's own call into an error it never raises. Each is answered by the one call that
-       * carries it; any other file in the same turn is its own row (`file-unclaimed`).
-       */
-      #picks = []
-      /** Where the claim's answers continue (a file asked for twice is answered twice). */
-      #at = 0
-      /** The task that ends the claim's turn (every microtask the capture's turn queues goes first). */
-      #turn = null
 
       constructor(deps = {}) {
         this.#global = deps.global ?? globalThis
@@ -551,86 +653,39 @@ window.__ModuleLoader__.load({
         this.#noticeSink = typeof deps.onNotice === 'function' ? deps.onNotice : null
       }
 
-      /** The bridge and the descriptor the global holds right now. */
-      #live() {
-        if (!isRecord(this.#global) && typeof this.#global !== 'function') return { value: undefined, descriptor: undefined }
-        const descriptor = Object.getOwnPropertyDescriptor(this.#global, HOST_PATHS_GLOBAL)
-        if (descriptor === undefined) return { value: undefined, descriptor }
-        if (!Object.hasOwn(descriptor, 'value')) return { value: null, descriptor }
-        return { value: descriptor.value, descriptor }
+      /** The bridge the preload exposed, or undefined (the Web GUI, where every file already uploads). */
+      #bridge() {
+        const holder = this.#global
+        if (!isRecord(holder) && typeof holder !== 'function') return undefined
+        try { return holder[HOST_PATHS_GLOBAL] } catch { return undefined }
       }
 
       /**
-       * Wrap the live pathFor IN PLACE, or not at all. On any self-test mismatch nothing is
-       * patched and `status()` carries the reason (A1.2). An absent bridge is not a mismatch:
-       * the Web GUI needs no wrap and reports `wrapped: true, reason: 'no-bridge'`.
+       * Switch on for this renderer. ACTIVATION IS THE INSTALL: nothing is fetched, no source
+       * of DSH's is read from the page (an installed shell serves no package `src` tree, so a
+       * page-side read could only ever be a gap — and a gap that kept the first picks of
+       * every page DSH's own). What the mechanism rests on is proven per pick, at the pick:
+       * the composer region and session attribute (`attributionOfPicker`), the `File`/
+       * `DataTransfer` round trip measured here, `answersNoPath` for the page-built copy, and
+       * the readback of the replaced list.
        *
-       * A member that cannot be replaced is `bridge-frozen` and nothing else is touched (R6):
-       * re-pointing the global binding at a delegating object reads as wrapped while the
-       * composers already rendered hold the ORIGINAL object — `apply.ts` does
-       * `const bridge = hostPathBridge()` once per composer inject (line 504) — so their
-       * picks would still become controller-local paths and the page would say otherwise.
-       * @returns {{surface: string, wrapped: boolean, reason: string|null, shape: string|null, calls: number}}
+       * Outcomes:
+       *  - `browser-unavailable`: no `File`/`DataTransfer` to build copies with, or a
+       *    `DataTransfer` that drops what it is given. Nothing is changed, ever.
+       *  - `active` (`no-bridge`): the Web GUI, where a picked `File` has no path to pack and
+       *    every file already uploads.
+       *  - `active` (`measured`): an installed shell. The path-free proof is made per pick.
+       * @returns {{surface: string, state: 'active'|'unavailable', reason: string|null, shape: string|null, picks: number, uploaded: number}}
        */
       install() {
-        if (this.#installed) return this.status()
         this.#attempted = true
-        this.#calls = 0
-        const { value, descriptor } = this.#live()
-        const shape = hostPathsSelfTest(value)
-        if (shape !== null) return this.#refuse(shape)
-        if (value === undefined) {
-          // No bridge, so no local path and every pick is uploaded already. Nothing to restore either.
-          this.#refusal = null
-          return { ...this.status(), wrapped: true, reason: 'no-bridge' }
-        }
-        // Measured NOW, not at the self-test: a property that was a plain writable field
-        // there may be frozen here. A bridge whose own `pathFor` cannot be replaced is
-        // refused — the global binding is never re-pointed (see the method note).
-        if (!canReplace(value, HOST_PATHS_MEMBER)) return this.#refuse('bridge-frozen')
-        const root = rootOriginal(value[HOST_PATHS_MEMBER])
-        // The original is kept by the WRAPPER too (`ORIGINAL`), not only by this instance: a
-        // dispose can fail to restore it, and the wrapper then answers it for the life of the
-        // page (reviewer round 4). The capture listener may call the wrapper as a bare
-        // function, so it must not depend on `this` for anything it answers.
-        const intake = this
-        const wrapped = function (file) {
-          return intake.#frozen || intake.#root === null ? intake.#underneath(wrapped, file) : intake.#pathFor(this, file)
-        }
-        Object.defineProperty(wrapped, ORIGINAL, { value: root })
-        const before = Object.getOwnPropertyDescriptor(value, HOST_PATHS_MEMBER)
-        this.#found = value
-        this.#descriptor = descriptor
-        this.#member = before
-        this.#root = root
-        this.#wrapper = wrapped
-        // An accessor `pathFor` (a bridge that reads something else) is DSH's object to keep:
-        // the self-test refused it already, so this is only reachable when the property
-        // changed between the test and here — a no-op assignment would report a successful
-        // wrap that never happened.
-        const accessor = before !== undefined && ('get' in before || 'set' in before)
-        try {
-          if (accessor) throw new ThrowRecorded('an accessor pathFor is not replaceable')
-          value[HOST_PATHS_MEMBER] = wrapped
-          if (value[HOST_PATHS_MEMBER] !== wrapped) throw new ThrowRecorded('the in-place wrap did not take')
-          this.#ours = value
-          this.#shape = 'in-place'
-          this.#installed = true
-          this.#refusal = null
-          this.#frozen = false
-          this.#log('remote file attach: the Host path bridge is wrapped in place')
-          return this.status()
-        } catch (error) {
-          this.#log(`remote file attach: the in-place wrap was refused (${error?.name ?? 'error'})`)
-          // The original stands if it refuses; nothing was installed, and that is reported.
-          try { Reflect.defineProperty(value, HOST_PATHS_MEMBER, before) } catch { /* the original stands if it refuses */ }
-        }
-        this.#found = null
-        this.#descriptor = null
-        this.#member = null
-        this.#root = null
-        this.#wrapper = null
-        return this.#refuse('refused')
+        if (!canRematerialize(this.#global)) return this.#refuse('browser-unavailable')
+        this.#installed = true
+        this.#refusal = null
+        // `no-bridge` when the preload exposed nothing (the Web GUI): there is no path to pack,
+        // so the answer a page-built `File` gets is DSH's byte upload by construction.
+        this.#shape = this.#bridge() === undefined ? 'no-bridge' : 'measured'
+        return this.status()
       }
 
       #refuse(reason) {
@@ -642,28 +697,18 @@ window.__ModuleLoader__.load({
 
       /**
        * What the Devices page shows, measured NOW (A1.2: the failure mode is visible).
-       * `wrapped` means "the bridge DSH reads right now is ours, or needs no wrap"; a frozen
-       * bridge reports `wrapped: false` with `bridge-frozen` before any pick is tried.
-       * `reason` is the bridge's state, or the last pick's state while it is not `certain`.
+       * `state: 'active'` means "a pick in a remote composer is handed to DSH as byte-only
+       * files"; `unavailable` always carries the reason. `reason` with an active state is the
+       * last pick's state while it was not uploaded (`certain` means "remote, images only";
+       * `replace-failed` means "remote, and the picker refused the copies").
        */
       status() {
-        const base = { surface: HOST_PATHS_GLOBAL, shape: this.#shape, calls: this.#calls }
-        // A frozen wrapper still sits in DSH's slot (see `uninstall`): the bridge is disabled,
-        // not wrapped and not gone, whatever the global does now.
-        if (this.#frozen) return { ...base, wrapped: false, reason: 'bridge-frozen' }
-        const { value } = this.#live()
-        if (value === undefined) {
-          if (this.#attempted && this.#refusal !== null) return { ...base, wrapped: false, reason: this.#refusal }
-          return { ...base, wrapped: true, reason: 'no-bridge' }
-        }
-        const shape = hostPathsSelfTest(value)
-        if (shape !== null) return { ...base, wrapped: false, reason: shape }
-        if (!this.#installed) return { ...base, wrapped: false, reason: this.#attempted ? (this.#refusal ?? 'not-installed') : 'not-installed' }
-        if (value !== this.#found || value[HOST_PATHS_MEMBER] !== this.#wrapper) return { ...base, wrapped: false, reason: 'bridge-replaced' }
-        return { ...base, wrapped: true, reason: this.#last }
+        const base = { surface: HOST_PATHS_GLOBAL, shape: this.#shape, picks: this.#claims, uploaded: this.#ended }
+        if (!this.#installed) return { ...base, state: 'unavailable', reason: this.#attempted ? (this.#refusal ?? 'not-installed') : 'not-installed' }
+        return { ...base, state: 'active', reason: this.#last }
       }
 
-      /** The last pick's attribution state: `certain` when it was attributed, null before any pick. */
+      /** The last pick's attribution state: null before any pick. */
       get lastPick() { return this.#last }
 
       /** The pick report waiting to be read, once. */
@@ -672,380 +717,121 @@ window.__ModuleLoader__.load({
         this.#notice = null
         return notice
       }
+
+      /** Picks seen in the capture phase. */
+      get claimedPicks() { return this.#claims }
+
+      /** Picks re-materialized for their remote Host. */
+      get endedPicks() { return this.#ended }
+
+      /** Nothing was ever installed in DSH's realm, so there is nothing to put back but this record. */
+      uninstall() {
+        this.#installed = false
+        this.#shape = null
+        this.#notice = null
+        this.#last = null
+        this.#refusal = this.#refusal ?? null
+      }
+
       /**
-       * Attribute the batch of picks DSH is about to hand to `pathFor` (R6). `lib/client.js`
-       * calls this from a capture-phase `change` listener, i.e. before DSH's own bubble
-       * handler drains `.files` and resets the picker. It records which composer the picker
-       * belongs to, and — because the claim is only for what was actually picked — the exact
-       * `File` objects still in that picker, by identity (the one moment they exist;
-       * `pickedFilesOf`). It answers the attribution (`state` + `sessionId`) and the picks.
-       *
-       * The claim ends when the TURN it was made in is over — one task, queued here so it runs
-       * after every microtask that turn queues (DSH's own loop over the batch, a refused
-       * batch's nothing) — or as soon as every picked file has its answer (`#settle`).
+       * The capture-phase body `lib/client.js` calls for one `change` on DSH's picker (R6).
+       * Answers the attribution it claimed, with what it did, or null when the event was not a
+       * pick. Runs BEFORE DSH's own handler reads `e.target.files`, which is the whole point.
        * @param {Element} picker DSH's own hidden file input (the event target)
        * @param {{mark?: number}} [options] the order mark of the event
        */
       claimPicker(picker, options = {}) {
-        // A frozen wrap claims nothing: its wrapper is DSH's own method and never reads a claim.
-        if (this.#frozen) return null
         const attribution = attributionOfPicker(picker)
         const picks = pickedFilesOf(picker)
-        this.#claims += 1
-        this.#at = 0
         const claim = {
-          state: attribution.state, sessionId: attribution.sessionId, view: attribution.view,
-          container: attribution.container, sites: attribution.sites, mark: Number.isFinite(options.mark) ? options.mark : null,
-          pending: false,
+          state: attribution.state, sessionId: attribution.sessionId, sites: attribution.sites,
+          mark: Number.isFinite(options.mark) ? options.mark : null, files: picks.length, action: 'none',
         }
-        this.#claim = claim
-        this.#picks = picks
-        this.#arm(claim)
-        const canEnqueue = typeof queueMicrotask === 'function'
-        return { state: attribution.state, sessionId: attribution.sessionId, sites: attribution.sites,
-          agreed: picks.length === 0 ? 'none' : (canEnqueue ? 'pending' : 'unattributable'),
-          files: picks.length }
-      }
-
-      /**
-       * End the claim when the turn it was made in is over: one task from now, queued behind
-       * every microtask that turn queues (a queued microtask that answers an unrelated file,
-       * DSH's own loop over the batch, or nothing when DSH refuses the batch before asking).
-       * A task, not a microtask: DSH's loop awaits its first `readAttachmentPath` before it
-       * asks about the second file, and a claim ended by a microtask would miss it. Counted as
-       * `unattributable` by `claimPicker` only when the realm queues none (`queueMicrotask`
-       * lives in the same realm as `setTimeout`), and the claim then ends with every answer.
-       */
-      #arm(claim) {
-        const later = typeof setTimeout === 'function' ? setTimeout : null
-        if (later === null) return
-        this.#turn = later(() => {
-          this.#turn = null
-          if (this.#claim === claim) this.#disown(claim)
-        }, 0)
-      }
-
-      /** The claim in flight, for the page and the tests; never a DOM node. */
-      get pendingPick() {
-        const claim = this.#claim
-        if (claim === null) return null
-        return { state: claim.state, sessionId: claim.sessionId, sites: claim.sites, pending: claim.pending,
-          files: this.#picks.length, answers: this.#at }
-      }
-
-      /** Picks claimed since install: the page can tell "no capture reached us" from "no pick ran". */
-      get claimedPicks() { return this.#claims }
-
-      /** Claimed picks that ended with their turn or an explicit answer (a claim never lingers). */
-      get endedPicks() { return this.#ended }
-
-      /**
-       * Put back exactly the bridge's own `pathFor` descriptor — and only while that member is
-       * still the wrapper this instance installed. A property that refuses the original back
-       * (made non-configurable after install) reports `bridge-frozen` and why a restore was
-       * refused. When the member cannot take the original back the wrapper stays DSH's member
-       * and answers that original alone (`#underneath`); a member that is still writable gets
-       * the original assigned back first. The refusal is the BOOLEAN `Reflect.defineProperty`
-       * answers — not an exception — so a restore is only "done" when
-       * the slot was read back holding the original. Any other value in the slot is a later
-       * writer (another plugin, a DSH reload) and is never clobbered.
-       */
-      uninstall() {
-        const ours = this.#ours
-        const wrapper = this.#wrapper
-        const found = this.#found
-        const member = this.#member
-        const root = this.#root
-        // A wrapper a previous dispose froze is already plain DSH behaviour: this one only
-        // forgets its own record of the wrap (a later instance can still re-wrap it).
-        if (this.#frozen) {
-          this.#ours = null
-          this.#shape = null
-          this.#wrapper = null
-          this.#found = null
-          this.#descriptor = null
-          this.#member = null
-          this.#root = null
-          if (this.#claim !== null) this.#disown(this.#claim)
-          return
-        }
-        this.#ours = null
-        this.#shape = null
-        this.#wrapper = null
-        this.#found = null
-        this.#descriptor = null
-        this.#member = null
-        this.#root = null
-        this.#installed = false
-        this.#notice = null
-        this.#last = null
-        const claim = this.#claim
-        if (claim !== null) this.#disown(claim)
-        if (ours === null || wrapper === null) {
-          // A refused install left nothing to put back; the reason still stands until the
-          // next install (a reload that finds a frozen bridge must say so, not fall silent).
-          this.#refusal = this.#refusal ?? this.#last
-          return
-        }
-        this.#refusal = null
-        const live = Object.getOwnPropertyDescriptor(ours, HOST_PATHS_MEMBER)
-        // Ours means the same slot still HOLDS the wrapper this instance installed; a
-        // property that became an accessor after install no longer does, whatever it reads.
-        const holdsOurs = live !== undefined && 'value' in live && live.value === wrapper
-        if (!holdsOurs) {
-          this.#log('the Host path bridge is no longer ours; left in place')
-          return
-        }
-        // The MEMBER's own descriptor (`found` is the bridge this instance wrapped,
-        // `member` its own `pathFor`): the global binding's descriptor says nothing about
-        // this field, and using it here would put the member back with foreign flags.
-        const target = found ?? ours
-        const restored = member !== undefined && 'value' in member && typeof member.value === 'function'
-          ? member
-          : { value: root, writable: true, configurable: true, enumerable: true }
-        if (!this.#restore(target, restored, root)) this.#refusal = 'bridge-frozen'
-      }
-
-      /** Did the slot read back holding the restored function? The answer, not a throw. */
-      #restore(target, restored, root) {
-        let written = false
-        try { written = Reflect.defineProperty(target, HOST_PATHS_MEMBER, restored) === true } catch { written = false }
-        const after = Object.getOwnPropertyDescriptor(target, HOST_PATHS_MEMBER)
-        const readback = after !== undefined && 'value' in after ? after.value : undefined
-        if (written && readback === restored.value) return true
-        // Refused. The wrapper IS the member there, so it stays callable as DSH's own method —
-        // a pure passthrough to the original, no upload and no attribution (`#underneath`).
-        this.#frozen = true
-        this.#shape = 'frozen'
-        // A member made non-configurable but still WRITABLE (`writable: true,
-        // configurable: false`) refuses `defineProperty` when it asks for different flags, yet
-        // plain assignment of the original answer still takes. Try that before settling for the
-        // wrapper: DSH's own method is better than any stand-in.
-        const live = Object.getOwnPropertyDescriptor(target, HOST_PATHS_MEMBER)
-        if (live !== undefined && 'value' in live && live.writable === true) {
-          try { target[HOST_PATHS_MEMBER] = restored.value } catch { /* the wrapper stands */ }
-          const assigned = Object.getOwnPropertyDescriptor(target, HOST_PATHS_MEMBER)
-          if (assigned !== undefined && 'value' in assigned && typeof assigned.value === 'function'
-            && rootOriginal(assigned.value) === root) {
-            // A function is back — but a frozen instance compares identity, and the assigned
-            // value is the bridge's own original, so it answers DSH's method from here on. The
-            // page is still told `bridge-frozen`: this restore was not the exact one.
-            this.#log('the Host path bridge could not be restored exactly (bridge-frozen); its own pathFor was assigned back')
-            return false
-          }
-        }
-        // A NON-CALLABLE is never left in DSH's slot — every composer would then throw
-        // `pathFor is not a function` — so nothing is written here: the callable wrapper stays.
-        this.#log('the Host path bridge cannot be restored (bridge-frozen); its wrapper answers DSH\'s own pathFor alone')
-        return false
-      }
-
-      /**
-       * Who this call belongs to: the claim's session when the claim still fits the live
-       * document, `bridge-passthrough` when it does not, `null` when there is no claim.
-       */
-      #attribute() {
-        const claim = this.#claim
-        if (claim === null) return null
-        const doc = this.#doc
-        // A composer that left the document after the pick is a stale batch: the session a
-        // later pick shows says nothing about the one this file was picked for §R6).
-        if (claim.view !== null && !inDocument(doc, claim.view)) return { state: 'stale-batch', sessionId: null, sites: claim.sites }
-        if (claim.container !== null && !inDocument(doc, claim.container)) return { state: 'stale-batch', sessionId: null, sites: claim.sites }
-        // The composer may have re-rendered between the pick and the call: the session it
-        // names now must still be the one the pick was claimed for.
-        if (claim.state === 'certain' && sessionIdOf(claim.view) !== claim.sessionId) {
-          return { state: 'composer-uncertain', sessionId: null, sites: claim.sites }
-        }
-        return { state: claim.state, sessionId: claim.sessionId, sites: claim.sites }
-      }
-
-      /**
-       * The wrapped pathFor: DSH's own call shape (one argument) and DSH's own answer shape
-       * (a string; `''` = "upload these bytes"; `undefined` = DSH's own `?? ''`).
-       *
-       * Every call gets DSH's own answer FIRST, from the original underneath (`#passthrough`),
-       * so nothing here can change what DSH asked for — only what it hears for a file this
-       * pick actually carries.
-       */
-      #pathFor(bridge, file) {
-        // A frozen wrapper (see `uninstall`) is DSH's own method again: no upload, no notice.
-        if (this.#frozen) return this.#underneath(bridge, file)
-        const path = this.#passthrough(bridge, file)
-        this.#calls += 1
-        const claim = this.#claim
-        if (claim === null) {
-          // No pick event reached us (a drop, a paste, a direct call): DSH's own answer.
-          this.#remember({ state: 'no-document', sessionId: null, sites: 0 }, null, path)
-          return path
-        }
-        claim.pending = true
-        try {
-          return this.#decide(file, path)
-        } finally {
-          this.#settle(claim)
-        }
-      }
-
-      /** DSH's own answer: the original method, called exactly as DSH calls it. */
-      #passthrough(bridge, file) {
-        const root = this.#root
-        if (typeof root !== 'function') return undefined
-        // DSH's own bridge does not read `this`: the preload exposes
-        // `pathFor: (file) => electron.webUtils.getPathForFile(file)` (an arrow), so `this`
-        // is the bridge and the answer is the same. A throwing native call stays DSH's
-        // failure, not ours.
-        try { return Reflect.apply(root, bridge, [file]) } catch (error) {
-          this.#log(`remote file attach: the Host path bridge threw (${error?.name ?? 'error'}); DSH's own result stands`)
-          throw error
-        }
-      }
-
-      /**
-       * DSH's own answer from the wrapper's own `ORIGINAL`, for a wrapper whose instance has
-       * let go of the original (a frozen wrap, or a duplicate module instance in the same
-       * realm): DSH's member then, and it answers what DSH's method answers. A thrown native
-       * error stands here too — it is the native call's, not ours.
-       */
-      #underneath(wrapper, file) {
-        const root = rootOriginal(wrapper)
-        return typeof root === 'function' ? Reflect.apply(root, this.#found, [file]) : undefined
-      }
-
-      /**
-       * The place in this pick that answers for `file`: the next picked file when the call is
-       * not a `File` DSH can compare (a drop's `null`), and the exact pick when it is one.
-       * `null` is the `file-unclaimed` row: the claim is only for the files captured with it.
-       * @returns {{file: object, owns: boolean}|null}
-       */
-      #finding(file) {
-        if (!isPassed(file)) {
-          const next = this.#picks[this.#at]
-          return next === undefined ? null : { file: next, owns: false }
-        }
-        for (let at = 0; at < this.#picks.length; at += 1) {
-          if (isSameFile(this.#picks[at], file)) return { file, owns: true }
-        }
-        return null
-      }
-
-      /** One row of the decision table, with the attribution this claim gives it. */
-      #decide(file, path) {
-        const attribution = this.#attribute()
-        if (attribution === null) {
-          // No pick event reached us (a drop, a paste, a direct call): DSH's own answer.
-          this.#remember({ state: 'no-document', sessionId: null, sites: 0 }, null, path)
-          return path
-        }
+        this.#claims += 1
         if (attribution.state !== 'certain') {
-          // R6: DSH's own pick, DSH's own behaviour; the page says why.
-          this.#remember(attribution, null, path)
-          return path
+          // R6: DSH's own pick. A local composer shows a local id; anything unproven is reported.
+          this.#remember(attribution, null)
+          return claim
         }
         const tag = splitTaggedSessionId(attribution.sessionId)
         if (tag === null) {
-          this.#remember(attribution, null, path)
-          return path
+          this.#remember(attribution, null)
+          return claim
         }
-        const found = this.#finding(file)
-        if (found === null) {
-          // The claim is only for the files captured with it: a call for any other file in the
-          // same turn is not this pick, so DSH's own answer stands and the page says the
-          // session is not known FOR THIS FILE (reviewer round 4).
-          this.#remember({ state: 'file-unclaimed', sessionId: attribution.sessionId, sites: attribution.sites }, null, path)
-          return path
+        // R2: images upload whatever the path says, so an image-only pick changes nothing.
+        if (!picks.some((file) => isUploadableFile(file) && !isImageFile(file))) {
+          this.#remember(attribution, null)
+          return { ...claim, action: 'kept' }
         }
-        return this.#answer(attribution, tag, file, path, found)
-      }
-
-      /**
-       * The upload rows, for a file the claim covers: a directory answers `''` (R3: DSH's own
-       * `attachment.pathUnavailable`), an image and anything DSH cannot upload keep the path
-       * DSH gave, and a non-image file of a remote session answers `''` — its bytes.
-       * @param {{file: object, owns: boolean}} found the pick this answer stands for
-       */
-      #answer(attribution, tag, file, path, found) {
-        let answer
-        if (!isUploadableFile(file)) {
-          // R3: a directory reaches DSH's own `attachment.pathUnavailable` only through `''`.
-          answer = ''
-          this.#remember(attribution, null, path)
-        } else if (isImageFile(file) || !isUploadableFile(found.file)) {
-          // A non-file entry in DSH's loop (an image is uploaded whatever the path says; a
-          // pick that is not a file uploads nothing). DSH's own answer, and the page says why.
-          answer = path
-          this.#remember(attribution, null, path)
-        } else if (tag !== null) {
-          answer = ''
-          this.#last = null
-          this.#notice = null
-          this.#report('upload', { sessionId: attribution.sessionId, hostId: tag.hostId, name: file?.name })
-        } else {
-          answer = path
-          this.#remember(attribution, null, path)
+        if (!this.#installed) {
+          // A refused mechanism (no `File`/`DataTransfer`) never changes a pick: DSH's own,
+          // and the page says which refusal. Nothing here waits for a measurement.
+          this.#remember({ state: this.#refusal ?? 'not-installed', sessionId: attribution.sessionId, sites: attribution.sites }, null)
+          return { ...claim, action: 'refused' }
         }
-        // A call for a file the capture did not see closes the rest of the loop: every entry
-        // still open was asked about before it, so it is answered once more, by entry order.
-        if (!found.owns) this.#at = Math.min(this.#at + 1, this.#picks.length)
-        return answer
-      }
-
-      /**
-       * End the claim as soon as every pick it captured has its answer; otherwise the turn's
-       * own task ends it (`#arm`), so a pick DSH never asks about is never answered twice and a
-       * claim never outlives the turn it was made in.
-       */
-      #settle(claim) {
-        if (this.#claim !== claim) return
-        if (this.#picks.length === 0 || this.#at >= this.#picks.length) this.#disown(claim)
-      }
-
-      /** The claim is over: nothing of it may answer a later call. */
-      #disown(claim) {
-        if (claim !== null && this.#claim !== claim) return
-        this.#claim = null
-        this.#picks = []
-        this.#at = 0
+        // The pick itself is the last proof, and the one that is not a source pattern: a
+        // `File` this page builds has no path, and the preload must say so. When it names one
+        // anyway, a re-materialized pick would still be a mention — DSH's own pick stands and
+        // the page shows the measured state instead of an upload that did not happen.
+        const proof = rerawFile(this.#global, picks.find((file) => isUploadableFile(file) && !isImageFile(file)))
+        if (!answersNoPath(this.#global, proof)) {
+          this.#log('remote file attach: the preload names a path even for a page-built File; DSH\'s own pick stands')
+          this.#remember({ state: 'path-unavailable', sessionId: attribution.sessionId, sites: attribution.sites }, null)
+          return { ...claim, action: 'refused' }
+        }
+        const copies = []
+        for (const file of picks) {
+          // A directory keeps its own object (its entry is what DSH reads); everything else gets
+          // a path-free copy, so the WHOLE batch takes DSH's byte path and none of it is refused
+          // because a sibling kept a path (`apply.ts`: one `return` refuses the batch).
+          copies.push(isUploadableFile(file) ? rerawFile(this.#global, file) : file)
+        }
+        const failure = replacePickedFiles(this.#global, picker, copies)
+        if (failure !== null) {
+          // THE PICK WAS PROVEN REMOTE AND A NON-IMAGE, AND THE PICKER WOULD NOT TAKE THE COPIES.
+          // That is its own state, never `certain`: `certain` is a proven pick that needed
+          // nothing changed (a local id, images only), and recording it here would show the
+          // owner a local-session pick while DSH is about to mention a controller path to the
+          // remote Host. DSH's own objects stand (`replacePickedFiles` changes nothing it did
+          // not verify), and the page says `replace-failed` with the setter's own reason.
+          this.#log(`remote file attach: the picker refused the copies (${failure}); DSH's own pick stands`)
+          this.#remember({ state: 'replace-failed', sessionId: attribution.sessionId, sites: attribution.sites }, null)
+          return { ...claim, action: 'refused' }
+        }
+        // Confirmed a second time on the list DSH will actually read: the review the capture
+        // phase exists for is that the pick it sees carries no path (`state: 'unverified'`).
+        const replaced = pickedFilesOf(picker)
+        const firstUploadable = replaced.find((file) => isUploadableFile(file) && !isImageFile(file))
+        if (replaced.length !== copies.length || (firstUploadable !== undefined && !answersNoPath(this.#global, firstUploadable))) {
+          this.#log('remote file attach: the replaced list did not read back path-free; DSH\'s own pick stands')
+          this.#remember({ state: 'unverified', sessionId: attribution.sessionId, sites: attribution.sites }, null)
+          // Best effort: DSH's own objects go back where the replacement could not be trusted.
+          replacePickedFiles(this.#global, picker, picks)
+          return { ...claim, action: 'kept' }
+        }
+        this.#last = null
+        this.#notice = null
         this.#ended += 1
+        this.#report(NOTICE_KINDS.upload, { sessionId: attribution.sessionId, hostId: tag.hostId, files: picks.length })
+        return { ...claim, action: 'rematerialized' }
       }
 
-      #remember(attribution, hostId, path) {
+      /** The pick report shape the page reads; `intake` mirrors what the last router kept. */
+      #remember(attribution, hostId) {
         this.#last = attribution.state
         this.#notice = { reason: attribution.state, sessionId: attribution.sessionId, sites: attribution.sites, intake: null }
-        this.#report('refused', { reason: attribution.state, sessionId: attribution.sessionId, hostId, path })
+        this.#report(NOTICE_KINDS.untouched, { reason: attribution.state, sessionId: attribution.sessionId, hostId })
       }
+
       #report(kind, notice) {
         if (this.#noticeSink === null) return
         try { this.#noticeSink(kind, notice) } catch { /* a report must never break a pick */ }
       }
     }
 
-    // THIS FILE NO LONGER RE-POINTS THE GLOBAL BINDING. DSH reads the bridge once per composer
-    // inject (installed `apply.ts:504` `const bridge = hostPathBridge()`, then `:520`
-    // `bridge?.pathFor(file)`), so a composer rendered before such a re-point held the ORIGINAL
-    // object and still answered a controller-local path while the page said wrapped (R6: a wrap
-    // that cannot cover DSH's composers is a wrong answer, not a partial one). A bridge whose
-    // own `pathFor` cannot be replaced is `bridge-frozen`: no wrap, nothing touched, the page
-    // says so. Every remaining install is that same bridge's own member, so an uninstall leaves
-    // nothing behind that a later instance could misread as DSH's bridge.
-
-    /** A recorded install failure: the message is the log line, nothing is thrown outward. */
-    class ThrowRecorded extends Error {}
-
-    /** The native method underneath any number of our wrappers. */
-    function rootOriginal(fn) {
-      let current = fn
-      for (let depth = 0; depth < 8; depth += 1) {
-        const next = current?.[ORIGINAL]
-        if (typeof next !== 'function') return current
-        current = next
-      }
-      return current
-    }
-
     /**
-     * The one live instance per global, so a DSH reload in the same window re-uses it instead
-     * of wrapping its own wrapper. Weak: a global that goes away takes it along.
+     * The one live instance per global, so a DSH reload in the same window re-uses it.
+     * Weak: a global that goes away takes it along.
      */
     const INSTANCES = new WeakMap()
 
@@ -1061,7 +847,7 @@ window.__ModuleLoader__.load({
       return instance
     }
 
-    /** Install the wrap for one global and report what happened; `uninstall` is the caller's disposer. */
+    /** Install for one global and report what happened; `uninstall` is the caller's disposer. */
     function installRemoteFileIntake(deps = {}) {
       return remoteFileIntakeFor(deps).install()
     }
@@ -1069,8 +855,7 @@ window.__ModuleLoader__.load({
     /**
      * The delegated capture-phase listener body `lib/client.js` installs for `change` on
      * `document`: the event's own target is the picker (never `currentTarget`, which is the
-     * document). Returns the attribution it claimed — with the files it bound it to — or null
-     * when the event was not a pick.
+     * document). Returns the attribution it claimed, or null when the event was not a pick.
      */
     function adoptPickerFrom(attach, event) {
       const target = event !== null && typeof event === 'object' && isElement(event.target) ? event.target : null
@@ -1082,10 +867,11 @@ window.__ModuleLoader__.load({
 
     return {
       HOST_PATHS_GLOBAL, HOST_PATHS_MEMBER, HOST_TAG, SESSION_VIEW_SELECTOR, COMPOSER_INPUT_SELECTOR,
-      COMPOSER_SEAT_SELECTOR, FILE_INPUT_SELECTOR, PICK_EVENT, hostPathsSelfTest, splitTaggedSessionId,
-      isUploadableFile, composerSites, composerContainerOf, attributionOfPicker, ATTRIBUTION_STATES,
+      COMPOSER_SEAT_SELECTOR, FILE_INPUT_SELECTOR, PICK_EVENT, splitTaggedSessionId,
+      isUploadableFile, isImageFile, composerSites, composerContainerOf, attributionOfPicker,
+      pickedFilesOf, canRematerialize, replacePickedFiles, dshContract, answersNoPath,
+      ATTRIBUTION_STATES, NOTICE_KINDS,
       RemoteFileIntake, remoteFileIntakeFor, installRemoteFileIntake, adoptPickerFrom,
-      HOST_PATHS_ORIGINAL: ORIGINAL, HOST_PATHS_INSTANCES: INSTANCES, hostPathsRootOriginal: rootOriginal,
     }
   },
 });

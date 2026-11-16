@@ -84,14 +84,20 @@ repo's `AGENTS.md` / `CLAUDE.md` and the role briefs.
   never wrap a method it did not install; no weakening of gateway authorization; a reviewer pass on
   the wrapper for every DSH version bump; the plugin README lists the wrapped methods. A1 otherwise
   unchanged.
-- 2026-11-15: owner approved **A1.2**, extending A1.1 so `plugins/devices` may also wrap the renderer's
-  `globalThis.__DSH_HOST_PATHS__.pathFor` (the bridge that turns a picked local file into an
-  `@"path"` mention). Purpose only: for a session owned by a remote Host, a non-image file picked in
-  the composer must take DSH's existing byte-upload path (so the bytes reach that Host) instead of a
-  controller-local path the Host cannot read. Same A1.1 conditions apply (structural self-test, no
-  wrap and a visible reason on mismatch, exact restore, never wrap what it did not install, no
-  weakening of authorization, reviewer pass, README lists it). Local sessions keep DSH's behaviour.
-  Spec `specs/033-remote-file-attach/`.
+- 2026-11-15: owner approved **A1.2** for spec `specs/033-remote-file-attach/`: for a session owned by
+  a remote Host, a non-image file picked in the composer must take DSH's existing byte-upload path (so
+  the bytes reach that Host) instead of a controller-local path the Host cannot read. Originally
+  granted as a wrap of `globalThis.__DSH_HOST_PATHS__.pathFor`; **2026-11-16 the owner's live test
+  showed the wrap is impossible** — the preload hands the page a `contextBridge` copy whose members
+  are frozen ("the local file-path bridge cannot be replaced"). A1.2 now covers the mechanism that
+  works without touching DSH: in the capture phase of the composer picker's `change` event, a pick
+  proven to belong to a remote session's composer has its `input.files` replaced with page-built
+  `File` copies, which carry no path. Conditions: the pick's session must be proven from the
+  composer's own DOM (never focus or a page-wide singleton), the replacement must be verified on the
+  spot and leaves the pick to DSH when it cannot be, a failed replacement is reported with its own
+  visible reason, nothing of DSH is mutated (dispose removes the listener), no authorization
+  weakening, reviewer pass, README lists the mechanism. Local sessions and images keep DSH's
+  behaviour. A1.1 conditions apply unchanged to the wrappers A1.1 covers.
 
 ## Standing rules
 - Spec Kit is the work process: every feature gets `specs/<###-slug>/` before code.

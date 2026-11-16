@@ -24,16 +24,24 @@
 // `/plugins/<id>/<chunk>?rev=<rev>`).
 //
 // What it fixes: in a session that lives on ANOTHER Host, a non-image file picked with the
-// composer's `+` never reached that Host. DSH's composer asks
-// `globalThis.__DSH_HOST_PATHS__.pathFor(file)` for a local path and turns a non-empty
-// answer into an `@"C:\…\file.zip"` MENTION — a path on this machine, which the remote
-// Host cannot read — while an empty answer sends the bytes through
-// `POST /api/session/uploadFileBinary`, which `lib/upload-route.mjs` already routes to
-// the owning Host.
+// composer's `+` never reached that Host. DSH's composer packs the picked file's path (the
+// preload's `__DSH_HOST_PATHS__.pathFor`, read once in `apply.ts` `addFiles`) into an
+// `@"C:\…\file.zip"` MENTION — a path on this machine, which the remote Host cannot read —
+// while an empty path sends the bytes through `POST /api/session/uploadFileBinary`, which
+// `lib/upload-route.mjs` already routes to the owning Host.
 //
-// The full rationale — A1.1/A1.2 conditions, the per-row decision table read from the
-// installed `apply.ts` `addFiles`, and R6's attribution rule — is the header of
-// `lib/client.remote-file-attach.js`, where the code that implements it lives.
+// The fix does NOT wrap the bridge (nor any other DSH object; A1.2 as revised 2026-11-16):
+// contextBridge hands the page a frozen copy, so an in-place wrap is refused. In the
+// capture phase of the picker's `change`, a pick proven to belong to a remote composer is
+// re-materialized into a fresh `DataTransfer` — `File` objects built by page script carry
+// no filesystem path — and DSH's own handler then reads that list and takes its byte path.
+//
+// The full rationale — the revision that retired the wrap, the per-row decision table read
+// from the installed `apply.ts` `addFiles`, and R6's attribution rule — is the header of
+// `lib/client.remote-file-attach.js`, where the code that implements it lives. Activation is
+// the install: the module fetches nothing (an installed Electron shell serves no package
+// `src` tree), and the DSH contract it rests on is asserted in the tests, from the installed
+// sources on disk.
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -95,8 +103,8 @@ const chunk = loadChunk()
 
 export const {
   HOST_PATHS_GLOBAL, HOST_PATHS_MEMBER, HOST_TAG, SESSION_VIEW_SELECTOR, COMPOSER_INPUT_SELECTOR,
-  COMPOSER_SEAT_SELECTOR, FILE_INPUT_SELECTOR, PICK_EVENT, hostPathsSelfTest, splitTaggedSessionId,
-  isUploadableFile, composerSites, composerContainerOf, attributionOfPicker, ATTRIBUTION_STATES,
-  RemoteFileIntake, remoteFileIntakeFor, installRemoteFileIntake, adoptPickerFrom, HOST_PATHS_ORIGINAL,
-  HOST_PATHS_INSTANCES, hostPathsRootOriginal,
+  COMPOSER_SEAT_SELECTOR, FILE_INPUT_SELECTOR, PICK_EVENT, splitTaggedSessionId,
+  isUploadableFile, isImageFile, composerSites, composerContainerOf, attributionOfPicker, pickedFilesOf,
+  canRematerialize, replacePickedFiles, dshContract, answersNoPath, ATTRIBUTION_STATES, NOTICE_KINDS,
+  RemoteFileIntake, remoteFileIntakeFor, installRemoteFileIntake, adoptPickerFrom,
 } = chunk

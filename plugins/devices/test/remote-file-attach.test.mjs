@@ -1,28 +1,31 @@
-// Spec 033 (constitution amendment A1.2, owner 2026-11-15): a non-image file picked in a
+// Spec 033 (constitution amendment A1.2, as revised 2026-11-16): a non-image file picked in a
 // composer that shows a session on ANOTHER Host must reach that Host as BYTES, not as a
-// controller-local `@"C:\…"` mention. lib/client.remote-file-attach.js wraps
-// `globalThis.__DSH_HOST_PATHS__.pathFor` — the bridge DSH's preload exposes — and answers
-// `''` for such a pick: the one answer DSH's own composer reads as "upload these bytes"
-// (installed `apply.ts` → lib/upload-route.mjs → the remote Host).
+// controller-local `@"C:\…"` mention.
+//
+// The first mechanism (wrapping `globalThis.__DSH_HOST_PATHS__.pathFor`) could never work: the
+// preload exposes that object through `contextBridge.exposeInMainWorld`, which hands the page a
+// FROZEN copy — measured live on the owner's remote client 2026-11-16 (the picked zip still
+// became `@"C:\…zip"`, nothing uploaded, the wrap reported `bridge-frozen`). The mechanism now
+// wraps nothing at all: in the CAPTURE phase of the picker's `change` — before DSH's own
+// `onPickFiles` reads `e.target.files`, its first statement — a pick proven to belong to a
+// remote composer is replaced by path-free `File` copies, and DSH's own composer then takes its
+// byte path (`apply.ts` `path === ''` → `POST /api/session/uploadFileBinary`, which
+// lib/upload-route.mjs routes to the owning Host).
 //
 // What these tests hold:
 //  - the chunk's REGISTRATION ENVELOPE (`window.__ModuleLoader__.load({id, chunk, factory})`,
 //    measured in the installed terminal chunk) and the adapter reading the same text;
-//  - the spec's acceptance rows, against a FAKE bridge and a composer document shaped like
-//    the installed one (the picker is a SIBLING of `[data-composer-input]`, and DSH drains
-//    and resets it BEFORE intakeFiles — test/helpers.mjs `createFakeComposerDocument`);
-//  - R6 at pick time: the attribution is claimed from the capture phase of `change` and
-//    held for the whole pick batch; anything unproven keeps DSH's own answer AND is
-//    reported;
-//  - A1.2: the strict structural self-test (null, accessor, hidden key, symbol, shape),
-//    no wrap on any mismatch, exact restore of the bridge member, another instance's
-//    overwrite left alone, and — the reviewer finding of 2026-11-16 — a member that cannot
-//    be replaced in place is `bridge-frozen`: the global binding is NEVER re-pointed at a
-//    delegating object (installed `apply.ts:504` captures the bridge once per composer
-//    inject, so a re-point reaches no composer that was already rendered);
-//  - the seam re-measured against the INSTALLED DSH's own shipped sources (`apply.ts`, the
-//    built `client.js`, the preload, the chunk loader), so an upgrade that moves it fails
-//    here instead of silently turning remote picks back into mentions.
+//  - the mechanism against the REAL domain, on a page shaped like the installed composer with
+//    real `File` objects and a replaceable picker list: DSH's own handler, reading the list in
+//    BUBBLE order after the capture phase, sees the copies;
+//  - the decision table: remote + a non-image file → every pick re-materialized; local,
+//    unproven, image-only → untouched; DSH's own outcome per row;
+//  - the visible refusals: no `DataTransfer`/`File`, and an installed DSH whose sources no
+//    longer read the file list the way the mechanism needs (`dsh-incompatible`);
+//  - R6: attribution is read from the picker's own composer, in the composer region;
+//  - the seam re-measured against the INSTALLED DSH's own shipped sources (`InputBar.tsx`,
+//    `apply.ts`, `preload-app.cjs`, the file-upload client, the chunk loader), so an upgrade
+//    that moves it fails here instead of silently turning remote picks back into mentions.
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -35,13 +38,18 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import * as shared from '../lib/remote-file-attach.mjs'
 import { PINNED_DSH_VERSION } from '../lib/host-router.mjs'
 import { splitTaggedSessionId as carrierSplit } from '../lib/upload-route.mjs'
-import { createFakeComposerDocument, dispatchIntake, pickFiles, settleMicrotasks } from './helpers.mjs'
+import {
+  PICKED_ORIGIN, createFakeComposerDocument, createLivePage,
+  createWebPage, dispatchIntake, installFileListStub, livePick, picked, pickFiles, settleMicrotasks,
+} from './helpers.mjs'
+
+// Node has `File` and `Blob` but no `FileList`; a browser's `input.files = dt.files` needs one.
+installFileListStub()
 
 /**
  * One realm per test — what each DSH renderer gets (its own page): the module keeps ONE
- * instance per global in a WeakMap, which is right for a page and wrong for a test file
- * that runs many "pages" through one realm (a later page's document would answer an earlier
- * page's pick). Each call reloads the adapter and binds it to the pages that test creates.
+ * instance per global in a WeakMap, which is right for a page and wrong for a test file that
+ * runs many "pages" through one realm. Each call reloads the adapter.
  */
 const ADAPTER_URL = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'remote-file-attach.mjs')).href
 let realmCount = 0
@@ -49,11 +57,19 @@ async function newRealm() {
   realmCount += 1
   const realm = await import(`${ADAPTER_URL}?realm=${realmCount}`)
   return {
-    /** A fake page bound to THIS realm, knowing the bridge its composer reads. */
-    page(holder, options) {
-      const fake = createFakeComposerDocument(options)
-      fake.document.holder = holder
-      return fake
+    /** A real-file page (spec 033's live mechanism) bound to THIS realm. */
+    live(box, deps = {}) {
+      // `picker`/`hero` are part of the page's box (a page-level input, a session-less composer).
+      const shape = { ...box }
+      delete shape.web
+      const made = box.web === true ? createWebPage(shape) : createLivePage(shape)
+      // The attachment module only needs the installed-DSH self-test where a path can exist.
+      const readFile = box.web === true ? undefined : (relative) => CONTRACT_SOURCES[relative] ?? null
+      const attach = realm.remoteFileIntakeFor({ global: made.holder, doc: made.document, log: () => {}, ...(readFile === undefined ? {} : { readFile }), ...deps })
+      made.document.addEventListener(realm.PICK_EVENT, (event) => {
+        if (event.currentTarget === made.document) realm.adoptPickerFrom(attach, event)
+      }, true)
+      return { ...made, attach }
     },
     route(holder, doc) { return realm.remoteFileIntakeFor({ global: holder, doc, log: () => {} }) },
     install(holder) { return realm.installRemoteFileIntake({ global: holder, doc: null, log: () => {} }) },
@@ -78,105 +94,29 @@ const PACKAGE = `${APP}/dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation
 const BUILT = `${PACKAGE}/lib/client.js`
 const APPLY = `${PACKAGE}/src/client/apply.ts`
 const INTAKE = `${PACKAGE}/src/client/skeleton/InputBar.tsx`
+const UPLOAD_CLIENT = `${APP}/dsh/node_modules/@deepseek-ai/dsh-client-file-upload/lib/client.js`
 const MODULES = `${APP}/dsh/node_modules/@deepseek-ai/dsh-client-modules`
 const TERMINAL_CHUNK = `${APP}/dsh/node_modules/@deepseek-ai/dsh-client-ui-sidebar-terminal/lib/client.terminal.js`
 const installed = () => fs.existsSync(PRELOAD) && fs.existsSync(BUILT) && fs.existsSync(APPLY) && fs.existsSync(INTAKE)
 
-const zip = () => ({ name: 'bundle.zip', type: 'application/zip', size: 11917 })
-const image = () => ({ name: 'shot.png', type: 'image/png', size: 1200 })
-const folder = () => ({ name: 'folder', type: 'inode/directory', size: 0 })
+/** DSH's own sources, as the in-page self-test reads them (`lib/client.js servedSourceReader`). */
+const CONTRACT_SOURCES = Object.freeze({
+  'dsh-client-ui-conversation/src/client/skeleton/InputBar.tsx': fs.readFileSync(INTAKE, 'utf8'),
+  'dsh-client-ui-conversation/src/client/apply.ts': fs.readFileSync(APPLY, 'utf8'),
+  'dsh-client-file-upload/lib/client.js': fs.readFileSync(UPLOAD_CLIENT, 'utf8'),
+})
+
+const zipFile = () => new File([new Uint8Array([80, 75, 3, 4, 1, 2, 3, 4])], 'bundle.zip', { type: 'application/zip', lastModified: 1700000000000 })
+const imageFile = () => new File([new Uint8Array([137, 80, 78, 71])], 'shot.png', { type: 'image/png' })
+const folderFile = () => new File([], 'folder', { type: 'inode/directory' })
 const DOWNLOADS = 'C:\\Users\\owner\\Downloads'
 
-/**
- * DSH's bridge as the preload exposes it: one own key, an ARROW `pathFor` that ignores
- * `this` (`preload-app.cjs` @119676, `pathFor: (file) => electron.webUtils.getPathForFile(file)`).
- */
-function bridgeGlobal({ frozen = false, dir = DOWNLOADS } = {}) {
-  const bridge = { pathFor: (file) => `${dir}\\${file.name}` }
-  if (frozen) Object.freeze(bridge)
-  const holder = {}
-  Object.defineProperty(holder, HOST_PATHS, { value: bridge, writable: !frozen, configurable: !frozen, enumerable: false })
-  return { holder, bridge, dir }
-}
+/** The preload's answer for a file, and `''` for a `File` this page built (no backing path). */
+const bridgePathFor = (holder, file) => (file instanceof File ? holder.__DSH_HOST_PATHS__.pathFor(file) : `not-a-file:${String(file)}`)
 
-/** DSH's preload for a non-file: `getPathForFile` answers `""` (`preload-app.cjs` @119676). */
-const fileBridge = (dir = DOWNLOADS) => ({ pathFor: (file) => (file === null || file === undefined ? '' : `${dir}\\${file.name}`) })
-
-/**
- * A bridge whose own `pathFor` cannot be replaced while the global binding still can:
- * the shape that used to reach the delegating install. Written out rather than passed as
- * `frozen`, because that switch freezes BOTH, and the reviewer finding is about the
- * member alone.
- */
-function immutableMember({ dir = DOWNLOADS } = {}) {
-  const bridge = {}
-  Object.defineProperty(bridge, 'pathFor', { value: (file) => `${dir}\\${file.name}`, writable: false, configurable: false, enumerable: true })
-  const holder = {}
-  Object.defineProperty(holder, HOST_PATHS, { value: bridge, writable: true, configurable: true, enumerable: false })
-  return { holder, bridge, dir }
-}
-
-/**
- * DSH's own per-file outcome, transcribed from `addFiles` in the installed `apply.ts` —
- * the parts a pick can take: the bytes (upload), the mention of a path, or DSH's own
- * refusal.
- */
-function dshPick(pathFor, file) {
-  const directory = file.type === 'inode/directory'
-  const answer = pathFor(file)
-  const filePath = answer ?? ''
-  if (directory && filePath === '') return { kind: 'refused', reason: 'attachment.pathUnavailable' }
-  if (filePath === '' || (!directory && /^image\//.test(file.type))) return { kind: 'upload' }
-  return { kind: 'mention', ref: `@"${filePath}"` }
-}
-
-/**
- * One pick exactly as DSH runs it: the capture listener claims the batch (what
- * `lib/client.js` installs), DSH's own handler drains and resets the picker, and `pathFor`
- * answers every file — through whichever bridge is passed in. That is DSH's own shape, not
- * a test convenience: `apply.ts` reads `hostPathBridge()` ONCE per composer inject
- * (`:504`) and calls `bridge?.pathFor(file)` (`:520`), so a composer rendered before any
- * later install keeps the object it captured.
- * @param {object} bridge what one composer holds
- * @returns {Array<{kind: string, ref?: string, reason?: string}>} DSH's own outcome per file
- */
-/**
- * One pick exactly as DSH runs it: the capture listener claims the batch (what
- * `lib/client.js` installs), DSH's own handler drains and resets the picker, then DSH's own
- * loop — announced first, `dispatchIntake`, as the installed `apply.ts` `addFiles` does it —
- * asks the bridge for every file. That is DSH's own shape, not a test convenience: `apply.ts`
- * reads `hostPathBridge()` ONCE per composer inject (`:504`) and calls `bridge?.pathFor(file)`
- * (`:520`), so a composer rendered before any later install keeps the object it captured.
- * @param {object} bridge what one composer holds
- * @returns {Array<{kind: string, ref?: string, reason?: string}>} DSH's own outcome per file
- */
-function pick(realm, route, document, picker, files = [zip()], bridge = document.holder[HOST_PATHS]) {
-  const listener = (event) => { realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    return pickFiles(document, picker, files, (file) => dshPick((picked) => bridge.pathFor(picked), file),
-      (handed) => dispatchIntake(document, handed))
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
-  }
-}
-
-/**
- * One capture with the files STILL in the picker and no answer yet: the state a queued
- * microtask can observe before DSH's own loop asks its bridge (`pickFiles` drains the picker
- * before it answers, so it cannot express this turn).
- */
-function fileInputFiles(picker, files) {
-  picker.files = Object.assign([...files], { item: (index) => files[index] ?? null })
-  picker.value = 'picked'
-}
-
-/** A hidden file input of another document (browser chrome): it is not in this page. */
-function makeForeignPicker() {
-  const other = createFakeComposerDocument({ sessions: [LOCAL] }).composers[0].fileInput
-  let at = other
-  while (at !== null && at !== undefined) { at.ownerDocument = { contains: () => false }; at = at.parent }
-  return other
+/** A bridge whose answer is DSH's own, for a realm whose consents this file writes itself. */
+function fileBridge(dir = DOWNLOADS) {
+  return { pathFor: (file) => (file?.origin === PICKED_ORIGIN ? `${dir}\\${file.name}` : '') }
 }
 
 // --------------------------------------------------------------- the envelope
@@ -202,79 +142,189 @@ test('the chunk ships in DSH\'s own registration envelope and the adapter reads 
   // `loadChunk` throws on a wrong count, id, chunk or factory), so these exports ARE the
   // factory's return value.
   assert.equal(typeof shared.remoteFileIntakeFor, 'function')
-  assert.equal(typeof shared.HOST_PATHS_ORIGINAL, 'symbol')
+  assert.equal(typeof shared.canRematerialize, 'function')
+})
+
+test('the chunk wraps nothing: no bridge member is written, and a frozen contextBridge bridge is left alone', async () => {
+  const realm = await newRealm()
+  const { holder, attach } = realm.live({ sessions: [TAGGED] })
+  const bridge = holder[HOST_PATHS]
+  const before = Object.getOwnPropertyDescriptor(bridge, 'pathFor')
+  assert.equal(attach.install().state, 'active')
+  // The old mechanism had a wrapper with an `ORIGINAL` symbol and a status `shape` of
+  // `in-place`/`frozen`; both are gone with it, and the preload's object is untouched.
+  assert.equal(shared.HOST_PATHS_ORIGINAL, undefined, 'no wrapper marker is exported any more')
+  assert.equal(shared.hostPathsSelfTest, undefined, 'no bridge self-test: nothing is wrapped')
+  assert.equal(shared.hostPathsRootOriginal, undefined)
+  assert.equal(Object.getOwnPropertyDescriptor(bridge, 'pathFor').value, before.value, 'the bridge\'s own function')
+  for (const key of ['writable', 'enumerable', 'configurable']) assert.equal(Object.getOwnPropertyDescriptor(bridge, 'pathFor')[key], before[key], key)
+  assert.equal(Object.isFrozen(bridge), true, 'the fixture is the frozen contextBridge copy')
 })
 
 // ------------------------------------------------------------- the acceptance
 
-test('remote session + zip: bytes, never the controller path (R1)', async () => {
+test('remote session + zip: DSH\'s own handler receives a path-free File, so the pick uploads (R1)', async () => {
   const realm = await newRealm()
-  const { holder } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  assert.deepEqual(route.install(),
-    { surface: HOST_PATHS, wrapped: true, reason: null, shape: 'in-place', calls: 0 })
-  // `''` is the answer whose bytes then travel the route lib/upload-route.mjs wraps; the
-  // tagged id in that request's query is what turns it into `remote-upload-*` frames.
-  assert.deepEqual(pick(realm, route, document, composers[0].fileInput), [{ kind: 'upload' }])
-  assert.equal(composers[0].intake.picked.length, 1, 'DSH\'s own intake still received the file')
-  const query = new URLSearchParams({ sessionId: TAGGED })
-  assert.deepEqual(carrierSplit(query.get('sessionId')), { hostId: HOST_ID, sessionId: 's-1' })
-  assert.equal(route.status().calls, 1, 'the page can see the wrap being used')
-  assert.equal(route.lastPick, null, 'a remote pick uploads, so there is no refusal to report')
+  const { holder, document, composers, attach } = realm.live({ sessions: [LOCAL, TAGGED] })
+  assert.deepEqual(attach.install(), { surface: HOST_PATHS, shape: 'measured', picks: 0, uploaded: 0, state: 'active', reason: null })
+  const zip = picked(zipFile())
+  let handed = []
+  // DSH's own outcome for what its handler reads: a path-free File takes the byte upload, the
+  // picked File keeps its path (`bridgePathFor` answers what the preload would). Without the
+  // capture-phase replacement (`pathFor: () => ''`) the live page shows `mention` instead —
+  // that fixture's own control below.
+  const answers = livePick(document, composers[1].fileInput, [zip], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.deepEqual(answers.map((answer) => answer.kind), ['upload'])
+  assert.equal(handed.length, 1)
+  const copy = handed[0]
+  assert.notEqual(copy, zip, 'DSH got a copy, not the picked File the bridge could name')
+  assert.ok(copy instanceof File)
+  assert.equal(copy.name, 'bundle.zip')
+  assert.equal(copy.type, 'application/zip')
+  assert.equal(copy.size, zip.size, 'the same bytes')
+  assert.equal(copy.lastModified, 1700000000000, 'the same timestamp')
+  assert.equal(holder[HOST_PATHS].pathFor(copy), '', 'and the preload has no path for it: "" is DSH\'s upload answer')
+  // The tagged id is what the upload route turns into `remote-upload-*` frames for that Host.
+  assert.deepEqual(carrierSplit(TAGGED), { hostId: HOST_ID, sessionId: 's-1' })
+  assert.deepEqual(attach.status(), { surface: HOST_PATHS, shape: 'measured', picks: 1, uploaded: 1, state: 'active', reason: null })
+  assert.equal(attach.lastPick, null, 'a remote pick uploads, so there is no refusal to report')
 })
 
-test('local session: the pick keeps DSH\'s own answer (R2)', async () => {
+test('local session: DSH\'s own File object, DSH\'s own path (R2)', async () => {
   const realm = await newRealm()
-  const { holder } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [LOCAL] })
-  const route = realm.route(holder, document)
-  route.install()
-  assert.deepEqual(pick(realm, route, document, composers[0].fileInput), [{ kind: 'mention', ref: `@"${DOWNLOADS}\\bundle.zip"` }])
-  assert.equal(route.lastPick, 'certain', 'attribution was certain; this pick is simply local')
-  assert.equal(route.takeNotice().sessionId, LOCAL, 'the page can say it was not uploaded')
+  const { holder, document, composers, attach } = realm.live({ sessions: [LOCAL] })
+  attach.install()
+  const zip = picked(zipFile())
+  let handed = []
+  const answers = livePick(document, composers[0].fileInput, [zip], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.deepEqual(answers.map((answer) => answer.kind), ['mention'])
+  assert.equal(handed[0], zip, 'the very object the user picked')
+  assert.equal(attach.lastPick, 'certain', 'the attribution was certain; this pick is simply local')
+  assert.equal(attach.takeNotice().sessionId, LOCAL, 'and the page can say it was not uploaded')
 })
 
-test('image: unchanged, because DSH uploads an image whatever the path says (R2)', async () => {
+test('images only, in a remote session: untouched (DSH uploads an image whatever the path says) (R2)', async () => {
   const realm = await newRealm()
-  const { holder } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  route.install()
-  const [answer] = pick(realm, route, document, composers[0].fileInput, [image()])
-  assert.equal(answer.kind, 'upload', 'apply.ts: an image uploads with a path too')
-  assert.equal(answer.ref, undefined)
-  assert.equal(route.status().calls, 1)
-  assert.equal(route.lastPick, 'certain')
+  const { holder, document, composers, attach } = realm.live({ sessions: [TAGGED] })
+  attach.install()
+  const image = picked(imageFile())
+  let handed = []
+  livePick(document, composers[0].fileInput, [image], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.equal(handed[0], image, 'the image keeps its own object: nothing about its outcome changes')
+  assert.equal(attach.lastPick, 'certain')
+  assert.equal(attach.status().uploaded, 0)
 })
 
-test('directory: DSH\'s own pathUnavailable, never a mention the Host cannot read (R3)', async () => {
+test('a batch is re-materialized WHOLE: an image beside a zip loses its path too, so DSH creates every draft', async () => {
   const realm = await newRealm()
-  const { holder } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  route.install()
-  const [answer] = pick(realm, route, document, composers[0].fileInput, [folder()])
-  // `''` is the only answer that reaches `attachment.pathUnavailable`; a path would become a
-  // folder chip for a Host that cannot read it, and a relative path would be `@folder/`.
-  assert.deepEqual(answer, { kind: 'refused', reason: 'attachment.pathUnavailable' })
-  assert.equal(shared.isUploadableFile(folder()), false)
-  assert.equal(route.takeNotice().sessionId, TAGGED)
+  const { holder, document, composers, attach } = realm.live({ sessions: [TAGGED] })
+  attach.install()
+  const image = picked(imageFile())
+  const zip = picked(zipFile())
+  let handed = []
+  // `apply.ts` returns from the loop on the FIRST file whose path cannot be used and only then
+  // creates the upload drafts — so a batch DSH accepts as bytes must have no path at all, and
+  // the image, whose own outcome never depended on a path, is a copy too.
+  const answers = livePick(document, composers[0].fileInput, [image, zip], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.deepEqual(answers.map((answer) => answer.kind), ['upload', 'upload'])
+  assert.equal(handed[0] === image || handed[1] === image, false, 'the image is a copy as well')
+  assert.equal(handed[1] === zip || handed[0] === zip, false)
+  assert.deepEqual(handed.map((file) => file.name), ['shot.png', 'bundle.zip'], 'picker order is kept')
 })
 
-test('a frozen bridge: no wrap, and the reason is visible before any pick (R5)', async () => {
+test('a directory keeps its own object: DSH\'s directory rule is not this mechanism\'s business (R3)', async () => {
   const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal({ frozen: true })
-  const { document } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  assert.deepEqual(route.install(), { surface: HOST_PATHS, wrapped: false, reason: 'bridge-frozen', shape: null, calls: 0 })
-  assert.equal(bridge.pathFor(zip()), `${DOWNLOADS}\\bundle.zip`, 'DSH keeps its own behaviour')
-  assert.equal(route.status().reason, 'bridge-frozen', 'measured every time it is asked')
+  const { holder, document, composers, attach } = realm.live({ sessions: [TAGGED] })
+  attach.install()
+  const folder = picked(folderFile())
+  const zip = picked(zipFile())
+  let handed = []
+  livePick(document, composers[0].fileInput, [folder], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.equal(handed[0], folder, 'a copy would carry no filesystem entry at all')
+  livePick(document, composers[0].fileInput, [folder, zip], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.equal(handed[0], folder, 'the directory still')
+  assert.notEqual(handed[1], zip, 'the file beside it uploads like any other remote file')
+})
+
+test('a mixed drop with no remote file at all (local session) is untouched', async () => {
+  const realm = await newRealm()
+  const { document, composers, attach } = realm.live({ sessions: [LOCAL] })
+  attach.install()
+  const image = picked(imageFile())
+  const zip = picked(zipFile())
+  let handed = []
+  livePick(document, composers[0].fileInput, [image, zip], (file) => (file.origin === 'picked' ? `${DOWNLOADS}\\${file.name}` : ''), (pickedFiles) => { handed = pickedFiles })
+  assert.deepEqual(handed, [image, zip])
+})
+
+// ------------------------------------------------------- the visible refusals
+
+test('no DataTransfer or no File: nothing is changed, and the page says why (browser-unavailable)', async () => {
+  const cases = [
+    ['DataTransfer', (holder) => { holder.DataTransfer = undefined }],
+    ['File', (holder) => { holder.File = undefined }],
+    ['a DataTransfer that drops what it is given', (holder) => {
+      holder.DataTransfer = class { constructor() { this.items = { add() {} } } get files() { return Object.assign([], { item: () => null }) } }
+    }],
+  ]
+  for (const [name, breakRealm] of cases) {
+    const realm = await newRealm()
+    const { holder, document, composers, attach } = realm.live({ sessions: [TAGGED] })
+    breakRealm(holder)
+    assert.deepEqual(attach.install(), { surface: HOST_PATHS, shape: null, picks: 0, uploaded: 0, state: 'unavailable', reason: 'browser-unavailable' }, name)
+    const zip = picked(zipFile())
+    let handed = []
+    const answers = livePick(document, composers[0].fileInput, [zip], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+    assert.equal(handed[0], zip, `${name}: DSH's own pick stands`)
+    assert.deepEqual(answers.map((answer) => answer.kind), ['mention'], name)
+    assert.equal(attach.lastPick, 'browser-unavailable', `${name}: and the pick says why nothing was uploaded`)
+    assert.deepEqual(attach.takeNotice(), { reason: 'browser-unavailable', sessionId: TAGGED, sites: 1, intake: null })
+  }
+})
+
+test('the installed DSH contract is asserted from disk, and a changed contract is reported as not composed', async () => {
+  const realm = await newRealm()
+  // Activation is the install: the page never fetches DSH sources (they are not served), so an
+  // unreadable tree cannot disable the feature. The contract is still asserted — in the tests —
+  // from the installed sources on disk (see CONTRACT_SOURCES), and `dshContract` reports each
+  // pattern it could not find instead of throwing.
+  const { attach } = realm.live({ sessions: [TAGGED] })
+  assert.deepEqual(attach.install(), { surface: HOST_PATHS, shape: 'measured', picks: 0, uploaded: 0, state: 'active', reason: null },
+    'installing never waits on a source read')
+  // A contract whose sources no longer say what the mechanism rests on is reported, pattern by
+  // pattern, rather than silently assumed:
+  const changed = (relative, text) => (other) => (other === relative ? text : CONTRACT_SOURCES[other])
+  const cases = [
+    ['InputBar.tsx no longer reads e.target.files first', 'composer', changed('dsh-client-ui-conversation/src/client/skeleton/InputBar.tsx', 'const picked = e.target.files ?? [];')],
+    ['apply.ts no longer uploads a path-less file', 'composed', changed('dsh-client-ui-conversation/src/client/apply.ts', 'if (path === null) { uploads.push(file); continue }')],
+    ['the upload client stopped posting the file', 'upload', changed('dsh-client-file-upload/lib/client.js', 'return send(data)')],
+  ]
+  for (const [name, field, readFile] of cases) {
+    const contract = shared.dshContract(readFile)
+    assert.equal(contract[field], false, `${name}: a changed contract is never composed`)
+  }
+  // The chunk runs in this realm (`runInThisContext`), so one plain object either side:
+  assert.deepEqual({ ...shared.dshContract((relative) => CONTRACT_SOURCES[relative]) }, { composed: true, composer: true, upload: true, read: true })
+  // Nothing readable: `read: false` is the fact (nothing claimed), and nothing is composed.
+  assert.deepEqual({ ...shared.dshContract(() => null) }, { composed: true, composer: true, upload: true, read: false },
+    'nothing readable: not measured, so no claim either way')
+})
+
+test('the Web GUI (no bridge): no contract to read, and every remote pick still re-materializes', async () => {
+  const realm = await newRealm()
+  const { holder, document, composers, attach } = realm.live({ sessions: [TAGGED], web: true })
+  assert.equal(HOST_PATHS in holder, false)
+  assert.deepEqual(attach.install(), { surface: HOST_PATHS, shape: 'no-bridge', picks: 0, uploaded: 0, state: 'active', reason: null })
+  const zip = zipFile()
+  let handed = []
+  const answers = livePick(document, composers[0].fileInput, [zip], () => '', (pickedFiles) => { handed = pickedFiles })
+  assert.notEqual(handed[0], zip)
+  assert.deepEqual(answers.map((answer) => answer.kind), ['upload'])
 })
 
 // ----------------------------------------------------------------- attribution
 
-test('the picker is a SIBLING of the composer input, and DSH empties it BEFORE pathFor runs', async () => {
+test('the picker is a SIBLING of the composer input, and DSH reads the list BEFORE pathFor ever runs', async () => {
   const realm = await newRealm()
   const { document, composers } = createFakeComposerDocument({ sessions: [LOCAL, TAGGED] })
   const { card, row, input, tools, fileInput } = composers[1]
@@ -285,14 +335,14 @@ test('the picker is a SIBLING of the composer input, and DSH empties it BEFORE p
   assert.equal(row.parent, card, '…and that row shares the composer card with the input')
   assert.equal(realm.composerContainerOf(fileInput), card, 'the container is the deepest element holding both')
   assert.deepEqual(realm.attributionOfPicker(fileInput), { state: 'certain', sessionId: TAGGED, sites: 2, view: composers[1].root, container: card })
-  // The order that breaks any `.files`-based attribution: DSH's own listener (registered per
-  // picker by the fake) runs in the bubble phase and resets the picker before
-  // `intakeFiles(picked)` hands the files to `addFiles`, where `pathFor` is called.
+  // The order the capture phase relies on: DSH's own handler drains `.files` and resets the
+  // picker before it hands the files to `addFiles`, so the capture phase is the last moment a
+  // replacement could still be seen.
   let seen = null
   document.addEventListener('change', (event) => {
     if (event.currentTarget === document) seen = event.target.files?.length
   }, true)
-  pickFiles(document, fileInput, [zip()], () => {
+  pickFiles(document, fileInput, [{ name: 'bundle.zip', type: 'application/zip', size: 11917 }], () => {
     assert.equal(fileInput.files, null, 'by the time pathFor runs, DSH has reset the picker')
     assert.equal(fileInput.value, '')
     return ''
@@ -301,234 +351,75 @@ test('the picker is a SIBLING of the composer input, and DSH empties it BEFORE p
   assert.equal(composers[1].intake.picked.length, 1, 'and DSH itself still, correctly, got the file')
 })
 
-test('R6: a claim from the capture phase attributes each pick to its composer, across the reset', async () => {
+test('R6: the pick is attributed to ITS composer — the second composer\'s pick never takes the first\'s session', async () => {
   const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [LOCAL, TAGGED] })
-  const route = realm.route(holder, document)
-  route.install()
-  const listener = (event) => { realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    // Remote composer: the claim survives DSH's drain-and-reset, so the answer is `''`.
-    assert.deepEqual(pickFiles(document, composers[1].fileInput, [zip()], (file) => bridge.pathFor(file)), [''])
-    // Local composer: the same mechanism answers DSH's own path.
-    assert.deepEqual(pickFiles(document, composers[0].fileInput, [zip()], (file) => bridge.pathFor(file)), [`${DOWNLOADS}\\bundle.zip`])
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
-  }
-  assert.equal(route.status().calls, 2, 'each pick reached this wrap exactly once')
-  await new Promise((resolve) => setTimeout(resolve, 0))
-  assert.equal(route.pendingPick, null, 'and each one-file batch ended on its own answer')
+  const { holder, document, composers, attach } = realm.live({ sessions: [LOCAL, TAGGED] })
+  attach.install()
+  let handed = []
+  const zipLocal = picked(zipFile())
+  livePick(document, composers[0].fileInput, [zipLocal], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.equal(handed[0], zipLocal, 'the local composer keeps its own File')
+  const zipRemote = picked(zipFile())
+  livePick(document, composers[1].fileInput, [zipRemote], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.notEqual(handed[0], zipRemote, 'the remote composer\'s pick is a copy')
+  assert.equal(attach.claimedPicks, 2)
+  assert.equal(attach.endedPicks, 1)
 })
 
-test('R6: a multi-file batch keeps its attribution for every file', async () => {
+test('R6: a picker outside every composer, and a hero with no session, are no claim', async () => {
   const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [LOCAL, TAGGED] })
-  const route = realm.route(holder, document)
-  route.install()
-  const listener = (event) => { realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    // DSH's `onPickFiles` drains the FileList into an array, resets `value`, then
-    // `addFiles` loops the array synchronously: one claim, several pathFor calls.
-    const answers = pickFiles(document, composers[1].fileInput, [zip(), { name: 'notes.txt', type: 'text/plain', size: 3 }, image()],
-      (file) => bridge.pathFor(file))
-    assert.deepEqual(answers, ['', '', `${DOWNLOADS}\\shot.png`], 'every non-image file of the batch uploads; the image keeps its path')
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
+  {
+    const { holder, document, loosePicker, attach } = realm.live({ sessions: [TAGGED], picker: true })
+    attach.install()
+    const zip = picked(zipFile())
+    let handed = []
+    livePick(document, loosePicker, [zip], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+    assert.equal(handed[0], zip, 'DSH\'s own pick')
+    assert.equal(attach.lastPick, 'picker-elsewhere')
   }
-})
-
-test('R6: one pick and then a call with no pick of its own — never pick A\'s session', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  route.install()
-  const listener = (event) => { realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    // Pick A is claimed, then answered — and its one-file batch ends with that answer.
-    assert.deepEqual(pickFiles(document, composers[0].fileInput, [zip()], (file) => bridge.pathFor(file)), [''])
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    assert.equal(route.pendingPick, null, 'one answer ended the one-file batch')
-    // A later call with no pick behind it (a drop, a paste, an unclaimed file) keeps DSH's
-    // own answer and says so; it never inherits pick A's remote session.
-    assert.equal(bridge.pathFor(zip()), `${DOWNLOADS}\\bundle.zip`, 'DSH\'s own answer')
-    assert.equal(route.takeNotice().reason, 'no-document', 'and the page says which state it was')
-    // A picker outside the document: the event saw a file input it cannot place.
-    const elsewhere = makeForeignPicker()
-    assert.equal(realm.adoptPickerFrom(route, { type: 'change', target: elsewhere, timeStamp: 2001 }).state, 'picker-document')
-    assert.equal(bridge.pathFor(zip()), `${DOWNLOADS}\\bundle.zip`)
-    assert.equal(route.lastPick, 'picker-document')
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
-  }
-})
-
-test('R6: a picker outside every composer is not a composer pick', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, loosePicker } = realm.page(holder, { sessions: [TAGGED], picker: true })
-  const route = realm.route(holder, document)
-  route.install()
-  let claimed = null
-  const listener = (event) => { claimed = realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    assert.deepEqual(pickFiles(document, loosePicker, [zip()], (file) => bridge.pathFor(file)), [`${DOWNLOADS}\\bundle.zip`])
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
-  }
-  assert.equal(claimed.state, 'picker-elsewhere', 'the capture phase saw a pick from no composer')
-  assert.equal(route.lastPick, 'picker-elsewhere', 'and the page says so')
-})
-
-test('R6: a batch DSH refuses BEFORE pathFor answers once never claims a later call', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [LOCAL, TAGGED] })
-  const route = realm.route(holder, document)
-  route.install()
-  let claimed = null
-  const listener = (event) => { claimed = realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    // Locked, busy, denied, the image limit, an emptied picker: the `change` fires — DSH's own
-    // bubble handler runs, because the fake picker always dispatches — and DSH never asks its bridge.
-    assert.equal(claimed, null)
-    assert.deepEqual(pickFiles(document, composers[1].fileInput, [], (file) => bridge.pathFor(file)), [])
-    assert.equal(claimed.state, 'certain', 'the picker was claimed for the REMOTE composer')
-    assert.equal(route.pendingPick.pending, false, 'and no pathFor answered it')
-    await settleMicrotasks()
-    // A later turn, an unattributed call keeps DSH\'s own answer: never the refused pick\'s session.
-    assert.equal(bridge.pathFor(zip()), `${DOWNLOADS}\\bundle.zip`)
-    assert.equal(route.lastPick, 'no-document')
-    assert.equal(route.takeNotice().reason, 'no-document')
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
-  }
-})
-
-test('R6 (reviewer round 4): the claim is bound to the picked FILES — an unrelated file before expiry keeps DSH\'s path', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED, LOCAL] })
-  const route = realm.route(holder, document)
-  route.install()
-  const listener = (event) => { realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    const picked = zip()
-    // The capture phase binds the claim to the exact File objects still in the picker.
-    fileInputFiles(composers[0].fileInput, [picked])
-    document.dispatch({ type: 'change', target: composers[0].fileInput, timeStamp: 4000 })
-    assert.equal(route.pendingPick.files, 1, 'one file was captured with the claim')
-    // A queued microtask answers an UNRELATED file before DSH's own loop asks about the pick:
-    // it is not this pick, so it keeps DSH's native answer.
-    let unrelated = null
-    queueMicrotask(() => { unrelated = bridge.pathFor({ name: 'other.txt', type: 'text/plain', size: 5 }) })
-    // Inside the turn the claim holds: DSH's own loop then asks about the file that WAS picked,
-    // and that one uploads — the unrelated call did not spend the pick.
-    const pickedAnswer = bridge.pathFor(picked)
-    await settleMicrotasks()
-    assert.equal(unrelated, `${DOWNLOADS}\\other.txt`, 'the unrelated file keeps DSH\'s own path')
-    assert.equal(pickedAnswer, '', 'the picked file uploads, even after an unrelated call in its turn')
-    // The turn is over: nothing of the pick answers a later call, the picked file's own repeat
-    // included.
-    assert.equal(bridge.pathFor(picked), `${DOWNLOADS}\\bundle.zip`, 'the batch is over: DSH\'s own answer')
-    assert.equal(bridge.pathFor(image()), `${DOWNLOADS}\\shot.png`)
-    await settleMicrotasks()
-    assert.equal(route.pendingPick, null, 'and the pick is over with its turn')
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
-  }
-})
-
-test('R6 (reviewer round 4): a batch DSH refuses before pathFor, then an unrelated microtask call — native path', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [LOCAL, TAGGED] })
-  const route = realm.route(holder, document)
-  route.install()
-  const listener = (event) => { realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    // The user picks for the REMOTE composer, and DSH refuses the batch before asking at all
-    // (a locked composer, the image limit, an emptied picker).
-    const refused = zip()
-    fileInputFiles(composers[1].fileInput, [refused])
-    document.dispatch({ type: 'change', target: composers[1].fileInput, timeStamp: 4100 })
-    assert.equal(route.pendingPick.sessionId, TAGGED, 'the pick WAS claimed for the remote composer')
-    // A queued microtask then calls pathFor for something else entirely — before the claim's
-    // macrotask ends it. It used to spend the claim and answer '' for a local file.
-    let unrelated = null
-    queueMicrotask(() => { unrelated = bridge.pathFor({ name: 'notes.txt', type: 'text/plain', size: 3 }) })
-    // DSH's own loop never asks about the pick: nothing consumes it, and its owned turn (the
-    // microtasks the capture queued) is over.
-    await Promise.resolve()
-    assert.equal(unrelated, `${DOWNLOADS}\\notes.txt`, 'DSH\'s own path, never "upload these bytes"')
-    // Nothing is ended early for it: the pick is still the claim's, no answer consumed it.
-    assert.equal(route.pendingPick.files, 1, 'the refused pick is not spent on that call')
-    await settleMicrotasks()
-    assert.equal(route.pendingPick, null, 'the refused batch ends with its turn and task, as before')
-    assert.equal(bridge.pathFor({ name: 'later.txt', type: 'text/plain', size: 1 }), `${DOWNLOADS}\\later.txt`)
-    assert.equal(route.lastPick, 'no-document', 'and a later call has no claim at all')
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
+  {
+    const page = realm.live({ sessions: [], hero: true })
+    page.attach.install()
+    assert.equal(realm.attributionOfPicker(page.composers[0].fileInput).state, 'no-session')
+    const zip = picked(zipFile())
+    let handed = []
+    livePick(page.document, page.composers[0].fileInput, [zip], (file) => bridgePathFor(page.holder, file), (pickedFiles) => { handed = pickedFiles })
+    assert.equal(handed[0], zip)
+    assert.equal(page.attach.lastPick, 'no-session')
   }
 })
 
 test('R6: focus and "the only composer present" are not proof', async () => {
   const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  route.install()
-  // Nothing claimed (a drop, a paste, a direct call) — even with one composer and focus in it.
+  const { holder, document, composers, attach } = realm.live({ sessions: [TAGGED] })
+  attach.install()
   document.activeElement = composers[0].input
-  assert.equal(bridge.pathFor(zip()), `${DOWNLOADS}\\bundle.zip`)
-  assert.equal(route.lastPick, 'no-document', 'no claim: DSH\'s own behaviour, and the page says so')
-  assert.equal(route.takeNotice().reason, 'no-document')
+  const zip = picked(zipFile())
+  let handed = []
+  livePick(document, composers[0].fileInput, [zip], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.notEqual(handed[0], zip, 'the composer\'s own session view is what decides, and it is remote')
 })
 
-test('R6: a composer with no session view (hero) keeps DSH\'s behaviour, and says so', async () => {
+test('R6: a page-level composer card nested in a session view, with no composer seat, is never that session\'s composer', async () => {
+  // The R6 case this attribution exists for: a page container (a dialog, a start-page bar)
+  // holds a composer input, and the session view around it holds exactly ONE composer input —
+  // 2026-11-16 measurement: the old "only composer under an ancestor" reading passed this, so
+  // the pick would have been uploaded to the remote Host from an unrelated composer. Without a
+  // composer seat above the card's input bar there is nothing that says the card composes
+  // THAT session, so the answer is a refusal, never a claim.
   const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [], hero: true })
-  const route = realm.route(holder, document)
-  route.install()
-  assert.equal(realm.attributionOfPicker(composers[0].fileInput).state, 'no-session')
-  const listener = (event) => { realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    assert.deepEqual(pickFiles(document, composers[0].fileInput, [zip()], (file) => bridge.pathFor(file)), [`${DOWNLOADS}\\bundle.zip`])
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
-  }
-  assert.equal(route.lastPick, 'no-session', 'the hero has no session, and R6 never uploads for a guess')
-})
-
-test('R6: a claim whose composer unmounted before pathFor is a stale batch, not a session', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  route.install()
-  const listener = (event) => { realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    // The claim is made, then the composer leaves the document before pathFor runs.
-    document.dispatch({ type: 'change', target: composers[0].fileInput, timeStamp: 3000 })
-    document.remove(composers[0].root)
-    assert.equal(bridge.pathFor(zip()), `${DOWNLOADS}\\bundle.zip`)
-    assert.equal(route.lastPick, 'stale-batch')
-    assert.equal(route.takeNotice().reason, 'stale-batch')
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
-  }
+  const made = createLivePage({ sessions: [TAGGED], hidSeat: true, dialog: true })
+  assert.equal(made.document.querySelectorAll(realm.COMPOSER_INPUT_SELECTOR).length, 2, 'two composer inputs in the page')
+  assert.equal(made.document.querySelectorAll(realm.SESSION_VIEW_SELECTOR).length, 1, 'one session view')
+  assert.deepEqual(realm.attributionOfPicker(made.composers[0].fileInput),
+    { state: 'picker-elsewhere', sessionId: null, sites: 2, view: null, container: null })
+  const { holder, attach } = realm.live({ sessions: [TAGGED], hidSeat: true, dialog: true })
+  attach.install()
+  const zip = picked(zipFile())
+  let handed = []
+  livePick(holder.document ?? made.document, made.composers[0].fileInput, [zip], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.equal(handed[0], zip, 'DSH\'s own pick: nothing was claimed')
+  assert.equal(attach.lastPick, 'picker-elsewhere')
 })
 
 test('attributionOfPicker and composerSites read DSH\'s anchors and name every refusal', async () => {
@@ -554,321 +445,49 @@ test('attributionOfPicker and composerSites read DSH\'s anchors and name every r
 
 test('R6: an unrelated file input in the same session view, outside the composer region, is no claim', async () => {
   const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
   // The session view holds exactly ONE composer input — the shape the forbidden "only composer"
   // heuristic accepted — and an unrelated file input beside its seat, in the transcript.
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED], elsewhere: true })
+  const { document, composers } = createFakeComposerDocument({ sessions: [TAGGED], elsewhere: true })
   const { root, elsewhere } = composers[0]
   assert.equal(root.querySelectorAll(realm.COMPOSER_INPUT_SELECTOR).length, 1, 'one composer input in this session view')
   assert.equal(elsewhere.parent, root, 'the unrelated picker is in the same session view')
   assert.equal(elsewhere.closest(realm.COMPOSER_SEAT_SELECTOR), null, '…but outside the composer region')
-  // The walk never reached the session view (or the page) to find that one composer input.
   assert.equal(realm.composerContainerOf(elsewhere), null, 'no suite holds this picker inside a composer region')
   assert.deepEqual(realm.attributionOfPicker(elsewhere),
     { state: 'picker-elsewhere', sessionId: null, sites: 1, view: null, container: null })
-  const route = realm.route(holder, document)
-  route.install()
-  const listener = (event) => { realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    assert.deepEqual(pickFiles(document, elsewhere, [zip()], (file) => bridge.pathFor(file)),
-      [`${DOWNLOADS}\\bundle.zip`], 'DSH\'s own answer: the pick is not attributed to the session around it')
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
-  }
-  assert.equal(route.lastPick, 'picker-elsewhere', 'and the page says which state it was')
-  // The composer's own picker in that same view is still certain: the bound is the region, not the count.
   assert.deepEqual(realm.attributionOfPicker(composers[0].fileInput),
     { state: 'certain', sessionId: TAGGED, sites: 1, view: root, container: composers[0].card })
 })
 
-test('R6: a picker outside the composer card, in a page container that also holds a composer input, is no claim', async () => {
+test('attributionOfPicker refuses a picker from another document', async () => {
   const realm = await newRealm()
-  // The same card markup mounted with its own composer input but NO composer region above it
-  // (a dialog or a start-page bar), beside the session view that holds the real composer: the
-  // ladder sees the session and the page each holding composer inputs, so nothing above the card
-  // is "the one that holds exactly one", and the count is exactly what must not decide.
-  const { holder } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED], hidSeat: true, dialog: true })
-  assert.equal(document.querySelectorAll(realm.COMPOSER_INPUT_SELECTOR).length, 2, 'two composer inputs in the page')
-  assert.equal(composers[0].root.querySelectorAll(realm.COMPOSER_INPUT_SELECTOR).length, 1, 'one under the session view')
-  assert.equal(realm.composerContainerOf(composers[0].fileInput), null,
-    'no composer region above this picker: the count of inputs above it decides nothing')
-  assert.equal(realm.attributionOfPicker(composers[0].fileInput).state, 'picker-elsewhere')
+  const other = createFakeComposerDocument({ sessions: [LOCAL] }).composers[0].fileInput
+  let at = other
+  while (at !== null && at !== undefined) { at.ownerDocument = { contains: () => false }; at = at.parent }
+  assert.equal(realm.attributionOfPicker(other).state, 'picker-document')
+  assert.equal(realm.attributionOfPicker(null).state, 'no-document')
 })
 
+// ------------------------------------------------------------- the module state
 
-// ------------------------------------------- A1.2 self-test and the whole decision
-
-test('the self-test is strict: only an absent global passes; null, accessors, keys and shapes name why', async () => {
+test('one instance per global: a second request never re-measures or re-installs', async () => {
   const realm = await newRealm()
-  assert.equal(realm.hostPathsSelfTest(undefined), null, 'the Web GUI has no bridge — and needs none')
-  assert.equal(realm.hostPathsSelfTest(null), 'bridge-shape', 'a null global is a shape mismatch, not an absence')
-  assert.equal(realm.hostPathsSelfTest({ pathFor: () => '' }), null)
-  assert.equal(realm.hostPathsSelfTest('bridge'), 'bridge-shape')
-  assert.equal(realm.hostPathsSelfTest([]), 'bridge-shape')
-  assert.equal(realm.hostPathsSelfTest(() => ''), 'bridge-shape')
-  assert.equal(realm.hostPathsSelfTest({}), 'bridge-keys')
-  assert.equal(realm.hostPathsSelfTest({ pathFor: () => '', extra: 1 }), 'bridge-keys')
-  assert.equal(realm.hostPathsSelfTest({ pathFor: () => '', [Symbol('marker')]: 1 }), 'bridge-keys', 'a symbol key is an own key')
-  assert.equal(realm.hostPathsSelfTest({ pathFor: 'not a function' }), 'bridge-pathFor')
-  // A non-enumerable foreign key is still a foreign key: removing what is not `pathFor` and
-  // calling the rest "the same object" is how a wrapper replaces somebody else's bridge.
-  const hiddenKey = { pathFor: () => '' }
-  Object.defineProperty(hiddenKey, 'hidden', { value: 1, enumerable: false })
-  assert.equal(realm.hostPathsSelfTest(hiddenKey), 'bridge-keys')
-  // An accessor `pathFor` is not DSH's preload object, even when it reads as a function.
-  const accessor = {}
-  Object.defineProperty(accessor, 'pathFor', { get: () => () => '', enumerable: true, configurable: true })
-  assert.equal(realm.hostPathsSelfTest(accessor), 'bridge-pathFor')
+  const { holder, document, attach } = realm.live({ sessions: [TAGGED] })
+  attach.install()
+  assert.equal(realm.remoteFileIntakeFor({ global: holder, log: () => {} }), attach)
+  assert.equal(attach.install().state, 'active')
 })
 
-test('a mismatch means no wrap, a visible reason, and never a throw', async () => {
+test('uninstall: every later pick is DSH\'s own again, and the page says the attach is off', async () => {
   const realm = await newRealm()
-  const cases = [
-    // A null global IS a shape mismatch (R5 lists it beside a frozen bridge), not an
-    // absence: a preload that exposed nothing and a preload that exposed null differ.
-    ['keys', (holder) => { holder[HOST_PATHS] = { pathFor: () => '/x', [Symbol.for('m')]: 1 } }, 'bridge-keys', false],
-    // A getter on the global is a property this module cannot measure, so it refuses it
-    // rather than read it (the read may throw) — and it touches nothing.
-    ['accessor', (holder) => Object.defineProperty(holder, HOST_PATHS, { get: () => ({ pathFor: () => '/x' }), configurable: true }), 'bridge-shape', false],
-    ['null', (holder) => { holder[HOST_PATHS] = null }, 'bridge-shape', false],
-    ['shape', (holder) => { holder[HOST_PATHS] = 'bridge' }, 'bridge-shape', false],
-    ['absent', (holder) => { void holder }, 'no-bridge', true],
-  ]
-  for (const [name, build, reason, wrapped] of cases) {
-    const holder = {}
-    build(holder)
-    const before = Object.getOwnPropertyDescriptor(holder, HOST_PATHS)
-    let status
-    assert.doesNotThrow(() => { status = realm.install(holder) }, name)
-    assert.equal(status.wrapped, wrapped, `${name}: wrapped`)
-    assert.equal(status.reason, reason, name)
-    sameDescriptor(Object.getOwnPropertyDescriptor(holder, HOST_PATHS), before)
-    if (before === undefined) assert.equal(HOST_PATHS in holder, false, `${name}: nothing was added`)
-    else assert.equal(Object.getOwnPropertyDescriptor(holder, HOST_PATHS).value, before.value, `${name}: the binding holds what it held`)
-  }
-})
-
-test('the Web GUI (no bridge) is not a failure, and nothing is installed', async () => {
-  const realm = await newRealm()
-  const holder = {}
-  const status = realm.install(holder)
-  assert.deepEqual(status, { surface: HOST_PATHS, wrapped: true, reason: 'no-bridge', shape: null, calls: 0 })
-  assert.equal(Object.getOwnPropertyDescriptor(holder, HOST_PATHS), undefined)
-})
-
-// -------------------------------------------------------------------- dispose
-
-/** The descriptor's own fields, compared one by one: `deepEqual` on descriptors never holds. */
-function sameDescriptor(actual, expected) {
-  if (expected === undefined) {
-    assert.equal(actual, undefined, 'still no binding')
-    return
-  }
-  assert.notEqual(actual, undefined, 'the binding exists')
-  for (const key of ['value', 'get', 'set', 'writable', 'enumerable', 'configurable']) {
-    if (key in expected || key in actual) assert.deepEqual(actual[key], expected[key], key)
-  }
-}
-
-test('dispose puts back the exact method and descriptor of the bridge member (in place)', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document } = realm.page(holder, { sessions: [TAGGED] })
-  const original = Object.getOwnPropertyDescriptor(bridge, 'pathFor')
-  const route = realm.route(holder, document)
-  route.install()
-  assert.notEqual(bridge.pathFor, original.value)
-  route.uninstall()
-  const restored = Object.getOwnPropertyDescriptor(bridge, 'pathFor')
-  assert.equal(restored.value, original.value, 'the same function object, not an equivalent one')
-  for (const key of ['writable', 'enumerable', 'configurable']) assert.equal(restored[key], original[key], key)
-  assert.equal(holder[HOST_PATHS], bridge)
-  assert.equal(route.status().wrapped, false)
-})
-
-test('dispose puts back the bridge member\'s OWN descriptor, not the global binding\'s flags (in place)', async () => {
-  const realm = await newRealm()
-  // A sealed bridge (no new field, `pathFor` still a writable configurable field): the in-place
-  // shape, where the member's own flags are the only flags in play. `enumerable: true` on the
-  // member against a non-enumerable binding, and the binding is never re-pointed here. Restoring
-  // the binding's descriptor instead would carry `enumerable: false` onto the member.
-  const original = (file) => `${DOWNLOADS}\\${file.name}`
-  const bridge = {}
-  Object.defineProperty(bridge, 'pathFor', { value: original, writable: true, enumerable: true, configurable: true })
-  Object.seal(bridge)
-  const holder = {}
-  Object.defineProperty(holder, HOST_PATHS, { value: bridge, writable: true, configurable: true, enumerable: false })
-  const beforeMember = Object.getOwnPropertyDescriptor(bridge, 'pathFor')
-  const beforeBinding = Object.getOwnPropertyDescriptor(holder, HOST_PATHS)
-  const { document } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  assert.equal(route.install().shape, 'in-place')
-  assert.notEqual(bridge.pathFor, original, 'wrapped in place')
-  route.uninstall()
-  const restored = Object.getOwnPropertyDescriptor(bridge, 'pathFor')
-  assert.equal(restored.value, original, 'the same function object')
-  for (const key of ['writable', 'enumerable', 'configurable']) assert.equal(restored[key], beforeMember[key], `member ${key}`)
-  sameDescriptor(Object.getOwnPropertyDescriptor(holder, HOST_PATHS), beforeBinding)
-  assert.equal(holder[HOST_PATHS], bridge)
-  assert.equal(route.status().wrapped, false, 'and the wrap is gone again')
-})
-
-test('immutable member: NO wrap (bridge-frozen), and a composer that kept the original stays DSH\'s own [reviewer 2026-11-16]', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = immutableMember()
-  const beforeMember = Object.getOwnPropertyDescriptor(bridge, 'pathFor')
-  const beforeBinding = Object.getOwnPropertyDescriptor(holder, HOST_PATHS)
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  // DSH's composer inject captured the bridge BEFORE the chunk arrived (`apply.ts:504`):
-  // this reference is what that composer calls (`:520`) for as long as it is mounted.
-  const retained = holder[HOST_PATHS]
-  assert.deepEqual(route.install(), { surface: HOST_PATHS, wrapped: false, reason: 'bridge-frozen', shape: null, calls: 0 },
-    'install refuses instead of reporting a wrap the composers would not see')
-  // The install touched NOTHING: not the member, not the binding (the old delegating mode
-  // re-pointed the binding, which this composer was not reading, and called that success).
-  sameDescriptor(Object.getOwnPropertyDescriptor(bridge, 'pathFor'), beforeMember)
-  sameDescriptor(Object.getOwnPropertyDescriptor(holder, HOST_PATHS), beforeBinding)
-  assert.equal(holder[HOST_PATHS], bridge, 'the same bridge object, never a delegating replacement')
-  assert.equal(retained, bridge)
-  // The pick through the retained reference: either it is intercepted (in-place case) or
-  // install reported refused (this case). Here: refused, and visibly so.
-  assert.deepEqual(pick(realm, route, document, composers[0].fileInput, [zip()], retained),
-    [{ kind: 'mention', ref: `@"${DOWNLOADS}\\bundle.zip"` }],
-    'the composer keeps DSH\'s own answer — and the page says why it is not uploaded')
-  assert.equal(route.status().wrapped, false)
-  assert.equal(route.status().reason, 'bridge-frozen', 'the reason survives the pick, so it is what the page shows')
-  assert.equal(route.status().calls, 0, 'the wrap never ran: nothing was wrapped')
-})
-
-test('in-place: a composer that kept the bridge before install() is intercepted through that reference', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  const retained = holder[HOST_PATHS]
-  assert.equal(retained, bridge)
-  assert.equal(route.install().shape, 'in-place')
-  // Not `holder[HOST_PATHS]`: the object the composer captured, exactly as `apply.ts:520`
-  // calls it. The wrap must reach it, or the remote pick becomes a controller path again.
-  assert.deepEqual(pick(realm, route, document, composers[0].fileInput, [zip()], retained), [{ kind: 'upload' }])
-  assert.equal(route.status().calls, 1, 'the wrap ran through the captured object')
-  route.uninstall()
-  assert.equal(bridge.pathFor(zip()), `${DOWNLOADS}\\bundle.zip`, 'and dispose put DSH\'s own method back')
-})
-
-test('dispose leaves another instance\'s overwrite alone (in place)', async () => {  const realm = await newRealm()
-  // In place: someone rewrote the bridge's own pathFor after us.
-  const first = bridgeGlobal()
-  const firstRoute = realm.route(first.holder, realm.page(first.holder, { sessions: [TAGGED] }).document)
-  firstRoute.install()
-  const theirs = () => '/theirs'
-  first.bridge.pathFor = theirs
-  assert.equal(firstRoute.status().reason, 'bridge-replaced')
-  firstRoute.uninstall()
-  assert.equal(first.bridge.pathFor, theirs, 'not ours any more: left in place')
-  // In place: someone re-defined it as an accessor after us.
-  const second = bridgeGlobal()
-  const secondRoute = realm.route(second.holder, realm.page(second.holder, { sessions: [TAGGED] }).document)
-  secondRoute.install()
-  const accessor = { get: () => () => '/accessor', configurable: true }
-  Object.defineProperty(second.bridge, 'pathFor', accessor)
-  secondRoute.uninstall()
-  assert.equal(Object.getOwnPropertyDescriptor(second.bridge, 'pathFor').get, accessor.get, 'an accessor another writer installed stays')
-  // The global binding was never ours to re-point, so a later writer's binding is untouched
-  // by an immutable-member instance too: it measured its refusal and stopped there.
-  const third = immutableMember()
-  const thirdRoute = realm.route(third.holder, realm.page(third.holder, { sessions: [TAGGED] }).document)
-  assert.equal(thirdRoute.install().reason, 'bridge-frozen')
-  const foreign = { pathFor: () => '/someone/else' }
-  third.holder[HOST_PATHS] = foreign
-  thirdRoute.uninstall()
-  assert.equal(third.holder[HOST_PATHS], foreign, 'a later writer is never clobbered')
-})
-
-test('freeze after install, then dispose: the wrapper stays a callable passthrough, and the page says bridge-frozen [reviewer round 4]', async () => {
-  const realm = await newRealm()
-  // DSH's own preload answers `""` for a non-file, the fixture the last assertion needs.
-  const bridge = fileBridge()
-  const holder = {}
-  Object.defineProperty(holder, HOST_PATHS, { value: bridge, writable: true, configurable: true, enumerable: false })
-  const original = Object.getOwnPropertyDescriptor(bridge, 'pathFor').value
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  assert.equal(route.install().shape, 'in-place')
-  const wrapper = bridge.pathFor
-  assert.notEqual(wrapper, original, 'the member is our wrapper')
-  // The slot is frozen AFTER install: neither the wrapper nor the original can be written
-  // back now. `Reflect.defineProperty` answers `false`, it does not throw.
-  Object.freeze(bridge)
-  assert.equal(Reflect.defineProperty(bridge, 'pathFor', { value: original }), false, 'the refusal is a boolean')
-  route.uninstall()
-  assert.equal(bridge.pathFor, wrapper, 'the wrapper is still the member DSH\'s composers read')
-  assert.deepEqual(route.status(), { surface: HOST_PATHS, wrapped: false, reason: 'bridge-frozen', shape: 'frozen', calls: 0 },
-    'and the page is told the bridge is frozen, not that it was restored')
-  // It is never gutted: DSH's own answer for every call, no upload, no attribution — a
-  // composer pick included, and a drop's `pathFor(null)` stays DSH's own `undefined`.
-  assert.equal(bridge.pathFor(zip()), `${DOWNLOADS}\\bundle.zip`, 'the native answer, not undefined')
-  assert.equal(bridge.pathFor(null), '', 'DSH\'s own answer for a non-file (preload getPathForFile) stays what it was')
-  const listener = (event) => { realm.adoptPickerFrom(route, event) }
-  document.addEventListener(realm.PICK_EVENT, listener, true)
-  try {
-    assert.deepEqual(pick(realm, route, document, composers[0].fileInput, [zip()]),
-      [{ kind: 'mention', ref: `@"${DOWNLOADS}\\bundle.zip"` }],
-      'a pick after the freeze keeps DSH\'s own behaviour, visibly: nothing is claimed or uploaded')
-  } finally {
-    document.removeEventListener(realm.PICK_EVENT, listener, true)
-  }
-  assert.equal(route.pendingPick, null, 'a frozen wrapper claims nothing')  // A second dispose is a no-op for the bridge and keeps saying why.
-  route.uninstall()
-  assert.equal(bridge.pathFor, wrapper)
-  assert.equal(route.status().reason, 'bridge-frozen')
-  // The pass-through really is the original: the bridge it is called on is passed through as
-  // `this`, exactly as DSH calls the member.
-  assert.equal(original.call(bridge, zip()), bridge.pathFor(zip()))
-})
-
-test('non-configurable but still writable after install, then dispose: the original goes back, never a non-callable stand-in [reviewer finding 2026-11-16]', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const original = Object.getOwnPropertyDescriptor(bridge, 'pathFor').value
-  const { document, composers } = realm.page(holder, { sessions: [TAGGED] })
-  const route = realm.route(holder, document)
-  assert.equal(route.install().shape, 'in-place')
-  const wrapper = bridge.pathFor
-  assert.notEqual(wrapper, original, 'the member is our wrapper')
-  // `defineProperty` with the original flags is refused by this slot (it asks for
-  // `configurable: true`), yet plain assignment still takes: the shape a restore used to
-  // fill with a stand-in OBJECT, which made every composer throw
-  // `bridge.pathFor is not a function`.
-  Object.defineProperty(bridge, 'pathFor', { configurable: false })
-  assert.equal(Reflect.defineProperty(bridge, 'pathFor',
-    { value: original, writable: true, configurable: true, enumerable: true }), false,
-  'the exact restore is refused by this slot (a boolean): `configurable` cannot be raised again')
-  route.uninstall()
-  assert.equal(typeof bridge.pathFor, 'function', 'DSH\'s member is always callable after a dispose')
-  assert.equal(bridge.pathFor(zip()), `${DOWNLOADS}\\bundle.zip`, 'the bridge\'s own answer, not a stand-in')
-  assert.equal(bridge.pathFor, original, 'the exact original is back: assignment was tried before any fallback')
-  assert.deepEqual(route.status(), { surface: HOST_PATHS, wrapped: false, reason: 'bridge-frozen', shape: 'frozen', calls: 0 },
-    'the restore was not the exact one, so the page still says bridge-frozen')
-  // The pick a composer makes now is DSH's own, through the reference DSH holds.
-  assert.deepEqual(pick(realm, route, document, composers[0].fileInput, [zip()]),
-    [{ kind: 'mention', ref: `@"${DOWNLOADS}\\bundle.zip"` }])
-})
-
-// ------------------------------------------------------------- one instance
-
-test('one instance per global: a second install never wraps the first wrapper', async () => {
-  const realm = await newRealm()
-  const { holder, bridge } = bridgeGlobal()
-  const first = realm.route(holder, realm.page(holder, { sessions: [TAGGED] }).document)
-  first.install()
-  const wrapped = bridge.pathFor
-  assert.equal(realm.remoteFileIntakeFor({ global: holder, log: () => {} }), first)
-  first.install()
-  assert.equal(bridge.pathFor, wrapped)
+  const { holder, document, composers, attach } = realm.live({ sessions: [TAGGED] })
+  attach.install()
+  attach.uninstall()
+  assert.deepEqual(attach.status(), { surface: HOST_PATHS, shape: null, picks: 0, uploaded: 0, state: 'unavailable', reason: 'not-installed' })
+  const zip = picked(zipFile())
+  let handed = []
+  livePick(document, composers[0].fileInput, [zip], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+  assert.equal(handed[0], zip)
 })
 
 test('splitTaggedSessionId agrees with the carrier on every shape', () => {
@@ -879,66 +498,37 @@ test('splitTaggedSessionId agrees with the carrier on every shape', () => {
   }
 })
 
-test('the decision table: every session × file row, against DSH\'s own outcome', async () => {
-  const rows = [
-    [TAGGED, zip(), 'upload'],
-    [TAGGED, image(), 'upload'],
-    [TAGGED, folder(), 'refused'],
-    [LOCAL, zip(), 'mention'],
-    [LOCAL, image(), 'upload'],
-    [LOCAL, folder(), 'mention'],
-  ]
-  for (const [session, file, outcome] of rows) {
-    const realm = await newRealm()
-    const { holder } = bridgeGlobal()
-    const { document, composers } = realm.page(holder, { sessions: [session] })
-    const route = realm.route(holder, document)
-    route.install()
-    const [answer] = pick(realm, route, document, composers[0].fileInput, [file])
-    assert.equal(answer.kind, outcome, `${session} + ${file.type}`)
-  }
-})
-
 // ----------------------- measured against the installed DSH (skipped without one)
 
-test('the installed composer still decides a pick this way', (t) => {
+test('the installed composer still reads the file list first, in BUBBLE order, and maps an empty path to bytes', (t) => {
   if (!installed()) { t.skip('no installed DSH on this machine: the composer seam was not re-measured'); return }
-  const apply = fs.readFileSync(APPLY, 'utf8')
-  assert.match(apply, /const path = bridge\?\.pathFor\(file\) \?\? ''/,
-    'the composer reads pathFor once per file, with one argument; an absent bridge is ""')
-  assert.match(apply, /if \(directory && path === ''\) return t\('attachment\.pathUnavailable'\)/,
-    'a directory with no path is DSH\'s own refusal (R3)')
-  assert.match(apply, /if \(path === '' \|\| \(!directory && isImageMediaType\(file\.type\)\)\) \{/,
-    'a file with no path — or any image — still goes to the byte upload (R1, R2)')
-  assert.match(apply, /const relative = relativizeToCwd\(path, cwd\)/,
-    'a returned path is relativized first, so a relative default would still be a mention')
-  assert.match(apply, /registerFileIntake: fileIntake,/)
   const intake = fs.readFileSync(INTAKE, 'utf8')
-  assert.match(intake, /return addFiles\(files, directories\)/,
-    'the hook reaches addFiles with the SAME call as a path-less pick')
-  assert.match(intake, /intakeFiles, uploadsPending, uploadsHeldText, showToast, canAcceptDrop/, 'the card gate is the same intake')
-})
-
-test('the installed renderer still lays out the picker the way the attribution expects', (t) => {
-  if (!installed()) { t.skip('no installed DSH on this machine: the DOM anchors were not re-measured'); return }
+  // The installed handler, in its own words: `e.target.files` is the FIRST thing it reads.
+  assert.match(intake, /const onPickFiles = \(e: ChangeEvent<HTMLInputElement>\): void => \{\n {4}const picked = e\.target\.files === null \? \[\] : \[\.\.\.e\.target\.files\]/,
+    'onPickFiles reads e.target.files before anything else')
+  assert.match(intake, /e\.target\.value = ''/, '…then resets value so a re-pick re-fires')
+  assert.match(intake, /onChange=\{onPickFiles\}/, 'the picker\'s change is React\'s onChange (a root delegate, bubble phase)')
+  // The built bundle DSH actually runs.
   const built = fs.readFileSync(BUILT, 'utf8')
-  assert.match(built, /"data-conversation-session":sessionId/, 'the session view root declares its session id')
-  assert.match(built, /"data-composer-input":true/, 'the composer input is marked')
-  assert.match(built, /ref:fileInputRef,type:`file`,multiple:true,disabled:!canAcceptDrop\|\|subagent!==null,hidden:true,onChange:onPickFiles/,
-    'DSH\'s picker is hidden and handled by onPickFiles')
-  const toolsAt = built.search(/className:InputBar_module_css_default\.tools/)
-  const pickerAt = built.indexOf('ref:fileInputRef,type:`file`')
-  const inputAt = built.indexOf('ComposerContentEditable')
-  assert.ok(toolsAt > 0 && pickerAt > toolsAt, 'the picker is rendered inside the tools row')
-  assert.ok(inputAt > 0 && inputAt < toolsAt, '…which comes AFTER the composer input, as its sibling')
   assert.match(built, /const onPickFiles=e=>\{const picked=e\.target\.files===null\?\[\]:\[\.\.\.e\.target\.files\];e\.target\.value=``;/,
-    'onPickFiles drains .files and resets value BEFORE intakeFiles')
+    'the built handler still drains the picker first')
+  const apply = fs.readFileSync(APPLY, 'utf8')
+  assert.match(apply, /const path = bridge\?\.pathFor\(file\) \?\? ''/, 'the composer reads pathFor once per file; an absent bridge is ""')
+  assert.match(apply, /if \(path === '' \|\| \(!directory && isImageMediaType\(file\.type\)\)\) \{/, 'a file with no path — or any image — goes to the byte upload (R1, R2)')
+  assert.match(apply, /if \(directory && path === ''\) return t\('attachment\.pathUnavailable'\)/, 'a directory with no path is DSH\'s own refusal (R3)')
+  assert.match(apply, /const relative = relativizeToCwd\(path, cwd\)/, 'a returned path is relativized first, so a relative default would still be a mention')
+  // Why the batch is re-materialized whole: the loop returns before any draft exists.
+  assert.match(apply, /const uploads: File\[\] = \[\]/, 'reference files and uploads are collected in ONE loop')
+  assert.match(apply, /const drafts = conversation\.createDrafts\(sessionId, uploads, ordinary\)/, 'the uploads are created only after the whole loop passed')
+  const upload = fs.readFileSync(UPLOAD_CLIENT, 'utf8')
+  assert.match(upload, /return this\.ctx\.remote\.fileUploads\.upload\(/, 'a File is posted as bytes, with no Blob/FormData/size conversion')
+  assert.deepEqual({ ...shared.dshContract((relative) => CONTRACT_SOURCES[relative]) }, { composed: true, composer: true, upload: true, read: true })
 })
 
-test('the installed preload still exposes exactly {pathFor}', (t) => {
+test('the installed preload exposes the bridge through contextBridge (a frozen copy: that is why no wrap)', (t) => {
   if (!installed()) { t.skip('no installed DSH on this machine: the preload was not re-measured'); return }
   const preload = fs.readFileSync(PRELOAD, 'utf8')
-  assert.match(preload, /contextBridge\.exposeInMainWorld\("__DSH_HOST_PATHS__", \{ pathFor: \(file\) => electron\.webUtils\.getPathForFile\(file\) \}\)/)
+  assert.match(preload, /electron\.contextBridge\.exposeInMainWorld\("__DSH_HOST_PATHS__", \{ pathFor: \(file\) => electron\.webUtils\.getPathForFile\(file\) \}\)/)
   assert.equal(HOST_PATHS, '__DSH_HOST_PATHS__')
   assert.equal(PINNED_DSH_VERSION, '0.2.2-rc.3', 'the release this evidence was read from')
 })
@@ -975,9 +565,9 @@ test('the composer host renders one file input per session view', async () => {
 })
 
 test('the staged bytes still reach the upload route as a file of this size (spec 013 seam)', async () => {
-  // Not a re-test of test/upload-route.test.mjs: this only proves the two halves meet —
-  // a tagged id and a `file` kind travel with the bytes, so a pick that the wrap clears
-  // arrives at the remote Host as that size and that digest.
+  // Not a re-test of test/upload-route.test.mjs: this only proves the two halves meet — a tagged
+  // id and a `file` kind travel with the bytes, so a pick whose copies DSH uploads arrives at
+  // the remote Host as that size and that digest.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'spec033-'))
   const { createUploadRoute } = await import('../lib/upload-route.mjs')
   const frames = []
@@ -1012,3 +602,6 @@ test('the staged bytes still reach the upload route as a file of this size (spec
 })
 
 void here
+void dispatchIntake
+void fileBridge
+void settleMicrotasks

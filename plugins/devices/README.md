@@ -164,100 +164,77 @@ single object field the right seam. The whole implementation is `lib/upload-rout
 read it yet (it is outside this change's scope), so the reason is currently visible only in this
 response and in the plugin log line `remote attachments: active|off (…)`.
 
-### The Host path bridge (A1.2 amendment, spec 033)
+### Remote file attach (A1.2 amendment, spec 033) — no DSH object is wrapped
 
 In a session that lives on **another** Host, a non-image file picked with the composer's `+` used to
 arrive there as the controller-local mention `@"C:\…\file.zip"` — a path that Host cannot read — while
-images worked. Under A1.2 (owner-approved 2026-11-15) this plugin wraps **exactly one member of one
-global the preload exposes** — never a prototype, module export or DSH file:
+images worked (an image always uploads). The first fix wrapped
+`globalThis.__DSH_HOST_PATHS__.pathFor`; **it could never take**, and that is measured: the preload
+exposes the object with `electron.contextBridge.exposeInMainWorld("__DSH_HOST_PATHS__", { pathFor: … })`,
+and contextBridge hands the page a **frozen** copy, so the member cannot be replaced (`bridge-frozen`)
+and re-pointing the global binding would not help either (a composer captures the bridge once per
+inject, `apply.ts:504`). The owner's remote client, on a fully restarted DSH, still turned the picked
+zip into a controller path.
 
-- `globalThis.__DSH_HOST_PATHS__.pathFor`
+**What ships now wraps nothing.** The plugin decides, at the moment of the pick, what `File` objects
+DSH's own composer will see:
 
-DSH's composer reads that bridge once per picked file (`bridge?.pathFor(file) ?? ''`) and treats an
-empty answer as "upload these bytes"; the bytes then travel the route above
-(`POST /api/session/uploadFileBinary` → `remote-upload-*` → the owning Host). The whole implementation
-is `lib/client.remote-file-attach.js` (a package-local client chunk), with `lib/remote-file-attach.mjs`
-re-exporting it for the Host-side tests; `lib/client.js` reaches it with
-`require.async('./client.remote-file-attach.js')`, the mechanism DSH's own multi-module bundles use.
-
+- `lib/client.js` installs **one** CAPTURE-phase `change` listener on `document`, before DSH's own
+  `onPickFiles` reads `e.target.files` (its first statement, `InputBar.tsx:281`; the built form
+  `const onPickFiles=e=>{const picked=e.target.files===null?[]:[...e.target.files];e.target.value=``;…}`).
+- For a pick proven to belong to a composer that shows a **remote** session (`h:<hostId>:…`) and that
+  holds a non-image file, the picker's `input.files` is replaced with fresh copies —
+  `new DataTransfer()`, `new File([original], original.name, { type, lastModified })`,
+  `input.files = dt.files`. A `File` built by page script has no backing path, so
+  `webUtils.getPathForFile` answers `''`, and DSH's own `addFiles` then takes its **byte upload**
+  (`apply.ts:522` `if (path === '' || …) uploads.push(file)`), which `lib/upload-route.mjs` routes to
+  the owning Host (`POST /api/session/uploadFileBinary` → `remote-upload-*` → the Host's store).
+- A **mixed batch is re-materialized whole** (the image's copy too): `apply.ts` `return`s out of the
+  loop on the first file it cannot use, before any upload draft exists, so one left-over path would
+  land the whole batch nowhere.
+- **Local sessions, a hero with no session, a picker outside a composer, images only, and a
+  directory-only pick are untouched** — DSH's own behaviour, exactly as before. A directory keeps
+  its own `File` (a copy would carry no filesystem entry; DSH's `attachment.pathUnavailable` rule
+  stays DSH's).
+- **The pick is verified on the spot, twice**: the page-built `File` must answer `''` from the
+  preload *before* the list is replaced, and the list must read back path-free *after*. A page where
+  either check fails changes nothing and says so (`path-unavailable`, `unverified`) instead of
+  claiming an upload that did not happen.
+- **Unmeasured is not agreed.** DSH's own sources are re-read (structural patterns, never a version
+  equality) to confirm the contract: the composer drains `e.target.files` first, `addFiles` maps an
+  empty path to bytes, and the file-upload client posts the `File` itself. A **measured** mismatch is
+  `dsh-incompatible` and nothing is touched. When the sources are not readable *yet* (the page's own
+  reads start with the install, so the first moments of a page are a gap), the mechanism is **not
+  installed**: every pick stays DSH's own and the page says `unmeasured`; the page re-measures on a
+  short bounded retry and on the next pick, and re-publishes itself once the answer lands.
 - **The chunk ships in DSH's own registration envelope**, because the Host serves a package file
-  verbatim and DSH's loader keys a chunk by what it registers
-  (`@deepseek-ai/dsh-client-modules` `importChunk`: a bundle that does not call
-  `window.__ModuleLoader__.load` fails with *loaded without registering*). The file opens with
-  ``window.__ModuleLoader__.load({id:'@dsh-ext/devices',chunk:'client.remote-file-attach.js',factory:(require)=>{…}});``
-  — the same shape as the installed `dsh-client-ui-sidebar-terminal/lib/client.terminal.js` — and
+  verbatim and DSH's loader keys a chunk by what it registers (`@deepseek-ai/dsh-client-modules`
+  `importChunk`: a bundle that does not call `window.__ModuleLoader__.load` fails with *loaded without
+  registering*). `lib/client.js` reaches it with `require.async('./client.remote-file-attach.js')`;
   `lib/remote-file-attach.mjs` evaluates that exact text against a fake `__ModuleLoader__` and asserts
-  the registration (one factory, that id, that chunk name, a DSH-legal name), so the Host tests run the
-  code the renderer materializes.
-- **Only a file picked for a REMOTE session changes.** `pathFor` answers `''` for a non-image FILE
-  whose composer shows a tagged session (`h:<hostId>:…`) — DSH's own upload answer. An **image** keeps
-  the original path (DSH uploads images whatever the path says), a **directory** answers `''` so DSH
-  raises its own `attachment.pathUnavailable` (R3), and a **local** session, an unattributable pick, a
-  picker outside a composer or no bridge at all all get DSH's own answer unchanged. The dependency
-  order (`pathFor` → `''` → upload route → gateway) is what makes it work; no DSH file is edited.
-- **Attribution is certainty or nothing (spec R6), taken from the picker and bounded by the composer
-  region.** The composer calls `pathFor` with one argument, so nothing in the call names a composer.
-  In the installed layout DSH's hidden picker is a **sibling** of `[data-composer-input]` (both live
-  in the composer card, the picker in the input bar's tools row), and `onPickFiles` drains `.files`
-  and sets `value = ''` **before** `intakeFiles`, so `.files` is already empty when `pathFor` runs.
-  `lib/client.js` therefore listens for the picker's `change` in the **capture** phase, and the pick
-  is claimed from the picker's own container — the deepest element holding the picker and the
-  composer input (the card) **inside the composer seat** `[data-conversation-region="composer"]` —
-  plus the session its view root (`[data-conversation-session]`) names. The search never ascends
-  past the composer region: a file input rendered elsewhere in the same session view (a panel, a
-  dialog) has no claim, however many composer inputs sit above it.
-- **The claim is bound to the files, and it ends with the turn that made it** (reviewer round 4,
-  2026-11-16). In the capture phase — the last moment the picker still holds what the user picked —
-  the exact `File` objects are snapshotted by identity, and only those are answered: any other
-  `pathFor` call in the same turn (a queued microtask, a second picker) keeps DSH's own answer and
-  the page says the session is not known for it (`file-unclaimed`). The claim ends one task after
-  the capture, i.e. after every microtask that turn queues — DSH's own loop over the batch, or
-  nothing when DSH refuses the batch before asking at all (locked, busy, denied, the image limit,
-  an emptied picker) — or as soon as every picked file has its answer. A later drop, paste or call
-  never inherits an earlier pick's session. Focus, "the only composer present" and the picker's
-  `.files` are **not** proof: a drop, a paste or any call with no live claim keeps DSH's behaviour
-  **and** the page says which state it was (`no-document`, `picker-document`, `picker-elsewhere`,
-  `no-session`, `composer-uncertain`, `stale-batch`, `file-unclaimed`).
-- **Self-test, not a version equality.** The global must be **exactly** DSH's `{pathFor}`: one own
-  key, `pathFor`, a data property holding a function — checked with `Reflect.ownKeys` and each
-  property's descriptor, so a hidden (non-enumerable) extra key, a symbol key, an accessor `pathFor`,
-  a `null`/string/array global all mean **no wrap** and a reason. Whether it can be replaced is
-  measured at runtime (`install`), and it has to be **in place**: the bridge's own `pathFor` member
-  must be a writable/configurable data field. A member that cannot be replaced is `bridge-frozen` —
-  the wrap stops there and the global binding is **never** re-pointed at a delegating object. DSH
-  takes the bridge once per composer inject (`apply.ts:504` `const bridge = hostPathBridge()`, then
-  `:520` `bridge?.pathFor(file)`), so a composer rendered before the chunk installed would keep the
-  original object and still turn a remote pick into a controller-local path while the page said
-  wrapped (reviewer finding, 2026-11-16); a getter on the global is never read and never replaced
-  either.
-- **Failure mode.** `wrapped: false` plus a reason — `bridge-frozen`, `bridge-shape`, `bridge-keys`,
-  `bridge-pathFor`, `bridge-replaced`, `bridge-module-missing`, `not-installed` — is shown on the
-  Devices page (**Remote file attach**), together with the state of the last pick that was *not*
-  uploaded. A shell with no bridge (the Web GUI) is not a failure: every file there already uploads.
-  The reason survives a dispose that had nothing to restore, so a reload that finds a frozen bridge
-  still says so instead of falling silent.
-- **Exact restore, never two wrappers — and a restore that is refused keeps a usable bridge.**
-  One instance per global; `dispose` restores only while the bridge's own `pathFor` member is
-  **still strictly** the wrapper this instance installed, and puts back that exact descriptor —
-  the **member's own** flags (the global binding's descriptor never stands for it). A later writer
-  (another plugin, another instance, an accessor) is never clobbered. The restore's outcome is
-  `Reflect.defineProperty`'s **boolean** (a refusal does not throw), read back: only a slot that
-  holds the original again counts as restored. If the member refuses the exact descriptor back
-  (frozen after install), the bridge's own `pathFor` is first **assigned back** when the member is
-  still writable (non-configurable but writable: `defineProperty` is refused, plain assignment is
-  not); if that too fails, **nothing is gutted** — the wrapper stays DSH's member, keeps answering
-  the bridge's own original `pathFor` (it carries it as
-  `Symbol.for('@dsh-ext/devices.uploadRouteOriginal')`), never uploads and never attributes, and
-  `status()` reports `bridge-frozen` from then on. Nothing that is not a function is ever written
-  into that slot (a stand-in object there made every composer throw `pathFor is not a function`;
-  reviewer finding 2026-11-16). A wrapper
-  carries that same symbol pointing at the TRUE `pathFor`, so a reload finds the original instead of
-  wrapping a wrapper.
-- **No authorization weakening.** The wrapper answers a path **string**, never a request. The bytes
-  travel the route above, and the remote gateway remains the sole authority (`attachments:write`,
-  size, session visibility).
-- **Review gate.** Same rule as the others: a reviewer pass over the wrapper whenever the self-test
-  reports a mismatch or `engines.dsh` moves.
+  the registration, so the Host tests run the code the renderer materializes. There is one
+  implementation, not a copy.
+- **Attribution is certainty or nothing (spec R6), read from the picker.** The pick is claimed from
+  the picker's own composer: the card that holds both the picker and `[data-composer-input]` (the
+  installed `InputBar` card, `data-composer-card`), inside the composer seat
+  `[data-conversation-region="composer"]` of the view root `[data-conversation-session]` that names
+  the session. The search never ascends past the composer region, never takes a node that merely
+  contains the picker, and never lets a page-level composer card inherit the session around it.
+  Focus, "the only composer present" and the picker's own `.files` are **not** proof; anything
+  unproven keeps DSH's behaviour **and** the Devices page says which state it was (`no-document`,
+  `picker-document`, `picker-elsewhere`, `no-session`, `composer-uncertain`, `ambiguous`, …).
+- **Failure mode, visible (A1.2).** The Devices page (**Remote file attach**) shows the measured
+  state: on (`measured` / `no-bridge`), or off with the reason — `browser-unavailable` (no
+  `File`/`DataTransfer`, or a `DataTransfer` that drops what it is given), `dsh-incompatible`,
+  `unmeasured`, `bridge-module-missing`, `not-installed`, `no-window` — plus the state of the last
+  pick that was *not* uploaded. A shell with no `__DSH_HOST_PATHS__` (the Web GUI) is not a failure:
+  every file there already uploads.
+- **No authorization weakening.** Nothing here makes a request. The plugin only decides whether the
+  picked list keeps DSH's own `File` objects; the bytes travel the route above, and the remote gateway
+  remains the sole authority (`attachments:write`, size, session visibility).
+- **Review gate.** Same rule as the other exceptions: a reviewer pass whenever the structural
+  self-test reports a mismatch or `engines.dsh` moves.
+
 
 ## Plugin self-update (spec 027)
 
@@ -402,6 +379,42 @@ and cannot name another page. Phase 1 therefore works **only through that seam**
 
 The Start page's own behaviour is unchanged in every other respect: a refused seat (a shell that does
 not hand over `sidebarRightTabs`) simply leaves the entries out, and nothing else changes.
+## Sidebar tabs: This Computer / Remote Workspace
+
+The sidebar gets Qoder's two tabs above the New Task row. They are a **display filter only**: both
+tabs render the same native `WorkspaceBrowser`, and the tab that is not selected hides the rows the
+other one owns through **one** `<style data-plugin="dsh-ext.devices.host-tabs">` in `document.head`,
+whose text is swapped on a tab change and removed on dispose. Nothing is re-requested, re-merged or
+re-ordered: `workspace/follow` and `session/list` stay exactly the streams the shell already asked
+for, and a tab click writes that one style and nothing else (`test/client-host-tabs.test.mjs` proves
+it with a `fetch` spy).
+
+- **Placement.** A layer in the `sidebar.session.action` seat (`kind:'hoc'`, the shipped children
+  table of `client-ui-sidebar`): `dsh-ext.devices.tabs` draws the strip and then renders the shell's
+  own New Task row unchanged, once. On the collapsed rail (`!wide`) the strip is not drawn (the
+  `sidebar.workspaces` region is not dispatched there either) and the row passes straight through.
+- **The filter.** Rows are matched by the `data-row-key` the shipped browser emits
+  (`client-ui-workspace`): `workspace:<group.key>` (the ungrouped group is the literal
+  `workspace:`), `session:<node.id>`, `overflow:<group.key>`, and the empty state `empty` which is
+  never hidden. Remote ids minted by this plugin are `h:<hostId>:<id>` (`lib/host-router.mjs`
+  `namespaceId`; `HOST_TAG` in `lib/client.js` mirrors it), so one prefix decides both directions:
+  - *This Computer* hides `workspace:h:*`, `session:h:*`, `overflow:h:*`.
+  - *Remote Workspace* hides every workspace/session/overflow row whose key is not a host's
+    (`:not([data-row-key^="…:h:"])`), which includes the ungrouped `workspace:` / `overflow:` rows.
+    Measured on a live window (2026-11-16): remote workspace ids are always tagged, so no
+    structural `:has()` rule is needed.
+- **Persisted.** The choice lives in `localStorage['dsh-ext.devices.sidebar-tab']` (`'local'`
+  default; anything else falls back to `local`). **Ctrl+Alt+1 / Ctrl+Alt+2** switch it through the
+  shell's shortcut registry (`ctx.shortcuts.register`, ids `dsh-ext.devices.sidebar-tab-local` /
+  `…-remote`, `['primary','alt']` on every profile). The strip is always clickable, so a shell
+  without the registry simply has no keys.
+- **Degrade, never half-install.** A shell that does not declare `sidebar.session.action` gets no
+  layer, no style and no keys; a refused shortcut registration keeps the tabs. Either way the
+  **Devices page → Connect → Sidebar tabs** line states it (`not installed`, or the tabs on with the
+  keys missing).
+- Teardown removes the style, the layer and both commands; no data stream is subscribed to or
+  touched by any of it.
+
 ## Tests
 
-`npm test` runs plain scripts (spawning `node --test` workers is EPERM in the sandbox): `guards` (loopback/same-origin), `pin` (pin mismatch sends no credential bytes), `store` (token file perms, 4401 wipe), `client` (slots, labels, flows, the spec 016 Phase 1 per-machine Start-page doorways: entries, order, removal, the offline rule, no new timer, and the spec 025 R5 in-place Permissions editor: kind-limited scope list, diff body, route refusal codes, the missing-upload hint, vi+en twins, plus the spec 033 integration: the real `client.js` chunk asks `require.async` for the real attach chunk, the chunk registers in DSH's envelope, `apply()` installs the wrap, a remote pick answers `''` through the reference a composer captured before the chunk arrived, a local pick keeps DSH's path, dispose restores the exact method and removes the capture listener, and a bridge whose own `pathFor` cannot be replaced is refused as `bridge-frozen` with nothing re-pointed), `host-router` (multi-host routing/rename/merge), `upload-route` (spec 013: untagged passthrough, chunking + whole-file sha256, refusal mapping, abort → cancel, exact restore, self-test failure), `remote-file-attach` (spec 033 / A1.2: the chunk's registration envelope and the adapter reading it, the per-row decision table — remote file → bytes, local → DSH's answer, image → unchanged, folder → DSH's refusal — attributed against a fake composer document that mirrors the installed layout (picker as a sibling of `[data-composer-input]`, `.files` drained and reset before `pathFor`), the R6 claim across the reset and its end with the turn that made it, the reviewer round-4 regressions (an unrelated `pathFor` call — a queued microtask, or after a refused batch — keeps DSH's own answer, `file-unclaimed`; a bridge frozen after install and then disposed keeps its wrapper as a callable passthrough to the original, `bridge-frozen`; a member made non-configurable but still writable after install gets the bridge's own `pathFor` assigned back on dispose, so the slot is never left holding a non-callable), the strict structural self-test (`null`, accessor, hidden key, symbol, shape), exact restore of the member (its own flags), another instance's overwrite left alone, an immutable member refused with no wrap (a pick through a composer's retained bridge reference stays DSH's own, visibly), one instance per global, and the seam re-measured against the installed release's own `apply.ts`, built `client.js`, preload and chunk loader), `interactions` (remote approval/question cards in the native `$events` stream), `session-cache` (offline transcript copy: write, replay, refusal, delete, rotation), `agent-browser` (spec 016 Phase 3 against a FAKE CDP pipe: pipe-only launch args, ops, URL refusals, 768 KiB/256 KiB/1 MiB limits, consent off → `browser/denied`, one in flight, cancel, deadline, kill switch, idle shutdown, the consent/frame/stop routes), `e2e` (real `mobile-gateway` in-process: pair as `desktop` → sessions → history → prompt → approval → revoke), `e2e-otp` (OTP + Host approval through `POST /devices/pairings`), `disconnect-retention` (connection lifecycle: disconnect → sessions kept and marked disconnected → reconnect → same aliases resume, twice, in one process; forget and 4401 drop them) and `pairing-trust` (that route pairs against a listener whose certificate no CA store can chain to: the pin is the trust decision). Tests borrow `ws`, `selfsigned`, `react` and `react-test-renderer` from `../mobile-gateway/node_modules`.
+`npm test` runs plain scripts (spawning `node --test` workers is EPERM in the sandbox): `guards` (loopback/same-origin), `pin` (pin mismatch sends no credential bytes), `store` (token file perms, 4401 wipe), `client` (slots, labels, flows, the spec 016 Phase 1 per-machine Start-page doorways: entries, order, removal, the offline rule, no new timer, and the spec 025 R5 in-place Permissions editor: kind-limited scope list, diff body, route refusal codes, the missing-upload hint, vi+en twins, plus the spec 033 integration: the real `client.js` asks `require.async` for the real attach chunk, the chunk registers in DSH's envelope, the attach installs ONE capture-phase `change` listener and wraps nothing (the preload's frozen `__DSH_HOST_PATHS__` is left exactly as it is), a remote pick reaches DSH as path-free copies that the preload cannot name (so `addFiles` takes the byte upload) while a local pick keeps DSH's own `File` and path, dispose removes the listener and every later pick is DSH's own, the Devices card states what was measured with no wrap claim anywhere, an unmeasured page changes nothing until its own source reads land and then switches itself on and re-publishes, and a preload that names a path even for a page-built `File` is left alone as `path-unavailable`), `client-host-tabs` (the two sidebar tabs: the hoc layer with the shell's New Task row preserved once after the strip, the collapsed rail, the exact local/remote rule text against the shipped `data-row-key` shapes with the empty state kept, checked against a measured live key list, one swapped `<style data-plugin="dsh-ext.devices.host-tabs">`, persistence, Ctrl+Alt+1/2 through the fake registry with its disposers, a shell without `ctx.shortcuts`, a refused layer with the reason on the Devices page, dispose removing style and registrations, and a `fetch` spy proving a tab switch makes no call), `host-router` (multi-host routing/rename/merge), `upload-route` (spec 013: untagged passthrough, chunking + whole-file sha256, refusal mapping, abort → cancel, exact restore, self-test failure), `remote-file-attach` (spec 033 / A1.2, the 2026-11-16 mechanism: the chunk's registration envelope and the adapter reading it; that nothing is wrapped — a frozen contextBridge copy is left exactly as the preload exposes it; the per-row decision table — a remote pick with a non-image file is re-materialized into path-free `File` copies (same name, type, bytes, timestamp) so DSH's own `addFiles` takes the byte upload, a local pick keeps DSH's own object and path, images only are untouched, a directory keeps its own object, a mixed batch is copied whole; the two on-the-spot proofs (`path-unavailable` when the preload names a page-built `File`, `unverified` when the replaced list does not read back path-free); `dshContract`'s three states — measured, `dsh-incompatible` on a measured mismatch, and `unmeasured` (fail safe: nothing changed, then `refresh()` switches it on when the page's reads land); R6 attribution against a fake composer document shaped like the installed one (picker as a sibling of `[data-composer-input]` inside the card, card inside the composer seat, seat inside the session view; a picker elsewhere, a hero, a page-level card nested in a session view and a picker from another document are all no claim); the visible refusals (`browser-unavailable` for a missing or lossy `DataTransfer`); one instance per global; dispose; and the seam re-measured against the installed release's own `InputBar.tsx`, `apply.ts`, built `client.js`, preload and chunk loader), `interactions` (remote approval/question cards in the native `$events` stream), `session-cache` (offline transcript copy: write, replay, refusal, delete, rotation), `agent-browser` (spec 016 Phase 3 against a FAKE CDP pipe: pipe-only launch args, ops, URL refusals, 768 KiB/256 KiB/1 MiB limits, consent off → `browser/denied`, one in flight, cancel, deadline, kill switch, idle shutdown, the consent/frame/stop routes), `e2e` (real `mobile-gateway` in-process: pair as `desktop` → sessions → history → prompt → approval → revoke), `e2e-otp` (OTP + Host approval through `POST /devices/pairings`), `disconnect-retention` (connection lifecycle: disconnect → sessions kept and marked disconnected → reconnect → same aliases resume, twice, in one process; forget and 4401 drop them) and `pairing-trust` (that route pairs against a listener whose certificate no CA store can chain to: the pin is the trust decision). Tests borrow `ws`, `selfsigned`, `react` and `react-test-renderer` from `../mobile-gateway/node_modules`.
