@@ -40,7 +40,7 @@ import { PINNED_DSH_VERSION } from '../lib/host-router.mjs'
 import { splitTaggedSessionId as carrierSplit } from '../lib/upload-route.mjs'
 import {
   PICKED_ORIGIN, createFakeComposerDocument, createLivePage,
-  createWebPage, dispatchIntake, installFileListStub, livePick, picked, pickFiles, settleMicrotasks,
+  createWebPage, dispatchIntake, installFileListStub, livePick, picked, pickFiles, refusePickerList, settleMicrotasks,
 } from './helpers.mjs'
 
 // Node has `File` and `Blob` but no `FileList`; a browser's `input.files = dt.files` needs one.
@@ -279,6 +279,29 @@ test('no DataTransfer or no File: nothing is changed, and the page says why (bro
     assert.deepEqual(answers.map((answer) => answer.kind), ['mention'], name)
     assert.equal(attach.lastPick, 'browser-unavailable', `${name}: and the pick says why nothing was uploaded`)
     assert.deepEqual(attach.takeNotice(), { reason: 'browser-unavailable', sessionId: TAGGED, sites: 1, intake: null })
+  }
+})
+
+test('a proven remote pick whose list cannot be replaced says replace-failed, never a local pick', async () => {
+  // The pick was proven remote and carries a non-image file: if the picker will not take the
+  // copies, DSH is about to mention a controller path to that Host. That must be its own visible
+  // state — `certain` would tell the owner it was a local-session pick and hide the failure.
+  const cases = [
+    ['the setter throws', (input) => refusePickerList(input, 'throws')],
+    ['the setter ignores the new list', (input) => refusePickerList(input, 'ignored')],
+  ]
+  for (const [name, breakPicker] of cases) {
+    const realm = await newRealm()
+    const { holder, document, composers, attach } = realm.live({ sessions: [TAGGED] })
+    attach.install()
+    breakPicker(composers[0].fileInput)
+    const zip = picked(zipFile())
+    let handed = []
+    const answers = livePick(document, composers[0].fileInput, [zip], (file) => bridgePathFor(holder, file), (pickedFiles) => { handed = pickedFiles })
+    assert.equal(handed[0], zip, `${name}: DSH's own object stands`)
+    assert.deepEqual(answers.map((answer) => answer.kind), ['mention'], `${name}: and DSH mentions the controller path it was given`)
+    assert.equal(attach.lastPick, 'replace-failed', `${name}: the page says the list could not be replaced`)
+    assert.deepEqual(attach.takeNotice(), { reason: 'replace-failed', sessionId: TAGGED, sites: 1, intake: null }, name)
   }
 })
 
