@@ -28,6 +28,7 @@
     },
     "android": {
       "package": "com.dshext.companion",
+      "versionCode": 1,
       "predictiveBackGestureEnabled": false,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-foreground.png",
@@ -81,7 +82,8 @@
             "vi"
           ]
         }
-      ]
+      ],
+      "./plugins/withAndroidReleaseSigning"
     ],
     "experiments": {
       "typedRoutes": false,

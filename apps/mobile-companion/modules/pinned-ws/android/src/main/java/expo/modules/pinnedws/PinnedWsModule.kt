@@ -40,9 +40,12 @@ class PinnedWsModule : Module() {
 
     // Spec 032 is iOS-simulator only: Android never reports a simulator, because no JS-visible
     // Android fact can tell an emulator from an emulator running on a Play-enabled machine.
-    Constants {
-      "simulator" to false
-    }
+    // `Constant(name) { value }` (the singular per-name builder), not `Constants { ... }`: the
+    // plural trailing-lambda form expects `Map<String, Any?>` and binds the lambda's last
+    // expression, so a bare `"simulator" to false` (a Pair) does not type-check. Both forms
+    // export the same JS surface — a property named `simulator` decorated onto the module object,
+    // read as `module.simulator` (screenshot-mode.ts, events.ts).
+    Constant("simulator") { false }
 
     AsyncFunction("connect") { id: String, url: String, options: Map<String, Any?> ->
       try {
