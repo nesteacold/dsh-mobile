@@ -1186,11 +1186,20 @@ test('real gateway: an approval card still reaches the device and is applied ove
 // controller. Nothing is injected into the controller's merged streams.
 
 /**
- * A Host behind the real gateway that behaves like DSH's session controller:
- * accepting `session/prompt` appends a durable user/message to `session/follow`
- * and (unless withheld) an inbox projection to `session/control`, both keyed by
- * the requestId the controller minted. The controller's merged streams must
- * carry both with the source rpcId intact.
+ * A Host behind the real gateway that behaves like DSH 0.2.2-rc.3's session
+ * controller when a prompt is admitted. Three durable events cross
+ * `session/follow`; the two inbox splices each also emit an `inbox` projection
+ * on `session/control`:
+ *   1. followup/steer splices the user's message into the inbox (seq 7), receipt
+ *      index is set, projection watermark 7; 2. the driver's claim() splices it
+ *      out again (seq 8) with NO `outcome:'canceled'`, so the receipt becomes
+ *      `{index:null, seq:8}` and the projection watermark reaches 8;
+ *   3. the durable `user/message` (seq 9) admits the echo. Native rc.3 retires
+ *      the bubble only when the inbox projection watermark reaches seq 8.
+ * The wire `inbox` val uses the JSON keys `'next-turn'`/`'next-step'`
+ * (dsh-api-session-controller typert.host.js projection schema), not the
+ * TypeScript interface's camelCase. The controller's merged streams must carry
+ * every event and projection, in order, with the source rpcId intact.
  */
 function createEchoHost({ withholdControl = false } = {}) {
   const calls = []
@@ -1201,13 +1210,24 @@ function createEchoHost({ withholdControl = false } = {}) {
     if (!queue) { queue = createQueue(); streams.set(endpoint, queue) }
     return queue
   }
-  const INBOX_SEQ = 7
+  const SPLICE_SEQ = 7
+  const CLAIM_SEQ = SPLICE_SEQ + 1
+  const MESSAGE_SEQ = CLAIM_SEQ + 1
+  const inboxMessage = (requestId) => ({ id: 'm-echo', content: [{ type: 'text', text: 'ping' }],
+    source: { kind: 'user', rpcId: requestId } })
+  const projection = (seq, requestId) => ({ type: 'projection', sessionId: 's1', seq,
+    changes: [{ key: 'inbox', val: { seq,
+      'next-turn': seq === SPLICE_SEQ ? [inboxMessage(requestId)] : [],
+      'next-step': [],
+    } }] })
   let controlReleased = false
-  const releaseControl = () => {
+  const releaseControl = (requestId) => {
     if (controlReleased) return
     controlReleased = true
-    queueFor('session/control').push({ type: 'projection', sessionId: 's1', seq: INBOX_SEQ,
-      changes: [{ key: 'inbox', val: { seq: INBOX_SEQ, nextTurn: [], nextStep: [] } }] })
+    // Both splices' watermarks, in the Host's commit order. The claim watermark
+    // (CLAIM_SEQ) is the one that retires an index===null admitted echo.
+    queueFor('session/control').push(projection(SPLICE_SEQ, requestId))
+    queueFor('session/control').push(projection(CLAIM_SEQ, requestId))
   }
   const gateway = {
     async invoke(request) {
@@ -1226,15 +1246,27 @@ function createEchoHost({ withholdControl = false } = {}) {
       if (endpoint === 'session/list') return { ok: true, value: { items: [{ sessionId: 's1' }] } }
       if (endpoint === 'session/prompt') {
         const requestId = payload?.args?.requestId
-        // The durable echo the Host appends on accepting the prompt. It carries
-        // the controller's requestId as source.rpcId — the exact id rc.3's
-        // controller looks its optimistic bubble up by.
+        const message = inboxMessage(requestId)
+        // (1) the followup/steer splice PUTS the message in the inbox; the
+        // receipt's index is established from this event's seq.
         queueFor('session/follow').push({ type: 'event', event: {
-          type: 'user/message', seq: INBOX_SEQ, time: 1,
-          data: { id: 'm-echo', content: [{ type: 'text', text: 'ping' }], source: { kind: 'user', rpcId: requestId } },
+          type: 'agent/inbox/spliced', seq: SPLICE_SEQ, time: 1,
+          data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [message] },
         } })
-        // Without the control watermark an admitted (index === null) echo stays held.
-        if (!withholdControl) releaseControl()
+        // (2) driver claim() splices it OUT. No `outcome:'canceled'`: native
+        // session.js sets the receipt to index=null at this seq, without
+        // retiring the optimistic bubble.
+        queueFor('session/follow').push({ type: 'event', event: {
+          type: 'agent/inbox/spliced', seq: CLAIM_SEQ, time: 2,
+          data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] },
+        } })
+        // (3) the durable user message carries the controller's requestId as
+        // source.rpcId — the exact id rc.3 looks its optimistic bubble up by.
+        queueFor('session/follow').push({ type: 'event', event: {
+          type: 'user/message', seq: MESSAGE_SEQ, time: 3, data: message,
+        } })
+        // Without the control watermarks an admitted (index === null) echo stays held.
+        if (!withholdControl) releaseControl(requestId)
         return { ok: true, value: { accepted: true } }
       }
       return { ok: true, value: null }
@@ -1250,7 +1282,7 @@ function createEchoHost({ withholdControl = false } = {}) {
       return queue
     },
   }
-  return { gateway, calls, releaseControl, INBOX_SEQ }
+  return { gateway, calls, releaseControl, SPLICE_SEQ, CLAIM_SEQ, MESSAGE_SEQ }
 }
 
 /** A controller-side router harness with a short merge-baseline wait. */
@@ -1353,25 +1385,49 @@ test('real gateway: a remote prompt echo settles from follow + control without a
     assert.equal(promptCall.args.requestId, requestId,
       'the router did not rename the controller-minted requestId')
 
-    // The durable user/message arrives on the controller's merged follow with the
-    // SAME rpcId — the id the native controller looks its optimistic bubble up by.
-    const echo = await waitForFrame(() => streams.follow.frames.find((frame) => frame?.event?.type === 'user/message'
-      && frame.event.data?.source?.rpcId === requestId), 'durable user/message on session/follow')
+    // All three durable events arrive on the controller's merged follow, in the
+    // Host's commit order, with the SAME rpcId the native controller looks its
+    // optimistic bubble up by.
+    await waitForFrame(() => streams.follow.frames.filter((frame) => frame?.event?.type === 'agent/inbox/spliced').length >= 2,
+      'both agent/inbox/spliced events on session/follow')
+    await waitForFrame(() => streams.follow.frames.some((frame) => frame?.event?.type === 'user/message'),
+      'durable user/message on session/follow')
+    const followEvents = streams.follow.frames.filter((frame) => frame?.event?.type === 'agent/inbox/spliced'
+      || frame?.event?.type === 'user/message')
+    assert.deepEqual(followEvents.map((frame) => [frame.event.type, frame.event.seq]), [
+      ['agent/inbox/spliced', host.SPLICE_SEQ],
+      ['agent/inbox/spliced', host.CLAIM_SEQ],
+      ['user/message', host.MESSAGE_SEQ],
+    ], 'the follow events arrive in Host commit order with distinct seqs')
+    const [insert, claim, echo] = followEvents
+    assert.equal(insert.event.data.inserted?.[0]?.source?.rpcId, requestId)
+    assert.equal(claim.event.data.removedCount, 1, 'the claim splice removes the inbox row')
+    assert.equal(Object.hasOwn(claim.event.data, 'outcome'), false, 'the claim splice carries NO canceled outcome')
     assert.equal(echo.event.data.source.kind, 'user')
     assert.equal(echo.event.data.source.rpcId, requestId,
       'source.rpcId is the exact requestId, not a host-tagged id')
-    assert.equal(echo.event.seq, host.INBOX_SEQ)
     assert.ok(!echo.event.data.source.rpcId.startsWith('h:'), 'the source rpcId is never namespaced')
 
-    // The inbox projection watermark arrives on the controller's merged control
-    // stream for the NAMESPACED session — the only source of seqOf('inbox') remote.
-    const projection = await waitForFrame(() => streams.control.frames.find((frame) => frame?.type === 'projection'
+    // Both inbox projection watermarks arrive on the controller's merged control
+    // stream for the NAMESPACED session — the only source of seqOf('inbox')
+    // remote. The claim's watermark (seq 8) is what retires an index===null echo.
+    await waitForFrame(() => streams.control.frames.filter((frame) => frame?.type === 'projection'
       && frame.sessionId === namespaceId(HOST, 's1')
-      && frame.changes?.some((change) => change.key === 'inbox')), 'inbox projection on session/control')
-    const inbox = projection.changes.find((change) => change.key === 'inbox')
-    assert.equal(inbox.val.seq, host.INBOX_SEQ, 'the inbox watermark reaches the controller at the echo seq')
+      && frame.changes?.some((change) => change.key === 'inbox')).length >= 2,
+    'both inbox projections on session/control')
+    const projections = streams.control.frames.filter((frame) => frame?.type === 'projection'
+      && frame.sessionId === namespaceId(HOST, 's1')
+      && frame.changes?.some((change) => change.key === 'inbox'))
+    assert.deepEqual(projections.map((frame) => [
+      frame.seq, frame.changes.find((change) => change.key === 'inbox').val.seq,
+    ]), [[host.SPLICE_SEQ, host.SPLICE_SEQ], [host.CLAIM_SEQ, host.CLAIM_SEQ]],
+    'both watermarks reach the controller, in order, at their splice seqs')
+    assert.equal(projections[0].changes.find((change) => change.key === 'inbox').val['next-turn']?.[0]?.source?.rpcId,
+      requestId, 'the first inbox projection carries the queued message')
+    assert.deepEqual(projections[1].changes.find((change) => change.key === 'inbox').val['next-turn'], [],
+      'the claim projection carries an empty inbox')
 
-    // Both settlement facts are on the LIVE streams: no session switch, no
+    // Every settlement fact is on the LIVE streams: no session switch, no
     // dispose/reopen, no handmade frame injected into the controller.
     assert.equal(streams.follow.errors.length, 0, JSON.stringify(streams.follow.errors))
     assert.equal(streams.control.errors.length, 0, JSON.stringify(streams.control.errors))
@@ -1397,23 +1453,34 @@ test('real gateway: a withheld control stream holds the remote echo until its in
     } }, undefined, {})
     assert.equal(answer.ok, true, JSON.stringify(answer))
 
-    // The admitted echo is on follow (so the optimistic bubble exists), but its
-    // control watermark is missing: rc.3's trap holds it — the observed bug.
-    const echo = await waitForFrame(() => streams.follow.frames.find((frame) => frame?.event?.type === 'user/message'
-      && frame.event.data?.source?.rpcId === requestId), 'durable user/message on session/follow')
-    assert.ok(echo)
+    // All three durable events are on follow (so the optimistic bubble exists),
+    // but BOTH control watermarks are missing: the claim splice left the receipt
+    // at index===null, and rc.3's trap holds the admitted echo until seq 8
+    // reaches the inbox projection.
+    await waitForFrame(() => streams.follow.frames.filter((frame) => frame?.event?.type === 'agent/inbox/spliced').length >= 2,
+      'both splices on session/follow (held case)')
+    await waitForFrame(() => streams.follow.frames.some((frame) => frame?.event?.type === 'user/message'
+      && frame.event.data?.source?.rpcId === requestId), 'durable user/message on session/follow (held case)')
+    assert.deepEqual(streams.follow.frames.filter((frame) => frame?.event?.type === 'agent/inbox/spliced'
+      || frame?.event?.type === 'user/message').map((frame) => frame.event.seq),
+    [host.SPLICE_SEQ, host.CLAIM_SEQ, host.MESSAGE_SEQ], 'held echo still has the full ordered sequence')
     const held = streams.control.frames.some((frame) => frame?.type === 'projection'
       && frame.sessionId === namespaceId(HOST, 's1')
       && frame.changes?.some((change) => change.key === 'inbox'))
     assert.equal(held, false, 'with session/control withheld, no inbox watermark reaches the controller')
 
-    // Releasing the Host's inbox projection resolves the hold on the SAME live
+    // Releasing the Host's inbox projections resolves the hold on the SAME live
     // streams — no session switch, no dispose.
-    host.releaseControl()
-    const projection = await waitForFrame(() => streams.control.frames.find((frame) => frame?.type === 'projection'
+    host.releaseControl(requestId)
+    await waitForFrame(() => streams.control.frames.filter((frame) => frame?.type === 'projection'
       && frame.sessionId === namespaceId(HOST, 's1')
-      && frame.changes?.some((change) => change.key === 'inbox')), 'inbox projection after release')
-    assert.equal(projection.changes.find((change) => change.key === 'inbox').val.seq, host.INBOX_SEQ)
+      && frame.changes?.some((change) => change.key === 'inbox')).length >= 2,
+    'both inbox projections after release')
+    const projections = streams.control.frames.filter((frame) => frame?.type === 'projection'
+      && frame.sessionId === namespaceId(HOST, 's1')
+      && frame.changes?.some((change) => change.key === 'inbox'))
+    assert.deepEqual(projections.map((frame) => frame.changes.find((change) => change.key === 'inbox').val.seq),
+      [host.SPLICE_SEQ, host.CLAIM_SEQ], 'both watermarks arrive in order, the claim one last')
     assert.equal(streams.control.errors.length, 0, JSON.stringify(streams.control.errors))
     assert.equal(streams.follow.errors.length, 0, JSON.stringify(streams.follow.errors))
   } finally {
