@@ -740,10 +740,10 @@ function fakeHost() {
   return { gateway, calls }
 }
 
-/** The real gateway over the pinned TLS listener, with the Host above behind it. */
-async function startRealGateway(t) {
+/** The real gateway over the pinned TLS listener, with a Host behind it. */
+async function startRealGateway(t, makeHost = fakeHost) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-008-question-'))
-  const host = fakeHost()
+  const host = makeHost()
   const listeners = {}
   let management
   let upgrade
@@ -1166,6 +1166,257 @@ test('real gateway: an approval card still reaches the device and is applied ove
     await approval.pending.catch(() => undefined)
     control.abort()
     await iterator.return()
+    try { paired.connection.ws?.terminate() } catch { /* already gone */ }
+  }
+})
+
+// -- remote prompt echo settlement through the REAL gateway -------------------
+//
+// DSH 0.2.2-rc.3's session.js settles an optimistic user bubble only when a
+// durable `user/message` whose `source.rpcId` equals beginSubmission's `requestId`
+// reaches the controller, and — when the admit receipt has `index === null` —
+// only once the `inbox` projection watermark on `session/control` catches up
+// (trap :855-863). The control stream is the ONLY source of that watermark for a
+// remote session. Both ids and both streams cross this wrapper: a rename of
+// `source.rpcId`, or a dropped projection frame, strands the bubble until a
+// session switch disposes the admitted echo. These cases run the REAL
+// plugins/mobile-gateway in-process; the Host behind it appends the durable
+// message to its session journal on accepting the prompt and folds it into its
+// inbox projection, so the settlement facts travel Host → gateway → router →
+// controller. Nothing is injected into the controller's merged streams.
+
+/**
+ * A Host behind the real gateway that behaves like DSH's session controller:
+ * accepting `session/prompt` appends a durable user/message to `session/follow`
+ * and (unless withheld) an inbox projection to `session/control`, both keyed by
+ * the requestId the controller minted. The controller's merged streams must
+ * carry both with the source rpcId intact.
+ */
+function createEchoHost({ withholdControl = false } = {}) {
+  const calls = []
+  /** @type {Map<string, ReturnType<typeof createQueue>>} */
+  const streams = new Map()
+  const queueFor = (endpoint) => {
+    let queue = streams.get(endpoint)
+    if (!queue) { queue = createQueue(); streams.set(endpoint, queue) }
+    return queue
+  }
+  const INBOX_SEQ = 7
+  let controlReleased = false
+  const releaseControl = () => {
+    if (controlReleased) return
+    controlReleased = true
+    queueFor('session/control').push({ type: 'projection', sessionId: 's1', seq: INBOX_SEQ,
+      changes: [{ key: 'inbox', val: { seq: INBOX_SEQ, nextTurn: [], nextStep: [] } }] })
+  }
+  const gateway = {
+    async invoke(request) {
+      if (request?.namespace === 'session' && request?.method === 'list') return { items: [{ sessionId: 's1' }] }
+      return {}
+    },
+    async stream(request) {
+      return (async function* () {
+        yield { type: 'baseline', value: request?.namespace === 'workspace'
+          ? { items: [], archivedSessionIds: [] } : { projections: {} } }
+        while (!request?.signal?.aborted) await delay(10)
+      })()
+    },
+    async dispatchRpc(endpoint, payload, signal, peer) {
+      calls.push({ endpoint, args: clone(payload?.args), peer })
+      if (endpoint === 'session/list') return { ok: true, value: { items: [{ sessionId: 's1' }] } }
+      if (endpoint === 'session/prompt') {
+        const requestId = payload?.args?.requestId
+        // The durable echo the Host appends on accepting the prompt. It carries
+        // the controller's requestId as source.rpcId — the exact id rc.3's
+        // controller looks its optimistic bubble up by.
+        queueFor('session/follow').push({ type: 'event', event: {
+          type: 'user/message', seq: INBOX_SEQ, time: 1,
+          data: { id: 'm-echo', content: [{ type: 'text', text: 'ping' }], source: { kind: 'user', rpcId: requestId } },
+        } })
+        // Without the control watermark an admitted (index === null) echo stays held.
+        if (!withholdControl) releaseControl()
+        return { ok: true, value: { accepted: true } }
+      }
+      return { ok: true, value: null }
+    },
+    async openWireStream(endpoint, payload, uplink, peer, signal, control) {
+      const queue = queueFor(endpoint)
+      if (endpoint === 'session/follow') {
+        queue.push({ type: 'snapshot', cursor: 0, header: { version: 4, id: 's1' },
+          records: [], projections: {}, hasMore: false })
+      } else if (endpoint === 'session/control') {
+        queue.push({ type: 'baseline', value: { projections: {} } })
+      }
+      return queue
+    },
+  }
+  return { gateway, calls, releaseControl, INBOX_SEQ }
+}
+
+/** A controller-side router harness with a short merge-baseline wait. */
+function createSessionHarness(remotes) {
+  const localCalls = []
+  const localStreams = []
+  const logs = []
+  const gateway = {
+    async dispatchRpc(endpoint, payload, signal, peer) {
+      localCalls.push({ endpoint, payload: clone(payload) })
+      return { ok: true, value: { local: endpoint } }
+    },
+    async openWireStream(endpoint, payload, uplink, peer, signal, control, window) {
+      const queue = createQueue()
+      localStreams.push({ endpoint, payload: clone(payload), window, queue })
+      if (endpoint === '$events') queue.push({ type: 'ready', clientId: 'local-client', host: { home: '/home/owner' } })
+      if (endpoint === 'session/control') queue.push({ type: 'baseline', value: { projections: {} } })
+      return queue
+    },
+  }
+  const listeners = new Set()
+  const connected = new Set(remotes.map((remote) => remote.hostId))
+  const notify = () => { for (const listener of [...listeners]) listener() }
+  const router = createHostRouter({
+    gateway,
+    dshVersion: PINNED_DSH_VERSION,
+    mergeBaselineTimeoutMs: 80,
+    hosts: () => remotes.filter((remote) => connected.has(remote.hostId))
+      .map((remote) => ({ hostId: remote.hostId, hostName: remote.hostName, connection: remote.connection, online: true })),
+    onHostsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener) },
+    approvals: { pending: () => [] },
+    log: (line) => logs.push(line),
+  })
+  router.install()
+  return { gateway, router, localCalls, localStreams, logs }
+}
+
+/** Drain an iterator continuously so a later frame is never lost to a timed-out next(). */
+function drainFrames(iterator) {
+  const frames = []
+  const errors = []
+  let running = true
+  const done = (async () => {
+    try {
+      while (running) {
+        const { value, done: ended } = await iterator.next()
+        if (ended) break
+        frames.push(value)
+      }
+    } catch (error) { errors.push(error) }
+  })()
+  return {
+    frames, errors,
+    async stop() { running = false; try { await iterator.return() } catch { /* gone */ } await done },
+  }
+}
+
+/** Poll collected frames until `predicate` accepts one, or fail with a labelled deadline. */
+async function waitForFrame(predicate, label, ms = 2000) {
+  const deadline = Date.now() + ms
+  for (;;) {
+    const found = predicate()
+    if (found) return found
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`)
+    await delay(10)
+  }
+}
+
+async function openSessionStreams(harness, t) {
+  const controlAbort = new AbortController()
+  const followAbort = new AbortController()
+  t.after(() => { controlAbort.abort(); followAbort.abort() })
+  const controlSource = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, controlAbort.signal, controlAbort, 64)
+  const followSource = await harness.gateway.openWireStream('session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: namespaceId(HOST, 's1') } } } },
+    undefined, {}, followAbort.signal, followAbort, 64)
+  const control = drainFrames(controlSource[Symbol.asyncIterator]())
+  const follow = drainFrames(followSource[Symbol.asyncIterator]())
+  t.after(async () => { await control.stop(); await follow.stop() })
+  return { control, follow }
+}
+
+test('real gateway: a remote prompt echo settles from follow + control without a session switch', async (t) => {
+  const host = createEchoHost()
+  const gateway = await startRealGateway(t, () => host)
+  const paired = await pairRealDevice(gateway, t, 'desk-echo-real-0000-4000-800000000001',
+    ['sessions:read', 'prompt:send', 'approval:respond', 'harness:remote'])
+  const harness = createSessionHarness([{ hostId: HOST, hostName: 'Host B', connection: paired.connection }])
+  const streams = await openSessionStreams(harness, t)
+  const requestId = 'req-real-echo-1'
+  try {
+    const answer = await harness.gateway.dispatchRpc('session/prompt', { args: {
+      sessionId: namespaceId(HOST, 's1'), requestId, mode: 'instant',
+      content: [{ type: 'text', text: 'ping' }],
+    } }, undefined, {})
+    assert.equal(answer.ok, true, JSON.stringify(answer))
+    const promptCall = host.calls.find((call) => call.endpoint === 'session/prompt')
+    assert.ok(promptCall, 'the real gateway forwarded the prompt to the Host')
+    assert.equal(promptCall.args.requestId, requestId,
+      'the router did not rename the controller-minted requestId')
+
+    // The durable user/message arrives on the controller's merged follow with the
+    // SAME rpcId — the id the native controller looks its optimistic bubble up by.
+    const echo = await waitForFrame(() => streams.follow.frames.find((frame) => frame?.event?.type === 'user/message'
+      && frame.event.data?.source?.rpcId === requestId), 'durable user/message on session/follow')
+    assert.equal(echo.event.data.source.kind, 'user')
+    assert.equal(echo.event.data.source.rpcId, requestId,
+      'source.rpcId is the exact requestId, not a host-tagged id')
+    assert.equal(echo.event.seq, host.INBOX_SEQ)
+    assert.ok(!echo.event.data.source.rpcId.startsWith('h:'), 'the source rpcId is never namespaced')
+
+    // The inbox projection watermark arrives on the controller's merged control
+    // stream for the NAMESPACED session — the only source of seqOf('inbox') remote.
+    const projection = await waitForFrame(() => streams.control.frames.find((frame) => frame?.type === 'projection'
+      && frame.sessionId === namespaceId(HOST, 's1')
+      && frame.changes?.some((change) => change.key === 'inbox')), 'inbox projection on session/control')
+    const inbox = projection.changes.find((change) => change.key === 'inbox')
+    assert.equal(inbox.val.seq, host.INBOX_SEQ, 'the inbox watermark reaches the controller at the echo seq')
+
+    // Both settlement facts are on the LIVE streams: no session switch, no
+    // dispose/reopen, no handmade frame injected into the controller.
+    assert.equal(streams.follow.errors.length, 0, JSON.stringify(streams.follow.errors))
+    assert.equal(streams.control.errors.length, 0, JSON.stringify(streams.control.errors))
+    assert.ok(harness.logs.every((line) => !line.includes('remote/id-leak')),
+      `no ingress refusal of the echo (${JSON.stringify(harness.logs.slice(-6))})`)
+  } finally {
+    try { paired.connection.ws?.terminate() } catch { /* already gone */ }
+  }
+})
+
+test('real gateway: a withheld control stream holds the remote echo until its inbox watermark arrives', async (t) => {
+  const host = createEchoHost({ withholdControl: true })
+  const gateway = await startRealGateway(t, () => host)
+  const paired = await pairRealDevice(gateway, t, 'desk-echo-real-0000-4000-800000000002',
+    ['sessions:read', 'prompt:send', 'approval:respond', 'harness:remote'])
+  const harness = createSessionHarness([{ hostId: HOST, hostName: 'Host B', connection: paired.connection }])
+  const streams = await openSessionStreams(harness, t)
+  const requestId = 'req-real-echo-held'
+  try {
+    const answer = await harness.gateway.dispatchRpc('session/prompt', { args: {
+      sessionId: namespaceId(HOST, 's1'), requestId, mode: 'instant',
+      content: [{ type: 'text', text: 'ping' }],
+    } }, undefined, {})
+    assert.equal(answer.ok, true, JSON.stringify(answer))
+
+    // The admitted echo is on follow (so the optimistic bubble exists), but its
+    // control watermark is missing: rc.3's trap holds it — the observed bug.
+    const echo = await waitForFrame(() => streams.follow.frames.find((frame) => frame?.event?.type === 'user/message'
+      && frame.event.data?.source?.rpcId === requestId), 'durable user/message on session/follow')
+    assert.ok(echo)
+    const held = streams.control.frames.some((frame) => frame?.type === 'projection'
+      && frame.sessionId === namespaceId(HOST, 's1')
+      && frame.changes?.some((change) => change.key === 'inbox'))
+    assert.equal(held, false, 'with session/control withheld, no inbox watermark reaches the controller')
+
+    // Releasing the Host's inbox projection resolves the hold on the SAME live
+    // streams — no session switch, no dispose.
+    host.releaseControl()
+    const projection = await waitForFrame(() => streams.control.frames.find((frame) => frame?.type === 'projection'
+      && frame.sessionId === namespaceId(HOST, 's1')
+      && frame.changes?.some((change) => change.key === 'inbox')), 'inbox projection after release')
+    assert.equal(projection.changes.find((change) => change.key === 'inbox').val.seq, host.INBOX_SEQ)
+    assert.equal(streams.control.errors.length, 0, JSON.stringify(streams.control.errors))
+    assert.equal(streams.follow.errors.length, 0, JSON.stringify(streams.follow.errors))
+  } finally {
     try { paired.connection.ws?.terminate() } catch { /* already gone */ }
   }
 })
