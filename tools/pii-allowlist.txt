@@ -85,3 +85,7 @@ tailscale_ip:100.64.9.9
 # Spec 031 PWA pair-link attack fixture (apps/mobile-companion/test/pair-web-origin.test.ts):
 # userinfo-with-password inside a= on a reserved .example domain; not a mailbox.
 email:pass@attacker.example.com
+# UUID-shaped fixture in plugins/devices/test/client-host-tabs.test.mjs (2026-11-17, A1.3):
+# a fake LOCAL workspace id, not an API key. The literal remains in earlier commits, so
+# gitleaks' git-mode scan needs this reviewed exemption to push the scrubbed HEAD.
+generic-api-key:9f1c2a3e-1111-4b2c-8d3e-5a6b7c8d9e0f
