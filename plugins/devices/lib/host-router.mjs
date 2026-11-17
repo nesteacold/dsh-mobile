@@ -270,6 +270,12 @@ const SESSION_FOLLOW_ENDPOINT = 'session/follow'
  * Remote sessions never cross it on their own, so it is merged like the catalog.
  */
 const SESSION_CONTROL_ENDPOINT = 'session/control'
+/**
+ * Bound on seed-requiring cuts carried between generations. The native retry opens a
+ * new generation for each such cut, so without a cap an abandoned stream could pin
+ * one block per session forever.
+ */
+const MAX_CARRIED_CONTROL_CUTS = 64
 /** The Host-generation model catalog the native picker loads (it takes no argument). */
 const MODEL_CATALOG_ENDPOINT = 'session/modelCatalog'
 /**
@@ -1427,6 +1433,17 @@ export class HostRouter {
   /** Stop functions of the merged streams currently being consumed. */
   #merges = new Set()
   /**
+   * Seed-requiring `session/control` baselines that ended their generation, keyed by
+   * merged session id. A remote greeting is asynchronous and can arrive after the
+   * native retry's next opening baseline, so the cut must be carried explicitly:
+   * waiting for the greeting cannot carry a -1 cursor or clear a key the cut omits.
+   * Snapshotted by each generation and retired only when that Host finally greets
+   * at the seeded watermark: an unrelated Host's rebase must not drop it. Bounded
+   * so a discarded stream cannot grow it.
+   * @type {Map<string, {hostId: string|null, block: object}>}
+   */
+  #carriedControlCuts = new Map()
+  /**
    * Stop functions of the `session/follow` pumps, keyed by host.
    *
    * A pump outlives the LINK on purpose, but not the PAIRING: once a host is
@@ -1569,6 +1586,7 @@ export class HostRouter {
   uninstall() {
     for (const stop of [...this.#merges]) stop()
     this.#merges.clear()
+    this.#carriedControlCuts.clear()
     for (const stops of [...this.#followStops.values()]) for (const stop of [...stops]) stop()
     this.#followStops.clear()
     this.#eventSinks.clear()
@@ -2668,9 +2686,19 @@ export class HostRouter {
             // bound (see `pageUnseen`). An event's fill is already deduplicated against
             // the reader (`lastSeq`), and a snapshot's cursor is never counted: its value
             // is the page's cut, not a fill this reader lacks.
-            if (resumes && isCreatedRecordFrame(value)) {
-              for (let seq = Math.max(value.firstLiveSeq, (lastSeq ?? -1) + 1); seq <= value.end; seq += 1) countedPageSeqs.add(seq)
-            } else if (resumes && isSnapshotFrame(value)) {
+            // A refusal this part already carries is honored BEFORE walking a range the
+            // remote Host named — that end can be arbitrarily far past the reader.
+            const marker = frames.find((frame) => frame?.type === 'resume-overflow')
+            if (!marker && resumes && isCreatedRecordFrame(value)) {
+              // Count at most one page bound past the reader: an unmarked huge end is
+              // refused by the size check below without walking the whole range.
+              const start = Math.max(value.firstLiveSeq, (lastSeq ?? -1) + 1)
+              const stop = Math.min(value.end, start + MAX_RESUME_GAP)
+              for (let seq = start; seq <= stop; seq += 1) {
+                countedPageSeqs.add(seq)
+                if (countedPageSeqs.size > MAX_RESUME_GAP) break
+              }
+            } else if (!marker && resumes && isSnapshotFrame(value)) {
               for (const frame of unseenSnapshotEvents(value, lastSeq)) {
                 const seq = followSeqOf(frame)
                 if (seq !== null) countedPageSeqs.add(seq)
@@ -2679,7 +2707,7 @@ export class HostRouter {
             // A repair this window cannot take is refused VISIBLY and ends the follow
             // here, before a later live frame of this connection is accepted: `lastSeq`
             // stays exactly where the reader is, so nothing can be skipped silently.
-            const overflow = countedPageSeqs.size > MAX_RESUME_GAP ? { count: countedPageSeqs.size } : frames.find((frame) => frame?.type === 'resume-overflow')
+            const overflow = marker ?? (countedPageSeqs.size > MAX_RESUME_GAP ? { count: countedPageSeqs.size } : undefined)
             if (overflow) {
               const terminal = resumeOverflowError(hostId, overflow.count)
               this.#log(`session/follow for ${hostId} stopped (${STREAM_RESUME_OVERFLOW_CODE}): ${overflow.count} unseen events in one page`)
@@ -3243,18 +3271,94 @@ export class HostRouter {
   }
 
   /**
+   * Hold a cut that ended a generation until the native retry opens the next one.
+   * `blocks` are already merged (namespaced keys, ingress-applied values), so the
+   * replacement generation can put them in its ONE opening baseline verbatim.
+   * Re-inserting an id moves it to the end, so the cap sheds the oldest cuts first.
+   * A cut stays until its Host greets with the same watermark again: that repeat
+   * proves the seeded cut reached the store, so only then is it retired.
+   */
+  #rememberControlCuts(hostId, blocks) {
+    for (const [mergedId, block] of Object.entries(blocks)) {
+      if (!isPlainObject(block)) continue
+      this.#carriedControlCuts.delete(mergedId)
+      this.#carriedControlCuts.set(mergedId, { hostId, block })
+    }
+    while (this.#carriedControlCuts.size > MAX_CARRIED_CONTROL_CUTS) {
+      this.#carriedControlCuts.delete(this.#carriedControlCuts.keys().next().value)
+    }
+  }
+
+  /**
+   * Cuts for the generation that is opening now. This is a SNAPSHOT, not a
+   * consumption: a later rebase in this generation may still need the cuts of
+   * Hosts that have not re-greeted, so they must survive into its replacement.
+   * Each is retired only when its Host greets at the seeded watermark again.
+   */
+  #snapshotCarriedControlCuts() {
+    return new Map(this.#carriedControlCuts)
+  }
+
+  /** A greeting at the seeded watermark proves this cut landed; stop carrying it. */
+  #retireCarriedControlCut(mergedId) {
+    this.#carriedControlCuts.delete(mergedId)
+  }
+
+  /**
    * A baseline that arrives after the merged stream has opened is not a second
    * opening snapshot: DSH's snapshot stream ends on one (`snapshot-stream.ts`
    * checks `snapshotSeen`). Re-send its blocks as ordinary per-session projection
-   * frames, preserving the Host's watermark. `ProjectionValueStore.apply` drops
-   * a sequenced write whose `seq` is not newer, so an equal/old watermark cannot
-   * roll a newer value back.
+   * frames ONLY when that is admission-faithful: `ProjectionValueStore.apply`
+   * drops a sequenced write whose `seq` is not newer, so an equal/old watermark
+   * cannot roll a newer value back, but it also cannot clear a key the new cut
+   * omits (`seed` does) and the consumer admits frame seqs with `SessionSeq`,
+   * which rejects -1 while baselines may legitimately carry that empty cursor
+   * (`sessionSeqCursor`). When a cut needs seed semantics or a negative cursor,
+   * return null so the caller reopens the logical stream: the native's own
+   * retry then opens a fresh generation whose ONE baseline carries the cut.
+   *
+   * @param {object} baseline the late `{type:'baseline', value:{projections}}` frame
+   * @param {string|null} hostId host namespace, or null for Local
+   * @param {Map<string, Set<string>>} known keys currently held per merged session id
+   * @param {Map<string, number>} carriedCutSeqs watermarks of cuts carried from the
+   *   generation that rebased and already seeded by this generation's opening baseline
+   * @param {(mergedId: string) => void} [retire] called when a cut's own greeting
+   *   repeats its seeded watermark, proving the cut no longer needs carrying
+   * @returns {object[]|null} projection frames, or null when a fresh generation is required
    */
-  #controlBaselineFrames(baseline, hostId) {
+  #controlBaselineFrames(baseline, hostId, known, carriedCutSeqs, retire) {
+    // Validate the WHOLE remote frame first, before any watermark shortcut: a
+    // payload at a carried seq is still remote data and may smuggle an id that
+    // already names a namespace. #ingress refuses that (or an over-deep payload)
+    // through the same path as every other remote frame. Its renamed copy is
+    // discarded here: frames below are built from the raw cut and renamed once
+    // when emitted, so no id is tagged twice.
+    if (hostId !== null) this.#ingress(hostId, baseline, 'session/control baseline')
     const blocks = isPlainObject(baseline?.value?.projections) ? baseline.value.projections : {}
     const frames = []
     for (const [sessionId, block] of Object.entries(blocks)) {
       if (!isPlainObject(block) || !isPlainObject(block.values)) continue
+      const mergedId = hostId === null ? sessionId : namespaceId(hostId, sessionId)
+      // A greeting that repeats a cut the opening baseline already seeded is a
+      // duplicate, not a new cut. Native seed/apply at the same watermark cannot
+      // change the value, so ignore it — otherwise a remote that greets with the
+      // same -1 cut on every stream would end every generation in turn.
+      if (carriedCutSeqs?.has(mergedId) && carriedCutSeqs.get(mergedId) === block.asOfSeq) {
+        // The Host has now greeted at the watermark this generation seeded:
+        // the cut landed, so a later rebase need not carry it again.
+        retire?.(mergedId)
+        continue
+      }
+      // A baseline cursor of -1 is a valid empty-session cut, but the consumer
+      // admits projection frames with SessionSeq (non-negative safe integer).
+      // Mapping it to 0 would fake an event-0 write and mask the real one.
+      if (!Number.isSafeInteger(block.asOfSeq) || block.asOfSeq < 0) return null
+      // seed() clears every row whose key the cut omits; apply() only writes the
+      // carried keys. A prior row (from an earlier baseline or a live frame) that
+      // this cut drops must be removed by the native store, not papered over.
+      for (const key of known?.get(mergedId) ?? []) {
+        if (!Object.hasOwn(block.values, key)) return null
+      }
       const frame = {
         type: 'projection',
         sessionId,
@@ -3271,9 +3375,13 @@ export class HostRouter {
    *
    * DSH's client holds one projection store for all sessions; every host has its
    * own control stream and its own seq space. The ONE opening baseline folds in
-   * whatever arrived before the merge started; every later baseline (local or
-   * remote, late or re-opened) is re-sent as per-session projection frames, and
-   * every ordinary `{type:'projection'}` frame keeps its own (per-session) seq.
+   * whatever arrived before the merge started; later baselines are re-sent as
+   * per-session projection frames when that is admission-faithful, and a cut
+   * that needs native seed semantics ends this stream so the consumer's retry
+   * opens a fresh generation with one coherent replacement baseline. That cut is
+   * carried across the retry (bounded) and seeded by the next opening baseline;
+   * a repeated late greeting at the same watermark is ignored and retires the cut.
+   * Every ordinary `{type:'projection'}` frame keeps its own (per-session) seq.
    * A session id is namespaced, so seqs never collide. Without this, a remote
    * `model/selection` append is durable on that Host but the native model chip
    * never sees the `modelSelection` projection frame.
@@ -3301,20 +3409,75 @@ export class HostRouter {
     const streamStableMs = 1000
     let localBlocks = {}
     let started = false
+    /**
+     * Projection keys currently held per merged session id. A late baseline can
+     * only ride as projection frames when the cut carries every key the native
+     * store already has for that session (ProjectionValueStore.seed clears the
+     * rest). Live frames add keys too, so they are recorded here as well.
+     * @type {Map<string, Set<string>>}
+     */
+    const knownKeys = new Map()
+    /** Remembers keys learned from a sequenced block or frame; ingress keeps keys intact. */
+    const noteKeys = (id, values) => {
+      if (!isPlainObject(values)) return
+      let set = knownKeys.get(id)
+      if (set === undefined) knownKeys.set(id, set = new Set())
+      for (const key of Object.keys(values)) set.add(key)
+    }
+    const noteFrame = (frame) => {
+      if (!isPlainObject(frame)) return
+      const id = typeof frame.sessionId === 'string' ? frame.sessionId : null
+      if (id === null) return
+      if (frame.type === 'projection' && Array.isArray(frame.changes)) {
+        for (const change of frame.changes) if (isPlainObject(change) && typeof change.key === 'string') noteKeys(id, { [change.key]: true })
+      }
+    }
+    // A cut that ended the previous generation is folded into THIS generation's
+    // ONE opening baseline. Its Host may greet only after that baseline, so the
+    // cut cannot wait for the greeting: a -1 cursor has no projection frame and
+    // a cut that omits a key only clears the native store when seeded.
+    const carried = this.#snapshotCarriedControlCuts()
+    /**
+     * Watermarks of cuts carried from the generation that rebased, by merged session
+     * id. A late greeting repeating one of these is a duplicate of what THIS
+     * generation's opening baseline already seeded; greetings first folded in here
+     * are not in this map, so a remote that reopens its own stream still republishes
+     * its cut as an ordinary projection frame.
+     */
+    const carriedCutSeqs = new Map()
+    for (const [mergedId, entry] of carried) {
+      carriedCutSeqs.set(mergedId, entry.block.asOfSeq)
+      noteKeys(mergedId, entry.block.values)
+    }
+    /**
+     * A baseline needing seed semantics (negative cursor or an omitted key)
+     * cannot be synthesized from projection frames. End this stream after its
+     * accepted opening baseline so the native RemoteStream retries and the
+     * reopened generation publishes one coherent, freshly seeded baseline.
+     */
+    const rebase = (why) => {
+      if (lifetime.signal.aborted) return
+      this.#log(`${SESSION_CONTROL_ENDPOINT} re-opening merged stream: ${why}`)
+      stop()
+    }
     /** Increments that arrived before the first combined baseline (bounded by time, not count). */
     const pending = []
     const emit = (frame) => {
+      noteFrame(frame)
       if (started) queue.push(frame)
       else pending.push(frame)
     }
     const combinedBaseline = () => {
       const projections = { ...localBlocks }
+      for (const [mergedId, entry] of carried) projections[mergedId] = entry.block
       for (const pump of pumps.values()) Object.assign(projections, pump.blocks)
       return { type: 'baseline', value: { projections } }
     }
     // Only the generator below publishes the opening baseline, once. Before that,
     // a folded-in baseline is picked up by `combinedBaseline()`; after that, a
-    // re-baseline rides as projection frames, never as a second opening snapshot.
+    // re-baseline rides as projection frames OR ends this whole stream so the
+    // native retry opens a new generation with one replacement baseline — never
+    // a second opening snapshot in the current generation.
     // An obsolete pump must never remove the one that replaced it: `expected`
     // binds this removal to the pump whose error or backoff actually ended.
     const drop = (hostId, expected) => {
@@ -3361,10 +3524,25 @@ export class HostRouter {
               if (!isPlainObject(frame)) continue
               if (frame.type === 'baseline') {
                 if (started) {
-                  for (const projection of this.#controlBaselineFrames(frame, host.hostId)) emit(projection)
+                  const projections = this.#controlBaselineFrames(frame, host.hostId, knownKeys, carriedCutSeqs,
+                    (mergedId) => this.#retireCarriedControlCut(mergedId))
+                  if (projections === null) {
+                    // Carry this cut across to the reopened generation: its Host
+                    // greeting is asynchronous and may arrive after that generation
+                    // has already published its ONE opening baseline.
+                    const cut = {}
+                    this.#mergeControlBaseline(cut, frame, host.hostId)
+                    this.#rememberControlCuts(host.hostId, cut)
+                    rebase(`remote ${host.hostId} baseline needs native seed semantics`)
+                    return
+                  }
+                  for (const projection of projections) emit(projection)
                 } else {
                   pump.blocks = {}
                   this.#mergeControlBaseline(pump.blocks, frame, host.hostId)
+                  for (const [id, block] of Object.entries(pump.blocks)) {
+                    if (isPlainObject(block)) noteKeys(id, block.values)
+                  }
                 }
                 progressed = true
                 continue
@@ -3446,10 +3624,23 @@ export class HostRouter {
             if (lifetime.signal.aborted) break
             if (isPlainObject(frame) && frame.type === 'baseline') {
               if (started) {
-                for (const projection of this.#controlBaselineFrames(frame, null)) emit(projection)
+                const projections = this.#controlBaselineFrames(frame, null, knownKeys, carriedCutSeqs,
+                  (mergedId) => this.#retireCarriedControlCut(mergedId))
+                if (projections === null) {
+                  const cut = {}
+                  this.#mergeControlBaseline(cut, frame, null)
+                  this.#rememberControlCuts(null, cut)
+                  rebase('Local baseline needs native seed semantics')
+                  settleLocal.resolve()
+                  return
+                }
+                for (const projection of projections) emit(projection)
               } else {
                 localBlocks = {}
                 this.#mergeControlBaseline(localBlocks, frame, null)
+                for (const [id, block] of Object.entries(localBlocks)) {
+                  if (isPlainObject(block)) noteKeys(id, block.values)
+                }
               }
               settleLocal.resolve()
               continue

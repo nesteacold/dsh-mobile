@@ -947,7 +947,7 @@ const EXPANSION_KEY = 'dsh-ext.devices.workspace-expansion.v1'
 // The stored key is the row key minus `workspace:` — i.e. `h:<hostId>:<uuid>`.
 const REMOTE_KEY_A = 'h:r1:1a2b3c4d-2222-4e5f-8a9b-0c1d2e3f4a5b'
 const REMOTE_KEY_B = 'h:r2:2b3c4d5e-3333-4f60-9a1b-2c3d4e5f6a7b'
-const LOCAL_KEY = '9f1c2a3e-1111-4b2c-8d3e-5a6b7c8d9e0f'
+const LOCAL_KEY = 'local-workspace-fixed-id'
 const row = (key, expanded) => ({
   // A remote key already carries its `h:` tag; a local one is a bare uuid.
   'data-row-key': `workspace:${key}`,

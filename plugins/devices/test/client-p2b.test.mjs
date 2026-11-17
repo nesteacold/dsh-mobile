@@ -235,11 +235,12 @@ test('the stock sidebar keeps its seat in every routing state; the plugin only f
   }
   // The Devices page reads: the badge seats are in, and an off routing says so.
   // No connected host is not a failure — the seats are still there. The tab strip is
-  // its own half of the same line (`tabs`/`tabsReason`): with this fake document there
-  // is no sidebar to place it in and no root renderer to draw it, so it reports the
-  // same `no-tabs` a shell without the placement seat would — the strip's own placement
-  // is proven in test/client-host-tabs.test.mjs, against a fake sidebar.
-  const TABS = { tabs: false, tabsReason: 'no-tabs' }
+  // its own half of the same line (`tabs`/`tabsReason`): this fake declares no
+  // `shell.overlay` seat and hands over no root renderer, so the strip reports the
+  // exact missing piece — `no-seat`, the shell's refused placement seat. The strip's
+  // own placement (and its `no-header`/`no-renderer` facts) is proven in
+  // test/client-host-tabs.test.mjs, against a fake sidebar.
+  const TABS = { tabs: false, tabsReason: 'no-seat' }
   assert.deepEqual({ ...off.api.testing.remoteUI.getSnapshot() },
     { grouped: false, reason: 'multi-host routing is off: disabled', hosts: 0, ...TABS })
   assert.deepEqual({ ...noHost.api.testing.remoteUI.getSnapshot() }, { grouped: true, reason: null, hosts: 0, ...TABS })

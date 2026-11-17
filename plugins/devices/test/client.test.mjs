@@ -1305,7 +1305,23 @@ await check('OPT pairing kind: the page offers a phone/PWA seat and a computer s
   page.unmount()
 })
 
-
+await check('OTP dialog: X only closes the dialog — the waiting request stays on the Host', async () => {
+  const ui = load({ status: ONLINE })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  await click(button(page, 'Generate pairing code'))
+  await flush()
+  assert.ok(find(page, (node) => node.props['data-testid'] === 'otp-code').length, 'the dialog is open')
+  assert.match(text(page), /Closing this dialog keeps the code/, 'the copy explains X is harmless')
+  const before = ui.calls.length
+  const close = find(page, (node) => node.props['aria-label'] === ui.api.testing.DICT.en.otpClose)[0]
+  assert.ok(close, 'the close button exists')
+  await click(close)
+  const made = ui.calls.slice(before)
+  assert.equal(made.filter((call) => call.method === 'DELETE').length, 0, 'X never sends a withdrawal')
+  assert.equal(find(page, (node) => node.props['data-testid'] === 'otp-code').length, 0, 'the dialog closed')
+  page.unmount()
+})
 await check('Advanced (Allow tab): shows remoteBridgeLimits read-only, 0 = unlimited; never writes the limits', async () => {
   const limits = { maxConnectionsPerDevice: 0, maxStreamsPerDevice: 32, maxInflightPerDevice: 0, callsPerSecond: 20, maxResultBytes: 0 }
   const ui = load({ status: { ...ONLINE, remoteBridgeLimits: limits } })

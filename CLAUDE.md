@@ -98,6 +98,19 @@ repo's `AGENTS.md` / `CLAUDE.md` and the role briefs.
   visible reason, nothing of DSH is mutated (dispose removes the listener), no authorization
   weakening, reviewer pass, README lists the mechanism. Local sessions and images keep DSH's
   behaviour. A1.1 conditions apply unchanged to the wrappers A1.1 covers.
+- 2026-11-17: owner approved **A1.3 — remote workspace expansion**: `plugins/devices`
+  may observe the native sidebar's workspace rows (`[data-row-key^="workspace:h:"]`)
+  and, in a debounced pass after a remote row appears, click that row ONCE when the
+  plugin's own per-workspace remembered state or a first-seen default says it should
+  be expanded. Conditions: only remote rows (never local or ungrouped); a read-only
+  capture-phase click listener learns the owner's own toggles and a temporary flag
+  keeps a plugin-initiated click from being recorded as a user choice; persist the
+  map under a namespaced `localStorage` key, never DSH's `dsh.workspace.view.v5`;
+  never write DSH state or DSH files, never wrap another DSH surface, no
+  context-menu/drag side effects (synthetic click on the row only); first-seen remote
+  workspace defaults to expanded, an owner-recorded collapse is restored and wins;
+  dispose removes the observer/listener/timers; reviewer pass and README
+  documentation before use. A1.1/A1.2 conditions apply unchanged to their surfaces.
 
 ## Standing rules
 - Spec Kit is the work process: every feature gets `specs/<###-slug>/` before code.

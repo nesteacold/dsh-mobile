@@ -1300,6 +1300,41 @@ const createControlProtocolReader = () => {
   }
 }
 
+// Native admission, mirrored from the INSTALLED rc.1 sources (not invented here):
+// `SessionSeq` (dsh-session/lib/types/types.js:15-19) throws for a negative or
+// unsafe integer; `sessionSeqCursor` (dsh-api-session-controller's manager)
+// admits -1 ONLY for a baseline cursor; `handleControlFrame` admits projection
+// frames with SessionSeq(seq) and seeds baselines through ProjectionValueStore
+// (projection-store.js seed/apply: seed clears keys the cut omits, apply never).
+const admitSessionSeq = (value, label) => {
+  if (!Number.isSafeInteger(value) || value < 0 || Object.is(value, -0)) {
+    throw new TypeError(`${label}: SessionSeq must be a non-negative safe integer, got ${String(value)}`)
+  }
+  return value
+}
+const admitBaselineCursor = (value, label) => value === -1 ? -1 : admitSessionSeq(value, label)
+const createNativeProjectionStore = () => {
+  const rows = new Map()
+  return {
+    seed(block) {
+      const seq = admitBaselineCursor(block.asOfSeq, 'baseline cursor')
+      for (const key of Object.keys(block.values)) {
+        if ((rows.get(key)?.seq ?? -Infinity) < seq) rows.set(key, { value: block.values[key], seq })
+      }
+      for (const [key, row] of [...rows]) {
+        if (Object.hasOwn(block.values, key) || row.seq > seq) continue
+        rows.delete(key)
+      }
+    },
+    apply(key, value, seq) {
+      admitSessionSeq(seq, 'projection seq')
+      if ((rows.get(key)?.seq ?? -Infinity) < seq) rows.set(key, { value, seq })
+    },
+    get(key) { return rows.get(key)?.value },
+    keys() { return [...rows.keys()] },
+  }
+}
+
 test('session/modelCatalog keeps every host as its own section, tagged by host', async () => {
   const hostB = createFakeRemote('hostB', 'Host B', { replies: {
     'session/modelCatalog': catalog([
@@ -1523,6 +1558,377 @@ test('session/control emits one opening baseline: a delayed remote baseline beco
   assert.equal(extra, null, 'no second baseline was emitted after the late remote baseline')
   assertNoNamespacedId(hostB)
   control.abort()
+  await iterator.return()
+})
+
+test('session/control emits one opening baseline: a late Local baseline also becomes projections', async () => {
+  // The same snapshot-stream rule applies to Local: after the opening baseline,
+  // a re-baseline from the carrier must not be forwarded as another opening
+  // snapshot. Hold Local's greeting until after the merge has started.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const originalOpenStream = hostB.connection.openStream.bind(hostB.connection)
+  hostB.connection.openStream = async (endpoint, args, options) => {
+    if (endpoint !== 'session/control') return originalOpenStream(endpoint, args, options)
+    return createQueue()
+  }
+  const harness = createHarness({ remotes: [hostB], controlBaseline: null })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const nextControl = createControlProtocolReader()
+  const opening = await nextControl(iterator, 'opening baseline after Local timeout')
+  assert.equal(opening.type, 'baseline')
+  assert.deepEqual(opening.value.projections, {})
+
+  harness.localStreams.at(-1).queue.push({ type: 'baseline', value: { projections: {
+    local: { kind: 'sequenced', asOfSeq: 3, values: { title: 'Local title' } },
+  } } })
+  const localLate = await nextControl(iterator, 'late Local baseline projection')
+  assert.deepEqual(localLate, {
+    type: 'projection', sessionId: 'local', seq: 3,
+    changes: [{ key: 'title', val: 'Local title' }],
+  })
+  const afterLocal = await frameWithin(iterator, 50)
+  assert.equal(afterLocal, null, 'the late Local baseline did not emit a second opening baseline')
+  control.abort()
+  await iterator.return()
+})
+
+test('a late -1 baseline reopens once: the carried cut seeds the replacement opening baseline and a late repeat does not reopen', async () => {
+  // Native contract (installed rc.1): a baseline's `asOfSeq` may be -1
+  // (`sessionSeqCursor` keeps it), but a projection frame's `seq` is admitted by
+  // `SessionSeq` and THROWS for -1. Mapping -1 to 0 would mask the real event 0.
+  // The cut must be carried to the native retry's ONE opening baseline: a remote
+  // greeting is asynchronous and normally arrives after Local, so waiting for it
+  // would end generation after generation with the same -1 cut.
+  const emptyBlock = { kind: 'sequenced', asOfSeq: -1, values: {
+    modelSelection: { lastUsed: selection('r9-fallback', 'old-model'), next: selection('r9-fallback', 'old-model') },
+  } }
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const controlQueues = []
+  const originalOpenStream = hostB.connection.openStream.bind(hostB.connection)
+  hostB.connection.openStream = async (endpoint, args, options) => {
+    if (endpoint !== 'session/control') return originalOpenStream(endpoint, args, options)
+    const queue = createQueue()
+    controlQueues.push(queue)
+    // No synchronous greeting on ANY generation: the Host greets asynchronously.
+    return queue
+  }
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source1 = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator1 = source1[Symbol.asyncIterator]()
+  const next1 = createControlProtocolReader()
+  const opening1 = await next1(iterator1, 'first opening baseline')
+  assert.equal(opening1.type, 'baseline')
+  assert.deepEqual(opening1.value.projections, {}, 'the host had not greeted yet')
+
+  // The -1 baseline arrives late: it must NOT be converted to a projection with
+  // seq -1 (native SessionSeq throws), and it must NOT be a second baseline here.
+  controlQueues[0].push({ type: 'baseline', value: { projections: { s1: emptyBlock } } })
+  const afterNegative = await nextFrame(iterator1, 'stream end after negative baseline')
+  assert.equal(afterNegative.done, true, 'the merged stream ends so the native can retry')
+  assert.throws(() => admitSessionSeq(-1, 'invented projection'), /non-negative safe integer/,
+    'the native projection admission would have thrown on the old seq -1 conversion')
+  assert.ok(harness.logs.some((line) => line.includes('re-opening merged stream')),
+    'the rebase reason is logged')
+
+  // Simulate the native RemoteStream retry: a new physical stream generation.
+  const source2 = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator2 = source2[Symbol.asyncIterator]()
+  const next2 = createControlProtocolReader()
+  const opening2 = await next2(iterator2, 'reopened opening baseline')
+  assert.equal(opening2.type, 'baseline')
+  const block = opening2.value.projections['h:hostB:s1']
+  assert.ok(block, 'the carried -1 cut is in the ONE opening baseline without waiting for a greeting')
+  assert.equal(block.asOfSeq, -1, 'the empty cursor is preserved, never mapped to 0')
+  assert.deepEqual(admitBaselineCursor(block.asOfSeq, 'baseline'), -1)
+  assert.throws(() => admitSessionSeq(block.asOfSeq, 'projection'), TypeError,
+    'the same number would be refused as a projection frame seq')
+
+  // Local already greeted (it is the opening baseline's spine). The remote now
+  // greets late, after Local, with the SAME cut. It must neither reopen again nor
+  // emit a -1 projection; hold the pending read so a later frame is not stolen.
+  const pendingAfterGreeting = iterator2.next()
+  controlQueues[1].push({ type: 'baseline', value: { projections: { s1: emptyBlock } } })
+  const quiet = await Promise.race([
+    pendingAfterGreeting.then((result) => ({ result })),
+    new Promise((resolve) => { const timer = setTimeout(() => resolve({ quiet: true }), 120); timer.unref?.() }),
+  ])
+  assert.ok(quiet.quiet, `a repeated late -1 greeting must be quiet, got ${JSON.stringify(quiet.result)}`)
+  assert.equal(controlQueues.length, 2, 'no repeated reopening after the carried cut')
+
+  // The first live event is seq 0 — the value a -1 -> 0 remap would have masked.
+  controlQueues.at(-1).push({ type: 'projection', sessionId: 's1', seq: 0,
+    changes: [{ key: 'modelSelection', val: { lastUsed: selection('r9-fallback', 'old-model'), next: selection('r9-fallback', 'new-model') } }] })
+  const event0Result = await pendingAfterGreeting
+  assert.equal(event0Result.done, false, 'the reopened generation is still open after the late greeting')
+  const event0 = event0Result.value
+  assert.equal(event0.type, 'projection')
+  assert.equal(event0.seq, 0)
+  assert.equal(admitSessionSeq(event0.seq, 'event 0 seq'), 0, 'native admits event 0')
+  assert.equal(event0.changes[0].val.next.model, 'new-model')
+
+  // A positive update still flows in the same generation.
+  controlQueues.at(-1).push({ type: 'projection', sessionId: 's1', seq: 4,
+    changes: [{ key: 'title', val: 'Live title' }] })
+  const positive = await next2(iterator2, 'positive projection')
+  assert.equal(positive.seq, 4)
+  assert.equal(admitSessionSeq(positive.seq, 'positive seq'), 4)
+  control.abort()
+  await iterator1.return()
+  await iterator2.return()
+})
+
+test('a reconnect cut that omits a prior key is carried: the replacement opening baseline clears the stale row', async () => {
+  // ProjectionValueStore.seed clears a key the cut omits; apply (what a late
+  // baseline converted to projection frames would use) never does. When the
+  // Host re-greets with a cut that drops `modelSelection`, the whole merged
+  // stream must reopen and the cut must be carried into the retry's ONE opening
+  // baseline. A normal Host greeting is asynchronous (after Local); if the new
+  // generation opened with only Local's empty baseline, no seed would ever clear
+  // the already-seeded `modelSelection` row.
+  const initial = projectedSelection('r9-fallback', 'old-model', 5)
+  const omitted = { kind: 'sequenced', asOfSeq: 8, values: { title: 'Host B title' } }
+  const hostB = createFakeRemote('hostB', 'Host B', { controlProjections: { s1: initial } })
+  const controlQueues = []
+  const originalOpenStream = hostB.connection.openStream.bind(hostB.connection)
+  hostB.connection.openStream = async (endpoint, args, options) => {
+    if (endpoint !== 'session/control') return originalOpenStream(endpoint, args, options)
+    const queue = createQueue()
+    controlQueues.push(queue)
+    // Generation 1 greets with the initial cut. The reopened generation does NOT
+    // greet here: its greeting is asynchronous and pushed after Local below.
+    if (controlQueues.length === 1) queue.push({ type: 'baseline', value: { projections: { s1: initial } } })
+    return queue
+  }
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source1 = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator1 = source1[Symbol.asyncIterator]()
+  const next1 = createControlProtocolReader()
+  const opening1 = await next1(iterator1, 'opening baseline before omission')
+  const block1 = opening1.value.projections['h:hostB:s1']
+  assert.ok(block1.values.modelSelection, 'the first cut carries the selection key')
+  const store = createNativeProjectionStore()
+  store.seed(block1)
+  assert.deepEqual(store.keys().sort(), ['modelSelection'], 'native seed holds the prior key')
+
+  // Reconnect cut: same session, newer watermark, `modelSelection` omitted.
+  controlQueues[0].push({ type: 'baseline', value: { projections: { s1: omitted } } })
+  const afterOmission = await nextFrame(iterator1, 'stream end after omission')
+  assert.equal(afterOmission.done, true, 'a synthesized apply cannot clear the key; the stream reopens')
+  assert.equal((await nextFrame(iterator1, 'stream already ended')).done, true,
+    'no projection frame papered over the omission')
+
+  // The native retry's ONE opening baseline seeds the whole cut, omission included,
+  // before the reopened generation's remote greeting arrives.
+  const source2 = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator2 = source2[Symbol.asyncIterator]()
+  const opening2 = await (createControlProtocolReader())(iterator2, 'reopened baseline after omission')
+  assert.equal(opening2.type, 'baseline')
+  const block2 = opening2.value.projections['h:hostB:s1']
+  assert.equal(block2.asOfSeq, 8)
+  assert.deepEqual(Object.keys(block2.values), ['title'], 'the omitted key is absent from the fresh cut')
+  store.seed(block2)
+  assert.equal(store.get('title'), 'Host B title')
+  assert.equal(store.get('modelSelection'), undefined, 'native seed clears the key the cut omitted')
+  assert.deepEqual(store.keys(), ['title'])
+
+  // Local has greeted; the remote greeting now arrives asynchronously with the
+  // same omitted cut. It must not restore the key nor reopen the stream.
+  const pendingAfterGreeting = iterator2.next()
+  controlQueues[1].push({ type: 'baseline', value: { projections: { s1: omitted } } })
+  const quiet = await Promise.race([
+    pendingAfterGreeting.then((result) => ({ result })),
+    new Promise((resolve) => { const timer = setTimeout(() => resolve({ quiet: true }), 120); timer.unref?.() }),
+  ])
+  assert.ok(quiet.quiet, `a repeated late omitted-key greeting must be quiet, got ${JSON.stringify(quiet.result)}`)
+  assert.equal(controlQueues.length, 2, 'the late greeting did not reopen the stream')
+
+  // A live update still flows; the native store keeps only the fresh cut's keys.
+  controlQueues.at(-1).push({ type: 'projection', sessionId: 's1', seq: 9,
+    changes: [{ key: 'title', val: 'Live title' }] })
+  const liveResult = await pendingAfterGreeting
+  assert.equal(liveResult.done, false, 'the reopened generation is still open after the late greeting')
+  store.apply('title', liveResult.value.changes[0].val, liveResult.value.seq)
+  assert.equal(store.get('modelSelection'), undefined, 'no stale projection is restored by the late greeting')
+  control.abort()
+  await iterator1.return()
+  await iterator2.return()
+})
+
+test('two hosts alternating rebases carry both still-required cuts across three generations and go quiet', async () => {
+  // Reviewer finding: taking ALL carried cuts at generation start and then
+  // remembering only the triggering cut loses a second host's cut that has not
+  // re-greeted yet. Host A triggers generation 1 -> 2; Host B triggers 2 -> 3;
+  // generation 3's ONE opening baseline must still seed both cuts.
+  const cut = (model) => ({ kind: 'sequenced', asOfSeq: -1, values: {
+    modelSelection: { lastUsed: selection('r9-fallback', model), next: selection('r9-fallback', model) },
+  } })
+  const cutA = cut('model-A')
+  const cutB = cut('model-B')
+  const hostA = createFakeRemote('hostA', 'Host A')
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const queues = { hostA: [], hostB: [] }
+  for (const host of [hostA, hostB]) {
+    const original = host.connection.openStream.bind(host.connection)
+    host.connection.openStream = async (endpoint, args, options) => {
+      if (endpoint !== 'session/control') return original(endpoint, args, options)
+      const queue = createQueue()
+      queues[host.hostId].push(queue)
+      // No synchronous greeting: a Host normally greets asynchronously, after
+      // the merged opening baseline has already been published.
+      return queue
+    }
+  }
+  const harness = createHarness({ remotes: [hostA, hostB] })
+  const control = new AbortController()
+  const openGeneration = async (label) => {
+    const source = await harness.gateway.openWireStream('session/control', { args: {} },
+      undefined, {}, control.signal, control, 64)
+    const iterator = source[Symbol.asyncIterator]()
+    const opening = await (createControlProtocolReader())(iterator, label)
+    return { source, iterator, opening }
+  }
+  const pause = (ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); timer.unref?.() })
+
+  const gen1 = await openGeneration('generation 1 opening')
+  assert.deepEqual(gen1.opening.value.projections, {}, 'neither host has greeted yet')
+  queues.hostA[0].push({ type: 'baseline', value: { projections: { s1: cutA } } })
+  assert.equal((await nextFrame(gen1.iterator, 'generation 1 ends')).done, true, 'A rebased')
+
+  const gen2 = await openGeneration('generation 2 opening')
+  assert.equal(gen2.opening.value.projections['h:hostA:s1']?.asOfSeq, -1,
+    'A cut seeds the second generation before A greets')
+
+  // B's late cut triggers the second rebase. A has still not re-greeted, so its
+  // cut is still required and must survive alongside B's.
+  queues.hostB[1].push({ type: 'baseline', value: { projections: { s2: cutB } } })
+  assert.equal((await nextFrame(gen2.iterator, 'generation 2 ends')).done, true, 'B rebased')
+
+  const gen3 = await openGeneration('generation 3 opening')
+  const projections = gen3.opening.value.projections
+  assert.equal(projections['h:hostA:s1']?.asOfSeq, -1,
+    'A still-required cut survives B rebase into the third generation')
+  assert.equal(projections['h:hostB:s2']?.asOfSeq, -1, 'the triggering B cut is carried too')
+  // Ingress names each Host's provider, so the carried values are the merged
+  // ones the native store actually seeds (not the Host's raw provider id).
+  assert.equal(projections['h:hostA:s1']?.values.modelSelection.next.model, 'model-A')
+  assert.equal(projections['h:hostA:s1']?.values.modelSelection.next.provider, 'r9-fallback@hostA')
+  assert.equal(projections['h:hostB:s2']?.values.modelSelection.next.model, 'model-B')
+  assert.equal(projections['h:hostB:s2']?.values.modelSelection.next.provider, 'r9-fallback@hostB')
+
+  // Both hosts now greet late with their seeded cuts: both are duplicates and
+  // must be retired without another reopen (quiescence).
+  const pending = gen3.iterator.next()
+  queues.hostA[2].push({ type: 'baseline', value: { projections: { s1: cutA } } })
+  queues.hostB[2].push({ type: 'baseline', value: { projections: { s2: cutB } } })
+  const quiet = await Promise.race([
+    pending.then((result) => ({ result })),
+    pause(150).then(() => ({ quiet: true })),
+  ])
+  assert.ok(quiet.quiet, `late greetings must be quiet, got ${JSON.stringify(quiet.result)}`)
+  assert.equal(queues.hostA.length, 3, 'no fourth generation for A')
+  assert.equal(queues.hostB.length, 3, 'no fourth generation for B')
+
+  queues.hostA[2].push({ type: 'projection', sessionId: 's1', seq: 4,
+    changes: [{ key: 'title', val: 'A live' }] })
+  const live = await pending
+  assert.equal(live.done, false, 'the third generation is still open')
+  assert.equal(live.value.type, 'projection')
+  assert.equal(live.value.sessionId, 'h:hostA:s1')
+  control.abort()
+  await gen1.iterator.return()
+  await gen2.iterator.return()
+  await gen3.iterator.return()
+})
+
+test('a hostile payload at a carried watermark is refused by ingress before duplicate suppression', async () => {
+  // Reviewer finding: the carried-watermark shortcut skipped #ingress, so a
+  // same-watermark payload with a pre-tagged id was quietly treated as a
+  // duplicate instead of being refused and logged.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const queues = []
+  const original = hostB.connection.openStream.bind(hostB.connection)
+  hostB.connection.openStream = async (endpoint, args, options) => {
+    if (endpoint !== 'session/control') return original(endpoint, args, options)
+    const queue = createQueue()
+    queues.push(queue)
+    return queue
+  }
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source1 = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator1 = source1[Symbol.asyncIterator]()
+  await (createControlProtocolReader())(iterator1, 'first opening')
+  const cut = { kind: 'sequenced', asOfSeq: -1, values: {
+    modelSelection: { lastUsed: selection('r9-fallback', 'old-model'), next: selection('r9-fallback', 'old-model') },
+  } }
+  queues[0].push({ type: 'baseline', value: { projections: { s1: cut } } })
+  assert.equal((await nextFrame(iterator1, 'first generation ends')).done, true)
+
+  const source2 = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator2 = source2[Symbol.asyncIterator]()
+  const opening2 = await (createControlProtocolReader())(iterator2, 'reopened opening')
+  assert.equal(opening2.value.projections['h:hostB:s1']?.asOfSeq, -1,
+    'the cut was seeded by the reopened generation')
+  const pending = iterator2.next()
+  // Same watermark as the carried cut, but it smuggles an id that already names
+  // this controller's namespace; it must never be mistaken for a clean repeat.
+  queues[1].push({ type: 'baseline', value: { projections: { s1: {
+    kind: 'sequenced', asOfSeq: -1,
+    values: { sessionId: 'h:hostB:smuggled', title: 'hostile' },
+  } } } })
+  const quiet = await Promise.race([
+    pending.then((result) => ({ result })),
+    new Promise((resolve) => { const timer = setTimeout(() => resolve({ quiet: true }), 150); timer.unref?.() }),
+  ])
+  assert.ok(quiet.quiet, `the hostile frame must not be delivered, got ${JSON.stringify(quiet.result)}`)
+  assert.ok(harness.logs.some((line) => line.includes('session/control from hostB refused: remote/id-leak')),
+    'the same-watermark payload was validated and refused by ingress')
+  assert.equal(queues.length, 2, 'the hostile duplicate did not trigger another rebase')
+  control.abort()
+  await iterator1.return()
+  await iterator2.return()
+})
+
+test('a remote prompt carries requestId out and the durable user message returns the same rpcId', async () => {
+  // DSH's native controller settles its optimistic echo only when a durable
+  // user/message (or inbox row) carries source.rpcId === beginSubmission's
+  // requestId. Both ends cross this wrapper, so neither id may be renamed.
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/prompt': { accepted: true } } })
+  const harness = createHarness({ remotes: [hostB] })
+  const answer = await harness.gateway.dispatchRpc('session/prompt', { args: {
+    sessionId: 'h:hostB:s1', requestId: 'req-echo-1', mode: 'instant', content: [{ type: 'text', text: 'hello' }],
+  } }, undefined, {})
+  assert.equal(answer.ok, true)
+  assert.equal(hostB.calls.length, 1)
+  assert.equal(hostB.calls[0].args.sessionId, 's1', 'the session id is stripped for the Host')
+  assert.equal(hostB.calls[0].args.requestId, 'req-echo-1',
+    'the Host records this as source.rpcId; an id tag here would break echo settlement')
+  assertNoNamespacedId(hostB)
+
+  const source = await harness.gateway.openWireStream('session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: 'h:hostB:s1' } } } },
+    undefined, {}, new AbortController().signal, new AbortController(), 64)
+  hostB.streams.at(-1).queue.push({ type: 'event', event: {
+    type: 'user/message', seq: 3, time: 1,
+    data: { id: 'm1', content: [{ type: 'text', text: 'hello' }], source: { kind: 'user', rpcId: 'req-echo-1' } },
+  } })
+  const iterator = source[Symbol.asyncIterator]()
+  const frame = (await nextFrame(iterator, 'remote user message')).value
+  assert.equal(frame.event.type, 'user/message')
+  assert.equal(frame.event.data.source.kind, 'user')
+  assert.equal(frame.event.data.source.rpcId, 'req-echo-1',
+    'the local controller looks up its pending echo by this exact id')
   await iterator.return()
 })
 
@@ -2472,5 +2878,73 @@ test('RemoteConnection.openStream speaks remote-stream-open and cancels on abort
   assert.equal(sent[1].streamId, sent[0].streamId)
   await assert.rejects(() => pending, (error) => error.code === 'cancelled')
   assert.equal(connection.wireStreams.size, 0, 'the stream is released')
+})
+
+test('a resumed session/follow honours an overflow marker before walking the Host\'s huge created end', async () => {
+  // A remote Host may name a `created` fill with an `end` far past the reader. The
+  // repair already returns a resume-overflow marker for it; the pump must act on
+  // that marker BEFORE enumerating the range. A full walk would never finish.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: 'h:hostB:s1' } } } },
+    undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const openingStream = hostB.streams.at(-1)
+  openingStream.queue.push({ type: 'snapshot', cursor: 1, header: { version: 4, id: 's1' } })
+  assert.equal((await nextFrame(iterator, 'first opening snapshot')).value.type, 'snapshot')
+  // The stream ends normally; the pump re-opens it and the second attempt is a RESUME.
+  openingStream.queue.close()
+  let resumedStream
+  const reopenDeadline = Date.now() + 1500
+  while (Date.now() < reopenDeadline) {
+    if (hostB.streams.length >= 2) { resumedStream = hostB.streams.at(-1); break }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.ok(resumedStream, 'the follow re-opened after the stream ended')
+  // The re-open's snapshot opens this page (its own events are already seen, so it
+  // is not forwarded); the next created record is part of it, and followFrames has
+  // already turned its huge end into an overflow marker.
+  resumedStream.queue.push({ type: 'snapshot', cursor: 1, header: { version: 4, id: 's1' } })
+  const hugeEnd = Number.MAX_SAFE_INTEGER
+  resumedStream.queue.push({ firstLiveSeq: 2, end: hugeEnd })
+  let terminal
+  try { await nextFrame(iterator, 'resume overflow') } catch (error) { terminal = error }
+  assert.equal(terminal?.code, 'remote/stream-resume-overflow', 'the resized follow failed visibly')
+  assert.equal(terminal?.details?.unseen, hugeEnd - 2 + 1,
+    'the count is computed from the Host end — no integer range was enumerated')
+  control.abort()
+  await iterator.return()
+})
+
+test('a resumed session/follow bounds an unmarked huge created end at MAX_RESUME_GAP', async () => {
+  // The same huge end BEFORE the re-open's snapshot has no marker to short-circuit:
+  // the pump's own bound must stop inserting once the page Set crosses the gap.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: 'h:hostB:s1' } } } },
+    undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const openingStream = hostB.streams.at(-1)
+  openingStream.queue.push({ type: 'snapshot', cursor: 1, header: { version: 4, id: 's1' } })
+  assert.equal((await nextFrame(iterator, 'first opening snapshot')).value.type, 'snapshot')
+  openingStream.queue.close()
+  let resumedStream
+  const reopenDeadline = Date.now() + 1500
+  while (Date.now() < reopenDeadline) {
+    if (hostB.streams.length >= 2) { resumedStream = hostB.streams.at(-1); break }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.ok(resumedStream, 'the follow re-opened after the stream ended')
+  resumedStream.queue.push({ firstLiveSeq: 2, end: Number.MAX_SAFE_INTEGER })
+  let terminal
+  try { await nextFrame(iterator, 'bounded resume overflow') } catch (error) { terminal = error }
+  assert.equal(terminal?.code, 'remote/stream-resume-overflow', 'the unmarked huge end is refused')
+  assert.equal(terminal?.details?.unseen, 4097, 'count stops at MAX_RESUME_GAP + 1, not the Host end')
+  control.abort()
+  await iterator.return()
 })
 
