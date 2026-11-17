@@ -623,8 +623,8 @@ await check('one style element, from load on, under data-plugin dsh-ext.devices.
 const MEASURED_ROWS = [
   { key: 'workspace:', local: false, note: 'ungrouped header (holds only remote sessions)' },
   { key: 'overflow:', local: false, note: 'ungrouped group\'s hidden-sessions button' },
-  { key: 'workspace:9f1c2a3e-1111-4b2c-8d3e-5a6b7c8d9e0f', local: true },
-  { key: 'session:session-9f1c2a3e-1111-4b2c-8d3e-5a6b7c8d9e0f', local: true },
+  { key: 'workspace:local-workspace-fixed-id', local: true },
+  { key: 'session:session-local-workspace-fixed-id', local: true },
   { key: 'workspace:h:r1:1a2b3c4d-2222-4e5f-8a9b-0c1d2e3f4a5b', local: false },
   { key: 'session:h:r1:session-1a2b3c4d-2222-4e5f-8a9b-0c1d2e3f4a5b', local: false },
   { key: 'overflow:h:r1:6a7b8c9d-3333-4f50-9a1b-2c3d4e5f6a7b', local: false },
