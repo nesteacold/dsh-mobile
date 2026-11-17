@@ -56,8 +56,10 @@ export type ColorScheme = 'light' | 'dark';
 export interface Palette {
   /** True when this is the dark scheme (for one-off conditionals). */
   readonly isDark: boolean;
-  /** Screen background. */
+  /** Screen background. Opaque for gates, sheets and modals that must cover the ocean mesh. */
   readonly bg: string;
+  /** Screen root fill. Transparent so the spec-040 ocean mesh behind the shell is visible. */
+  readonly screenBackground: string;
   /** Card / row surface on top of `bg`. */
   readonly surface: string;
   /** Menus, sheets, dialogs: one step above `surface`. */
@@ -115,6 +117,7 @@ export interface Palette {
 export const lightColors: Palette = {
   isDark: false,
   bg: brand.paper, // Paper #F9FAFC
+  screenBackground: 'transparent',
   surface: '#FFFFFF', // surface = Color.White
   surfaceRaised: '#FFFFFF',
   border: '#E3E7EE',
@@ -156,6 +159,7 @@ export const lightColors: Palette = {
 export const darkColors: Palette = {
   isDark: true,
   bg: '#090D13', // background
+  screenBackground: 'transparent',
   surface: '#111720', // surface
   surfaceRaised: '#18202B', // one step up for menus/sheets
   border: '#232C38',

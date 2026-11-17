@@ -19,6 +19,19 @@ import { ActivityIndicator, Modal, Pressable, StyleSheet, Text, TextInput, View 
 import { FlashList } from '@shopify/flash-list';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import {
+  ArrowUp,
+  ChevronDown,
+  ChevronUp,
+  Ellipsis,
+  Folder,
+  LayoutGrid,
+  Monitor,
+  Plus,
+  Search,
+  Settings,
+  X,
+} from 'lucide-react-native';
 
 import { reconnectInProgress } from '../../src/app-state';
 import { isSubagentSession, type SessionSummary } from '../../src/core/sessions';
@@ -44,6 +57,8 @@ import {
   type ListStatusFilter,
 } from '../../src/ui/list-filters';
 import { grantState, newSessionAvailability, type LoadState } from '../../src/ui/components/authoring';
+import { GlassSurface } from '../../src/ui/components/ui';
+import { MeshBackdrop } from '../../src/ui/components/ocean-mesh';
 import { elevation, hit, radius, space, useTheme } from '../../src/ui/theme';
 import { useApp } from '../_layout';
 import type { CompatDecision } from '../../src/core/compat';
@@ -258,7 +273,8 @@ export default function ListScreen() {
   }, [availability.enabled, controller, draft, router, workspaceId]);
 
   return (
-    <View testID="workspace-home" style={[styles.root, { backgroundColor: colors.bg, paddingTop: insets.top }]}>
+    <View testID="workspace-home" style={[styles.root, { position: 'relative', backgroundColor: colors.screenBackground, paddingTop: insets.top }]}>
+      <MeshBackdrop />
       {/* Header: source switcher (ref 02) + the ⋯ menu (ref 03). */}
       <View style={styles.header}>
         <Pressable
@@ -268,18 +284,9 @@ export default function ListScreen() {
           onPress={() => setSourceOpen(true)}
           style={styles.headerTitle}
         >
-          {/* Drawn 2×2 grid: the APK ships NO font files, so an icon-font glyph would be invisible.
-              Views always render. */}
-          <View style={styles.gridGlyph}>
-            {[0, 1, 2, 3].map((cell) => (
-              <View key={cell} style={[styles.gridCell, { backgroundColor: colors.text }]} />
-            ))}
-          </View>
+          <LayoutGrid size={20} color={colors.text} accessibilityLabel={tr('list.title')} />
           <Text style={[type.title, { color: colors.text }]}>{tr('list.title')}</Text>
-          {/* Centred so the glyph cannot sit on the baseline. */}
-          <View style={styles.chevronSlot}>
-            <Text style={[type.caption, { color: colors.textMuted }]}>⌄</Text>
-          </View>
+          <ChevronDown size={20} color={colors.textMuted} accessibilityLabel={tr('list.title')} />
         </Pressable>
         <Pressable
           testID="list-menu"
@@ -288,7 +295,7 @@ export default function ListScreen() {
           onPress={() => setMenuOpen(true)}
           style={[styles.menuButton, { backgroundColor: colors.surfaceRaised, minWidth: hit, minHeight: hit }]}
         >
-          <Text style={[type.subheading, { color: colors.text }]}>⋯</Text>
+          <Ellipsis size={22} color={colors.text} accessibilityLabel={tr('list.more')} />
         </Pressable>
       </View>
 
@@ -303,10 +310,7 @@ export default function ListScreen() {
             testID={`chip-${host.gatewayId}`}
             style={[styles.chip, { backgroundColor: colors.surfaceRaised, borderRadius: radius.pill }]}
           >
-            {/* Drawn monitor: same reason as the grid — no font assets in the APK. */}
-            <View style={[styles.monitorGlyph, { borderColor: colors.textMuted }]}>
-              <View style={[styles.monitorStand, { backgroundColor: colors.textMuted }]} />
-            </View>
+            <Monitor size={20} color={colors.textMuted} accessibilityLabel={host.name ?? host.gatewayId} />
             <Text numberOfLines={1} style={[type.caption, { color: colors.text }]}>{host.name}</Text>
           </View>
         ))}
@@ -327,26 +331,21 @@ export default function ListScreen() {
 
       {/* Title search (reference: SessionSearch). Locale-independent testID for maestro. */}
       {snapshot.activeHost === null ? null : (
-        <TextInput
-          testID="list-search"
-          accessibilityLabel={tr('list.search')}
-          placeholder={tr('list.searchPlaceholder')}
-          placeholderTextColor={colors.textMuted}
-          value={query}
-          onChangeText={setQuery}
-          autoCorrect={false}
-          autoCapitalize="none"
-          returnKeyType="search"
-          style={[
-            styles.search,
-            {
-              color: colors.text,
-              backgroundColor: colors.surface,
-              borderColor: colors.border,
-              // Text glyphs only: no icon font exists in the APK, so the clear control is text.
-            },
-          ]}
-        />
+        <View style={[styles.search, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+          <Search size={20} color={colors.textMuted} accessibilityLabel={tr('list.search')} />
+          <TextInput
+            testID="list-search"
+            accessibilityLabel={tr('list.search')}
+            placeholder={tr('list.searchPlaceholder')}
+            placeholderTextColor={colors.textMuted}
+            value={query}
+            onChangeText={setQuery}
+            autoCorrect={false}
+            autoCapitalize="none"
+            returnKeyType="search"
+            style={{ color: colors.text, flex: 1 }}
+          />
+        </View>
       )}
 
       {snapshot.activeHost === null ? (
@@ -383,7 +382,7 @@ export default function ListScreen() {
             flex: 1,
             marginTop: 12,
             paddingBottom: composerHeight,
-            backgroundColor: colors.bg,
+            backgroundColor: colors.screenBackground,
             overflow: 'hidden',
           }}
         >
@@ -403,15 +402,13 @@ export default function ListScreen() {
                 onPress={() => toggleSection(item.id.replace(/^section-/, ''))}
                 style={[styles.section, { minHeight: hit }]}
               >
-                {/* Folder drawn with Views (reference 01): no font assets exist in the APK, so a
-                    glyph would be tofu — same approach as the monitor chip. */}
-                <View style={[styles.folderGlyph, { borderColor: colors.textMuted }]}>
-                  <View style={[styles.folderTab, { backgroundColor: colors.textMuted }]} />
-                </View>
+                <Folder size={20} color={colors.textMuted} accessibilityLabel={item.title} />
                 <Text style={[type.subheading, { color: colors.text, flex: 1 }]} numberOfLines={1}>{item.title}</Text>
-                <View style={styles.chevronSlot}>
-                  <Text style={[type.caption, { color: colors.textMuted }]}>{item.collapsed ? '⌄' : '⌃'}</Text>
-                </View>
+                {item.collapsed ? (
+                  <ChevronDown size={20} color={colors.textMuted} accessibilityLabel={item.title} />
+                ) : (
+                  <ChevronUp size={20} color={colors.textMuted} accessibilityLabel={item.title} />
+                )}
               </Pressable>
             ) : (
               <Pressable
@@ -475,7 +472,7 @@ export default function ListScreen() {
         onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
         style={[styles.composerWrap, { paddingBottom: insets.bottom + space.sm }]}
       >
-        <View style={[styles.composer, { backgroundColor: colors.surfaceRaised, borderRadius: radius.pill }]}>
+        <GlassSurface style={[styles.composer, { borderRadius: radius.pill }]}>
           <Pressable
             testID="list-composer-plus"
             accessibilityRole="button"
@@ -483,7 +480,7 @@ export default function ListScreen() {
             onPress={() => setSourceOpen(true)}
             style={[styles.plus, { minWidth: hit, minHeight: hit }]}
           >
-            <Text style={[type.subheading, { color: colors.text }]}>+</Text>
+            <Plus size={22} color={colors.text} accessibilityLabel={tr('authoring.workspacePlaceholder')} />
           </Pressable>
           <TextInput
             testID="list-composer-input"
@@ -515,10 +512,14 @@ export default function ListScreen() {
             }]}
           >
             {creating ? <ActivityIndicator color={colors.onAccent} /> : (
-              <Text style={[type.subheading, { color: canSend ? colors.onAccent : colors.disabledLabel }]}>↑</Text>
+              <ArrowUp
+                size={22}
+                color={canSend ? colors.onAccent : colors.disabledLabel}
+                accessibilityLabel={tr('session.send')}
+              />
             )}
           </Pressable>
-        </View>
+        </GlassSurface>
         {/* The reason the composer is inert, in the same honest style as before. */}
         {availability.enabled ? null : (
           <Text testID="new-session-reason" style={[type.captionSmall, { color: colors.textMuted, paddingTop: space.xs, paddingHorizontal: space.sm }]}>
@@ -683,7 +684,7 @@ export default function ListScreen() {
                 onPress={() => setFilters(DEFAULT_LIST_FILTERS)}
                 style={[styles.sheetRow, { minHeight: hit }]}
               >
-                <Text style={[type.body, { color: colors.accent, flex: 1 }]}>✕</Text>
+                <X size={20} color={colors.accent} accessibilityLabel={tr('list.groupDate')} />
               </Pressable>
             ) : null}
             <View style={[styles.divider, { backgroundColor: colors.border }]} />
@@ -697,6 +698,7 @@ export default function ListScreen() {
               }}
               style={[styles.sheetRow, { minHeight: hit }]}
             >
+              <Settings size={20} color={colors.text} accessibilityLabel={tr('settings.title')} />
               <Text style={[type.body, { color: colors.text }]}>{tr('settings.title')}</Text>
             </Pressable>
           </View>
@@ -903,6 +905,9 @@ function bannerKey(banner: Exclude<ReturnType<typeof useApp>['snapshot']['banner
 
 const styles = StyleSheet.create({
   search: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space.sm,
     marginHorizontal: space.xl,
     marginTop: space.md,
     borderWidth: StyleSheet.hairlineWidth,

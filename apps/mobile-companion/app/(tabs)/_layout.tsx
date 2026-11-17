@@ -14,8 +14,8 @@ export default function AppStackLayout() {
     <Stack
       screenOptions={{
         headerShown: false,
-        // Themed chrome: no white flash between screens.
-        contentStyle: { backgroundColor: colors.bg },
+        // Spec 040: let the ocean mesh show through; the mesh itself paints the themed backdrop.
+        contentStyle: { backgroundColor: colors.screenBackground },
       }}
     >
       <Stack.Screen name="index" />

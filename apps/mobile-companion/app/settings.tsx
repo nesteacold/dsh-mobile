@@ -13,6 +13,7 @@
 import { useEffect, useState } from 'react';
 import { Alert, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useRouter } from 'expo-router';
+import { ChevronRight, Settings as SettingsIcon } from 'lucide-react-native';
 
 import { useApp } from './_layout';
 import { Card, Divider, Screen, SectionLabel, StatusDot } from '../src/ui/components/ui';
@@ -90,9 +91,10 @@ export default function SettingsScreen() {
 
   return (
     <Screen scroll testID="settings-screen">
-      <Text style={[type.title, { color: colors.text, paddingHorizontal: space.xl, paddingTop: space.md }]}>
-        {tr('settings.title')}
-      </Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.sm, paddingHorizontal: space.xl, paddingTop: space.md }}>
+        <SettingsIcon size={20} color={colors.text} accessibilityLabel={tr('settings.title')} />
+        <Text style={[type.title, { color: colors.text }]}>{tr('settings.title')}</Text>
+      </View>
 
       <View style={styles.group}>
         <SectionLabel style={{ paddingHorizontal: space.xl }}>{tr('settings.computer')}</SectionLabel>
@@ -108,7 +110,7 @@ export default function SettingsScreen() {
                 style={[styles.row, { minHeight: 48 }]}
               >
                 <Text style={[settingsType.item, { color: colors.text, flex: 1 }]}>{tr('schedules.open')}</Text>
-                <Text style={[settingsType.item, { color: colors.textMuted }]}>›</Text>
+                <ChevronRight size={20} color={colors.textMuted} accessibilityLabel={tr('schedules.open')} />
               </Pressable>
             </Card>
           </View>
@@ -225,7 +227,7 @@ export default function SettingsScreen() {
               style={[styles.row, { minHeight: 48 }]}
             >
               <Text style={[settingsType.item, { color: colors.text, flex: 1 }]}>{tr('storage.title')}</Text>
-              <Text style={[settingsType.item, { color: colors.textMuted }]}>›</Text>
+              <ChevronRight size={20} color={colors.textMuted} accessibilityLabel={tr('storage.title')} />
             </Pressable>
             <Divider />
             <Pressable
@@ -236,7 +238,7 @@ export default function SettingsScreen() {
               style={[styles.row, { minHeight: 48 }]}
             >
               <Text style={[settingsType.item, { color: colors.text, flex: 1 }]}>{tr('privacy.title')}</Text>
-              <Text style={[settingsType.item, { color: colors.textMuted }]}>›</Text>
+              <ChevronRight size={20} color={colors.textMuted} accessibilityLabel={tr('privacy.title')} />
             </Pressable>
           </Card>
         </View>

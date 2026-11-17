@@ -27,6 +27,12 @@ const STUBS: Record<string, string> = {
   'expo-camera': 'expo-camera.stub.ts',
   'react-native-safe-area-context': 'safe-area-context.stub.ts',
   '@shopify/flash-list': 'flash-list.stub.ts',
+  // Spec 040: screen modules now import SVG-based icons and the ocean mesh. The Node tests read or
+  // import those modules without rendering, so they use inert host-name stubs instead of the real
+  // native colour processing in react-native-svg.
+  'lucide-react-native': 'lucide-react-native.stub.ts',
+  'react-native-svg': 'react-native-svg.stub.ts',
+  'expo-blur': 'expo-blur.stub.ts',
 };
 
 registerHooks({

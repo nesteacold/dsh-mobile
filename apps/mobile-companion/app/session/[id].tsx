@@ -37,6 +37,16 @@ import {
 } from 'react-native';
 import { useLocalSearchParams, useNavigation, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import {
+  ArrowUp,
+  Check,
+  ChevronLeft,
+  Ellipsis,
+  Monitor,
+  RotateCcw,
+  ShieldCheck,
+  X,
+} from 'lucide-react-native';
 
 import type { ApprovalCardView } from '../../src/app-state';
 import { isSubagentSession } from '../../src/core/sessions';
@@ -69,6 +79,8 @@ import { ToolRow } from '../../src/ui/conversation/ToolRow';
 import { Markdown } from '../../src/ui/markdown/Markdown';
 // Spec 011 — the composer's leading model/mode row (ported from Clarklevis's ComposerMorphLayout).
 import { ComposerModelRow, ModelPicker, modelUnavailableReasonKey } from '../../src/ui/components/authoring';
+import { GlassSurface } from '../../src/ui/components/ui';
+import { MeshBackdrop } from '../../src/ui/components/ocean-mesh';
 // Spec 019 — permission chip + lower-only sheet (see specs/019-parity-wave3-high-risk-design).
 import { canLowerPermission, chipView, optionRows } from '../../src/ui/permission-lower';
 import { PermissionChip, PermissionSheetBody } from '../../src/ui/components/permission-lower';
@@ -424,9 +436,10 @@ export default function SessionScreen() {
 
   return (
     <KeyboardAvoidingView
-      style={[styles.container, { backgroundColor: colors.bg }]}
+      style={[styles.container, { position: 'relative', backgroundColor: colors.screenBackground }]}
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
+      <MeshBackdrop />
       <View
         onLayout={(event) => setHeaderMeasured(event.nativeEvent.layout.height)}
         style={[
@@ -471,7 +484,7 @@ export default function SessionScreen() {
           }}
           testID="session-back"
         >
-          <Text style={[type.heading, { color: colors.text }]}>‹</Text>
+          <ChevronLeft size={24} color={colors.text} accessibilityLabel={tr('common.back')} />
         </TouchableOpacity>
 
         <View style={[styles.headerTitles, { marginHorizontal: space.sm }]}>
@@ -484,22 +497,11 @@ export default function SessionScreen() {
             {session === undefined ? tr('common.host') : sessionDisplayTitle(session, tr, locale)}
           </Text>
           <View style={[styles.subline, { gap: space.xs }]}>
-            {/* A drawn MONITOR (screen + stand), not the "▢" glyph and not a plain square: this
-                device's system font has no U+25A2 (it rendered as tofu) and the APK carries no icon
-                font, and a bare square read as a checkbox. Reference 04 shows a small computer. */}
-            <View style={{ alignItems: 'center', justifyContent: 'center' }}>
-              <View
-                style={{
-                  width: 12,
-                  height: 9,
-                  borderRadius: 2,
-                  borderWidth: 1,
-                  borderColor: colors.textMuted,
-                }}
-              />
-              <View style={{ width: 5, height: 1, backgroundColor: colors.textMuted, marginTop: 1 }} />
-              <View style={{ width: 8, height: 1, backgroundColor: colors.textMuted }} />
-            </View>
+            <Monitor
+              size={20}
+              color={colors.textMuted}
+              accessibilityLabel={snapshot.activeHost?.name ?? tr('common.host')}
+            />
             <Text style={[type.captionSmall, { color: colors.textMuted, flexShrink: 1 }]} numberOfLines={1}>
               {snapshot.activeHost?.name ?? tr('common.host')}
             </Text>
@@ -553,7 +555,7 @@ export default function SessionScreen() {
           onPress={() => setMenuOpen(true)}
           testID="session-more"
         >
-          <Text style={[type.heading, { color: colors.text }]}>⋯</Text>
+          <Ellipsis size={22} color={colors.text} accessibilityLabel={tr('session.more')} />
         </TouchableOpacity>
       </View>
 
@@ -786,17 +788,14 @@ export default function SessionScreen() {
             <MicHintLine text={tr('session.micHint')} />
           </View>
         ) : null}
-        <View
+        <GlassSurface
           style={[
             styles.composer,
             {
-              backgroundColor: colors.surfaceRaised,
-              borderColor: colors.border,
               borderRadius: radius.xxl,
               paddingHorizontal: space.md,
               paddingVertical: space.sm,
               gap: space.sm,
-              ...elevation(colors, 'bar'),
             },
           ]}
         >
@@ -828,9 +827,9 @@ export default function SessionScreen() {
                   hitSlop={8}
                   onPress={() => setReplyTo(null)}
                   testID="session-reply-cancel"
-                  style={{ minWidth: hit, minHeight: 24, alignItems: 'center', justifyContent: 'center' }}
+                  style={{ minWidth: hit, minHeight: hit, alignItems: 'center', justifyContent: 'center' }}
                 >
-                  <Text style={[type.caption, { color: colors.textMuted }]}>✕</Text>
+                  <X size={20} color={colors.textMuted} accessibilityLabel={tr('common.cancel')} />
                 </TouchableOpacity>
               </View>
               <Text style={[type.captionSmall, { color: colors.textMuted }]} numberOfLines={2}>
@@ -912,7 +911,11 @@ export default function SessionScreen() {
               {sending ? (
                 <ActivityIndicator color={colors.onAccent} />
               ) : (
-                <Text style={[type.heading, { color: canSend ? colors.onAccent : colors.disabledLabel }]}>↑</Text>
+                <ArrowUp
+                  size={22}
+                  color={canSend ? colors.onAccent : colors.disabledLabel}
+                  accessibilityLabel={tr('session.send')}
+                />
               )}
             </TouchableOpacity>
           </View>
@@ -924,7 +927,7 @@ export default function SessionScreen() {
               {tr(modelUnavailableReasonKey(snapshot.modelsError))}
             </Text>
           )}
-        </View>
+        </GlassSurface>
       </View>
 
       {/* "More" holds exactly one action today: stopping the session. Rename/archive/pin are
@@ -1006,7 +1009,7 @@ export default function SessionScreen() {
               testID="session-team-close"
               style={{ minWidth: hit, minHeight: hit, alignItems: 'center', justifyContent: 'center' }}
             >
-              <Text style={[type.heading, { color: colors.textMuted }]}>✕</Text>
+              <X size={22} color={colors.textMuted} accessibilityLabel={tr('common.cancel')} />
             </TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={{ padding: space.lg, gap: space.lg }}>
@@ -1027,7 +1030,7 @@ export default function SessionScreen() {
               testID="session-stats-close"
               style={{ minWidth: hit, minHeight: hit, alignItems: 'center', justifyContent: 'center' }}
             >
-              <Text style={[type.heading, { color: colors.textMuted }]}>✕</Text>
+              <X size={22} color={colors.textMuted} accessibilityLabel={tr('common.cancel')} />
             </TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={{ padding: space.lg, gap: space.lg }}>
@@ -1053,7 +1056,7 @@ export default function SessionScreen() {
               testID="permission-close"
               style={{ minWidth: hit, minHeight: hit, alignItems: 'center', justifyContent: 'center' }}
             >
-              <Text style={[type.heading, { color: colors.textMuted }]}>✕</Text>
+              <X size={22} color={colors.textMuted} accessibilityLabel={tr('common.cancel')} />
             </TouchableOpacity>
           </View>
           <PermissionSheetBody
@@ -1255,7 +1258,12 @@ function ApprovalCardView(props: {  card: ApprovalCardView;
       ]}
       testID={`approval-card-${card.approvalId}`}
     >
-      <Text style={[type.subheading, { color: colors.text }]}>{tr('approval.title', { tool: card.toolName })}</Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.sm }}>
+        <ShieldCheck size={22} color={colors.accent} accessibilityLabel={tr('approval.title', { tool: card.toolName })} />
+        <Text style={[type.subheading, { color: colors.text, flexShrink: 1 }]}>
+          {tr('approval.title', { tool: card.toolName })}
+        </Text>
+      </View>
       {reasonText !== '' ? (
         <Text style={[type.bodySmall, { color: colors.textMuted }]}>{reasonText}</Text>
       ) : null}
@@ -1301,6 +1309,7 @@ function ApprovalCardView(props: {  card: ApprovalCardView;
             accessibilityState={{ disabled: busy }}
             testID={`approval-approve-${card.approvalId}`}
           >
+            <Check size={20} color={colors.onAccent} accessibilityLabel={tr('approval.approve')} />
             <Text style={[type.button, { color: colors.onAccent }]}>{tr('approval.approve')}</Text>
           </TouchableOpacity>
           <TouchableOpacity
@@ -1322,6 +1331,7 @@ function ApprovalCardView(props: {  card: ApprovalCardView;
             accessibilityState={{ disabled: busy }}
             testID={`approval-reject-${card.approvalId}`}
           >
+            <X size={20} color={colors.danger} accessibilityLabel={tr('approval.reject')} />
             <Text style={[type.button, { color: colors.danger }]}>{tr('approval.reject')}</Text>
           </TouchableOpacity>
         </View>
@@ -1333,6 +1343,7 @@ function ApprovalCardView(props: {  card: ApprovalCardView;
           accessibilityLabel={tr('approval.reviewAgain')}
           onPress={onReload}
         >
+          <RotateCcw size={20} color={colors.accent} accessibilityLabel={tr('approval.reviewAgain')} />
           <Text style={[type.caption, { color: colors.accent }]}>{tr('approval.reviewAgain')}</Text>
         </TouchableOpacity>
       ) : null}

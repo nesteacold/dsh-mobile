@@ -6,11 +6,13 @@
 
 import type { ReactNode } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { BlurView } from 'expo-blur';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { elevation, useTheme } from '../theme';
+import { MeshBackdrop } from './ocean-mesh';
 
-/** Full-bleed screen: theme background, safe-area padding, no white flash while transitions run. */
+/** Full-bleed screen: transparent over the ocean mesh, safe-area padding, no white flash. */
 export function Screen(props: {
   children: ReactNode;
   /** 'scroll' wraps the content in a ScrollView (forms/settings); default is a plain flex column. */
@@ -29,16 +31,18 @@ export function Screen(props: {
     return (
       <ScrollView
         testID={props.testID}
-        style={{ flex: 1, backgroundColor: colors.bg }}
+        style={{ flex: 1, position: 'relative', backgroundColor: colors.screenBackground }}
         contentContainerStyle={[styles.scrollContent, padding]}
         keyboardShouldPersistTaps="handled"
       >
+        <MeshBackdrop />
         {props.children}
       </ScrollView>
     );
   }
   return (
-    <View testID={props.testID} style={[styles.screen, { backgroundColor: colors.bg }, padding]}>
+    <View testID={props.testID} style={[styles.screen, { backgroundColor: colors.screenBackground }, padding]}>
+      <MeshBackdrop />
       {props.children}
     </View>
   );
@@ -72,38 +76,36 @@ export function StatusDot(props: { kind: 'running' | 'decision' | 'idle' | 'mute
   );
 }
 
-/** Card surface (recent-session row, settings group): raised fill, soft shadow, 14pt radius. */
+/** Card surface (recent-session row, settings group): liquid-glass fill, soft shadow, 14pt radius. */
 export function Card(props: { children: ReactNode; onPress?: () => void; testID?: string; label?: string; style?: object }) {
-  const { colors, radius, space } = useTheme();
+  const { radius, space, hit } = useTheme();
   const surface = {
-    backgroundColor: colors.surface,
     borderRadius: radius.md,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
     paddingVertical: space.md,
     paddingHorizontal: space.lg,
-    ...elevation(colors, 'card'),
     ...(props.style ?? {}),
   };
-  if (props.onPress === undefined) return <View style={surface}>{props.children}</View>;
+  if (props.onPress === undefined) return <GlassSurface style={surface}>{props.children}</GlassSurface>;
   return (
     <Pressable
       testID={props.testID}
       accessibilityRole="button"
       accessibilityLabel={props.label}
       onPress={props.onPress}
-      style={({ pressed }) => [surface, pressed && styles.pressed]}
+      style={({ pressed }) => [{ minHeight: hit }, pressed && styles.pressed]}
     >
-      {props.children}
+      <GlassSurface style={surface}>{props.children}</GlassSurface>
     </Pressable>
   );
 }
 
-/** Translucent glass fill used by the floating tab bar and pills (their "liquid glass"). */
+/** Translucent glass fill used by cards, composers and pills (their "liquid glass"). */
 export function GlassSurface(props: { children: ReactNode; style?: object }) {
-  const { colors, radius } = useTheme();
+  const { colors, radius, scheme } = useTheme();
   return (
-    <View
+    <BlurView
+      intensity={10}
+      tint={scheme === 'dark' ? 'dark' : 'light'}
       style={[
         {
           backgroundColor: colors.glass,
@@ -116,7 +118,7 @@ export function GlassSurface(props: { children: ReactNode; style?: object }) {
       ]}
     >
       {props.children}
-    </View>
+    </BlurView>
   );
 }
 
@@ -224,7 +226,7 @@ export function StateMessage(props: { title: string; body?: string; actionLabel?
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1 },
+  screen: { flex: 1, position: 'relative' },
   scrollContent: { paddingBottom: 96 },
   pressed: { opacity: 0.7 },
   sectionLabel: { textTransform: 'uppercase', letterSpacing: 0.6 },

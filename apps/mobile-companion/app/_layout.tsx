@@ -23,6 +23,7 @@ import type { CreatePinnedTransportOptions } from '../src/platform/pinned-transp
 import { buildProfileLabel, nativePinnedWsConstants, screenshotDecision } from '../src/platform/screenshot-mode';
 import { detectLocale, t, type Interpolate, type Locale, type MessageKey } from '../i18n';
 import { PairPanel } from '../src/ui/pair-panel';
+import OceanMesh from '../src/ui/components/ocean-mesh';
 // UI ported from Clarklevis1995/dsh-mobile androidApp/.../ui/DshTheme.kt (MIT).
 // The gate and the update screen sit outside the Stack, so they read the scheme directly; the
 // screens under the Stack read the same palette through `ThemeProvider` / `useTheme()`.
@@ -337,6 +338,12 @@ export default function RootLayout() {
   return (
     <SafeAreaProvider>
       <ThemeProvider initialFontScale={fontScale}>
+      {/* Spec 040: ocean mesh behind every screen. It must sit INSIDE ThemeProvider so the mesh can
+          read the real colour scheme; absolute and non-interactive, it costs no layout and cannot
+          steal a tap from the gate, the navigator or any sheet. */}
+      <View style={StyleSheet.absoluteFill} pointerEvents="none">
+        <OceanMesh />
+      </View>
       <StatusBar style={palette.isDark ? 'light' : 'dark'} />
       {locked ? (
         isWeb ? (
@@ -402,10 +409,10 @@ export default function RootLayout() {
           <Stack
             screenOptions={{
               headerShown: true,
-              headerStyle: { backgroundColor: palette.bg },
+              headerStyle: { backgroundColor: palette.screenBackground },
               headerTintColor: palette.text,
               headerShadowVisible: false,
-              contentStyle: { backgroundColor: palette.bg },
+              contentStyle: { backgroundColor: palette.screenBackground },
             }}
           >
             <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
