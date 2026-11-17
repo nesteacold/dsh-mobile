@@ -263,6 +263,7 @@ window.__ModuleLoader__.load({
         planErrDisabled: 'Allow connections (and LAN access) must be on before the listen address can move.',
         otpTitle: 'Pairing code',
         otpHelp: 'Type this code on the other device together with this address. It works once, for 10 minutes, and you will still have to approve the request here.',
+        otpCloseHelp: 'Closing this dialog keeps the code and any waiting request on the Host.',
         otpNew: 'Generate pairing code',
         otpClose: 'Close',
         otpQrAlt: 'Pairing QR code',
@@ -355,6 +356,12 @@ window.__ModuleLoader__.load({
         tabShortcutLocal: 'Ctrl+Alt+1',
         tabShortcutRemote: 'Ctrl+Alt+2',
         sidebarReasonNoTabs: 'This shell renders no sidebar workspace header to place the tabs under.',
+        // A seat was declared and the strip is installed and watching, but the sidebar's
+        // workspace header has not been drawn (yet, or at all). Kept apart from the line
+        // above so "the shell has no such seat" and "the sidebar has not drawn it" are not
+        // read as the same fact.
+        sidebarReasonNoHeader: 'The sidebar workspace header did not appear, so there is nowhere to place the tabs yet.',
+        sidebarReasonNoRenderer: 'This shell handed over no root renderer, so the tabs cannot be drawn.',
         sidebarReasonShortcut: 'The sidebar tabs are on, but Ctrl+Alt+1 / 2 could not be registered',
         // --- spec 033 (A1.2): a file picked for a remote session reaches that Host as bytes ---
         attachTitle: 'Remote file attach',
@@ -602,6 +609,7 @@ window.__ModuleLoader__.load({
         planErrDisabled: 'Cần bật Cho phép kết nối (và quyền truy cập LAN) trước khi đổi địa chỉ lắng nghe.',
         otpTitle: 'Mã ghép đôi',
         otpHelp: 'Nhập mã này trên thiết bị kia cùng với địa chỉ này. Chỉ dùng một lần, trong 10 phút, và bạn vẫn phải phê duyệt yêu cầu tại đây.',
+        otpCloseHelp: 'Đóng hộp này không huỷ mã hay yêu cầu đang chờ trên máy tính.',
         otpNew: 'Tạo mã ghép đôi',
         otpClose: 'Đóng',
         otpQrAlt: 'Mã QR ghép đôi',
@@ -691,6 +699,8 @@ window.__ModuleLoader__.load({
         tabShortcutLocal: 'Ctrl+Alt+1',
         tabShortcutRemote: 'Ctrl+Alt+2',
         sidebarReasonNoTabs: 'Giao diện này không dựng tiêu đề danh sách workspace để đặt thẻ bên dưới.',
+        sidebarReasonNoHeader: 'Tiêu đề danh sách workspace của thanh bên chưa xuất hiện nên chưa có chỗ đặt thẻ.',
+        sidebarReasonNoRenderer: 'Giao diện này không cung cấp bộ dựng gốc nên không vẽ được các thẻ.',
         sidebarReasonShortcut: 'Thẻ thanh bên đang bật, nhưng không đăng ký được Ctrl+Alt+1 / 2',
         // --- spec 033 (A1.2): tệp chọn cho phiên từ xa đến host đó dưới dạng byte ---
         attachTitle: 'Đính kèm tệp từ xa',
@@ -894,12 +904,28 @@ window.__ModuleLoader__.load({
 .dshdev-seg button{background:transparent;border:0;color:inherit;font:inherit;padding:5px 14px;cursor:pointer}
 .dshdev-seg button[aria-pressed=true]{background:${colors.accent};color:${colors.accentText}}
 .dshdev-seg button:disabled{opacity:.5;cursor:default}
-/* The sidebar's host tabs are ONE box inserted between the sidebar's own section header */
-/* and the scrolling list area (never inside it, never over it), so the strip is a plain */
-/* block in the sidebar's flow: no position, no size or scroll container of its own. */
-.dshdev-hosttabs{display:block;flex:none;margin:2px 10px 8px}
-.dshdev-hosttabs-strip{display:flex;gap:2px;margin:0;padding:2px;border:1px solid ${colors.border};border-radius:999px;background:${colors.hover}}
-.dshdev-hosttabs-strip button{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* The sidebar's host tabs are ONE box inserted immediately BEFORE the sidebar's own */
+/* Workspaces section header (after New Session, still outside the scrolling list area): */
+/* a compact, left-aligned row of two icon buttons in the sidebar's flow — no position, */
+/* no scroll container of its own, and the New Session button keeps its exact place and size. */
+/* The left inset matches the header's label text: dsh-client-ui-workspace's .sectionHeader */
+/* uses padding-left: var(--dsh-sidebar-row-padding) (12px shipped) and .sectionLabel sits */
+/* 1px left of that, so the strip's border starts at the same 11px as the Workspaces ink. */
+/* The glyphs stroke with currentColor: the selected tab draws in DSH accent blue on a
+   light blue chip, the inactive one in muted gray on the shell's hover wash. A tinted
+   chip (not a flat blue fill) keeps the blue stroke legible in both themes; the name
+   stays in title/aria-label, never as text in the 28x24 button. */
+.dshdev-hosttabs{display:flex;flex:none;width:max-content;justify-content:flex-start;margin:1px 10px 6px calc(var(--dsh-sidebar-row-padding, 12px) - 1px)}
+.dshdev-hosttabs-strip{display:inline-flex;gap:2px;margin:0;padding:2px;border:1px solid ${colors.border};border-radius:8px;background:${colors.hover}}
+.dshdev-hosttabs-strip button{flex:none;width:28px;height:24px;display:grid;place-items:center;padding:0;border:0;border-radius:6px;background:transparent;color:${colors.muted};cursor:pointer}
+/* rgba is the fallback for a shell without color-mix; the @supports rule then ties the
+   tint to the shell's own accent so the chip follows the theme. */
+.dshdev-hosttabs-strip button[aria-selected=true]{background:rgba(79,124,255,.16);color:${colors.accent}}
+@supports (background: color-mix(in srgb, red 16%, transparent)) {
+  .dshdev-hosttabs-strip button[aria-selected=true]{background:color-mix(in srgb, ${colors.accent} 16%, transparent)}
+}
+.dshdev-hosttabs-strip button:hover:not([aria-selected=true]){color:${colors.text}}
+.dshdev-hosttabs-strip svg{display:block}
 /* spec 008 P2b: the host seat on a native session row, the composer chip/popover
    and the session notices. The seat is a sibling of the row's own timestamp, so
    it stays small and quiet and never pushes the title. */
@@ -1168,6 +1194,7 @@ window.__ModuleLoader__.load({
     function OtpDialog({ offer, addresses, lanHost, onQr, onClose }) {
       useLang()
       const [qr, setQr] = React.useState(null)
+      // The × button is a display-only close: the code and any waiting request stay on the Host.
       React.useEffect(() => {
         let live = true
         post('/devices/pair-qr', { otp: String(offer.otp), lanHost: lanHost || '', fallbackAddress: addresses[0] || '' })
@@ -1191,7 +1218,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dshdev-row', style: { justifyContent: 'center', marginBottom: 8 } },
           h(Countdown, { expiresAt: offer.pairing.expiresAt }),
           h(CopyButton, { text: String(offer.otp) })),
-        h('div', { className: 'dshdev-muted', style: { marginBottom: 10 } }, tr('otpHelp')),
+        h('div', { className: 'dshdev-muted', style: { marginBottom: 10 } }, tr('otpHelp'), h('br'), tr('otpCloseHelp')),
         h('h3', null, tr('address')),
         shown.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('noAddress'))
           : h('div', { className: 'dshdev-row', 'data-testid': 'otp-addresses' }, shown.map((address) =>
@@ -2984,7 +3011,11 @@ window.__ModuleLoader__.load({
       if (value === 'the shell provides no client services') return tr('sidebarReasonNoServices')
       if (value === 'no remote host is connected') return tr('sidebarReasonNoHost')
       if (value === 'the shell provides no workspace actions') return tr('sidebarReasonNoActions')
-      if (value === 'no-tabs') return tr('sidebarReasonNoTabs')
+      // The three tab facts, each with its own sentence so the owner can tell which one
+      // it is (owner report 2026-11-16: "nothing renders" named none of them).
+      if (value === 'no-seat') return tr('sidebarReasonNoTabs')
+      if (value === 'no-header') return tr('sidebarReasonNoHeader')
+      if (value === 'no-renderer') return tr('sidebarReasonNoRenderer')
       if (value === 'shortcuts') return tr('sidebarReasonShortcut')
       const routing = /^multi-host routing is off(?:: (.*))?$/.exec(value)
       if (routing) {
@@ -2995,14 +3026,20 @@ window.__ModuleLoader__.load({
     function RemoteGroupingStatus() {
       useLang()
       const status = useRemoteUI()
+      // "Installed" and "on screen" are two facts. A placement that has a seat and a
+      // renderer but no header yet is installed (`tabs: true`) and NOT visible, so the
+      // line must not promise two tabs it cannot draw: those two reasons read as
+      // `not installed — <why>` and the strip appears by itself once the header does.
+      const unplaced = status.tabsReason === 'no-header' || status.tabsReason === 'no-renderer'
+      const tabsLine = status.tabs && !unplaced
+        ? `${tr('hostTabsOn')}${status.tabsReason ? ` — ${groupingReasonText(status.tabsReason)}` : ''}`
+        : `${tr('hostTabsOff')}${status.tabsReason ? ` — ${groupingReasonText(status.tabsReason)}` : ''}`
       return h('div', { className: 'dshdev-card', 'data-testid': 'sidebar-grouping' },
         h('h3', null, tr('sidebarGrouping')),
         h('div', { className: 'dshdev-muted', 'data-testid': 'sidebar-grouping-state' },
           status.grouped ? `${tr('sidebarOn')} (${status.hosts})` : `${tr('sidebarOffState')} — ${groupingReasonText(status.reason)}`),
         h('div', { className: 'dshdev-muted', 'data-testid': 'sidebar-tabs-state' },
-          `${tr('hostTabs')}: ${status.tabs
-            ? `${tr('hostTabsOn')}${status.tabsReason ? ` — ${groupingReasonText(status.tabsReason)}` : ''}`
-            : tr('hostTabsOff')}`))
+          `${tr('hostTabs')}: ${tabsLine}`))
     }
 
     // ------------------------------- the sidebar's two tabs (This Computer / Remote)
@@ -3025,13 +3062,13 @@ window.__ModuleLoader__.load({
     // tags workspace ids that way too, so one prefix decides both directions: a row is
     // remote iff its key carries the `:h:` tag after the kind.
     const HOST_TABS_STYLE_ID = 'dsh-ext.devices.host-tabs'
-    // Placement (owner decision 2026-11-16): the New Session button keeps its exact
-    // position and size, so the strip is NOT a layer around it any more. It is a box
-    // INSERTED below the sidebar's own `Workspaces` section header and directly above
-    // the scrolling list area — see `installSidebarTabStrip` for the anchor and the
-    // contract it must not break. `shell.overlay` is where the render helper lives: the
-    // one root-scope `list` seat `dsh-client-ui-layout` declares, so this plugin asks no
-    // new seat of the sidebar, and the seat says nothing about where the box goes.
+    // Placement (owner decision 2026-11-16, ordering refined 2026-11-17): the New Session
+    // button keeps its exact position and size, so the strip is NOT a layer around it. It
+    // is a box INSERTED immediately BEFORE the sidebar's own `Workspaces` section header
+    // (after New Session, still outside the scrolling list area) — see `installSidebarTabStrip`
+    // for the anchor and the contract it must not break. `shell.overlay` is where the render
+    // helper lives: the one root-scope `list` seat `dsh-client-ui-layout` declares, so this
+    // plugin asks no new seat of the sidebar, and the seat says nothing about where the box goes.
     const HOST_TABS_SLOT = 'shell.overlay'
     // The two shipped markers this placement rests on (dsh-client-ui-workspace, read
     // from source): the section header div and the scrolling area `bindScrollerRef` is
@@ -3042,6 +3079,14 @@ window.__ModuleLoader__.load({
     // The observer waits this long after a mutation before looking for the header: the
     // sidebar re-renders in bursts and one look per burst is enough.
     const HOST_TABS_DEBOUNCE_MS = 80
+    // How long a header may be missing before the placement says so (one `console.warn`
+    // and a `tabsReason` on the Devices page). `apply()` runs before the sidebar's
+    // workspace browser mounts, so "missing right now" is normal; "still missing after
+    // this long" is a fact the owner can act on. The observer keeps looking afterwards.
+    const HOST_TABS_HEADER_WAIT_MS = 2000
+    // The one English sentence for a header that never arrived. Kept next to the
+    // selector so a diagnostic cannot drift away from the thing it is about.
+    const HOST_TABS_NO_HEADER_WARN = `[devices] host tabs: no sidebar header found (selector ${HOST_TABS_HEADER})`
     // What the THIS-COMPUTER tab hides: every row tagged for a remote host, and nothing
     // else — the untagged `workspace:`/`overflow:` ungrouped headers stay, since local
     // loose sessions may live there.
@@ -3075,8 +3120,14 @@ window.__ModuleLoader__.load({
     const HOST_TABS_STORAGE = 'dsh-ext.devices.sidebar-tab'
     const HOST_TABS_DEFAULT = 'local'
     // Declared in `apply` so `installRemoteSurfaces` can report it on the Devices page.
-    // `tabs: false` means "not installed"; `tabsReason` explains a partial install
-    // ('shortcuts') or a refused seat ('no-tabs').
+    // `tabs: false` means "not installed"; `tabsReason` explains WHY, with the three
+    // facts the owner has to be able to tell apart (owner report 2026-11-16):
+    //  - `no-seat`     — the shell never declared `shell.overlay` (nothing to hook into);
+    //  - `no-renderer` — a seat but no root renderer, so no strip can be built;
+    //  - `no-header`   — installed and watching, but the sidebar's workspace header never
+    //                    appeared, so there is nowhere to put the strip;
+    //  - `shortcuts`   — the tabs work, only Ctrl+Alt+1/2 could not be registered.
+    // A fourth state has no reason at all: placed, which is `tabs: true, tabsReason: null`.
     const syncHostTabsStatus = () => remoteUI.set({
       tabs: toggles.registered,
       tabsReason: toggles.reason || null,
@@ -3107,11 +3158,29 @@ window.__ModuleLoader__.load({
       return true
     }
 
+    // The two tab glyphs, drawn once in the package's own 24-unit stroke style (the
+    // same inline-SVG pattern as `IconMonitor`/`deviceGlyph`, React's SVG namespace):
+    // a compact monitor with a check for THIS computer, a compact cloud with a link
+    // dot for a REMOTE workspace — the shapes from artifacts/host-tabs-mockup.html.
+    // `icon()` strokes with `currentColor`, so CSS paints the selected one accent blue
+    // and the inactive one muted gray; the filled link dot uses currentColor too, so
+    // neither glyph carries a colour of its own.
+    const IconTabLocal = () => icon(16, [
+      h('rect', { key: 's', x: 2.5, y: 4.5, width: 19, height: 12.5, rx: 2 }),
+      h('path', { key: 'p', d: 'M9 20.5h6M12 17v3.5' }),
+      h('path', { key: 'c', d: 'M8.5 10.5l2.5 2.5 4.5-4.5' }),
+    ])
+    const IconTabRemote = () => icon(16, [
+      h('path', { key: 'c', d: 'M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z' }),
+      h('circle', { key: 'd', cx: 12, cy: 15, r: 1.5, fill: 'currentColor', stroke: 'none' }),
+    ])
+
     /**
-     * The strip itself: the two segmented buttons, nothing else. It is a real box in
-     * the sidebar's flow, inserted by `installSidebarTabStrip`, so it takes no children
-     * and wraps nothing of the shell's — the New Session button stays exactly where and
-     * as big as it ships.
+     * The strip itself: two compact ICON buttons, nothing else — the localized name
+     * and its shortcut live in `title`/`aria-label`, never as text inside the button.
+     * It is a real box in the sidebar's flow, inserted by `installSidebarTabStrip`, so
+     * it takes no children and wraps nothing of the shell's — the New Session button
+     * stays exactly where and as big as it ships.
      */
     function SidebarHostTabs() {
       useLang()
@@ -3119,26 +3188,28 @@ window.__ModuleLoader__.load({
       const choose = (next) => { publishHostTab(next) }
       return h('div', { className: 'dshdev-hosttabs', 'data-testid': HOST_TABS_TESTID },
         h('div', { className: 'dshdev-hosttabs-strip dshdev-seg', role: 'tablist', 'aria-label': tr('hostTabs') },
-          [['local', 'tabThisComputer', 'tabSwitchLocal', 'tabShortcutLocal'],
-            ['remote', 'tabRemoteWorkspace', 'tabSwitchRemote', 'tabShortcutRemote']].map(([id, label, title, keys]) =>
-            h('button', { key: id, type: 'button', role: 'tab', 'data-tab': id, 'aria-selected': tab === id, 'aria-pressed': tab === id,
-              title: `${tr(title)} (${tr(keys)})`,
-              onClick: () => choose(id) }, tr(label)))))
+          [['local', 'tabThisComputer', 'tabShortcutLocal', IconTabLocal],
+            ['remote', 'tabRemoteWorkspace', 'tabShortcutRemote', IconTabRemote]].map(([id, label, keys, Glyph]) => {
+            const name = `${tr(label)} (${tr(keys)})`
+            return h('button', { key: id, type: 'button', role: 'tab', 'data-tab': id, 'data-testid': `sidebar-host-tab-${id}`,
+              'aria-selected': tab === id, 'aria-pressed': tab === id, 'aria-label': name, title: name,
+              onClick: () => choose(id) }, h(Glyph))
+          })))
     }
 
     /**
      * Where the strip goes, and the one rule that keeps it from breaking the sidebar:
-     * it is the header's NEXT SIBLING (the list area's previous sibling), so it never
-     * sits inside the scrolling area that owns the sidebar's `100cqh` scroll contract,
+     * it is the header's PREVIOUS SIBLING (after New Session, before "Workspaces"), so it
+     * never sits inside the scrolling area that owns the sidebar's `100cqh` scroll contract,
      * and it never floats over anything.
      *
      * Wide-only: the header is drawn by the wide workspace browser only (the collapsed
      * rail draws no header at all), so "header present" IS the wide state and no other
      * collapsed-state signal is read. Two rules, both idempotent:
-     *  - nothing to do while the header's next sibling is already our node (that is what
+     *  - nothing to do while the header's previous sibling is already our node (that is what
      *    stops an observer feedback loop: our own insert must not schedule another one);
      *  - otherwise exactly one node per header: a second copy is removed, ours is placed.
-     * @returns {boolean} whether our node is now the header's next sibling
+     * @returns {boolean} whether our node is now the header's previous sibling
      */
     function placeHostTabsNode(doc, node) {
       const header = doc.querySelector(HOST_TABS_HEADER)
@@ -3147,12 +3218,11 @@ window.__ModuleLoader__.load({
       const strays = [...doc.querySelectorAll(`[data-testid="${HOST_TABS_TESTID}"]`)].filter((found) => found !== node)
       // Nothing to move and nothing to remove: this pass changes no DOM, so it raises no
       // observer record of its own — which is what keeps a feedback loop impossible.
-      if (strays.length === 0 && header.nextElementSibling === node) return false
-      // The copies go first (one node per header), and the insertion point is then read
-      // from the header: `remove()` rewires parents, so anything captured before it can be
-      // stale, while `header.nextSibling` always describes the tree as it is NOW.
+      if (strays.length === 0 && header.previousElementSibling === node) return false
+      // The copies go first (one node per header); the header itself is the insertion
+      // reference, so it stays valid whatever the removals did to the rest of the tree.
       for (const stray of strays) { try { stray.remove() } catch { /* a copy already gone needs nothing */ } }
-      parent.insertBefore(node, header.nextSibling)
+      parent.insertBefore(node, header)
       return true
     }
 
@@ -3160,16 +3230,22 @@ window.__ModuleLoader__.load({
      * The invisible `shell.overlay` helper: the seat is an ordinary root-scope `list`
      * entry, so it renders inside the app frame — the box it must produce is the
      * sidebar's, though, which no overlay can reach. So it renders nothing, and a
-     * MutationObserver on the document places a React root of `SidebarHostTabs` between
-     * the sidebar's section header and its list area. One debounced pass per burst of
+     * MutationObserver on the document places a React root of `SidebarHostTabs` immediately
+     * before the sidebar's section header. One debounced pass per burst of
      * mutations; the observer stays on because the sidebar re-renders (a re-render that
      * drops our node is re-inserted, and every one of those re-inserts is skipped while
-     * ours is already in place, so the loop cannot run away). A shell whose header never
-     * appears simply gets no strip — the Devices page says so.
+     * ours is already in place, so the loop cannot run away).
+     *
+     * `apply()` runs BEFORE the sidebar's workspace browser mounts, so the first pass
+     * normally finds no header at all. That is not a failure: the placement stays
+     * installed, the observer catches the header when it appears, and `HOST_TABS_HEADER_WAIT_MS`
+     * later a header that still has not shown up is reported once (a single `console.warn`
+     * plus a `tabsReason` on the Devices page) so "no header", "no seat" and "no renderer"
+     * are telling apart. The wait is a diagnostic only — the observer keeps looking after it.
      *
      * `deps` is a test seam only: production passes nothing, so the document is the
      * page's own.
-     * @returns {{ status: () => string, dispose: () => void }}
+     * @returns {{ status: () => 'placed'|'waiting'|'unavailable', reason: () => string|null, dispose: () => void }}
      */
     function installHostTabPlacement(deps = {}) {
       const doc = 'doc' in deps ? deps.doc : (typeof document === 'undefined' ? null : document)
@@ -3182,11 +3258,20 @@ window.__ModuleLoader__.load({
       // locale subscription and React's own event ownership, so a shell without a root
       // renderer is REPORTED instead.
       const createRoot = deps.createRoot ?? deps.reactRoot ?? null
+      const warn = typeof deps.warn === 'function' ? deps.warn : (typeof console !== 'undefined' && typeof console.warn === 'function' ? (...args) => console.warn(...args) : null)
+      // Called when the placement's own visibility changes (placed late, or given up on):
+      // the Devices page reads this through `toggles`, so it must not stay stale.
+      const notify = typeof deps.onChange === 'function' ? deps.onChange : null
+      const announce = () => { if (notify !== null) { try { notify() } catch { /* a page listener must not break placement */ } } }
+      // A1.3: the workspace-expansion pass rides this same observer/debounce instead of
+      // owning a second one — the sidebar re-renders in the same bursts that move the
+      // strip, so one pass per burst is enough for both jobs.
+      const onPass = typeof deps.onPass === 'function' ? deps.onPass : null
       // What a shell without a document, an observer or a root renderer gets: nothing is
-      // installed, and the Devices page prints the same reason as a missing header.
-      if (!doc || typeof doc.querySelector !== 'function') return { status: () => 'no-tabs', dispose() {} }
-      if (typeof Observer !== 'function' || !delay) return { status: () => 'no-tabs', dispose() {} }
-      if (typeof createRoot !== 'function') return { status: () => 'no-tabs', dispose() {} }
+      // installed, and the page names the missing piece (`unavailable`, never `no-tabs`).
+      if (!doc || typeof doc.querySelector !== 'function') return { status: () => 'unavailable', reason: () => 'no-document', dispose() {} }
+      if (typeof Observer !== 'function' || !delay) return { status: () => 'unavailable', reason: () => 'no-observer', dispose() {} }
+      if (typeof createRoot !== 'function') return { status: () => 'unavailable', reason: () => 'no-renderer', dispose() {} }
       const node = doc.createElement('div')
       // The node is found by a test id, and the sidebar re-renders through React, which
       // may drop a sibling it never rendered: the id goes on the container the root
@@ -3198,7 +3283,23 @@ window.__ModuleLoader__.load({
       const root = createRoot(node)
       let placed = false
       let timer = null
+      let waitTimer = null
+      let headerWarned = false
       let disposed = false
+      // One warn at most, after a wait with no header. Re-armed when a mutation proves
+      // the sidebar is drawing, so a header that is merely late is never called missing.
+      const armHeaderWait = () => {
+        if (placed || disposed || waitTimer !== null || headerWarned || !delay) return
+        waitTimer = delay(() => {
+          waitTimer = null
+          if (disposed || placed) return
+          headerWarned = true
+          toggles.reason = toggles.registered ? 'no-header' : toggles.reason
+          syncHostTabsStatus()
+          announce()
+          try { warn(HOST_TABS_NO_HEADER_WARN) } catch { /* no console */ }
+        }, HOST_TABS_HEADER_WAIT_MS)
+      }
       const place = () => {
         if (disposed) return
         try {
@@ -3206,11 +3307,29 @@ window.__ModuleLoader__.load({
           // `placed` is a fact about the DOM, not about this pass: a pass with nothing to
           // do still leaves our node exactly where the contract wants it.
           if (inserted) placed = true
-          else placed = doc.querySelector(HOST_TABS_HEADER)?.nextElementSibling === node
+          else placed = doc.querySelector(HOST_TABS_HEADER)?.previousElementSibling === node
         } catch { /* a document mid-teardown: the next pass retries */ }
+        // A row scan is a separate job and must never stop the placement it rides on.
+        if (onPass !== null) { try { onPass() } catch { /* a bad row is not a lost strip */ } }
+        // The strip is only useful once it is in the page: render the tree on the first
+        // pass that finds a seat, so a header that arrives late still gets its tabs.
+        if (placed && !published) {
+          published = true
+          try { root.render(h(SidebarHostTabs)) } catch { /* a broken root is reported by the shell */ }
+          // `no-header` was a fact about the past: the page must stop saying it.
+          if (toggles.reason === 'no-header') { toggles.reason = null; syncHostTabsStatus() }
+          announce()
+        }
+        // A mutation cancelled the wait, but this pass still found no header: arm a
+        // fresh one so "never arrived" is still reported, once, after the wait.
+        armHeaderWait()
       }
       const schedule = () => {
         if (disposed) return
+        // A foreign mutation means the sidebar is being drawn: the header may be in
+        // this batch. Do not let the 2s "never arrived" warn fire ahead of the 80ms
+        // placement pass — a header that is merely late is not a missing header.
+        if (waitTimer !== null && cancel) { cancel(waitTimer); waitTimer = null }
         if (timer !== null && cancel) cancel(timer)
         timer = delay(() => { timer = null; place() }, HOST_TABS_DEBOUNCE_MS)
       }
@@ -3221,28 +3340,227 @@ window.__ModuleLoader__.load({
         // run for it would find the node already in place and insert nothing. The batch
         // after it is the sidebar's own re-render, and that one does reach the DOM.
         observer = new Observer((entries) => {
-          const foreign = (entries ?? []).filter((entry) => !(entry.addedNodes ?? []).every((added) => added === node))
+          // Ignore ONLY the batch that carries our own insertion. A record with no
+          // addedNodes means the renderer REMOVED something; `.every()` is true on an
+          // empty list, so that branch used to be mistaken for "our own node" and the
+          // strip was never re-inserted after React dropped it.
+          const foreign = (entries ?? []).filter((entry) => {
+            // A browser hands MutationRecord a NodeList, which has no array methods.
+            const added = Array.from(entry.addedNodes ?? [])
+            const removed = Array.from(entry.removedNodes ?? [])
+            return !(added.length > 0 && added.every((item) => item === node) && !removed.includes(node))
+          })
           if (foreign.length === 0) return
           schedule()
         })
-        observer.observe(doc.body, { childList: true, subtree: true })
+        // `document.body` exists from the first script on, but a shell that runs apply()
+        // before the body (or a test document without one) is observed at the document
+        // element instead — the header is discovered either way.
+        observer.observe(doc.body ?? doc.documentElement ?? doc, { childList: true, subtree: true })
       } catch {
         observer = null
       }
-      root.render(h(SidebarHostTabs))
+      let published = false
       // The first pass runs now: a sidebar that is already drawn must not wait 80ms.
       place()
+      // `place()` above armed the wait when it found no header. One warn, once, after
+      // that wait; the observer keeps looking, so a header that shows up later works.
+      armHeaderWait()
       return {
-        status: () => (placed ? 'placed' : 'no-tabs'),
+        status: () => (placed ? 'placed' : 'waiting'),
+        reason: () => (placed ? null : 'no-header'),
         dispose() {
           disposed = true
           if (timer !== null && cancel) cancel(timer)
           timer = null
+          if (waitTimer !== null && cancel) cancel(waitTimer)
+          waitTimer = null
           // A shell that refused the observer took nothing to disconnect, and one that
           // refused it also has no re-insert to lose: the box it holds is final.
           try { observer?.disconnect() } catch { /* a disconnected observer needs nothing */ }
-          try { root.unmount() } catch { /* already unmounted */ }
+          // Rendering into an unmounted root throws; a root that was never published has
+          // nothing of ours in the page to take back.
+          if (published) { try { root.unmount() } catch { /* already unmounted */ } }
           try { node.remove() } catch { /* already gone */ }
+        },
+      }
+    }
+
+    // A1.3 (owner-approved 2026-11-17): remote workspace rows remember whether the owner
+    // left them open. Only rows the shell tags `workspace:h:<hostId>:<uuid>` and marks
+    // `role="treeitem"` count; local and ungrouped `workspace:` rows are never read or
+    // clicked. The map lives in OUR OWN namespaced localStorage entry — DSH's
+    // `dsh.workspace.view.v5` is never read, written or otherwise touched — and a
+    // first-seen remote row defaults to expanded.
+    const WORKSPACE_EXPANSION_STORAGE = 'dsh-ext.devices.workspace-expansion.v1'
+    const WORKSPACE_PREFIX = 'workspace:'
+    const REMOTE_WORKSPACE_PREFIX = 'workspace:h:'
+    const WORKSPACE_ROW_SELECTOR = '[data-row-key^="workspace:h:"][role="treeitem"]'
+
+    /** Read one attribute from a real element or a test's lightweight element. */
+    const rowAttr = (node, name) => {
+      if (!node) return null
+      if (typeof node.getAttribute === 'function') return node.getAttribute(name)
+      const value = node.attrs?.[name]
+      return value === undefined ? null : String(value)
+    }
+    const isRemoteWorkspaceRow = (node) => {
+      const key = rowAttr(node, 'data-row-key')
+      return typeof key === 'string' && key.startsWith(REMOTE_WORKSPACE_PREFIX) && rowAttr(node, 'role') === 'treeitem'
+    }
+    /** The storage key is the row key without its `workspace:` kind prefix. */
+    const workspaceRowKey = (node) => {
+      const key = rowAttr(node, 'data-row-key')
+      return typeof key === 'string' ? key.slice(WORKSPACE_PREFIX.length) : null
+    }
+    /** Walk up from a click target so a click on a row's child is still the row's own. */
+    const workspaceRowOf = (node) => {
+      for (let cursor = node; cursor; cursor = cursor.parentNode) {
+        if (isRemoteWorkspaceRow(cursor)) return cursor
+      }
+      return null
+    }
+
+    /**
+     * The plugin's own map, loaded from a namespaced entry. A shell without storage, a
+     * junk value, or an entry holding non-booleans simply starts empty: a broken entry
+     * must never stop the row pass, and nothing here reaches DSH's own view state.
+     */
+    function workspaceExpansionStore(storage) {
+      const map = Object.create(null)
+      if (storage) {
+        try {
+          const parsed = JSON.parse(storage.getItem(WORKSPACE_EXPANSION_STORAGE))
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            for (const [key, value] of Object.entries(parsed)) {
+              if (typeof value === 'boolean') map[key] = value
+            }
+          }
+        } catch { /* no entry, no storage, or a junk entry: start empty */ }
+      }
+      return {
+        map,
+        save() {
+          if (!storage) return
+          try { storage.setItem(WORKSPACE_EXPANSION_STORAGE, JSON.stringify(map)) } catch { /* in-memory only */ }
+        },
+      }
+    }
+
+    /**
+     * Install the A1.3 expansion helper. It owns no observer or timer of its own: the
+     * caller feeds `pass()` from the strip's existing debounced MutationObserver, so
+     * one burst moves both jobs and there is only one thing to tear down. What it does
+     * own is the CAPTURE-phase click listener that learns the owner's own toggles.
+     *
+     * `deps` is a test seam only; production reads the page's document/window.
+     * @returns {{ pass: () => void, dispose: () => void }}
+     */
+    function installWorkspaceExpansion(deps = {}) {
+      const doc = 'doc' in deps ? deps.doc : (typeof document === 'undefined' ? null : document)
+      let storage = null
+      if ('storage' in deps) storage = deps.storage
+      else if (typeof window !== 'undefined') {
+        // The getter itself can throw in a locked-down shell, before getItem is reached.
+        try { storage = window.localStorage } catch { storage = null }
+      }
+      const { map, save } = workspaceExpansionStore(storage)
+      const target = doc?.addEventListener ? doc : (doc?.body?.addEventListener ? doc.body : null)
+      // Our own synthetic clicks are marked here for the one event they raise; the
+      // listener drops the mark instead of recording a user choice, and pass() clears
+      // any mark a shell that does not dispatch clicks left behind.
+      const pluginClicks = new Set()
+      let disposed = false
+      const schedule = deps.setTimeout ?? ((fn, ms) => setTimeout(fn, ms))
+      const clearScheduled = deps.clearTimeout ?? ((id) => clearTimeout(id))
+      const pendingReads = new Set()
+      // An owner's toggle is learned on the next task. A pass scheduled before that
+      // read would see the stale map value and click the just-collapsed row open.
+      const pendingOwnerKeys = new Set()
+      const afterOwnerClick = (key) => {
+        let id
+        try {
+          id = schedule(() => {
+            pendingReads.delete(id)
+            if (disposed) return
+            pendingOwnerKeys.delete(key)
+            // DSH may replace the row between the click and this task. Read the row
+            // in the page NOW; a detached one must never overwrite the map.
+            const current = typeof doc?.querySelector === 'function'
+              ? doc.querySelector(`[data-row-key="workspace:${key}"]`) : null
+            if (!isRemoteWorkspaceRow(current)) return
+            map[key] = rowAttr(current, 'aria-expanded') === 'true'
+            save()
+          }, 0)
+        } catch {
+          pendingOwnerKeys.delete(key)
+          return /* no timer: keep the previous choice */
+        }
+        if (id !== undefined && id !== null) pendingReads.add(id)
+      }
+      const clickRow = (row) => {
+        if (typeof row.click !== 'function') return
+        pluginClicks.add(row)
+        try { row.click() } catch { /* a row mid-teardown: the next pass retries */ }
+      }
+      const pass = () => {
+        if (disposed || !doc || typeof doc.querySelectorAll !== 'function') return
+        let rows
+        try { rows = doc.querySelectorAll(WORKSPACE_ROW_SELECTOR) } catch { return }
+        let changed = false
+        for (const row of rows ?? []) {
+          if (!isRemoteWorkspaceRow(row)) continue
+          const key = workspaceRowKey(row)
+          if (key === null) continue
+          if (pendingOwnerKeys.has(key)) continue
+          const expanded = rowAttr(row, 'aria-expanded') === 'true'
+          const known = Object.prototype.hasOwnProperty.call(map, key)
+          if (!known) {
+            // First look: default to expanded, and remember it even when DSH already
+            // drew the row open — only the owner's own toggles may change it later.
+            if (!expanded) clickRow(row)
+            map[key] = true
+            changed = true
+          } else if (map[key] ? !expanded : expanded) {
+            // Known true drawn shut, or known false drawn open: one synthetic click
+            // puts the row back where the owner's last choice says it belongs.
+            clickRow(row)
+          }
+        }
+        pluginClicks.clear()
+        if (changed) save()
+      }
+      const onClick = (event) => {
+        if (disposed) return
+        // Our own click is a tool action, never a user preference. The mark is dropped
+        // here, in the same pass that produced it; nothing is prevented or stopped.
+        if (pluginClicks.has(event?.target)) { pluginClicks.delete(event?.target); return }
+        const row = workspaceRowOf(event?.target)
+        if (row === null) return
+        const key = workspaceRowKey(row)
+        if (key === null) return
+        // Capture runs BEFORE the row's own (bubble-phase) toggle, and the browser may
+        // checkpoint microtasks in between. Read on the next task instead; any read
+        // still pending here is cancelled (and ignored) when the strip is disposed.
+        // Hold the key pending so a pass queued before this read cannot undo the
+        // owner's choice using the value the map had before the toggle.
+        pendingOwnerKeys.add(key)
+        afterOwnerClick(key)
+      }
+      if (target?.addEventListener) {
+        try { target.addEventListener('click', onClick, true) } catch { /* no listener, no memory */ }
+      }
+      return {
+        pass,
+        dispose() {
+          disposed = true
+          pluginClicks.clear()
+          pendingOwnerKeys.clear()
+          for (const id of pendingReads) { try { clearScheduled(id) } catch { /* already fired */ } }
+          pendingReads.clear()
+          if (target?.removeEventListener) {
+            try { target.removeEventListener('click', onClick, true) } catch { /* already gone */ }
+          }
         },
       }
     }
@@ -3285,9 +3603,11 @@ window.__ModuleLoader__.load({
 
     // One effect owns the strip, the style and the two Ctrl+Alt+1 / 2 commands, so a
     // reload removes exactly what this installed. A shell that declares no
-    // `shell.overlay` seat — or renders no sidebar header to place the strip under —
-    // degrades to "no tabs" with the reason on the Devices page, and the native sidebar
-    // is then exactly as shipped.
+    // `shell.overlay` seat degrades to "no tabs" with `no-seat` on the Devices page, and
+    // the native sidebar is then exactly as shipped. A declared seat whose header has not
+    // been drawn YET is NOT a refusal: the placement stays installed and watching (that
+    // was the 2026-11-16 defect — it disposed itself at apply() and the tabs never came
+    // back), reporting `no-header` only if the header never shows up.
     function installSidebarTabStrip(ctx, options = {}) {
       const disposers = []
       toggles.tab = storedHostTab()
@@ -3302,6 +3622,9 @@ window.__ModuleLoader__.load({
           // An invisible render helper: the seat is a root-scope list entry, and the box
           // the user sees is the sidebar's, placed by `installHostTabPlacement`. The
           // helper renders nothing, so nothing of this plugin floats over the shell.
+          // `id` is the one option a `list` slot requires (the cell key: a fresh id is
+          // added beside the shipped entries); the shape is the one every shipped
+          // `shell.overlay` occupant uses, `{ name, id, order }`.
           const registration = ctx.slots.register(
             { name: HOST_TABS_SLOT, id: 'dsh-ext.devices.tabs', order: 100 }, () => null)
           declared = true
@@ -3311,40 +3634,107 @@ window.__ModuleLoader__.load({
         declared = false
       }
       let placement = null
+      // A1.3 exists only while the strip exists: no seat / no renderer means the native
+      // sidebar is exactly as shipped, including its workspace rows' expansion.
+      let expansion = null
+      // `place()` can announce synchronously from inside `installHostTabPlacement` (a
+      // header already in the page at apply time), before the helpers below exist. The
+      // hook is assigned after them; an early announcement only syncs the page status,
+      // and the apply()-tail call installs the filter and keys for that placed case.
+      let onPlaced = null
+      // Why a placement could not be installed, when it could not be: the reason the page
+      // has to show, kept out of the `try` so a throw cannot turn `no-renderer` into
+      // `no-seat` (they are different facts for the owner).
+      let missReason = 'no-seat'
       if (declared) {
         // The root renderer: the seam the shell's renderer supplies, else the module
         // loader's `react-dom/client`.
         const createRoot = options.createRoot ?? reactRoot()
-        try { placement = installHostTabPlacement({ reactRoot: createRoot }) } catch { placement = null }
-        // A helper with no header to stand under is no better than a refused seat: the
-        // strip cannot be reached, so it is not installed and the page says why.
-        if (placement !== null && placement.status() !== 'placed') {
+        missReason = 'no-renderer'
+        // The helper is created BEFORE the placement: its pass is called on the
+        // placement's very first (synchronous) pass, so a row already in the page is
+        // handled without waiting for another mutation.
+        expansion = installWorkspaceExpansion()
+        try {
+          placement = installHostTabPlacement({
+            reactRoot: createRoot,
+            // One observer, one debounce: the strip's own pass drives the row scan.
+            onPass: expansion.pass,
+            // The strip appearing (or the wait giving up) is a status change the page reads;
+            // the filter AND the keys come with the strip, on the first pass that places it.
+            onChange: () => {
+              const now = placement !== null && placement.status() === 'placed'
+              toggles.reason = now ? null : toggles.reason
+              if (now && onPlaced) onPlaced()
+              syncHostTabsStatus()
+            },
+          })
+        } catch { placement = null }
+        // A missing header at THIS instant is the normal case, not a refusal: `apply()`
+        // runs while the shell is still assembling, and the sidebar's workspace browser
+        // mounts after it. The placement owns an observer, so a header that arrives later
+        // still gets the strip; tearing the placement down here is what made the two tabs
+        // never appear (measured 2026-11-16: header absent at apply → placement disposed →
+        // observer gone → nothing could ever place it again). Only a placement that could
+        // not be installed at all (no document, no observer, no root renderer) is a miss.
+        if (placement !== null && placement.status() === 'unavailable') {
+          const why = typeof placement.reason === 'function' ? placement.reason() : null
+          if (why === 'no-document' || why === 'no-observer') missReason = 'no-seat'
           try { placement.dispose() } catch { /* nothing was installed */ }
           placement = null
         }
       }
       if (!declared || placement === null) {
+        // Nothing was installed: the owner's rows keep their native behaviour.
+        if (expansion) expansion.dispose()
+        expansion = null
         toggles.registered = false
-        toggles.reason = 'no-tabs'
+        // Two different facts, told apart on the page: no seat at all, or a seat whose
+        // renderer the shell could not hand over (`installHostTabPlacement` names it).
+        toggles.reason = declared ? missReason : 'no-seat'
         // An inert injector at an undeclared seat is usually not invoked at all, so a
         // disposer it returned must still be released here.
         if (typeof seat === 'function') { try { seat() } catch { /* nothing was installed */ } }
         return null
       }
       toggles.registered = true
-      toggles.reason = null
+      // The placement has a seat declared and a renderer; a header it has not seen yet is
+      // `no-header`, which it reports itself once its own wait expires (or immediately
+      // clears when the header shows up).
+      toggles.reason = placement.status() === 'placed' ? null : 'no-header'
       if (typeof seat === 'function') disposers.push(seat)
       disposers.push(() => placement.dispose())
+      // Reverse teardown: the click listener goes before the observer and timer it rode
+      // on, so no pass between the two can record a state we just stopped caring about.
+      if (expansion) disposers.push(() => expansion.dispose())
+      // The filter is the tabs' only switch, so it is installed ONLY once the tabs can be
+      // reached. Until the header is drawn, the strip is invisible: a filter there would
+      // hide half the sidebar with nothing on screen to switch back. The placement calls
+      // back on its first successful pass and the filter is written then.
       let filter = null
-      // The strip is a second subscriber to the same store, so a click on it and a key
-      // press land on the same writer and the same persisted choice.
       const overlay = () => { if (filter) filter.write(toggles.tab) }
-      if (typeof document !== 'undefined' && document && document.head) {
+      const ensureFilter = () => {
+        if (filter !== null) return
+        if (typeof document === 'undefined' || !document || !document.head) return
         filter = hostTabsStyleWriter(document, toggles.tab)
+        disposers.push(subscribeHostTab(overlay))
       }
+      // The strip is a second subscriber to the same store, so a click on it and a key
+      // press land on the same writer and the same persisted choice — but only once the
+      // filter exists (that subscription is made with it, in `ensureFilter`).
+      if (placement.status() === 'placed') ensureFilter()
       // The shortcuts are an accelerator, never the only way to switch: the strip is
-      // always clickable, so a shell without `ctx.shortcuts` simply has no keys.
-      if (toggles.registered && ctx.shortcuts && typeof ctx.shortcuts.register === 'function') {
+      // clickable, so a shell without `ctx.shortcuts` simply has no keys. A strip that
+      // has not been placed yet has NOTHING to switch: no filter and no tabs on screen,
+      // so registering Ctrl+Alt+1/2 there would leave keys pointing at nothing (owner
+      // report 2026-11-16). `no-header` is a waiting state, not a placed one; the keys
+      // come with the strip on the first pass that places it. Idempotent: the same
+      // installer is called at apply() and from the placement's onChange.
+      let shortcutsReady = false
+      const ensureShortcuts = () => {
+        if (shortcutsReady || !toggles.registered || placement.status() !== 'placed') return
+        if (!ctx.shortcuts || typeof ctx.shortcuts.register !== 'function') return
+        shortcutsReady = true
         const keys = [['local', 'Key1', 'tabSwitchLocal'], ['remote', 'Key2', 'tabSwitchRemote']]
         try {
           for (const [tab, code, label] of keys) {
@@ -3364,9 +3754,10 @@ window.__ModuleLoader__.load({
               resolve: () => ({ status: 'handled', run: () => { publishHostTab(tab) } }),
             }))
           }
-        } catch { toggles.reason = 'shortcuts' /* the tabs still work; the page says the keys did not */ }
+        } catch { if (!toggles.reason) toggles.reason = 'shortcuts' /* the tabs still work; the page says the keys did not */ }
       }
-      if (filter) disposers.push(subscribeHostTab(overlay))
+      onPlaced = () => { ensureFilter(); ensureShortcuts(); syncHostTabsStatus() }
+      if (placement.status() === 'placed') onPlaced()
       return () => {
         // Reverse order: the strip goes before the seat that hosts its helper, so a
         // teardown never leaves a placed node behind a released seat.
@@ -4008,29 +4399,33 @@ window.__ModuleLoader__.load({
       // The sidebar's two tabs: a display filter plus one box placed between the
       // sidebar's section header and its list area. It owns the same `remoteUI` snapshot
       // as the surfaces above, so it is installed AFTER them and reports the tab half of
-      // it; a seat this shell refuses, or a shell with no header to stand under, is
-      // stated on the Devices page instead of ending the whole bundle.
+      // it; a seat this shell refuses is stated on the Devices page instead of ending the
+      // whole bundle, and a header that has not been drawn yet is reported there as its own
+      // fact (`no-header`) while the placement keeps watching for it.
       if (typeof ctx.slots === 'object' && ctx.slots !== null) {
-        // The injector draw runs now, so the measurable disposition is read after it,
-        // not only after the effect: a shell that hands back an inert injector gets no
-        // filter at all (a filter whose only switch is missing would hide half the list).
-        let register = null
-        ctx.effect(() => {
-          const dispose = installSidebarTabStrip(ctx, { createRoot: options.createRoot })
-          register = dispose
-          return () => {
-            if (register === dispose) register = null
-            if (typeof dispose === 'function') dispose()
-            syncHostTabsStatus()
-          }
+        // Install synchronously, from apply(): a shell that defers its effects must
+        // still get the strip (or an observer watching for the header) on this tick.
+        // The effect only owns teardown; a shell that hands back an inert injector
+        // gets no filter at all (a filter with no switch would hide half the list).
+        const disposeTabs = installSidebarTabStrip(ctx, { createRoot: options.createRoot })
+        const register = disposeTabs
+        ctx.effect(() => () => {
+          if (typeof disposeTabs === 'function') disposeTabs()
+          syncHostTabsStatus()
         }, 'devices: sidebar host tabs')
         if (register === null) {
-          remoteUI.set({ tabs: false, tabsReason: 'no-tabs' })
+          // `installSidebarTabStrip` already wrote the specific reason (`no-seat` /
+          // `no-renderer`) into `toggles`; publish it even when the P2b surfaces wrote
+          // their own `no-seat` into the shared snapshot first — otherwise the owner
+          // sees the generic reason instead of the actual missing piece. A shell that
+          // never ran the installer keeps the plain `no-seat`.
+          if (remoteUI.getSnapshot().tabsReason === null) remoteUI.set({ tabs: false, tabsReason: 'no-seat' })
+          syncHostTabsStatus()
         } else {
           syncHostTabsStatus()
         }
       } else {
-        remoteUI.set({ tabs: false, tabsReason: 'no-tabs' })
+        remoteUI.set({ tabs: false, tabsReason: 'no-seat' })
       }
     }
 
@@ -4050,8 +4445,13 @@ window.__ModuleLoader__.load({
       SidebarHostTabs, hostTabsStyle, HOST_TABS_STYLE, HOST_TABS_STYLE_ID, HOST_TABS_SELECTORS,
       installSidebarTabStrip, installHostTabPlacement, placeHostTabsNode, hostTabsStyleWriter,
       publishHostTab, storedHostTab, HOST_TABS_STORAGE, HOST_TABS_SLOT, HOST_TABS_HEADER, HOST_TABS_LIST,
-      HOST_TABS_TESTID, HOST_TABS_DEBOUNCE_MS,
+      HOST_TABS_TESTID, HOST_TABS_DEBOUNCE_MS, HOST_TABS_HEADER_WAIT_MS, HOST_TABS_NO_HEADER_WARN,
       hostTabsStore: { getSnapshot: hostTabSnapshot, subscribe: subscribeHostTab },
+      // A1.3: remote workspace expansion rides the strip's own observer/debounce; the
+      // helper and its namespaced key are exported so a test can prove the row rule,
+      // the first-seen default, the owner toggle and the teardown.
+      installWorkspaceExpansion, workspaceExpansionStore, WORKSPACE_EXPANSION_STORAGE,
+      WORKSPACE_ROW_SELECTOR, isRemoteWorkspaceRow,
       // Spec 033 (A1.2): the wrap's measured state, the page line, and the installer (so a
       // test proves install-on-start / restore-on-dispose without a live window).
       attachUI, RemoteAttachStatus, installRemoteFileAttach, attachReasonText, ATTACH_REASON_KEYS,
