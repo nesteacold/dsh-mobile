@@ -6,6 +6,7 @@
 // about routing / renaming / merging and about what actually crosses the wire to
 // a remote Host.
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { test } from 'node:test'
 
 import { RemoteConnection } from '../lib/remote-client.mjs'
@@ -669,6 +670,58 @@ test('$events is the Local stream, plus the remotes cards (spec 008 P2c)', async
   harness.localStreams[0].queue.push({ type: 'ready', clientId: 'c1', host: { home: '/home/owner' } })
   assert.deepEqual((await first).value, { type: 'ready', clientId: 'c1', host: { home: '/home/owner' } })
   assert.equal(hostB.streams.length, 0, 'no remote stream is opened for the Local event feed')
+  control.abort()
+  await iterator.return()
+})
+
+test('$events carries remote session statuses in the host namespace, and refuses a tagged id', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B')
+  // A real RemoteConnection emits `sessionStatus`; give only this stub the same
+  // surface so the test drives the watcher through its actual listener contract.
+  const pushed = new EventEmitter()
+  hostB.connection.on = pushed.on.bind(pushed)
+  hostB.connection.off = pushed.off.bind(pushed)
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('$events', { args: {} }, undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const first = iterator.next()
+  await new Promise((resolve) => setImmediate(resolve))
+  harness.localStreams[0].queue.push({ type: 'ready', clientId: 'c1', host: { home: '/home/owner' } })
+  assert.equal((await first).value.type, 'ready', 'the Local spine still comes first')
+  assert.equal(pushed.listenerCount('sessionStatus'), 1)
+
+  const status = (sessionId, running) => ({ kind: 'session-status', sessionId, running })
+  const frameOf = (sessionId, running) => ({ type: 'emit', event: 'api-session/status', args: [`h:hostB:${sessionId}`, running] })
+  pushed.emit('sessionStatus', status('s1', true))
+  assert.deepEqual((await nextFrame(iterator, 'status true')).value, frameOf('s1', true))
+  pushed.emit('sessionStatus', status('s1', false))
+  assert.deepEqual((await nextFrame(iterator, 'status false')).value, frameOf('s1', false))
+
+  // The pre-tagged id must name no host but the one the frame came from: a valid
+  // frame right after it proves the refusal published nothing at all.
+  pushed.emit('sessionStatus', status('h:hostX:s1', true))
+  assert.ok(harness.logs.some((line) => line.includes('remote/id-leak')), 'the refusal is logged')
+  pushed.emit('sessionStatus', status('s2', true))
+  assert.deepEqual((await nextFrame(iterator, 'status after refusal')).value, frameOf('s2', true))
+
+  harness.disconnect('hostB')
+  assert.equal(pushed.listenerCount('sessionStatus'), 0, 'the watcher detaches on disconnect')
+  // A disconnect republishes the catalog; consume that announcement, then prove
+  // the detached host can no longer put a status on the stream.
+  const within = (ms) => Promise.race([
+    iterator.next(),
+    new Promise((resolve) => {
+      const timer = setTimeout(() => resolve({ value: undefined, done: true }), ms)
+      timer.unref?.()
+    }),
+  ])
+  for (;;) {
+    const next = await within(30)
+    if (next.value?.event === 'llm/models-updated') continue
+    assert.equal(next.value, undefined, 'no status frame from a detached host')
+    break
+  }
   control.abort()
   await iterator.return()
 })
@@ -1991,6 +2044,99 @@ test('a successful remote selectModel reaches the native model chip through the 
   assert.notDeepEqual(face.next, face.lastUsed, 'the chip reads a new selection, not the old one')
   assertNoNamespacedId(hostB)
   control.abort()
+})
+
+test('a remote inbox claim splice publishes an inbox projection fallback on the merged control stream', async () => {
+  // rc.3 retires an admitted echo with receipt.index===null only when
+  // seqOf('inbox') reaches the claim's seq. The splice is durable on follow; its
+  // projection can be missing from session/control. The router must advance the
+  // watermark from the splice itself, in the controller's namespace, without
+  // touching the follow frame it also delivers.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const controlSource = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const controlIterator = controlSource[Symbol.asyncIterator]()
+  const opening = (await nextFrame(controlIterator, 'control opening baseline')).value
+  assert.equal(opening.type, 'baseline')
+
+  const followAbort = new AbortController()
+  const followSource = await harness.gateway.openWireStream('session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: 'h:hostB:s1' } } } },
+    undefined, {}, followAbort.signal, followAbort, 64)
+  const followIterator = followSource[Symbol.asyncIterator]()
+  // The pump opens the remote follow asynchronously; wait for that queue rather
+  // than pushing into the control stream that happened to open first.
+  const deadline = Date.now() + 2000
+  let remoteFollow = null
+  while (!remoteFollow && Date.now() < deadline) {
+    remoteFollow = hostB.streams.find((entry) => entry.endpoint === 'session/follow') ?? null
+    if (!remoteFollow) await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.ok(remoteFollow, 'the remote follow stream was opened')
+  assert.equal(remoteFollow.args.request.address.sessionId, 's1',
+    'the Host sees only its own id; the namespace is minted on the way back')
+
+  const claim = (seq) => ({ type: 'event', event: {
+    type: 'agent/inbox/spliced', seq, time: seq,
+    data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] },
+  } })
+  remoteFollow.queue.push(claim(8))
+  const frame = (await nextFrame(controlIterator, 'fallback inbox projection')).value
+  assert.deepEqual(frame, {
+    type: 'projection', sessionId: 'h:hostB:s1', seq: 8,
+    changes: [{ key: 'inbox', val: { 'next-turn': [], 'next-step': [] } }],
+  }, 'the claim watermark is published with the installed wire keys, at the event seq')
+  const followed = (await nextFrame(followIterator, 'claim on follow')).value
+  assert.equal(followed.event.seq, 8, 'the durable follow frame is unchanged')
+  assert.equal(followed.event.data.removedCount, 1)
+
+  // A replayed older claim is not republished. Even if it were, ProjectionValueStore.apply
+  // drops seq <= row.seq, so a lower watermark can never roll the store back.
+  remoteFollow.queue.push(claim(5))
+  assert.equal(await frameWithin(controlIterator, 50), null, 'an older seq is not republished')
+  let stored = 8
+  const apply = (seq) => { if (seq <= stored) return; stored = seq }
+  apply(5)
+  assert.equal(stored, 8, 'a stale seq cannot regress the native store')
+  assertNoNamespacedId(hostB)
+  control.abort()
+  followAbort.abort()
+  await controlIterator.return()
+  await followIterator.return()
+})
+
+test('a local session inbox splice never publishes a synthetic control projection', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const controlSource = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const controlIterator = controlSource[Symbol.asyncIterator]()
+  assert.equal((await nextFrame(controlIterator, 'control opening baseline')).value.type, 'baseline')
+
+  // An untagged session id stays Local; the router has no remote follow to learn
+  // a watermark from, so it must not invent one for the controller's own stream.
+  const followAbort = new AbortController()
+  const followSource = await harness.gateway.openWireStream('session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: 'local-s1' } } } },
+    undefined, {}, followAbort.signal, followAbort, 64)
+  const followIterator = followSource[Symbol.asyncIterator]()
+  const localFollow = harness.localStreams.at(-1)
+  assert.ok(localFollow, 'the Local carrier opened the follow')
+  localFollow.queue.push({ type: 'event', event: {
+    type: 'agent/inbox/spliced', seq: 8, time: 8,
+    data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] },
+  } })
+  assert.equal((await nextFrame(followIterator, 'local claim')).value.event.seq, 8)
+  assert.equal(await frameWithin(controlIterator, 80), null,
+    'no control frame was invented for a Local session')
+  assertNoNamespacedId(hostB)
+  control.abort()
+  followAbort.abort()
+  await controlIterator.return()
+  await followIterator.return()
 })
 
 test('a normally-ended remote control stream is reopened and republishes the model chip', async () => {

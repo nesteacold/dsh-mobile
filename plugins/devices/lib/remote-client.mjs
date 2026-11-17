@@ -598,6 +598,7 @@ export class BrowserChannel {
  *  - `resolved` (frame)           an `approval-resolved` frame
  *  - `question` (frame)           a `question-requested` frame
  *  - `questionResolved` (frame)   a `question-resolved` frame
+ *  - `sessionStatus` (frame)      a `session-status` frame (running dot of a remote session)
  *  - `revoked`  ()                the remote closed with 4401: the caller wipes the token
  */
 export class RemoteConnection extends EventEmitter {
@@ -775,6 +776,11 @@ export class RemoteConnection extends EventEmitter {
     // multi-host router turns both into native `$events` cards (spec 008 P2c).
     if (frame.kind === 'question-requested') { this.emit('question', frame); return }
     if (frame.kind === 'question-resolved') { this.emit('questionResolved', frame); return }
+    // The gateway rebroadcasts DSH's `api-session/status` for every connected
+    // device; the merged `$events` stream turns it back into the native event.
+    // Only a well-formed frame is a status — every other push stays ignored.
+    if (frame.kind === 'session-status' && typeof frame.sessionId === 'string'
+      && typeof frame.running === 'boolean') { this.emit('sessionStatus', frame); return }
     // Spec 016 Phase 3 (revision 10): the first host-initiated request. The channel
     // validates it with the shared protocol, keeps one in flight, and answers exactly
     // once (or not at all for a cancelled command).

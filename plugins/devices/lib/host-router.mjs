@@ -276,6 +276,13 @@ const SESSION_CONTROL_ENDPOINT = 'session/control'
  * one block per session forever.
  */
 const MAX_CARRIED_CONTROL_CUTS = 64
+/**
+ * Bound on the per-session "last fallback watermark" table. A re-opened follow
+ * replays the same claim event; without a memory of the seq we just published,
+ * that replay would spam the merged control stream with duplicates. Bounded like
+ * the other per-session tables here, and cleared on uninstall.
+ */
+const MAX_FALLBACK_CONTROL_SEQS = 64
 /** The Host-generation model catalog the native picker loads (it takes no argument). */
 const MODEL_CATALOG_ENDPOINT = 'session/modelCatalog'
 /**
@@ -311,6 +318,8 @@ const MODEL_CATALOG_REFRESH_EVENT = 'llm/models-updated'
 /** The two waterfall events whose cards the native UI renders and answers. */
 const APPROVAL_EVENT = 'approval/request'
 const QUESTION_EVENT = 'user-questions/request'
+/** The native event that carries a session's running dot (sidebar status). */
+const SESSION_STATUS_EVENT = 'api-session/status'
 /** How many remote cards one controller keeps addressable (bounded like the buffer). */
 const MAX_TRACKED_CARDS = 128
 /** How many per-host refusals the status keeps for the Devices page (bounded). */
@@ -1456,6 +1465,19 @@ export class HostRouter {
   /** Push functions of the `$events` streams currently open in the native UI. */
   #eventSinks = new Set()
   /**
+   * Push functions of the merged `session/control` streams currently open in the
+   * native UI. A remote follow can publish a projection fallback here; with no
+   * open stream there is nowhere to publish, so the frame is dropped rather than
+   * buffered across generations (the stream's own opening baseline seeds state).
+   */
+  #controlSinks = new Set()
+  /**
+   * Last inbox fallback seq published per namespaced session, so a re-opened
+   * follow (or a replayed snapshot) does not republish a claim it already advanced.
+   * @type {Map<string, number>}
+   */
+  #fallbackControlSeqs = new Map()
+  /**
    * The connected-host set last announced (`#connectedKey`), so an unchanged SET
    * stays quiet. It is bookkeeping about this stream's own notifications; what the
    * picker is actually told is decided against `#catalogHostKey`.
@@ -1590,6 +1612,8 @@ export class HostRouter {
     for (const stops of [...this.#followStops.values()]) for (const stop of [...stops]) stop()
     this.#followStops.clear()
     this.#eventSinks.clear()
+    this.#controlSinks.clear()
+    this.#fallbackControlSeqs.clear()
     this.#cards.clear()
     this.#hostErrors.clear()
     // Retention describes hosts this controller was reading a moment ago: a torn-down
@@ -2584,6 +2608,11 @@ export class HostRouter {
     const args = this.#forwardArgs(payload, hostId)
     this.#assertNoNamespace(args, hostId)
     const sessionId = this.#cache ? followSessionId(args) : null
+    // The fallback needs the controller-side name even when there is no cache:
+    // `args` are host-relative, so the id is minted in this Host's namespace here
+    // and nowhere else (a frame from this pump must never name a raw remote id).
+    const rawSessionId = followSessionId(args)
+    const controlSessionId = rawSessionId === null ? null : namespaceId(hostId, rawSessionId)
     const cache = this.#cache
     const lifetime = new AbortController()
     const queue = new ValueQueue()
@@ -2721,6 +2750,15 @@ export class HostRouter {
               if (sessionId) cache?.append(hostId, sessionId, frame)
               const seq = followSeqOf(frame)
               if (seq !== null) lastSeq = seq
+              // A claim that removes the pending inbox row leaves the native
+              // controller's admission receipt at `index:null`; it retires the
+              // optimistic echo only once seqOf('inbox') reaches this seq. The
+              // Host's projection sometimes never arrives on session/control, so
+              // advance that watermark from the durable splice we do see. Only a
+              // removal without `outcome:'canceled'` takes that path: a canceled
+              // splice is already settled by the controller itself, and an insert
+              // must not be replaced by an empty inbox the Host has not sent.
+              this.#fallbackInboxProjection(hostId, controlSessionId, frame)
               opened = true
               progressed = true
               queue.push(renamed)
@@ -3019,6 +3057,52 @@ export class HostRouter {
   }
 
   /**
+   * Advance the native inbox watermark when a remote claim splice removes the
+   * pending row but its `session/control` projection is missing.
+   *
+   * rc.3 retires an admitted echo with `receipt.index === null` only once
+   * `projections.seqOf('inbox') >= receipt.seq` (session.js `retireAdmittedSubmission`).
+   * The splice is durable and crosses this router on `session/follow`; the
+   * projection that normally carries the same seq crosses a different stream and
+   * can be withheld. A projection frame keyed to the splice's seq unblocks the
+   * controller, and `ProjectionValueStore.apply` drops any later real frame at
+   * the same or a lower seq, so a real projection that does arrive is harmless.
+   *
+   * Only removal splices without a canceled outcome are synthesized: a canceled
+   * splice settles its echo directly, and an insert splice must never overwrite
+   * the Host's real inbox value with an empty one.
+   */
+  #fallbackInboxProjection(hostId, sessionId, frame) {
+    if (typeof sessionId !== 'string' || !isPlainObject(frame) || frame.type !== 'event') return
+    const event = frame.event
+    if (!isPlainObject(event) || event.type !== 'agent/inbox/spliced') return
+    if (!Number.isSafeInteger(event.seq) || event.seq < 0) return
+    const data = event.data
+    if (!isPlainObject(data) || !(Number.isSafeInteger(data.removedCount) && data.removedCount > 0)) return
+    if (data.outcome === 'canceled') return
+    // No merged control stream open: drop, never buffer across generations.
+    if (this.#controlSinks.size === 0) return
+    const lastSeq = this.#fallbackControlSeqs.get(sessionId)
+    if (lastSeq !== undefined && lastSeq >= event.seq) return
+    this.#fallbackControlSeqs.set(sessionId, event.seq)
+    if (this.#fallbackControlSeqs.size > MAX_FALLBACK_CONTROL_SEQS) {
+      this.#fallbackControlSeqs.delete(this.#fallbackControlSeqs.keys().next().value)
+    }
+    // Wire keys are the hyphenated JSON keys of DSH's InboxWireState, not the
+    // TypeScript camelCase names; empty arrays are enough to advance the watermark.
+    this.#publishControl({
+      type: 'projection', sessionId, seq: event.seq,
+      changes: [{ key: 'inbox', val: { 'next-turn': [], 'next-step': [] } }],
+    })
+  }
+
+  #publishControl(frame) {
+    for (const sink of [...this.#controlSinks]) {
+      try { sink(frame) } catch { /* one broken consumer must not stop the others */ }
+    }
+  }
+
+  /**
    * `$events` merged: the Local stream unchanged, plus the interaction cards of
    * every connected Host, renamed into that Host's namespace. A disconnecting
    * Host withdraws its cards, so the native UI never shows a dead approval.
@@ -3054,17 +3138,33 @@ export class HostRouter {
           this.#forgetCard(card, true)
         }
       }
+      const onSessionStatus = (frame) => {
+        if (typeof frame?.sessionId !== 'string' || typeof frame?.running !== 'boolean') return
+        // Same rule as an interaction card: a remote may not name a host namespace.
+        // `namespaceId` throws on an already-tagged id, so the frame never reaches
+        // the native stream under a host it did not come from.
+        let sessionId
+        try {
+          sessionId = namespaceId(host.hostId, frame.sessionId)
+        } catch (error) {
+          this.#log(`session status from ${host.hostId} refused: ${error?.code ?? 'error'}`)
+          return
+        }
+        this.#publishEvent({ type: 'emit', event: SESSION_STATUS_EVENT, args: [sessionId, frame.running === true] })
+      }
       const onState = (state) => { if (state !== 'online') this.#withdrawHost(host.hostId) }
       connection.on('approval', onCard)
       connection.on('question', onCard)
       connection.on('resolved', onResolved)
       connection.on('questionResolved', onResolved)
+      connection.on('sessionStatus', onSessionStatus)
       connection.on('state', onState)
       watching.set(host.hostId, () => {
         connection.off('approval', onCard)
         connection.off('question', onCard)
         connection.off('resolved', onResolved)
         connection.off('questionResolved', onResolved)
+        connection.off('sessionStatus', onSessionStatus)
         connection.off('state', onState)
       })
       // Cards the Host pushed before this stream opened (a reload, a second // window) are still answerable: seed them in the order they arrived.
@@ -3467,6 +3567,14 @@ export class HostRouter {
       if (started) queue.push(frame)
       else pending.push(frame)
     }
+    // A remote follow can publish its claim watermark here. Going through `emit`
+    // keeps the snapshot-stream rule: a frame arriving before the opening baseline
+    // is replayed after it, never before it and never as a second baseline.
+    const controlSink = (frame) => emit(frame)
+    // A new generation seeds its own projection rows; a claim this router already
+    // published in the old generation may need to be advanced again there.
+    this.#fallbackControlSeqs.clear()
+    this.#controlSinks.add(controlSink)
     const combinedBaseline = () => {
       const projections = { ...localBlocks }
       for (const [mergedId, entry] of carried) projections[mergedId] = entry.block
@@ -3681,6 +3789,7 @@ export class HostRouter {
     } finally {
       for (const source of watched) source.removeEventListener?.('abort', onAbort)
       unsubscribe?.()
+      this.#controlSinks.delete(controlSink)
       this.#merges.delete(stop)
       stop()
       refusedConnections.clear()

@@ -4,12 +4,16 @@
 // the way plugins/mobile-gateway/test/connection-choice-ui.test.cjs does.
 // React + react-test-renderer come from the gateway's node_modules (no install here).
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import path from 'node:path'
+import tls from 'node:tls'
 import vm from 'node:vm'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 
+import { RemoteConnection, getWebSocket } from '../lib/remote-client.mjs'
 import { check, finish, createFakeComposerDocument, createLivePage, installFileListStub, livePick, picked, pickFiles, refusePickerList } from './helpers.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -3037,6 +3041,62 @@ await check('spec 033: a page whose preload names a path even for a constructed 
   assert.equal(shell.status().uploaded, 0, 'nothing was claimed as uploaded')
   assert.deepEqual(shell.status().last, { reason: 'path-unavailable', sessionId: SPEC033_PAGE.sessions[0] }, 'and the page names the measured reason')
   shell.dispose()
+})
+
+await check('a raw session-status frame becomes a sessionStatus event; unknown kinds stay ignored', async () => {
+  // The whole dial is local: the pin check still runs, but on a fake leaf, and
+  // the fake WebSocket is where the gateway frame would really arrive. The
+  // connection resolves `ws` itself, so stub the module it actually loads.
+  const raw = Buffer.from('a fake leaf for the pin check')
+  const certSha256 = crypto.createHash('sha256').update(raw).digest('hex')
+  const originalConnect = tls.connect
+  tls.connect = () => {
+    const socket = new EventEmitter()
+    socket.getPeerCertificate = () => ({ raw })
+    socket.destroy = () => {}
+    setImmediate(() => socket.emit('secureConnect'))
+    return socket
+  }
+  class FakeSocket extends EventEmitter {
+    constructor() {
+      super()
+      this.readyState = 1
+      // The gateway greets first; the client sends its `client-hello` afterwards.
+      setImmediate(() => this.emit('message', Buffer.from(JSON.stringify({ kind: 'hello', authenticated: true }))))
+    }
+    send() {}
+    terminate() {
+      this.readyState = 3
+      this.emit('close', 1005)
+    }
+  }
+  const wsPath = require.resolve(path.join(here, '../../mobile-gateway/node_modules/ws'))
+  const priorWs = require.cache[wsPath]
+  require.cache[wsPath] = { id: wsPath, filename: wsPath, loaded: true, exports: FakeSocket }
+  assert.equal(getWebSocket(), FakeSocket, 'the dial uses the fake WebSocket')
+  const connection = new RemoteConnection({
+    remote: { publicUrl: 'wss://127.0.0.1:3081', certSha256, clientDeviceId: 'test-device' },
+    readToken: () => 'fake-token',
+  })
+  try {
+    await connection.connect()
+    const seen = []
+    connection.on('sessionStatus', (frame) => seen.push(frame))
+    connection.ws.emit('message', Buffer.from(JSON.stringify({ kind: 'session-status', sessionId: 's1', running: true })))
+    connection.ws.emit('message', Buffer.from(JSON.stringify({ kind: 'session-status', sessionId: 's2', running: false })))
+    // An unknown kind, and a status missing its running flag, are not events.
+    connection.ws.emit('message', Buffer.from(JSON.stringify({ kind: 'something-else', sessionId: 's1', running: true })))
+    connection.ws.emit('message', Buffer.from(JSON.stringify({ kind: 'session-status', sessionId: 's3' })))
+    assert.deepEqual(seen, [
+      { kind: 'session-status', sessionId: 's1', running: true },
+      { kind: 'session-status', sessionId: 's2', running: false },
+    ])
+  } finally {
+    connection.close()
+    tls.connect = originalConnect
+    if (priorWs) require.cache[wsPath] = priorWs
+    else delete require.cache[wsPath]
+  }
 })
 
 finish('client')
