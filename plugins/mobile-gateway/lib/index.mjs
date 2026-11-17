@@ -231,11 +231,15 @@ import { handleScheduleQuery, SCHEDULE_REQUEST_TYPES } from './schedule-manageme
 // Generated copy of the contract (see scripts/sync-mobile-protocol.mjs): the
 // bare package specifier would not resolve in an installed tarball.
 import { DEVICE_KINDS, SCOPES, REMOTE_CLIENT_TYPES, DESKTOP_DEFAULT_SCOPES, NEVER_DEFAULT_SCOPES,
+  // Spec 021 rev 15: what a kind may hold is the CONTRACT's table, not a local one.
+  scopesForKind,
   ATTACHMENTS_WRITE_SCOPE, BROWSER_AGENT_CAPABILITY, BROWSER_CLIENT_TYPES, QUESTION_CUSTOM_MAX_LENGTH,
   QUESTION_RESPONSE_SCOPE, SESSION_EDIT_CAPABILITY_SCOPE,
   // Spec 021 (revision 14): the web passkey unlock frames, codes and `hello.webLock`.
   PASSKEY_APPROVAL_KIND, PASSKEY_ASSERT_OPTIONS_TYPE, PASSKEY_ASSERT_TYPE, PASSKEY_CLIENT_TYPES,
-  PASSKEY_REGISTER_OPTIONS_TYPE, PASSKEY_REGISTER_TYPE, WEB_LOCK_ERROR,
+  PASSKEY_REGISTER_OPTIONS_TYPE, PASSKEY_REGISTER_TYPE, WEB_LOCK_ERROR, WEB_UNLOCK_SCOPE,
+  // Spec 036 (revision 16): the opt-in web unlock session.
+  WEB_UNLOCK_SESSION_CAPABILITY, WEB_UNLOCK_SESSION_TTL_MS,
   // Spec 026 (revision 15): the web push frames, capability and validators.
   WEB_PUSH_CAPABILITY, WEB_PUSH_CLIENT_TYPES, WEB_PUSH_RESPONSE_KINDS,
   validatePushSubscribe, validatePushUnsubscribe } from './vendor/mobile-protocol.mjs'
@@ -1203,6 +1207,12 @@ const plugin = {
     const createdAtVersion = new Map() // sessionId -> removalVersion at creation
     let removalVersion = 0
     const removedAtVersion = new Map() // sessionId -> removalVersion at removal
+    // Reviewer finding 2026-11-15 (remote Team switch): when the CURRENT snapshot came from an ACCEPTED `session/list`
+    // (the visible refresh below), so a caller can tell a Host-backed grant from the
+    // half-built list a cold start begins with. Re-stamped on every accepted refresh
+    // and whenever the list is changed by a Host event instead of by an answer
+    // (a creation or a removal), which is when the list is no longer one answer's.
+    let visibleSnapshotAt = 0
     // Spec 011 FR-003, live blocker 2026-11-10: DSH filters a `workspace/follow`
     // baseline item by item through `remoteAccess.allows({kind:'workspace', id})`,
     // and a DSH binding cannot express a wildcard, so the policy can only admit the
@@ -1307,6 +1317,20 @@ const plugin = {
         ? { workspaceId }
         : { workspaceId, workspaceLabel }
     }
+    /**
+     * The visible-session snapshot the DSH policy is built from, read at the moment of
+     * the call, for surfaces outside this file that must compare an id against it (spec
+     * 008 remote bridge: the Team switch). When no Host push has filled it yet the
+     * answer is the empty set (a caller refuses) while a refresh is started, so a
+     * half-built snapshot never passes for the grant senses `visibleSnapshotAt` (`> 0`).
+     * Only the owner `api` writes it.
+     */
+    // Side-effect free (reviewer 2026-11-16): an authorization read must never start Host
+    // work, or a refused caller could drive repeated session/list refreshes. The startup
+    // and session-event refreshes keep the snapshot current.
+    const getVisibleSessionSnapshot = () => {
+      return { ids: visibleSessionIds, freshness: visibleSnapshotAt > 0 ? visibleSnapshotAt : undefined }
+    }
     const deviceAccess = createDeviceAccess({
       ctx,
       getDevice: (deviceId) => registry.get(deviceId),
@@ -1335,7 +1359,12 @@ const plugin = {
       // identifier is never shadowed by an older removal.
       removedAtVersion.delete(id)
       createdAtVersion.set(id, removalVersion)
-      if (!visibleSessionIds.includes(id)) visibleSessionIds = [...visibleSessionIds, id]
+      if (!visibleSessionIds.includes(id)) {
+        visibleSessionIds = [...visibleSessionIds, id]
+        // Not an answer's list any more: the Team-switch proof has to come from the
+        // refresh this creation schedules, not from the snapshot it was added to.
+        visibleSnapshotAt = 0
+      }
       deviceAccess.invalidate()
     }
     // Read per request, never captured at apply: the service is not injected (see
@@ -1509,11 +1538,18 @@ const plugin = {
       // (the web-ingress live helpers are not defined yet here); every call happens after this
       // closure returned.
       originPolicy: (socket, origin) => passkeyOriginPolicy(socket, origin),
+      // Spec 021 rev 15 / spec 036: the grant may exist only on a kind that can hold the scope,
+      // and only while this socket still speaks for the live credential and an enabled gateway.
+      mayHoldUnlock: (device) => !!device && scopesForKind(device.kind).includes(WEB_UNLOCK_SCOPE),
+      authorizationLive: (device, socket) => !!device && gatewayEnabled && remoteControlEnabled()
+        && typeof socket.deviceGeneration === 'number'
+        && registry.generation(device.id) === socket.deviceGeneration,
       gatewayName: gatewayIdentity.gatewayName,
       listDevices: () => registry.list(),
       // A replacement invalidates the device's other sockets: they show the lock screen again and
-      // re-assert on the new passkey (contract §14.6).
+      // re-assert on the new passkey (contract §14.6, spec 036 §14.7).
       onPasskeyChanged: (deviceId) => {
+        passkeyService.invalidate(deviceId, 'passkey-changed')
         for (const client of [...clients]) {
           if (client.deviceId !== deviceId || !holdsWebUnlockScope(registry.get(deviceId)?.scopes)) continue
           if (client.passkeySlot) passkeyLock.lock(client.passkeySlot)
@@ -1532,6 +1568,22 @@ const plugin = {
       ...(Number.isSafeInteger(options.testWebUnlockIdleMs) && options.testWebUnlockIdleMs > 0
         ? { idleMs: options.testWebUnlockIdleMs } : {}),
     })
+
+    // Spec 036 §14.7: THE grant predicate. The socket-creation/hello state, the inbound dispatch
+    // gate and the outbound send gate all call this one function; none keeps a second truth.
+    const effectiveGrant = (device, socket, at) => passkeyService.effectiveGrant(device, socket, at)
+
+    /** Spec 036: explicit Lock is DEVICE-WIDE — grant, every socket, every in-flight ceremony. */
+    const lockDeviceEverywhere = (deviceId) => {
+      const live = registry.get(deviceId)
+      if (live) passkeyService.invalidate(deviceId, PASSKEY_LOCK_TYPE)
+      for (const client of [...clients]) {
+        if (client.deviceId !== deviceId || !client.passkeySlot) continue
+        passkeyLock.lock(client.passkeySlot)
+        passkeyService.forgetSocket(client)
+      }
+      log(`passkey locked device-wide: device=${deviceId}`)
+    }
 
     // Spec 026 (revision 15): Web Push for the PWA. The owner switch is read LIVE on every send
     // (never cached), so turning it off stops the next push even if a subscription still exists.
@@ -2159,6 +2211,9 @@ const plugin = {
     // direct listener teardown) can reach it before the pairing state machine below assigns it.
     var endWebPendingPairings = () => {}
     const applyDisabledState = () => {
+      // Spec 036 §14.7: disabling the gateway is an authorization change, not a suspension.
+      // Clear every grant permanently; a later enable/reconnect must re-assert.
+      passkeyService.invalidateAll('gateway-disabled')
       endPendingPairings()
       // Spec 031 step 2: the global switch-off gates BOTH ingresses — a disabled gateway must
       // not leave a browser path listening behind the direct listener's teardown.
@@ -2359,7 +2414,11 @@ const plugin = {
       return frame
     }
     const AGGREGATE_KINDS = new Set(['session-archives', 'session-queues', 'projection-baseline'])
-    const broadcastSessionMetadataFrame = (frame) => {
+    // `audience` ('all' | 'admin' | 'device') splits the two notification paths for
+    // session-status frames: the admin/loopback path is immediate and independent of
+    // visibility, the device path is gated on refresh + visibility by the caller.
+    // Default 'all' keeps every existing caller unchanged.
+    const broadcastSessionMetadataFrame = (frame, audience = 'all') => {
       // Spec 011 addendum: every session-update event carries the same additive
       // `workspaceId` + `workspaceLabel` pair as the list item, so a client can group
       // a session the moment it learns about it (including a session it did not list
@@ -2375,6 +2434,9 @@ const plugin = {
       const adminWire = stringifyWireFrame(frame)
       for (const client of clients) {
         if (client.mobileChannel === 'conversation') continue
+        const isAdmin = deviceLive(client) === undefined
+        if (audience === 'admin' && !isAdmin) continue
+        if (audience === 'device' && isAdmin) continue
         let wire = adminWire
         if (aggregate) {
           const reduced = aggregateFrameFor(client, frame)
@@ -2806,6 +2868,14 @@ const plugin = {
       // of that session. A frame without a session id records nothing (the bridge only
       // calls this for a dispatched `session/prompt`).
       onPrompt: (deviceId, sessionId) => sessionDriver.noteDevicePrompt(sessionId, deviceId),
+      // Reviewer finding 2026-11-15: the Team switch names a root session id DSH resolves no
+      // resource from, so the bridge checks it against the visible set THIS gateway
+      // builds the device's DSH policy from; `freshness` tells the bridge whether a
+      // Host `session/list` backs the current set at all. No Host call: read here.
+      visibleSessions: () => {
+        const { ids, freshness } = getVisibleSessionSnapshot()
+        return { visibleSessionIds: new Set(ids), freshness, sessionListed: freshness !== undefined }
+      },
       log,
     })
 
@@ -3225,10 +3295,21 @@ const plugin = {
               // Spec 011 FR-006: a mobile offer that names no scopes must not hand out
               // `sessions:author` (contract `NEVER_DEFAULT_SCOPES`) — creating sessions
               // and choosing models is always a deliberate tick, never a default.
+              // Spec 021 rev 15: whatever the list (a default or the Devices page's
+              // "every scope"), it is filtered by the DEVICE KIND first (`scopesForKind`),
+              // so a desktop offer can never carry `web:unlock` — the scope that locked
+              // every desktop frame for good in the measured 2026-11-14 OTP offer.
               const offerScopes = scopes ?? (kind === 'desktop'
                 ? [...DESKTOP_DEFAULT_SCOPES]
                 : SCOPES.filter((scope) => scope !== REMOTE_SCOPE && !NEVER_DEFAULT_SCOPES.includes(scope)))
-              const created = pairingRequests.createOffer({ kind, scopes: offerScopes.filter((scope) => kind === 'desktop' || scope !== REMOTE_SCOPE) })
+              const holdable = scopesForKind(kind)
+              const requested = offerScopes.filter((scope) => kind === 'desktop' || scope !== REMOTE_SCOPE)
+              const kindScopes = requested.filter((scope) => holdable.includes(scope))
+              const notForKind = requested.filter((scope) => !holdable.includes(scope))
+              if (notForKind.length > 0) {
+                log(`otp pairing offer: dropped scope(s) a ${kind} cannot hold: ${notForKind.join(', ')}`)
+              }
+              const created = pairingRequests.createOffer({ kind, scopes: kindScopes })
               log(`otp pairing offer created: kind=${kind}, scopes=${created.offer.scopes.join(', ')}, expires=${new Date(created.offer.expiresAt).toISOString()}`)
               sendJson(res, 201, {
                 mode: 'otp',
@@ -3238,6 +3319,8 @@ const plugin = {
                 addresses: lanListening
                   ? lanWebSocketUrls(options, wsPath, lanBoundPort, advertiseHost, await advertisedTailscaleName(options.lanHost, lanListening)).map((url) => new URL(url).host)
                   : [],
+                // Spec 021 rev 15: the offer is kept, the unfitting scope is not — say which.
+                ...(notForKind.length > 0 ? { scopesNotForKind: notForKind } : {}),
                 ...gatewayIdentity,
               })
               return
@@ -3485,6 +3568,10 @@ const plugin = {
             // A re-pair of an installation that is already paired drops what the
             // old grant opened, exactly as the direct claim path does.
             if (claimed.repaired) {
+              // Spec 036 §14.7: the pending-approval re-pair is the SAME authorization change as
+              // the direct claim path. Clear the old grant, bump the epoch and cancel every
+              // in-flight challenge/approval BEFORE the promoted socket is activated.
+              passkeyService.invalidate(device.id, 'device-repaired')
               rtc?.closeDevice(device.id)
               void deviceAccess.revoke(device.id)
               forgetWebPushDevice(device.id)
@@ -3533,6 +3620,9 @@ const plugin = {
             }
             const updated = registry.updateScopes(id, plan.scopes)
             if (!updated) { sendJson(res, 404, { error: 'not-found', message: 'no such device' }); return }
+            // Spec 036 §14.7: ANY scope change invalidates the grant, even a remove→re-add of
+            // `web:unlock` — the generation changed, so an older grant cannot come back.
+            passkeyService.invalidate(id, 'scope-changed')
             // R3: the live sockets of this device close with the contract's re-auth code, so the next
             // connection carries the new grant. The credential itself is unchanged, which is why the
             // code is CLOSE_REVOKED (the code a re-pair uses for the very same reason) and not a
@@ -3691,10 +3781,23 @@ const plugin = {
         // Spec 016 Phase 3: what this client can do. Only `browser-agent:1` is read today;
         // unknown names are kept out so a typo can never widen what the host sends.
         ...(Array.isArray(msg.capabilities)
-          ? { capabilities: msg.capabilities.filter((name) => name === BROWSER_AGENT_CAPABILITY) }
+          ? { capabilities: msg.capabilities.filter((name) => name === BROWSER_AGENT_CAPABILITY
+            || name === WEB_UNLOCK_SESSION_CAPABILITY) }
           : {}),
       }
       ws.clientHello = client
+      // Spec 036: only an accepted opt-in enables the Host grant. A client that omits it keeps
+      // spec 021 behaviour (a new socket always starts locked).
+      if (client.capabilities?.includes(WEB_UNLOCK_SESSION_CAPABILITY) && ws.deviceId) {
+        passkeyService.markSocketOptIn(ws)
+        // The first hello was sent before the capability was known and was therefore locked.
+        // Re-send it NOW with the authoritative state: a valid Host grant makes this socket
+        // unlocked, without a new WebAuthn ceremony. No Host data is sent before this point.
+        if (ws.passkeyLockState) {
+          const device = registry.get(ws.deviceId)
+          ws.send(stringifyWireFrame(helloFrame(device, {}, ws.passkeyLockState())))
+        }
+      }
       ws.send(stringifyWireFrame({ kind: 'client-hello', ...requestId, ...client }))
     }
     // Contract §1: a companion request carries a `requestId` bounded to 64
@@ -3824,11 +3927,32 @@ const plugin = {
       // Spec 021 (revision 14): a `web:unlock` socket has its OWN lock record. It starts locked on
       // every connection (a tab reload or reconnect always needs a new assertion), and only a
       // `passkey-assert` ON THIS socket unlocks it. Ordinary devices get no slot and no gate.
-      const webDevice = !!device && holdsWebUnlockScope(device.scopes)
-      if (webDevice) ws.passkeySlot = passkeyLock.newSocket()
+      // Spec 021 rev 15: the lock is armed by what the KIND may hold (`scopesForKind`), not by the
+      // string in the store. A `desktop` can never run a ceremony (it sends no `Origin`), so a
+      // desktop record still listing `web:unlock` — the measured 2026-11-14 OTP offer — would be
+      // refused `auth/locked` on EVERY frame, forever. It is ignored here (fail-safe: the lock is a
+      // web protection, and a native desktop never had it), reported, and repaired on the next load.
+      const mayHoldUnlock = !!device && scopesForKind(device.kind).includes(WEB_UNLOCK_SCOPE)
+      const webDevice = mayHoldUnlock && holdsWebUnlockScope(device.scopes)
+      if (device && holdsWebUnlockScope(device.scopes) && !mayHoldUnlock) {
+        log(`device ${device.id}: ${device.kind} kind cannot hold ${WEB_UNLOCK_SCOPE}; not arming the web lock`)
+      }
+      if (webDevice) {
+        ws.passkeySlot = passkeyLock.newSocket()
+        passkeyService.bindSocket(ws.passkeySlot, device.id)
+      }
       // Spec 021: the socket's lock state, recomputed from the lock layer (which also applies the
-      // 15-minute idle re-lock). `unregistered` means the device has no passkey yet — register first.
-      const webLockState = () => (webDevice ? passkeyLock.state(ws.passkeySlot, device.id) : undefined)
+      // 15-minute idle re-lock). Spec 036: a valid Host grant also means `unlocked` for an
+      // opted-in device; the 15-minute idle bound does not apply while that grant is valid.
+      // `unregistered` means the device has no passkey yet — register first.
+      const webLockState = () => {
+        if (!webDevice) return undefined
+        const grant = effectiveGrant(device, ws)
+        // Reviewer: an opted-in socket has ONLY the Host grant as its source of truth. A stale
+        // slot.unlocked from an earlier assertion on this same socket must never be a fallback.
+        if (ws.webUnlockSessionOptIn === true && !grant) passkeyLock.lock(ws.passkeySlot)
+        return passkeyLock.state(ws.passkeySlot, device.id, grant)
+      }
       ws.passkeyLockState = webLockState
       // Spec 021 §14.5: the failure budget is part of the lock, and it applies to the OUTBOUND
       // gate as well — a device that failed its way over the limit stops receiving data, exactly
@@ -3864,6 +3988,10 @@ const plugin = {
         ...(typeof frame.requestId === 'string' ? { requestId: frame.requestId } : {}),
         ...(typeof frame.reason === 'string' ? { reason: frame.reason } : {}),
         ...(typeof frame.scope === 'string' ? { scope: frame.scope } : {}),
+        // Spec 021 rev 15: a `remote-stream-open` refusal is matched by the CLIENT on its stream id,
+        // never on the requestId (it may be absent), so the id travels here too. It is the client's
+        // own value, like a requestId — never a Host message.
+        ...(typeof frame.streamId === 'string' ? { streamId: frame.streamId } : {}),
         message: LOCKED_ERROR_MESSAGE,
       })
       // `session-stream-reset` is allowed through (a locked device may still have a stream it must
@@ -3875,7 +4003,16 @@ const plugin = {
         message: LOCKED_ERROR_MESSAGE,
       })
       ws.sendGate = (wire) => {
-        if (!webDevice || webLockReason() === 'unlocked') return wire
+        if (!webDevice) return wire
+        // Spec 036: an outbound DATA send on a socket with a valid grant slides its 24h window.
+        // Refusals/handshake frames never refresh it.
+        if (effectiveGrant(device, ws)) {
+          let kind
+          try { kind = JSON.parse(wire).kind } catch { /* not a JSON frame */ }
+          if (!LOCKED_PASSTHROUGH_KINDS.has(kind)) passkeyService.noteActivity(device, ws)
+          return wire
+        }
+        if (webLockReason() === 'unlocked') return wire
         let frame
         try { frame = JSON.parse(wire) } catch { return null }
         if (!LOCKED_PASSTHROUGH_KINDS.has(frame.kind)) return null
@@ -3938,12 +4075,19 @@ const plugin = {
       // them. Fails closed: a `web:unlock` socket with no lock record is refused, never served.
       const refuseIfWebLocked = (socket, msg) => {
         if (!socket.passkeySlot) return false
+        // Spec 036: the inbound gate is the same effectiveGrant predicate used at creation and
+        // on outbound sends; `webLockReason()` below keeps spec 021's refusal codes.
+        if (effectiveGrant(registry.get(socket.deviceId), socket)) return false
         // `webLockReason()` already folds in §14.5's failure budget, so an unlocked socket over
         // its limit is refused here too, with `reason: "rate-limited"`.
         const locked = webLockReason()
         if (locked === 'unlocked') return false
+        // Spec 021 rev 15: the refusal echoes the frame's `streamId` as well as its `requestId`.
+        // `remote-stream-open` is answered on that id (the PWA can only match it there, and the
+        // spec 008 frame may carry no requestId), so leaving it out left the client waiting for
+        // `remote/stream-open-timeout` on a `remote-stream-open` the Host had already decided.
         socket.send(stringifyWireFrame({ kind: 'error', code: WEB_LOCK_ERROR, requestType: msg.type,
-          ...requestIdEcho(msg), reason: locked,
+          ...requestIdEcho(msg), ...(typeof msg.streamId === 'string' ? { streamId: msg.streamId } : {}), reason: locked,
           message: 'this device is locked; unlock with a passkey first' }))
         log(`op locked: type=${msg.type} device=${socket.deviceId} reason=${locked}`)
         return true
@@ -3976,10 +4120,8 @@ const plugin = {
         // into a locked socket must still be able to say so). The answer is exactly the frame the
         // app waits for: `{kind:'passkey-lock', locked:true}`.
         if (msg.type === PASSKEY_LOCK_TYPE) {
-          passkeyLock.lock(socket.passkeySlot)
-          passkeyService.forgetSocket(socket)
+          lockDeviceEverywhere(live.id)
           sendFrame({ kind: PASSKEY_LOCK_TYPE, ...requestIdEcho(msg), locked: true })
-          log(`passkey locked: device=${socket.deviceId}`)
           return true
         }
         // The site (exact Origin ∈ allowedOrigins) is decided by the service; a refusal here means
@@ -4029,10 +4171,8 @@ const plugin = {
           // this is accepted in any lock state (a tab that reloaded into a locked socket can
           // still say so), and it answers `{kind:'passkey-lock', locked:true}` — never
           // `passkey-assert` fields, which the app does not read for this frame.
-          passkeyLock.lock(socket.passkeySlot)
-          passkeyService.forgetSocket(socket)
+          lockDeviceEverywhere(live.id)
           sendFrame({ kind: PASSKEY_LOCK_TYPE, ...requestIdEcho(msg), locked: true })
-          log(`passkey locked: device=${socket.deviceId}`)
           return true
         }
         if (msg.type === PASSKEY_ASSERT_TYPE) {
@@ -4226,6 +4366,12 @@ const plugin = {
         // The lock layer applies the idle bound BEFORE refreshing, so a frame that arrives after
         // the bound cannot extend an expired unlock; it only re-locks and is then refused below.
         if (ws.passkeySlot) passkeyLock.touch(ws.passkeySlot)
+        // Spec 036: the SAME predicate gates inbound dispatch and slides the grant on an
+        // authorized frame. A locked/rate-limited/invalid socket can never extend it.
+        if (ws.passkeySlot && ws.deviceId) {
+          const liveDevice = registry.get(ws.deviceId)
+          if (effectiveGrant(liveDevice, ws)) passkeyService.noteActivity(liveDevice, ws)
+        }
         // T013: the switch can be turned off while a socket is still draining
         // its close handshake. Nothing but the switch-state answer is served.
         if (!remoteControlEnabled()) {
@@ -4423,7 +4569,8 @@ const plugin = {
         // into the limit. A passkey frame is never gated here: its own handler answers
         // `passkey/rate-limited` instead.
         if (!adminCaller && ws.passkeySlot && !lockedAllowed) {
-          const locked = webLockReason()
+          const granted = effectiveGrant(registry.get(ws.deviceId), ws)
+          const locked = granted ? 'unlocked' : webLockReason()
           if (locked !== 'unlocked') {
             ws.send(stringifyWireFrame({ kind: 'error', code: WEB_LOCK_ERROR, requestType: msg.type,
               ...requestIdEcho(msg), reason: locked,
@@ -4766,7 +4913,7 @@ const plugin = {
         log(`client disconnected (id=${id}, remaining=${clients.size})`)
       })
 
-      log(`client connected (id=${id}, total=${clients.size})${device ? ' device=' + device.name : ''} channel=${channel}`)
+      log(`client connected (id=${id}, total=${clients.size})${device ? ' device=' + (device.name || `(unnamed ${device.id.slice(0, 8)})`) : ''} channel=${channel}`)
       if (paired) {
         ws.send(stringifyWireFrame({
           kind: 'paired',
@@ -4985,6 +5132,10 @@ const plugin = {
           // wider grant behind. A socket that authenticated in the meantime is
           // caught by the generation check in the message handler.
           if (paired.repaired) {
+            // Spec 036 §14.7: a re-pair is a new authorization generation. Clear the old grant,
+            // bump the epoch and cancel every in-flight challenge/approval BEFORE the new socket
+            // exists, so a ceremony started on the old credential cannot create a grant.
+            passkeyService.invalidate(device.id, 'device-repaired')
             rtc?.closeDevice(device.id)
             void deviceAccess.revoke(device.id)
             forgetWebPushDevice(device.id)
@@ -5515,6 +5666,7 @@ const plugin = {
       // (nothing new was raised), an enable/replace moves to a fresh one so every pending
       // request raised on the previous attempt is stale.
       const generation = webIngressState.generation + 1
+      const previousOrigin = webIngressState.origin
       let persists = true
       // An identical retry saved nothing new: the tuple that failed is already on disk, and a
       // refused write now would claim the owner's retry changed something it did not.
@@ -5529,7 +5681,11 @@ const plugin = {
           throw failure
         }
       }
-      // The switch is committed before anything moves live.
+      // The switch is committed before anything moves live. Spec 036 §14.7: a disabled or
+      // replaced ingress origin clears grants that were bound to the old origin immediately.
+      if (previousOrigin !== '' && (desired.enabled !== true || previousOrigin !== desired.origin)) {
+        passkeyService.invalidateOrigin(previousOrigin, 'origin-policy-changed')
+      }
       webIngressState = { enabled: desired.enabled, port: desired.port, origin: desired.origin, generation }
       if (desired.enabled !== true) {
         closeWebListener('web ingress disabled')
@@ -5643,6 +5799,10 @@ const plugin = {
     let refreshInFlight = null // Promise of the running refresh
     let refreshPending = false // one more refresh requested while one was running
     let refreshAbort = null
+    // Returns true only when a snapshot was ACCEPTED (the answer is the new
+    // authority for `visibleSessionIds`). A failed/aborted/timed-out refresh keeps
+    // the last good list and returns false — callers that gate a device frame must
+    // not treat a resolved promise as an accepted refresh (reviewer 2026-11-17 #2).
     const runVisibleRefresh = async () => {
       const startedAtVersion = removalVersion
       const abort = new AbortController()
@@ -5651,7 +5811,7 @@ const plugin = {
       try {
         const listed = await api.sessions.list({}, abort.signal)
         abort.signal.throwIfAborted()
-        if (disposed) return
+        if (disposed) return false
         const ids = Array.isArray(listed?.items)
           ? listed.items.map((item) => item?.sessionId).filter((id) => typeof id === 'string' && id.length > 0)
           : null
@@ -5666,6 +5826,8 @@ const plugin = {
           if (version > startedAtVersion && !fresh.includes(id)) fresh.push(id)
         }
         visibleSessionIds = [...new Set(fresh)]
+        // An answer landed: the Team-switch proof may be taken from this snapshot.
+        visibleSnapshotAt = Date.now()
         // Accepted: tombstones at or before this refresh's start are reflected in
         // the Host's own list (it started after the removal) and can go.
         for (const [id, version] of removedAtVersion) if (version <= startedAtVersion) removedAtVersion.delete(id)
@@ -5673,28 +5835,35 @@ const plugin = {
         // Host's list is now the authority for that id (a later removal re-tombstones it).
         for (const [id, version] of createdAtVersion) if (version <= startedAtVersion) createdAtVersion.delete(id)
         deviceAccess.invalidate()
+        return true
       } catch (error) {
         log(`visible session refresh failed (keeping the previous list): ${error && error.message ? error.message : String(error)}`)
+        return false
       } finally {
         clearTimeout(timer)
         if (refreshAbort === abort) refreshAbort = null
       }
     }
+    // Resolves to whether ANY refresh in the (possibly coalesced) chain was
+    // accepted. A caller joining an in-flight chain shares its result; a later
+    // pending run that fails does not retroactively hide an accepted snapshot.
     const refreshVisibleSessions = () => {
-      if (disposed) return Promise.resolve()
+      if (disposed) return Promise.resolve(false)
       if (refreshInFlight) {
         refreshPending = true
         return refreshInFlight
       }
       refreshInFlight = (async () => {
+        let accepted = false
         try {
           do {
             refreshPending = false
-            await runVisibleRefresh()
+            if (await runVisibleRefresh()) accepted = true
           } while (refreshPending && !disposed)
         } finally {
           refreshInFlight = null
         }
+        return accepted
       })()
       return refreshInFlight
     }
@@ -5702,22 +5871,77 @@ const plugin = {
       refreshPending = false
       refreshAbort?.abort(new Error('plugin stopped'))
     }
+    // Reviewer 2026-11-17 #1/#2: an `added` status reaches DEVICES only after an
+    // accepted refresh (a Host-created session is not visible until then). While
+    // that refresh is in flight a newer `status` for the same id supersedes the
+    // deferred value, and a `removed` cancels it, so the device's final frame is
+    // the latest effective status and no stale `false` can land after a newer
+    // `true`. The per-session token makes two `added`s for one id emit at most one
+    // device frame. Admin/loopback is notified immediately on a separate path and
+    // never double-sent. No timer is added here — the refresh stays bounded by
+    // its own abort/timeout. Withheld logs are static (ids only in host events).
+    let pendingAddedToken = 0
+    const pendingAddedStatus = new Map() // sessionId -> { running, token }
+    const supersedeAddedStatus = (sessionId, running) => {
+      const pending = pendingAddedStatus.get(sessionId)
+      if (pending) pending.running = running
+    }
+    const cancelAddedStatus = (sessionId) => { pendingAddedStatus.delete(sessionId) }
     const disposeSessionStatus = ctx.on('api-session/status', (sessionId, running) => {
-      broadcastSessionMetadataFrame({ kind: 'session-status', sessionId: String(sessionId), running })
+      const id = String(sessionId)
+      supersedeAddedStatus(id, running)
+      broadcastSessionMetadataFrame({ kind: 'session-status', sessionId: id, running })
     })
     const disposeSessionAdded = ctx.on('api-session/added', summary => {
-      broadcastSessionMetadataFrame({ kind: 'session-status', sessionId: String(summary.sessionId), running: summary.running })
-      void refreshVisibleSessions()
+      const sessionId = String(summary.sessionId)
+      // Admin/loopback: the same immediate, visibility-independent notification as
+      // before the refresh-first change. Device delivery is decided below.
+      broadcastSessionMetadataFrame({ kind: 'session-status', sessionId, running: summary.running }, 'admin')
+      let token = 0
+      if (visibleSessionIds.includes(sessionId)) {
+        // Already addressable: the device frame needs no refresh. Cancel any older
+        // pending emission so the deferred path cannot add a duplicate frame.
+        cancelAddedStatus(sessionId)
+        broadcastSessionMetadataFrame({ kind: 'session-status', sessionId, running: summary.running }, 'device')
+      } else {
+        token = ++pendingAddedToken
+        pendingAddedStatus.set(sessionId, { running: summary.running, token })
+      }
+      // Coalesce a refresh for every `added` (existing behaviour). The deferred
+      // device frame is emitted only for an accepted refresh whose answer contains
+      // the id; a failed/absent refresh withholds it from devices entirely.
+      void refreshVisibleSessions().then((accepted) => {
+        const pending = pendingAddedStatus.get(sessionId)
+        if (!pending || pending.token !== token) return // already sent, superseded, or cancelled
+        pendingAddedStatus.delete(sessionId)
+        if (!accepted) {
+          log('session-added status withheld: visible session refresh failed')
+          return
+        }
+        if (!visibleSessionIds.includes(sessionId)) {
+          log('session-added status withheld: session not in the refreshed visible list')
+          return
+        }
+        // `pending.running` is the latest status observed during the refresh.
+        broadcastSessionMetadataFrame({ kind: 'session-status', sessionId, running: pending.running }, 'device')
+      }).catch(() => {
+        if (pendingAddedStatus.get(sessionId)?.token === token) pendingAddedStatus.delete(sessionId)
+        log('session-added status withheld: visible session refresh failed')
+      })
     })
     const disposeSessionRemoved = ctx.on('api-session/removed', sessionId => {
-      broadcastSessionMetadataFrame({ kind: 'session-status', sessionId: String(sessionId), running: false })
+      const id = String(sessionId)
+      cancelAddedStatus(id)
+      broadcastSessionMetadataFrame({ kind: 'session-status', sessionId: id, running: false })
       // Drop the id right away (no await): a removed session must not stay
       // grantable while the refreshed list is on its way.
       // The tombstone stores the version AFTER the bump: any refresh that started
       // before this point has `startedAtVersion < tombstone` and must ignore the id.
       removalVersion += 1
-      removedAtVersion.set(String(sessionId), removalVersion)
-      visibleSessionIds = visibleSessionIds.filter((id) => id !== String(sessionId))
+      removedAtVersion.set(id, removalVersion)
+      visibleSessionIds = visibleSessionIds.filter((visible) => visible !== id)
+      // No longer one answer's list (see `visibleSnapshotAt`).
+      visibleSnapshotAt = 0
       deviceAccess.invalidate()
       void refreshVisibleSessions()
     })

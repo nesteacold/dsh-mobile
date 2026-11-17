@@ -56,6 +56,8 @@ async function factory(t, options = {}) {
     sessionList: ['s1', 's2'], listGate: null, archives: [], projections: {}, queuesInbox: {},
     // Spec 018 item 4 harness hook (OPT-IN, default off): see the list branch below.
     listOverride: null, listOverrideRemaining: 0,
+    // Ordered Host-answer / device-frame markers for the session-added ordering proof.
+    order: [],
   }
   let management
   let upgrade
@@ -82,6 +84,7 @@ async function factory(t, options = {}) {
         if (request.namespace === 'session' && request.method === 'list') {
           const call = { signal: request.signal, aborted: false }
           listCalls.push(call)
+          state.order.push({ kind: 'list:start', n: listCalls.length - 1 })
           request.signal?.addEventListener('abort', () => { call.aborted = true }, { once: true })
           if (state.listGate) {
             await new Promise((resolve, reject) => {
@@ -99,6 +102,7 @@ async function factory(t, options = {}) {
             state.listOverrideRemaining -= 1
           }
           call.answered = [...listed]
+          state.order.push({ kind: 'list:answered', n: listCalls.length - 1, ids: call.answered })
           return { items: call.answered.map((sessionId) => ({ sessionId })) }
         }
         if (request.namespace === 'session' && request.method === 'search') return { items: [], hasMore: false }
@@ -434,6 +438,122 @@ test('R3d: a live broadcast after a scope-narrowing re-pair reaches nobody who l
   instance.listeners['api-session/status']('s1', true)
   await delay(100)
   assert.equal(seenOf(ws).some((frame) => frame.kind === 'session-status'), false, 'the stale generation gets nothing')
+})
+
+test('R3e: a Host-created session absent from the previous snapshot reaches a paired device AFTER the refresh', async (t) => {
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  const reader = await pairDevice(instance, DEV_A, { scopes: ['sessions:read'] })
+  const ws = await connectToken(instance, reader.token, DEV_A)
+  await waitFor(() => visibleIds(instance, reader.device.id).length === 2, 'initial snapshot')
+  await flush(ws) // drain the connect baselines before the event
+  assert.equal(visibleIds(instance, reader.device.id).includes('s9'), false, 'the new session is not visible yet')
+  assert.equal(seenOf(ws).some((frame) => frame.kind === 'session-status' && frame.sessionId === 's9'), false)
+
+  instance.state.order.length = 0
+  instance.state.sessionList = ['s1', 's2', 's9'] // the Host now reports the new session
+  ws.on('message', (data) => {
+    let frame
+    try { frame = JSON.parse(data.toString()) } catch { return }
+    if (frame.kind === 'session-status' && frame.sessionId === 's9') instance.state.order.push({ kind: 'status:s9' })
+  })
+  instance.listeners['api-session/added']({ sessionId: 's9', running: true })
+
+  const status = await take(ws, (frame) => frame.kind === 'session-status' && frame.sessionId === 's9')
+  assert.equal(status.running, true)
+  assert.ok(visibleIds(instance, reader.device.id).includes('s9'), 'the refresh admitted the session')
+  const order = instance.state.order
+  const answerAt = order.findIndex((entry) => entry.kind === 'list:answered' && entry.ids.includes('s9'))
+  const sentAt = order.findIndex((entry) => entry.kind === 'status:s9')
+  assert.notEqual(answerAt, -1, 'a session/list answer included the new session')
+  assert.notEqual(sentAt, -1, 'the device socket received the status')
+  assert.ok(answerAt < sentAt, `session/list must be answered before the device send: ${JSON.stringify(order)}`)
+  ws.close()
+})
+
+// ---------------------------------------------------------------------------
+// R3f/R3g/R3h (reviewer 2026-11-17): added-during-refresh status ordering,
+// accepted-refresh gating for devices, and the unchanged admin/loopback path.
+// ---------------------------------------------------------------------------
+
+test('R3f: a status during an added-refresh supersedes the added value; the device ends running:true with no stale false', async (t) => {
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  const reader = await pairDevice(instance, DEV_A, { scopes: ['sessions:read'] })
+  const ws = await connectToken(instance, reader.token, DEV_A)
+  await waitFor(() => visibleIds(instance, reader.device.id).length === 2, 'initial snapshot')
+  await flush(ws)
+  const before = instance.listCalls.length
+  // Hold the Host answer so the newer `status` lands while the added refresh is in flight.
+  instance.state.listGate = {}
+  instance.state.sessionList = ['s1', 's2', 's9']
+  instance.listeners['api-session/added']({ sessionId: 's9', running: false })
+  await waitFor(() => instance.listCalls.length === before + 1, 'the added refresh is in flight')
+  instance.listeners['api-session/status']('s9', true) // supersedes the pending false
+  const gate = instance.state.listGate
+  instance.state.listGate = null
+  gate.release()
+  // The device frame carries the LATEST status, emitted only after the accepted refresh.
+  const final = await take(ws, (frame) => frame.kind === 'session-status' && frame.sessionId === 's9')
+  assert.equal(final.running, true, 'the final device frame is running:true')
+  await flush(ws)
+  assert.equal(seenOf(ws).some((frame) => frame.kind === 'session-status' && frame.sessionId === 's9' && frame.running === false), false,
+    'no stale false reached the device after the newer true')
+})
+
+test('R3g: a failed or absent added refresh sends no device status, but admin/loopback still receives it', async (t) => {
+  // Device side: a failed refresh withholds the frame from the device entirely.
+  const instance = await factory(t)
+  await instance.start(); await ready(instance)
+  const reader = await pairDevice(instance, DEV_A, { scopes: ['sessions:read'] })
+  const ws = await connectToken(instance, reader.token, DEV_A)
+  await waitFor(() => visibleIds(instance, reader.device.id).length === 2, 'snapshot')
+  await flush(ws)
+  let before = instance.listCalls.length
+  instance.state.listError = 'host unavailable'
+  instance.listeners['api-session/added']({ sessionId: 's9', running: true })
+  await waitFor(() => instance.listCalls.length > before, 'the failing refresh ran')
+  await delay(100); await flush(ws)
+  assert.equal(seenOf(ws).some((frame) => frame.kind === 'session-status' && frame.sessionId === 's9'), false,
+    'a failed refresh sends no added-status to the device')
+  // Absent id: an accepted refresh that does not list the id withholds it too.
+  before = instance.listCalls.length
+  instance.state.listError = null
+  instance.state.sessionList = ['s1', 's2'] // no s9
+  instance.listeners['api-session/added']({ sessionId: 's9', running: true })
+  await waitFor(() => instance.listCalls.length > before, 'the accepted refresh ran')
+  await delay(100); await flush(ws)
+  assert.equal(seenOf(ws).some((frame) => frame.kind === 'session-status' && frame.sessionId === 's9'), false,
+    'an absent id sends no added-status to the device')
+
+  // Admin/loopback (separate instance, legacyAdmin): the same events still notify admin.
+  const adminInstance = await factory(t, { config: { legacyAdmin: true } })
+  await adminInstance.start(); await ready(adminInstance)
+  const admin = await pairDevice(adminInstance, DEV_B, { scopes: [] })
+  await flush(admin.ws)
+  adminInstance.state.listError = 'host unavailable'
+  adminInstance.listeners['api-session/added']({ sessionId: 's9', running: true })
+  const failedFrame = await take(admin.ws, (frame) => frame.kind === 'session-status' && frame.sessionId === 's9')
+  assert.equal(failedFrame.running, true, 'admin receives the added/status notification even when the refresh fails')
+  adminInstance.state.listError = null
+  adminInstance.state.sessionList = ['s1', 's2'] // no s8
+  adminInstance.listeners['api-session/added']({ sessionId: 's8', running: true })
+  const absentFrame = await take(admin.ws, (frame) => frame.kind === 'session-status' && frame.sessionId === 's8')
+  assert.equal(absentFrame.running, true, 'admin receives it even when the id is absent from the list')
+})
+
+test('R3h: an accepted added refresh sends exactly one admin frame (no duplicate)', async (t) => {
+  const instance = await factory(t, { config: { legacyAdmin: true } })
+  await instance.start(); await ready(instance)
+  const admin = await pairDevice(instance, DEV_A, { scopes: [] })
+  await flush(admin.ws)
+  const before = instance.listCalls.length
+  instance.state.sessionList = ['s1', 's2', 's9']
+  instance.listeners['api-session/added']({ sessionId: 's9', running: true })
+  await waitFor(() => instance.listCalls.length > before, 'the accepted refresh ran')
+  await delay(100); await flush(admin.ws)
+  const adminFrames = seenOf(admin.ws).filter((frame) => frame.kind === 'session-status' && frame.sessionId === 's9')
+  assert.equal(adminFrames.length, 1, 'admin gets exactly one added/status frame, not one from each path')
 })
 
 // ---------------------------------------------------------------------------
