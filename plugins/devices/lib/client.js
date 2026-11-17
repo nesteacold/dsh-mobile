@@ -2695,13 +2695,11 @@ window.__ModuleLoader__.load({
     // right column's terminal tab is the only action left to this plugin.
     const nav = { openTerminal: null, openBrowserAgent: null }
 
-    // Host identity on a remote session row. The native browser renders
-    // `sidebar.session.row.trailing` beside the row's own timestamp and
-    // `sidebar.session.row.hover` inside the hover card (client-ui-workspace
-    // declares both seats, `kind:'list'`, `scope:'root'`), so a tagged session
-    // says which Host it lives on without a second sidebar: the merged
-    // `session/list` and `workspace/follow` answers already put the remote
-    // workspace and its sessions in the stock browser.
+    // Host identity for a tagged session. Kept as an export for callers/tests, but
+    // deliberately NOT mounted in the sidebar (owner decision 2026-11-17): the native
+    // workspace group header already names the Host, so a green dot + name on every
+    // session row only duplicated it. The composer `HostChip` below is where a remote
+    // session now names its Host; session rows stay exactly as the shell renders them.
     function SessionHostBadge(props) {
       useLang()
       const hosts = useHosts(hostsStore)
@@ -4139,14 +4137,6 @@ window.__ModuleLoader__.load({
       register('conversation.input.dock', { id: 'dsh-ext.devices.banners', order: 100, label: tr('banners') }, SessionBanners)
       register('conversation.input.right', { id: 'dsh-ext.devices.terminal', order: 100, label: tr('terminalEntry') }, RemoteTerminalEntry,
         () => ({ openTerminal: nav.openTerminal }))
-      // The native `WorkspaceBrowser` declares these two seats (`kind:'list'`,
-      // `scope:'root'`, the row's own `sessionId` as the owner prop), which is the
-      // documented way another package decorates a session row: the same shape as
-      // the shipped decoration template registering into `conversation.composer.dock`.
-      // The row keeps rendering them; nothing here replaces the browser.
-      register('sidebar.session.row.trailing', { id: 'dsh-ext.devices.host', order: 100, label: tr('hostChip') }, SessionHostBadge)
-      register('sidebar.session.row.hover', { id: 'dsh-ext.devices.host', order: 100, label: tr('hostChip') }, SessionHostBadge)
-
       const sync = () => {
         refreshForHosts(hostsStore.getSnapshot())
         syncAgentTabs()

@@ -1,7 +1,7 @@
 // Spec 008 P2b (client): the native remote-session surfaces.
-//  - the host badge: a tagged session row in the native browser names its Host, in
-//    the two row seats the native `WorkspaceBrowser` declares; the stock
-//    `sidebar.workspaces` browser is never replaced (the merged rows are its own);
+//  - session rows are left exactly as the native browser renders them: no green host
+//    dot or host name is added (the workspace group header already names the Host).
+//    The stock `sidebar.workspaces` browser is never replaced (the merged rows are its own);
 //  - a change to the connected-host set asks the native session catalog to pull
 //    `session/list` again, because a Host that connects after startup is in that
 //    merged answer only after the next pull;
@@ -69,10 +69,12 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
   // native browser renders the merged rows itself, so modelling the occupant here
   // turns "a replacement crept back in" into a failed test instead of a user's
   // session. The kinds are the shipped catalog's — the two session-row seats are
-  // `list` (client-ui-workspace declares them for exactly this kind of decoration) —
-  // and `register` below carries the rest of the rule: a `list`/`keyed` entry must
-  // carry its key option before a seat is even looked for, and a `list` seat is
-  // (id, priority).
+  // `list` (client-ui-workspace declares them) but this plugin deliberately leaves
+  // them empty, so the rows stay exactly as the shell renders them; keeping them
+  // declared makes "a badge crept back in" a failed assertion instead of a silent
+  // no-op. `register` below carries the rest of the rule: a `list`/`keyed` entry
+  // must carry its key option before a seat is even looked for, and a `list` seat
+  // is (id, priority).
   const SLOT_KINDS = {
     'sidebar.workspaces': 'single',
     'settings.section': 'list',
@@ -236,14 +238,16 @@ test('the stock sidebar keeps its seat in every routing state; the plugin only f
     assert.equal(ui.entryOf('sidebar.workspaces'), undefined, `${label}: the plugin never takes the browser's seat`)
     assert.equal(ui.winnerOf('sidebar.workspaces').meta.registrant, 'tk', `${label}: the stock browser is the only occupant`)
     // The additive surfaces are installed in every state; each renders nothing for a
-    // local session or an idle host, so none of them shadows the native row.
-    for (const slot of ['sidebar.session.row.trailing', 'sidebar.session.row.hover',
-      'conversation.input.left', 'conversation.input.dock', 'conversation.input.right']) {
+    // local session or an idle host, so none of them shadows the native row. The two
+    // session-row seats are deliberately NOT in this list: the rows stay native.
+    for (const slot of ['conversation.input.left', 'conversation.input.dock', 'conversation.input.right']) {
       assert.ok(ui.entryOf(slot), `${label}: ${slot} is registered`)
     }
+    assert.equal(ui.entryOf('sidebar.session.row.trailing'), undefined, `${label}: no trailing-row badge`)
+    assert.equal(ui.entryOf('sidebar.session.row.hover'), undefined, `${label}: no hover-row badge`)
   }
-  // The Devices page reads: the badge seats are in, and an off routing says so.
-  // No connected host is not a failure — the seats are still there. The tab strip is
+  // The Devices page reads: the composer chip is in, and an off routing says so.
+  // No connected host is not a failure — the chip is still there. The tab strip is
   // its own half of the same line (`tabs`/`tabsReason`): placement needs no slot seat
   // and no React root now, so this fake DOES install it, but its document has no sidebar
   // header — the only real failure it reports is `no-header` (installed, still watching).
@@ -255,53 +259,41 @@ test('the stock sidebar keeps its seat in every routing state; the plugin only f
   assert.deepEqual({ ...live.api.testing.remoteUI.getSnapshot() }, { grouped: true, reason: null, hosts: 1, ...TABS })
 })
 
-test('the host badge fills both native session-row seats under the plugin id, and stays when the host drops', async () => {
+test('no host badge is mounted in the session-row seats; the composer chip still is', async () => {
   const ui = load()
   await flush()
+  // The shell still declares both seats, but this plugin must not occupy them: the
+  // workspace group header already names the Host, so a green dot + name on every
+  // session row only duplicates it (owner decision 2026-11-17). Rows stay native.
   for (const slot of ['sidebar.session.row.trailing', 'sidebar.session.row.hover']) {
-    const entry = ui.entryOf(slot)
-    assert.ok(entry, `${slot} took its seat`)
-    assert.equal(entry.meta.name, slot)
-    assert.equal(entry.meta.id, 'dsh-ext.devices.host')
-    assert.equal(entry.meta.order, 100)
-    assert.equal(entry.meta.label, ui.api.testing.DICT.en.hostChip)
-    assert.equal(entry.component, ui.api.testing.SessionHostBadge, 'both seats render the same badge')
-    // A leaf decoration: the row stays the native browser's, so the entry declares
-    // no child seats of its own.
-    assert.equal(entry.meta.children, undefined)
+    assert.equal(ui.entryOf(slot), undefined, `${slot} is left to the native browser`)
+    assert.deepEqual(ui.occupants.get(slot), [], `${slot} has no registrations at all`)
   }
-  // Badging is additive: a dropped host changes what the badge says, not whether
-  // the row seat exists.
+  assert.equal(ui.entries.some((entry) => entry.component === ui.api.testing.SessionHostBadge), false,
+    'the badge component is not mounted anywhere')
+  assert.ok(ui.entryOf('conversation.input.left'), 'the composer chip still registered')
+  // A disconnect does not bring a badge back; the chip survives as before.
   ui.state.routing = { ...ROUTING, hosts: [] }
   await tick(ui)
-  assert.ok(ui.entryOf('sidebar.session.row.trailing'), 'the trailing seat survives a disconnect')
-  assert.ok(ui.entryOf('sidebar.session.row.hover'), 'the hover seat survives a disconnect')
+  for (const slot of ['sidebar.session.row.trailing', 'sidebar.session.row.hover']) {
+    assert.equal(ui.entryOf(slot), undefined, `${slot} stays empty after a disconnect`)
+  }
+  assert.ok(ui.entryOf('conversation.input.left'), 'the composer chip survives a disconnect')
 })
 
-test('the badge names the host of a tagged session with an online dot, and renders nothing for a local one', async () => {
+test('the composer chip still names a tagged session host with an online dot, and renders nothing for a local one', async () => {
   const ui = load()
   await flush()
-  const entry = ui.entryOf('sidebar.session.row.trailing')
-  const page = await mount(React.createElement(entry.component, { sessionId: 'h:r1:s-remote' }))
-  const badge = byTestId(page, 'session-host-badge')[0]
-  assert.ok(badge, 'the badge is rendered')
-  assert.equal(badge.props['data-host'], 'r1')
-  assert.equal(badge.props.title, `${ui.api.testing.DICT.en.hostChip}: Qoder-Sigma`)
-  assert.match(byTestId(page, 'session-host-dot')[0].props.className, /(^|\s)ok(\s|$)/, 'a live link reads as online')
-  assert.match(text(page), /Qoder-Sigma/, 'the host name is the visible label')
-  // An id with no host tag is a local session: the native row says all there is.
-  const localPage = await mount(React.createElement(entry.component, { sessionId: 's-local' }))
+  const page = await mount(React.createElement(ui.entryOf('conversation.input.left').component, { sessionId: 'h:r1:s-remote' }))
+  const chip = byTestId(page, 'host-chip')[0]
+  assert.ok(chip, 'the composer chip is where host identity lives now')
+  assert.match(text(page), /Qoder-Sigma/)
+  assert.match(byTestId(page, 'host-chip-dot')[0].props.className, /(^|\s)ok(\s|$)/, 'a live link reads as online')
+  // An id with no host tag is a local session: the native UI says all there is.
+  const localPage = await mount(React.createElement(ui.entryOf('conversation.input.left').component, { sessionId: 's-local' }))
   assert.equal(localPage.toJSON(), null)
-  // Paired but with no live link: the owner's session still carries the name it was
-  // paired under, and only the dot reads as dead.
-  const offline = load({ routing: { ...ROUTING, hosts: [] } })
-  await flush()
-  const offlinePage = await mount(React.createElement(offline.entryOf('sidebar.session.row.hover').component, { sessionId: 'h:r1:s-remote' }))
-  assert.match(byTestId(offlinePage, 'session-host-dot')[0].props.className, /(^|\s)off(\s|$)/)
-  assert.match(text(offlinePage), /Qoder-Sigma/)
   page.unmount()
   localPage.unmount()
-  offlinePage.unmount()
 })
 
 test('a change to the connected-host set pulls the native session catalog again; an unchanged set does not', async () => {
@@ -334,14 +326,15 @@ test('a host change that lands before the sessions service does is pulled once i
   assert.equal(ui.services.sessions.refreshes, 1, 'the pending pull runs as soon as the handle exists')
 })
 
-test('a refused session-row seat is reported on the Devices page and takes no other surface down', async () => {
-  const ui = load({ missingSlots: ['sidebar.session.row.hover'] })
+test('a refused additive seat is reported on the Devices page and takes no other surface down', async () => {
+  const ui = load({ missingSlots: ['conversation.input.dock'] })
   await flush()
-  assert.ok(ui.entryOf('sidebar.session.row.trailing'), 'the other seat still registered')
   assert.ok(ui.entryOf('conversation.input.left'), 'the composer chip still registered')
+  assert.equal(ui.entryOf('conversation.input.dock'), undefined, 'the refused banner seat is absent')
+  assert.equal(ui.entryOf('sidebar.session.row.trailing'), undefined, 'no session-row badge either')
   const status = ui.api.testing.remoteUI.getSnapshot()
   assert.equal(status.grouped, false)
-  assert.ok(status.reason.includes('sidebar.session.row.hover'), status.reason)
+  assert.ok(status.reason.includes('conversation.input.dock'), status.reason)
   assert.match(status.reason, /is not declared/)
   // The status line is part of the Devices page, so the reason is visible in the UI.
   const page = await mount(React.createElement(ui.api.testing.RemoteGroupingStatus))
@@ -530,14 +523,9 @@ test('a disconnected host is labelled as such, not as a host that was never ther
   // retained for it, so claiming otherwise would invent a retention.
   assert.equal(ui.api.testing.hostLinkOf(ui.api.testing.hostsStore.getSnapshot(), 'r-unknown').disconnected, false)
 
-  // The native row badge: dot off, and the title names the state.
-  const badge = await mount(React.createElement(ui.entryOf('sidebar.session.row.trailing').component, { sessionId: 'h:r1:s-remote' }))
-  const node = byTestId(badge, 'session-host-badge')[0]
-  assert.equal(node.props['data-link'], 'disconnected')
-  assert.match(byTestId(badge, 'session-host-dot')[0].props.className, /(^|\s)off(\s|$)/)
-  assert.match(node.props.title, /Disconnected/, 'the badge says which kind of dead the link is')
-  assert.match(text(badge), /Qoder-Sigma/, 'the host name is still shown')
-  badge.unmount()
+  // Session rows stay native — there is no host badge on them any more.
+  assert.equal(ui.entryOf('sidebar.session.row.trailing'), undefined)
+  assert.equal(ui.entryOf('sidebar.session.row.hover'), undefined)
 
   // The composer chip's popover says what still works, so "Offline" is not the whole story.
   const chip = await mount(React.createElement(ui.entryOf('conversation.input.left').component, { sessionId: 'h:r1:s-remote' }))

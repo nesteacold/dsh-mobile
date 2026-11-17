@@ -1,6 +1,6 @@
 {
   "name": "@dsh-mobile/bundle",
-  "version": "0.4.8",
+  "version": "0.4.10",
   "private": true,
   "type": "module",
   "description": "dsh-mobile: Devices (control other DSH Hosts), the mobile gateway for the phone app, and the agent's sidebar Browser tools, as one bundle. Spec 028.",
