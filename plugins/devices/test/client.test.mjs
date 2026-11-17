@@ -321,16 +321,39 @@ await check('registers settings.section and settings.section.icon for the same i
   assert.equal(typeof section.component, 'function')
 })
 
-await check('spec 028: the self-update section renders on the dsh-mobile bundle page only (public plugins.detail.section)', () => {
+await check('spec 028/027: the self-update section renders for the dsh-mobile bundle and devices row/package detail (public plugins.detail.section)', () => {
   const ui = load()
   const entry = ui.registered.find((e) => e.meta.name === 'plugins.detail.section')
   assert.ok(entry, 'registered')
   assert.equal(entry.meta.id, 'dsh-mobile-self-update')
+  const { isMobileBundleSubject, isSelfUpdateSubject } = ui.api.testing
+  // The bundle page case stays as it was.
   const bundle = { kind: 'bundle', pkg: { name: '@dsh-mobile/bundle' } }
   assert.notEqual(entry.component({ subject: bundle }), null)
-  assert.equal(entry.component({ subject: { kind: 'bundle', pkg: { name: '@dsh-ext/dsh-wiki' } } }), null)
-  assert.equal(entry.component({ subject: { kind: 'row', pkg: { name: '@dsh-mobile/bundle' }, row: {} } }), null)
+  assert.equal(isMobileBundleSubject(bundle), true)
+  assert.equal(isSelfUpdateSubject(bundle), true)
+  // The Plugin Manager also opens this slot on a row/package: both names render.
+  for (const subject of [
+    { kind: 'row', pkg: { name: '@dsh-ext/devices' }, row: {} },
+    { kind: 'package', pkg: { name: '@dsh-ext/devices' } },
+    { kind: 'row', pkg: { name: '@dsh-mobile/bundle' }, row: {} },
+    { kind: 'package', pkg: { name: '@dsh-mobile/bundle' } },
+  ]) {
+    assert.notEqual(entry.component({ subject }), null, `renders for ${subject.kind}/${subject.pkg.name}`)
+    assert.equal(isSelfUpdateSubject(subject), true)
+  }
+  // Other bundles/rows/packages stay hidden, and a missing subject renders nothing.
+  for (const subject of [
+    { kind: 'bundle', pkg: { name: '@dsh-ext/dsh-wiki' } },
+    { kind: 'row', pkg: { name: '@dsh-ext/dsh-wiki' }, row: {} },
+    { kind: 'package', pkg: { name: '@dsh-ext/dsh-wiki' } },
+    { kind: 'bundle', pkg: { name: '@dsh-ext/devices' } },
+  ]) {
+    assert.equal(entry.component({ subject }), null, `null for ${subject.kind}/${subject.pkg.name}`)
+    assert.equal(isSelfUpdateSubject(subject), false)
+  }
   assert.equal(entry.component({}), null)
+  assert.equal(isSelfUpdateSubject({}), false)
 })
 
 await check('spec 027: both self-update POSTs carry the client marker and JSON, and set no Origin', async () => {

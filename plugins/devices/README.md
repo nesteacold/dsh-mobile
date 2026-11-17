@@ -240,8 +240,11 @@ DSH's own composer will see:
 
 ## Plugin self-update (spec 027)
 
-**Check for updates** on the dsh-mobile bundle page (`lib/client.js` `SelfUpdate`, the
-`plugins.detail.section` entry this plugin declares) reads the linked checkout — branch, HEAD,
+**Check for updates** appears on the dsh-mobile bundle page and on the Devices component/row
+detail page (`lib/client.js` `SelfUpdate`, the `plugins.detail.section` entry this plugin declares;
+the subject matcher accepts the bundle and a row/package with the dsh-mobile bundle or Devices
+package name, so the updater is not hidden when the Plugin Manager opens the Devices row instead of
+the bundle). It reads the linked checkout — branch, HEAD,
 `git fetch --tags origin` — and shows the highest `v*` release, its notes and each plugin's
 `engines.dsh` at that tag. **Update** asks first, then applies `git merge --ff-only <tag>` plus
 `npm ci --ignore-scripts` only when a lockfile changed; it never resets, stashes, checks out or

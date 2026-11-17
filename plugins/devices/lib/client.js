@@ -4308,7 +4308,19 @@ window.__ModuleLoader__.load({
 
     // The bundle that carries this plugin (spec 028) and its rows' packages.
     const MOBILE_BUNDLE = '@dsh-mobile/bundle'
+    const DEVICES_PACKAGE = '@dsh-ext/devices'
     const isMobileBundleSubject = (subject) => !!subject && subject.kind === 'bundle' && !!subject.pkg && subject.pkg.name === MOBILE_BUNDLE
+    // The Plugin Manager opens the same detail slot for a row/package as for a
+    // bundle page, so the updater must also be there when the owner opens the
+    // Devices component instead of the bundle. Only these two packages qualify.
+    const isSelfUpdateSubject = (subject) => {
+      if (!subject || !subject.pkg) return false
+      if (subject.kind === 'bundle') return subject.pkg.name === MOBILE_BUNDLE
+      if (subject.kind === 'row' || subject.kind === 'package') {
+        return subject.pkg.name === MOBILE_BUNDLE || subject.pkg.name === DEVICES_PACKAGE
+      }
+      return false
+    }
 
     const inject = ['slots', 'locale']
     // `options` stays in the signature for renderers that still pass the old root-renderer
@@ -4352,7 +4364,7 @@ window.__ModuleLoader__.load({
       // is the updater that applies; it lives with this row, so it is absent while Devices is off.
       seat('plugins.detail.section', () => ctx.slots.register(
         { name: 'plugins.detail.section', id: 'dsh-mobile-self-update', order: 10 },
-        (props) => (isMobileBundleSubject(props && props.subject)
+        (props) => (isSelfUpdateSubject(props && props.subject)
           ? h('div', { className: 'dshdev', 'data-testid': 'bundle-self-update' }, h(SelfUpdate)) : null)))
       // Spec 033 (A1.2): remote file attach. One effect owns the capture listener and the
       // module, so a reload removes exactly what it installed (and no DSH object is ever
@@ -4419,7 +4431,7 @@ window.__ModuleLoader__.load({
       // spec 016 Phase 3
       BrowserAgentTab, agentKindOf,
       // spec 028
-      SelfUpdate, isMobileBundleSubject, MOBILE_BUNDLE,
+      SelfUpdate, isMobileBundleSubject, isSelfUpdateSubject, MOBILE_BUNDLE,
       // spec 016 Phase 1: the per-machine Start-page doorways, their numbers and the
       // card each one opens, so a test can prove the entries without a browser.
       HostDoorTab, HostDoorIcon, hostDoorEntries, hostDoorId, HOST_DOORWAYS,
