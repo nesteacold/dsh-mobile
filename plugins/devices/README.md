@@ -389,7 +389,8 @@ it). The strip's left edge lines up with the header's label text (11px: DSH's `-
 12px minus the 1px `.sectionLabel` shift). They render as **two compact icon buttons** (a monitor
 with a check for *This Computer*, a cloud with a link dot for *Remote Workspace*): no text inside the
 buttons — the localized name and its shortcut live in `title`/`aria-label`, and the glyphs stroke with
-`currentColor` so the active button's accent ink draws them. They are a **display filter only**: both tabs render the
+`currentColor` so the selected button's fixed mockup-blue ink draws them; the inactive button stays muted
+gray and the selected chip uses a pale blue tint, never the shell's button-primary alias. They are a **display filter only**: both tabs render the
 same native `WorkspaceBrowser`, and the tab that is not selected hides the rows the other one owns
 through **one** `<style data-plugin="dsh-ext.devices.host-tabs">` in `document.head`, whose text is
 swapped on a tab change and removed on dispose. Nothing is re-requested, re-merged or re-ordered:

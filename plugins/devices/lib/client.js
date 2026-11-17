@@ -824,6 +824,10 @@ window.__ModuleLoader__.load({
     // Their XML namespace is assembled from two pieces so the file's "no external
     // URL" scan stays a literal, exact check instead of needing an exception.
     const SVG_NS = ['http:', '//www.w3.org/2000/svg'].join('')
+    // Fixed mockup palette for the two host tabs: the shell's button-primary
+    // alias can resolve gray, which would paint the selected glyph as inactive.
+    const HOST_TAB_ACCENT = '#4f7cff'
+    const HOST_TAB_ACCENT_PALE = 'rgba(79,124,255,.16)'
     const css = `
 .dshdev{font-family:var(--dsw-font-family,system-ui,sans-serif);font-size:13px;color:${colors.text};max-width:880px;line-height:1.5}
 /* The sidebar panel's host: the main column ships no padding and does not scroll,
@@ -883,18 +887,19 @@ window.__ModuleLoader__.load({
 /* The left inset matches the header's label text: dsh-client-ui-workspace's .sectionHeader */
 /* uses padding-left: var(--dsh-sidebar-row-padding) (12px shipped) and .sectionLabel sits */
 /* 1px left of that, so the strip's border starts at the same 11px as the Workspaces ink. */
-/* The glyphs stroke with currentColor: the selected tab draws in DSH accent blue on a
-   light blue chip, the inactive one in muted gray on the shell's hover wash. A tinted
-   chip (not a flat blue fill) keeps the blue stroke legible in both themes; the name
-   stays in title/aria-label, never as text in the 28x24 button. */
+/* The glyphs stroke with currentColor: the selected tab draws in the mockup blue on a
+   pale blue chip, the inactive one in muted gray on the shell's hover wash. The selected
+   chip uses the fixed palette above: the shell's button-primary alias can resolve gray,
+   which makes the selected glyph look inactive. The name stays in title/aria-label,
+   never as text in the 28x24 button. */
 .dshdev-hosttabs{display:flex;flex:none;width:max-content;justify-content:flex-start;margin:1px 10px 6px calc(var(--dsh-sidebar-row-padding, 12px) - 1px)}
 .dshdev-hosttabs-strip{display:inline-flex;gap:2px;margin:0;padding:2px;border:1px solid ${colors.border};border-radius:8px;background:${colors.hover}}
 .dshdev-hosttabs-strip button{flex:none;width:28px;height:24px;display:grid;place-items:center;padding:0;border:0;border-radius:6px;background:transparent;color:${colors.muted};cursor:pointer}
-/* rgba is the fallback for a shell without color-mix; the @supports rule then ties the
-   tint to the shell's own accent so the chip follows the theme. */
-.dshdev-hosttabs-strip button[aria-selected=true]{background:rgba(79,124,255,.16);color:${colors.accent}}
+/* rgba is the fallback for a shell without color-mix; the @supports rule keeps the
+   same fixed tint where color-mix is available. */
+.dshdev-hosttabs-strip button[aria-selected=true]{background:${HOST_TAB_ACCENT_PALE};color:${HOST_TAB_ACCENT}}
 @supports (background: color-mix(in srgb, red 16%, transparent)) {
-  .dshdev-hosttabs-strip button[aria-selected=true]{background:color-mix(in srgb, ${colors.accent} 16%, transparent)}
+  .dshdev-hosttabs-strip button[aria-selected=true]{background:color-mix(in srgb, ${HOST_TAB_ACCENT} 16%, transparent)}
 }
 .dshdev-hosttabs-strip button:hover:not([aria-selected=true]){color:${colors.text}}
 .dshdev-hosttabs-strip svg{display:block}

@@ -12,7 +12,7 @@
 //    either way;
 //  - the two tabs are compact ICON buttons (monitor+check / cloud+link-dot), never text:
 //    the localized name and its Ctrl+Alt+1/2 shortcut live in `title`/`aria-label`, the
-//    glyph strokes with `currentColor` so the selected accent ink (or inactive gray)
+//    glyph strokes with `currentColor` so the selected mockup blue (or inactive gray)
 //    draws it;
 //  - the insertion is idempotent: one node per header however many observer passes run,
 //    re-inserted after a re-render drops it, and never duplicated;
@@ -623,6 +623,22 @@ await check('one style element, from load on, under data-plugin dsh-ext.devices.
   const styles = ui.doc.head.children.filter((node) => node.attrs?.['data-plugin'] === STYLE_ID)
   assert.equal(styles.length, 1, 'exactly one injected element')
   assert.equal(styles[0].textContent, ui.api.testing.HOST_TABS_STYLE.local, 'local is the default rule set')
+  ui.dispose()
+})
+
+await check('the selected tab uses fixed mockup blue and a pale chip, never the DSH button-primary alias', async () => {
+  assert.match(source, /const HOST_TAB_ACCENT = '#4f7cff'/)
+  assert.match(source, /const HOST_TAB_ACCENT_PALE = 'rgba\(79,124,255,\.16\)'/)
+  const start = source.indexOf("/* The glyphs stroke with currentColor: the selected tab draws in the mockup blue on a")
+  const end = source.indexOf('/* spec 008 P2b:')
+  assert.ok(start >= 0 && end > start, 'the host-tab CSS is in the shipped stylesheet')
+  const css = source.slice(start, end)
+  assert.match(css, /\.dshdev-hosttabs-strip button\[aria-selected=true\]\{background:\$\{HOST_TAB_ACCENT_PALE\};color:\$\{HOST_TAB_ACCENT\}\}/)
+  assert.match(css, /color-mix\(in srgb, \$\{HOST_TAB_ACCENT\} 16%, transparent\)/)
+  assert.match(css, /\.dshdev-hosttabs-strip button\{[^}]*color:\$\{colors\.muted\}/)
+  assert.doesNotMatch(css, /\$\{colors\.accent\}|--dsw-alias-button-primary-fill/)
+  const ui = load()
+  for (const tab of tabsOf(ui)) glyphOf(tab)
   ui.dispose()
 })
 
