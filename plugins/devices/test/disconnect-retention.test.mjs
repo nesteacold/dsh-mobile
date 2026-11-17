@@ -27,11 +27,14 @@ console.log('disconnect-retention')
 
 const BACKOFF = [100, 150, 250, 400]
 
-/** The sessions this Host offers; the test re-reads the list around every link move. */
+/** The sessions this Host offers; the test re-reads the list around every link move.
+ * Rows carry the installed rc.3 SessionProjectionHints shape — `kind` and a finite
+ * `asOfSeq` alongside `values` — because the router refuses a malformed list row.
+ */
 const SESSIONS = [
-  { sessionId: 'sess-alpha', running: false, updatedAt: 3, projections: { values: { title: 'Alpha' } } },
-  { sessionId: 'sess-beta', running: true, updatedAt: 2, projections: { values: { title: 'Beta' } } },
-  { sessionId: 'sess-gamma', running: false, updatedAt: 1, projections: { values: { title: 'Gamma' } } },
+  { sessionId: 'sess-alpha', running: false, updatedAt: 3, projections: { kind: 'sequenced', asOfSeq: 3, values: { title: 'Alpha' } } },
+  { sessionId: 'sess-beta', running: true, updatedAt: 2, projections: { kind: 'sequenced', asOfSeq: 2, values: { title: 'Beta' } } },
+  { sessionId: 'sess-gamma', running: false, updatedAt: 1, projections: { kind: 'sequenced', asOfSeq: 1, values: { title: 'Gamma' } } },
 ]
 
 async function startGateway() {

@@ -1555,7 +1555,8 @@ export class HostRouter {
   /**
    * Last authoritative inbox value per merged session id, at the seq of the
    * source that carried it (control baseline, control projection, or a follow
-   * snapshot's projections block). A claim splice folds into this value so the
+   * snapshot's projections block). Every value here is ALREADY INGRESSED into
+   * controller-id space. A claim splice folds into this value so the
    * synthetic frame preserves every OTHER queued message; with no known value
    * there is nothing safe to synthesize.
    * @type {Map<string, {seq: number, value: {'next-turn': object[], 'next-step': object[]}}>}
@@ -2811,7 +2812,7 @@ export class HostRouter {
             // A follow opening snapshot carries the session's own projection cut.
             // Seed the reconstruction state before any splice from that page is
             // delivered; an absent block only means "unknown here", never empty.
-            this.#noteInboxFollowSnapshot(controlSessionId, value)
+            this.#noteInboxFollowSnapshot(hostId, controlSessionId, value)
             const frames = followFrames(value, { resumed: resumes, expected, lastSeq, opening })
             // The unseen stretch a part of the page names, counted toward the page's own
             // bound (see `pageUnseen`). An event's fill is already deduplicated against
@@ -3212,17 +3213,32 @@ export class HostRouter {
    * "unknown here", not an empty inbox; an explicit block without `inbox` is a
    * capability-absent cut and clears what this router could otherwise synthesize.
    */
-  #noteInboxFollowSnapshot(sessionId, value) {
+  #noteInboxFollowSnapshot(hostId, sessionId, value) {
     if (typeof sessionId !== 'string' || !isSnapshotFrame(value)) return
     const projections = value.projections
     if (!isPlainObject(projections)) return
     const seq = projections.asOfSeq
     if (!Number.isSafeInteger(seq) || seq < -1 || !isPlainObject(projections.values)
-      || !Object.hasOwn(projections.values, 'inbox') || normalizeInboxValue(projections.values.inbox) === null) {
+      || !Object.hasOwn(projections.values, 'inbox')) {
       this.#clearInboxState(sessionId)
       return
     }
-    this.#setInboxState(sessionId, projections.values.inbox, seq)
+    // This frame is still in RAW remote coordinates on the follow pump; the
+    // baseline/projection sources are already ingressed. Fold in ONE coordinate
+    // system: ingress a detached copy before it becomes tracked state. Never
+    // ingress the delivered frame itself (the pump does that below).
+    let renamed
+    try {
+      renamed = this.#ingress(hostId, structuredClone(projections.values.inbox), 'session/follow snapshot projections')
+    } catch {
+      this.#clearInboxState(sessionId)
+      return
+    }
+    if (normalizeInboxValue(renamed) === null) {
+      this.#clearInboxState(sessionId)
+      return
+    }
+    this.#setInboxState(sessionId, renamed, seq)
   }
 
   /**
@@ -3242,7 +3258,19 @@ export class HostRouter {
     const known = this.#inboxStates.get(sessionId)
     if (known === undefined || known.seq >= event.seq) return
     const data = event.data
-    const folded = foldInboxValue(known.value, data)
+    // The follow frame is raw; tracked state and the published frame are already
+    // in the controller's namespace. Ingress a detached copy of the splice BEFORE
+    // folding, so inserted messages use the same id coordinate as the state.
+    // `namespaceIds` keeps kind:'user' source.rpcId opaque while renaming real id
+    // fields; a refusal here fails closed instead of leaking raw ids downstream.
+    let renamedData
+    try {
+      renamedData = this.#ingress(hostId, structuredClone(data), 'session/follow inbox splice')
+    } catch {
+      this.#clearInboxState(sessionId)
+      return
+    }
+    const folded = foldInboxValue(known.value, renamedData)
     if (folded === null) {
       this.#clearInboxState(sessionId)
       return

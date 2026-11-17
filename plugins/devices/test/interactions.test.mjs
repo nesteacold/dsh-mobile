@@ -1196,10 +1196,13 @@ test('real gateway: an approval card still reaches the device and is applied ove
  *      `{index:null, seq:8}` and the projection watermark reaches 8;
  *   3. the durable `user/message` (seq 9) admits the echo. Native rc.3 retires
  *      the bubble only when the inbox projection watermark reaches seq 8.
- * The wire `inbox` val uses the JSON keys `'next-turn'`/`'next-step'`
- * (dsh-api-session-controller typert.host.js projection schema), not the
- * TypeScript interface's camelCase. The controller's merged streams must carry
- * every event and projection, in order, with the source rpcId intact.
+ * Two other queued turns are already in the Host's authoritative `inbox`
+ * baseline/snapshot, so a claim must leave them in place: the router may not
+ * synthesize an empty inbox just to advance the watermark. The wire `inbox` val
+ * uses the JSON keys `'next-turn'`/`'next-step'` (dsh-api-session-controller
+ * typert.host.js projection schema), not the TypeScript interface's camelCase.
+ * The controller's merged streams must carry every event and projection, in
+ * order, with the source rpcId intact.
  */
 function createEchoHost({ withholdControl = false } = {}) {
   const calls = []
@@ -1210,14 +1213,25 @@ function createEchoHost({ withholdControl = false } = {}) {
     if (!queue) { queue = createQueue(); streams.set(endpoint, queue) }
     return queue
   }
+  const BASE_SEQ = 5
+  const SNAPSHOT_SEQ = 6
   const SPLICE_SEQ = 7
   const CLAIM_SEQ = SPLICE_SEQ + 1
   const MESSAGE_SEQ = CLAIM_SEQ + 1
+  const queuedTurns = [
+    { id: 'm-queued-a', content: [{ type: 'text', text: 'earlier A' }],
+      source: { kind: 'user', rpcId: 'req-queued-a' } },
+    { id: 'm-queued-b', content: [{ type: 'text', text: 'earlier B' }],
+      source: { kind: 'user', rpcId: 'req-queued-b' } },
+  ]
   const inboxMessage = (requestId) => ({ id: 'm-echo', content: [{ type: 'text', text: 'ping' }],
     source: { kind: 'user', rpcId: requestId } })
+  const baselineInbox = { 'next-turn': queuedTurns.slice(), 'next-step': [] }
+  const snapshotInbox = { 'next-turn': queuedTurns.slice(), 'next-step': [] }
+  const survivingInbox = { 'next-turn': queuedTurns.slice(), 'next-step': [] }
   const projection = (seq, requestId) => ({ type: 'projection', sessionId: 's1', seq,
     changes: [{ key: 'inbox', val: { seq,
-      'next-turn': seq === SPLICE_SEQ ? [inboxMessage(requestId)] : [],
+      'next-turn': seq === SPLICE_SEQ ? [inboxMessage(requestId), ...queuedTurns] : queuedTurns.slice(),
       'next-step': [],
     } }] })
   let controlReleased = false
@@ -1275,14 +1289,16 @@ function createEchoHost({ withholdControl = false } = {}) {
       const queue = queueFor(endpoint)
       if (endpoint === 'session/follow') {
         queue.push({ type: 'snapshot', cursor: 0, header: { version: 4, id: 's1' },
-          records: [], projections: {}, hasMore: false })
+          records: [], projections: { asOfSeq: SNAPSHOT_SEQ, values: { inbox: snapshotInbox } }, hasMore: false })
       } else if (endpoint === 'session/control') {
-        queue.push({ type: 'baseline', value: { projections: {} } })
+        queue.push({ type: 'baseline', value: { projections: {
+          s1: { asOfSeq: BASE_SEQ, values: { inbox: baselineInbox } },
+        } } })
       }
       return queue
     },
   }
-  return { gateway, calls, releaseControl, SPLICE_SEQ, CLAIM_SEQ, MESSAGE_SEQ }
+  return { gateway, calls, releaseControl, queuedTurns, survivingInbox, SPLICE_SEQ, CLAIM_SEQ, MESSAGE_SEQ }
 }
 
 /** A controller-side router harness with a short merge-baseline wait. */
@@ -1411,21 +1427,39 @@ test('real gateway: a remote prompt echo settles from follow + control without a
     // Both inbox projection watermarks arrive on the controller's merged control
     // stream for the NAMESPACED session — the only source of seqOf('inbox')
     // remote. The claim's watermark (seq 8) is what retires an index===null echo.
-    await waitForFrame(() => streams.control.frames.filter((frame) => frame?.type === 'projection'
-      && frame.sessionId === namespaceId(HOST, 's1')
-      && frame.changes?.some((change) => change.key === 'inbox')).length >= 2,
-    'both inbox projections on session/control')
-    const projections = streams.control.frames.filter((frame) => frame?.type === 'projection'
+    // The router also publishes a reconstructed fallback (the Host's real
+    // projection can be withheld); it carries only the installed wire keys, no
+    // Host `val.seq`, so the real Host frames stay separately identifiable.
+    const inboxFrames = () => streams.control.frames.filter((frame) => frame?.type === 'projection'
       && frame.sessionId === namespaceId(HOST, 's1')
       && frame.changes?.some((change) => change.key === 'inbox'))
-    assert.deepEqual(projections.map((frame) => [
-      frame.seq, frame.changes.find((change) => change.key === 'inbox').val.seq,
-    ]), [[host.SPLICE_SEQ, host.SPLICE_SEQ], [host.CLAIM_SEQ, host.CLAIM_SEQ]],
-    'both watermarks reach the controller, in order, at their splice seqs')
-    assert.equal(projections[0].changes.find((change) => change.key === 'inbox').val['next-turn']?.[0]?.source?.rpcId,
+    const valOf = (frame) => frame.changes.find((change) => change.key === 'inbox').val
+    const inboxOf = (frame) => {
+      const value = { ...valOf(frame) }
+      delete value.seq
+      return value
+    }
+    const real = () => inboxFrames().filter((frame) => Object.hasOwn(valOf(frame), 'seq'))
+    // A late control baseline is re-sent as a router projection at its own cut
+    // (seq 5) and also lacks `val.seq`; the synthetic claim is keyed to seq 8.
+    const fallback = () => inboxFrames().filter((frame) => frame.seq === host.CLAIM_SEQ
+      && !Object.hasOwn(valOf(frame), 'seq'))
+    await waitForFrame(() => real().length >= 2, 'both real inbox projections on session/control')
+    await waitForFrame(() => fallback().length >= 1, 'the router claim fallback on session/control')
+    const projections = real()
+    assert.deepEqual(projections.map((frame) => [frame.seq, valOf(frame).seq]),
+      [[host.SPLICE_SEQ, host.SPLICE_SEQ], [host.CLAIM_SEQ, host.CLAIM_SEQ]],
+    'both Host watermarks reach the controller, in order, at their splice seqs')
+    assert.equal(inboxOf(projections[0])['next-turn']?.[0]?.source?.rpcId,
       requestId, 'the first inbox projection carries the queued message')
-    assert.deepEqual(projections[1].changes.find((change) => change.key === 'inbox').val['next-turn'], [],
-      'the claim projection carries an empty inbox')
+    assert.deepEqual(inboxOf(projections[0])['next-turn']?.map((message) => message.id),
+      ['m-echo', ...host.queuedTurns.map((message) => message.id)],
+      'the insert splice leaves both earlier queued turns behind it')
+    assert.deepEqual(inboxOf(projections[1]), host.survivingInbox,
+      'the claim projection preserves the other queued turns, not an empty inbox')
+    assert.deepEqual(fallback().map((frame) => [frame.seq, valOf(frame)]),
+      [[host.CLAIM_SEQ, host.survivingInbox]],
+    'the fallback publishes the full surviving inbox at the claim watermark')
 
     // Every settlement fact is on the LIVE streams: no session switch, no
     // dispose/reopen, no handmade frame injected into the controller.
@@ -1438,7 +1472,7 @@ test('real gateway: a remote prompt echo settles from follow + control without a
   }
 })
 
-test('real gateway: a withheld control stream holds the remote echo until its inbox watermark arrives', async (t) => {
+test('real gateway: a withheld Host control stream is repaired by the router inbox fallback', async (t) => {
   const host = createEchoHost({ withholdControl: true })
   const gateway = await startRealGateway(t, () => host)
   const paired = await pairRealDevice(gateway, t, 'desk-echo-real-0000-4000-800000000002',
@@ -1454,9 +1488,10 @@ test('real gateway: a withheld control stream holds the remote echo until its in
     assert.equal(answer.ok, true, JSON.stringify(answer))
 
     // All three durable events are on follow (so the optimistic bubble exists),
-    // but BOTH control watermarks are missing: the claim splice left the receipt
+    // but the Host sends NO control projections: the claim splice left the receipt
     // at index===null, and rc.3's trap holds the admitted echo until seq 8
-    // reaches the inbox projection.
+    // reaches seqOf('inbox'). The router must publish that watermark from the
+    // durable claim splice on the SAME live streams — no session switch.
     await waitForFrame(() => streams.follow.frames.filter((frame) => frame?.event?.type === 'agent/inbox/spliced').length >= 2,
       'both splices on session/follow (held case)')
     await waitForFrame(() => streams.follow.frames.some((frame) => frame?.event?.type === 'user/message'
@@ -1464,23 +1499,39 @@ test('real gateway: a withheld control stream holds the remote echo until its in
     assert.deepEqual(streams.follow.frames.filter((frame) => frame?.event?.type === 'agent/inbox/spliced'
       || frame?.event?.type === 'user/message').map((frame) => frame.event.seq),
     [host.SPLICE_SEQ, host.CLAIM_SEQ, host.MESSAGE_SEQ], 'held echo still has the full ordered sequence')
-    const held = streams.control.frames.some((frame) => frame?.type === 'projection'
+    const inboxFrames = () => streams.control.frames.filter((frame) => frame?.type === 'projection'
       && frame.sessionId === namespaceId(HOST, 's1')
       && frame.changes?.some((change) => change.key === 'inbox'))
-    assert.equal(held, false, 'with session/control withheld, no inbox watermark reaches the controller')
+    const valOf = (frame) => frame.changes.find((change) => change.key === 'inbox').val
+    const inboxOf = (frame) => {
+      const value = { ...valOf(frame) }
+      delete value.seq
+      return value
+    }
+    // A late control baseline is re-sent at its own seq 5 without `val.seq`;
+    // the synthetic claim is the router projection keyed to seq 8.
+    const fallback = () => inboxFrames().filter((frame) => frame.seq === host.CLAIM_SEQ
+      && !Object.hasOwn(valOf(frame), 'seq'))
+    await waitForFrame(() => fallback().length >= 1,
+      'router fallback watermark while Host control is withheld')
+    assert.deepEqual(fallback().map((frame) => [frame.seq, valOf(frame)]),
+    [[host.CLAIM_SEQ, host.survivingInbox]],
+    'the withheld claim is reconstructed with the other queued turns intact')
+    assert.equal(inboxFrames().filter((frame) => Object.hasOwn(valOf(frame), 'seq')).length, 0,
+      'the Host withheld its own projection; only router-derived frames are present')
 
-    // Releasing the Host's inbox projections resolves the hold on the SAME live
-    // streams — no session switch, no dispose.
+    // Releasing the Host's inbox projections still reaches the controller on the
+    // SAME live streams. The native store drops seq <= row.seq, so the fallback
+    // at seq 8 cannot be regressed by the duplicate that arrives later.
     host.releaseControl(requestId)
-    await waitForFrame(() => streams.control.frames.filter((frame) => frame?.type === 'projection'
-      && frame.sessionId === namespaceId(HOST, 's1')
-      && frame.changes?.some((change) => change.key === 'inbox')).length >= 2,
-    'both inbox projections after release')
-    const projections = streams.control.frames.filter((frame) => frame?.type === 'projection'
-      && frame.sessionId === namespaceId(HOST, 's1')
-      && frame.changes?.some((change) => change.key === 'inbox'))
-    assert.deepEqual(projections.map((frame) => frame.changes.find((change) => change.key === 'inbox').val.seq),
-      [host.SPLICE_SEQ, host.CLAIM_SEQ], 'both watermarks arrive in order, the claim one last')
+    await waitForFrame(() => inboxFrames().filter((frame) => Object.hasOwn(valOf(frame), 'seq')).length >= 2,
+    'both Host inbox projections after release')
+    const projections = inboxFrames().filter((frame) => Object.hasOwn(valOf(frame), 'seq'))
+    assert.deepEqual(projections.map((frame) => valOf(frame).seq),
+      [host.SPLICE_SEQ, host.CLAIM_SEQ], 'both Host watermarks arrive in order, the claim one last')
+    assert.deepEqual(inboxOf(projections[1]), host.survivingInbox,
+      'the real claim projection matches the reconstructed surviving inbox')
+    assert.equal(fallback().length, 1, 'the replayed claim is not synthesized twice')
     assert.equal(streams.control.errors.length, 0, JSON.stringify(streams.control.errors))
     assert.equal(streams.follow.errors.length, 0, JSON.stringify(streams.follow.errors))
   } finally {

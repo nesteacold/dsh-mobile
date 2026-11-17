@@ -2353,18 +2353,25 @@ test('a successful remote selectModel reaches the native model chip through the 
   control.abort()
 })
 
-test('a remote claim splice reconstructs the surviving inbox from authoritative state', async () => {
+test('a remote claim splice reconstructs the surviving inbox in ONE id namespace', async () => {
   // rc.3 retires an admitted echo with receipt.index===null only when
   // seqOf('inbox') reaches the claim's seq. The splice is durable on follow; its
   // projection can be missing from session/control. The router must reconstruct
   // the WHOLE post-splice inbox from a sequenced baseline/snapshot, fold the
-  // splice with DSH's own rules, and publish that value at the claim seq.
-  const turnA = { id: 'turn-a', content: [{ type: 'text', text: 'A' }] }
-  const turnB = { id: 'turn-b', content: [{ type: 'text', text: 'B' }] }
-  const step = { id: 'step-1', content: [{ type: 'text', text: 'step' }] }
+  // splice with DSH's own rules in the SAME id coordinate, and publish that value.
+  const wireMessage = (id, text, rpcId) => ({
+    id, content: [{ type: 'text', text }],
+    sessionId: 's1', agentId: 'agent-a', workspaceId: 'ws-a',
+    source: { kind: 'user', rpcId },
+  })
+  const turnA = wireMessage('turn-a', 'A', 'rpc-a')
+  const turnB = wireMessage('turn-b', 'B', 'rpc-b')
+  const turnC = wireMessage('turn-c', 'C', 'rpc-c')
+  const step = wireMessage('step-1', 'step', 'rpc-step')
   const baselineInbox = { 'next-turn': [turnA, turnB], 'next-step': [] }
   const snapshotInbox = { 'next-turn': [turnA, turnB], 'next-step': [step] }
-  const surviving = { 'next-turn': [turnB], 'next-step': [step] }
+  const rawSurviving = { 'next-turn': [turnC, turnB], 'next-step': [step] }
+  const renamedSurviving = namespaceIds(rawSurviving, 'hostB')
   const hostB = createFakeRemote('hostB', 'Host B', {
     controlProjections: { s1: { asOfSeq: 5, values: { inbox: baselineInbox } } },
   })
@@ -2375,8 +2382,8 @@ test('a remote claim splice reconstructs the surviving inbox from authoritative 
   const controlIterator = controlSource[Symbol.asyncIterator]()
   const opening = (await nextFrame(controlIterator, 'control opening baseline')).value
   assert.equal(opening.type, 'baseline')
-  assert.deepEqual(opening.value.projections['h:hostB:s1'].values.inbox, baselineInbox,
-    'the merged baseline carries the Host\'s sequenced inbox cut under the minted id')
+  assert.deepEqual(opening.value.projections['h:hostB:s1'].values.inbox, namespaceIds(baselineInbox, 'hostB'),
+    'the merged baseline stores the ingress-renamed inbox cut')
 
   const followAbort = new AbortController()
   const followSource = await harness.gateway.openWireStream('session/follow',
@@ -2393,47 +2400,63 @@ test('a remote claim splice reconstructs the surviving inbox from authoritative 
   assert.equal(remoteFollow.args.request.address.sessionId, 's1',
     'the Host sees only its own id; the namespace is minted on the way back')
 
-  // A follow opening snapshot is the session's own projection cut; its higher
+  // A follow opening snapshot is the session's own RAW projection cut; its higher
   // seq adds the untouched next-step queue the control baseline did not have.
   remoteFollow.queue.push({ type: 'snapshot', cursor: 6, header: { version: 4, id: 's1' },
     records: [], projections: { asOfSeq: 6, values: { inbox: snapshotInbox } }, hasMore: false })
   const opened = (await nextFrame(followIterator, 'follow opening snapshot')).value
   assert.equal(opened.type, 'snapshot')
-  assert.deepEqual(opened.projections.values.inbox, snapshotInbox,
-    'the follow snapshot carries the session projection block')
+  assert.deepEqual(opened.projections.values.inbox, namespaceIds(snapshotInbox, 'hostB'),
+    'the delivered snapshot is ingressed once; nested ids are renamed, source.rpcId stays opaque')
 
   const claim = (seq) => ({ type: 'event', event: {
     type: 'agent/inbox/spliced', seq, time: seq,
-    data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] },
+    data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [turnC] },
   } })
   remoteFollow.queue.push(claim(8))
   const frame = (await nextFrame(controlIterator, 'fallback inbox projection')).value
-  assert.deepEqual(frame, {
-    type: 'projection', sessionId: 'h:hostB:s1', seq: 8,
-    changes: [{ key: 'inbox', val: surviving }],
-  }, 'the splice preserves the other turn and the untouched next-step queue')
+  assert.equal(frame.sessionId, 'h:hostB:s1')
+  assert.equal(frame.seq, 8)
+  assert.equal(frame.changes[0].key, 'inbox')
+  assert.deepEqual(frame.changes[0].val, renamedSurviving,
+    'the full synthesized value is in the controller id namespace')
+  const inserted = frame.changes[0].val['next-turn'][0]
+  assert.equal(inserted.sessionId, namespaceId('hostB', 's1'), 'nested sessionId is renamed')
+  assert.equal(inserted.agentId, namespaceId('hostB', 'agent-a'), 'nested agentId is renamed')
+  assert.equal(inserted.workspaceId, namespaceId('hostB', 'ws-a'), 'nested workspaceId is renamed')
+  assert.equal(inserted.source.rpcId, 'rpc-c', 'kind:user source.rpcId stays the controller-minted id')
   const followed = (await nextFrame(followIterator, 'claim on follow')).value
   assert.equal(followed.event.seq, 8, 'the durable follow frame is unchanged')
-  assert.equal(followed.event.data.removedCount, 1)
+  assert.deepEqual(followed.event.data.inserted, namespaceIds([turnC], 'hostB'),
+    'the follow frame keeps the inserted message, ingressed once like every remote payload')
 
-  // Native-equivalent ProjectionValueStore.apply: a real Host frame at the same
-  // seq is dropped, so an equal-seq value with the surviving queue is harmless.
+  // The real Host frame carries the same RAW value. After the router's normal
+  // ingress it must be byte-for-byte the frame we synthesized at the same seq.
+  const remoteControl = hostB.streams.find((entry) => entry.endpoint === 'session/control')
+  assert.ok(remoteControl, 'the remote control pump is open')
+  remoteControl.queue.push({ type: 'projection', sessionId: 's1', seq: 8,
+    changes: [{ key: 'inbox', val: rawSurviving }] })
+  const realFrame = (await nextFrame(controlIterator, 'real same-seq inbox projection')).value
+  assert.deepEqual(realFrame, frame,
+    'synthesized value equals the real Host projection after ingress, at the same seq')
+
+  // Native-equivalent ProjectionValueStore.apply drops that real frame at seq 8.
   const store = new Map([['inbox', { kind: 'sequenced', seq: frame.seq, value: frame.changes[0].val }]])
   const nativeApply = (key, value, seq) => {
     const row = store.get(key)
     if (row?.kind === 'sequenced' && seq <= row.seq) return
     store.set(key, { kind: 'sequenced', value, seq })
   }
-  nativeApply('inbox', { 'next-turn': [], 'next-step': [] }, 8)
-  assert.deepEqual(store.get('inbox').value, surviving,
-    'a real same-seq projection cannot replace the reconstructed full value')
+  nativeApply('inbox', realFrame.changes[0].val, 8)
+  assert.deepEqual(store.get('inbox').value, renamedSurviving,
+    'the equal-seq real projection cannot replace the reconstructed full value')
 
   // A replayed older claim is not republished. Even if it were, ProjectionValueStore.apply
   // drops seq <= row.seq, so a lower watermark can never roll the store back.
   remoteFollow.queue.push(claim(5))
   assert.equal(await frameWithin(controlIterator, 50), null, 'an older seq is not republished')
   nativeApply('inbox', { 'next-turn': [], 'next-step': [] }, 5)
-  assert.deepEqual(store.get('inbox').value, surviving, 'a stale seq cannot regress the native store')
+  assert.deepEqual(store.get('inbox').value, renamedSurviving, 'a stale seq cannot regress the native store')
   assertNoNamespacedId(hostB)
   control.abort()
   followAbort.abort()
