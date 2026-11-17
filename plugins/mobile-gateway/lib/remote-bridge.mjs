@@ -553,6 +553,65 @@ const hasBinary = (value) => value instanceof Uint8Array || value instanceof Arr
 const binaryLength = (value) => value.byteLength
 
 /**
+ * Spec 039: DSH's `encodeRpcResult` replaces Uint8Array leaves with `null` and
+ * ships the bytes in `attachments: [{ path, bytes }]`. Restore each placeholder
+ * before describing the value so the existing $binary stream path carries it.
+ * Path checks mirror DSH's `parseBinaryResponse`: own string keys on objects,
+ * safe in-bounds integer indexes on arrays, and a target that is exactly null.
+ * A refusal is stable and never includes the bytes.
+ */
+function applyGatewayAttachments(value, attachments) {
+  const refuse = () => ({ ok: false, error: {
+    code: 'internal', message: 'the Host returned an invalid binary attachment',
+  } })
+  const toBytes = (bytes) => {
+    if (bytes instanceof Uint8Array) return bytes
+    if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes)
+    if (Array.isArray(bytes) && bytes.every((item) => Number.isInteger(item) && item >= 0 && item <= 255)) {
+      return Uint8Array.from(bytes)
+    }
+    return undefined
+  }
+  // The root is a holder so an empty path can replace `value` itself (root bytes).
+  const root = { value }
+  for (const attachment of attachments) {
+    if (!isRecord(attachment) || !Array.isArray(attachment.path)) return refuse()
+    const bytes = toBytes(attachment.bytes)
+    if (bytes === undefined) return refuse()
+    let parent = root
+    let key = 'value'
+    for (const segment of attachment.path) {
+      const current = Reflect.get(parent, key)
+      if (typeof current !== 'object' || current === null) return refuse()
+      if (Array.isArray(current)) {
+        if (typeof segment !== 'number' || !Number.isSafeInteger(segment) || segment < 0 || segment >= current.length) return refuse()
+      } else if (typeof segment !== 'string') {
+        return refuse()
+      }
+      if (!Object.hasOwn(current, segment)) return refuse()
+      parent = current
+      key = segment
+    }
+    // The placeholder must be an own data property holding null; an accessor or a
+    // non-writable, non-configurable slot cannot be given bytes without changing
+    // the shape DSH handed us. Preserve the original descriptor flags on replace.
+    const descriptor = Object.getOwnPropertyDescriptor(parent, key)
+    if (!descriptor || !('value' in descriptor) || descriptor.value !== null) return refuse()
+    try {
+      Object.defineProperty(parent, key, {
+        value: bytes,
+        enumerable: descriptor.enumerable,
+        writable: descriptor.writable,
+        configurable: descriptor.configurable,
+      })
+    } catch {
+      return refuse()
+    }
+  }
+  return { ok: true, value: root.value }
+}
+
+/**
  * Describe a result value WITHOUT materializing chunks: either a plain `value`
  * or a lazy `frames()` generator (one frame per binary chunk, `data` replaced
  * by the marker, other fields repeated) plus the raw byte length.
@@ -950,6 +1009,14 @@ export function createRemoteBridge(deps) {
           if (msg.endpoint === 'session/prompt') {
             const prompted = promptSessionId(args)
             if (prompted !== undefined) deps.onPrompt?.(deviceId, prompted)
+          }
+          // Spec 039: the Host gateway extracts binary leaves into attachments and
+          // leaves null placeholders behind. Restore them before describing the
+          // value; a malformed envelope is a stable refusal, never a byte leak.
+          if (Array.isArray(result.attachments) && result.attachments.length > 0) {
+            const restored = applyGatewayAttachments(result.value, result.attachments)
+            if (!restored.ok) { reply({ ok: false, error: restored.error }); return }
+            result.value = restored.value
           }
           const described = describeResultValue(result.value)
           // Transport, not a limit: a result that cannot ride one WS frame (binary,

@@ -1276,6 +1276,23 @@ function failureOf(error) {
   return { code: 'internal', message: error instanceof Error ? error.message : 'the remote call failed', details: {} }
 }
 
+/**
+ * A remote result that still holds bytes has to reach DSH's native gateway as the
+ * attachment envelope it understands: JSON carries a null placeholder and the bytes
+ * travel beside it. Anything else keeps its existing `{ok, value}` shape.
+ */
+function binaryResultEnvelope(value) {
+  // A fresh Uint8Array owns its bytes: a Buffer may be a view into a shared pool,
+  // and handing the original on would alias memory this caller does not own.
+  const copyBytes = (bytes) => new Uint8Array(bytes)
+  if (value instanceof Uint8Array) {
+    return { ok: true, value: null, attachments: [{ path: [], bytes: copyBytes(value) }] }
+  }
+  if (value !== null && typeof value === 'object' && value.data instanceof Uint8Array) {
+    return { ok: true, value: { ...value, data: null }, attachments: [{ path: ['data'], bytes: copyBytes(value.data) }] }
+  }
+  return null
+}
 /** Bounded FIFO the merged streams deliver through. */
 class ValueQueue {
   constructor(max = 4096) {
@@ -2105,8 +2122,8 @@ export class HostRouter {
       if (endpoint === APPROVAL_RESULT_ENDPOINT) return { ok: true, value: await this.#answerCard(target, payload, signal) }
       const forwarded = this.#forwardArgs(args, target.hostId)
       this.#assertNoNamespace(forwarded, target.hostId)
-      const value = await target.connection.call(endpoint, forwarded, { signal })
-      return { ok: true, value: this.#ingress(target.hostId, value, endpoint) }
+      const value = this.#ingress(target.hostId, await target.connection.call(endpoint, forwarded, { signal }), endpoint)
+      return binaryResultEnvelope(value) ?? { ok: true, value }
     } catch (error) {
       return { ok: false, error: failureOf(error) }
     }

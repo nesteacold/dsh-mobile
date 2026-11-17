@@ -127,6 +127,18 @@ function fakeGateway() {
   return gateway
 }
 
+/** Spec 039: a Host gateway whose RPC results carry DSH's binary attachment envelope. */
+function attachmentGateway(makeResult) {
+  const gateway = fakeGateway()
+  gateway.dispatchRpc = async (endpoint, payload, signal, peer) => {
+    gateway.calls.push({ endpoint, payload, peer })
+    // The bridge's host-side constraint checks use the visible session list.
+    if (endpoint === 'session/list') return { ok: true, value: { items: [{ sessionId: gateway.visibleSessionId }] } }
+    return makeResult()
+  }
+  return gateway
+}
+
 async function factory(t, { gateway = fakeGateway(), config = {} } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-008-bridge-'))
   const listeners = {}
@@ -533,6 +545,112 @@ test('T2d: a binary result on remote-call is upgraded to a stream (never inline,
   assert.equal(frames[0].value.data.$binary.offset, 0)
   assert.equal(frames[0].value.name, 'a.bin', 'non-binary fields travel with each chunk')
   assert.ok(Buffer.from(frames[0].value.data.$binary.base64, 'base64').length <= REMOTE_BINARY_CHUNK_BYTES)
+})
+
+test('T2g (spec 039): gateway attachments on workspaceFiles/readBytes are restored before describing, upgraded to a stream and reassembled byte-exact', async (t) => {
+  const bytes = Uint8Array.from({ length: REMOTE_BINARY_CHUNK_BYTES + 10 }, (_, i) => (i * 31 + 7) % 256)
+  const instance = await factory(t, { gateway: attachmentGateway(() => ({
+    ok: true,
+    value: { offset: 0, eof: true, absolutePath: 'a.bin', version: 'v1', data: null },
+    attachments: [{ path: ['data'], bytes }],
+  })) })
+  const { ws } = await desktop(instance)
+  const upgraded = await call(ws, 'workspaceFiles/readBytes', { path: 'a.bin' })
+  assert.equal(upgraded.ok, true, JSON.stringify(upgraded).slice(0, 200))
+  assert.equal(upgraded.streamed, true)
+  assert.match(upgraded.streamId, /^res\.\d+$/)
+  assert.equal(upgraded.value, undefined, 'nothing is duplicated into the one-shot reply')
+  await takeFrame(ws, (f) => f.kind === 'remote-stream-closed' && f.streamId === upgraded.streamId)
+  const frames = framesOf(ws, (f) => f.kind === 'remote-frame' && f.streamId === upgraded.streamId)
+  assert.equal(frames.length, 2, 'the restored bytes are chunked at REMOTE_BINARY_CHUNK_BYTES')
+  assert.equal(frames[0].value.offset, 0, 'the sibling fields ride with every chunk')
+  assert.equal(frames[0].value.absolutePath, 'a.bin')
+  assert.equal(frames[0].value.version, 'v1')
+  assert.equal(frames[0].value.data.$binary.total, bytes.length)
+  const got = Buffer.concat(frames.map((f) => Buffer.from(f.value.data.$binary.base64, 'base64')))
+  assert.deepEqual(got, Buffer.from(bytes), 'reassembles byte-exact')
+})
+
+test('T2h (spec 039): root gateway bytes (path: []) replace a null result and stream as root $binary markers', async (t) => {
+  const bytes = new Uint8Array([0, 1, 2, 253, 254, 255])
+  const instance = await factory(t, { gateway: attachmentGateway(() => ({
+    ok: true, value: null, attachments: [{ path: [], bytes }],
+  })) })
+  const { ws } = await desktop(instance)
+  const upgraded = await call(ws, 'workspaceFiles/readBytes', { path: 'a.bin' })
+  assert.equal(upgraded.ok, true, JSON.stringify(upgraded).slice(0, 200))
+  assert.equal(upgraded.streamed, true)
+  await takeFrame(ws, (f) => f.kind === 'remote-stream-closed' && f.streamId === upgraded.streamId)
+  const frames = framesOf(ws, (f) => f.kind === 'remote-frame' && f.streamId === upgraded.streamId)
+  assert.equal(frames.length, 1)
+  assert.equal(frames[0].value.$binary.total, bytes.length)
+  assert.deepEqual(Buffer.from(frames[0].value.$binary.base64, 'base64'), Buffer.from(bytes))
+})
+
+test('T2i (spec 039): malformed gateway attachments are refused with a stable internal error and leak no bytes', async () => {
+  const bytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef])
+  const frozen = {}
+  Object.defineProperty(frozen, 'data', { value: null, enumerable: true, writable: false, configurable: false })
+  const accessor = {}
+  Object.defineProperty(accessor, 'data', { get: () => null, enumerable: true, configurable: true })
+  const cases = [
+    ['non-array path', { data: null }, { path: 'data', bytes }],
+    ['unknown own key', { data: null }, { path: ['missing'], bytes }],
+    ['prototype key', { data: null }, { path: ['__proto__'], bytes }],
+    ['array index out of bounds', { items: [null] }, { path: ['items', 1], bytes }],
+    ['string array index', { items: [null] }, { path: ['items', '0'], bytes }],
+    ['non-null placeholder', { data: 'not a placeholder' }, { path: ['data'], bytes }],
+    ['non-null root', { data: null }, { path: [], bytes }],
+    ['segment through a primitive', { data: null }, { path: ['data', 'x'], bytes }],
+    ['invalid bytes', { data: null }, { path: ['data'], bytes: 'not bytes' }],
+    ['frozen null placeholder', frozen, { path: ['data'], bytes }],
+    ['accessor placeholder', accessor, { path: ['data'], bytes }],
+  ]
+  for (const [label, value, attachment] of cases) {
+    const sent = []
+    const ws = { readyState: 1, bufferedAmount: 0, send: (text) => sent.push(JSON.parse(text)) }
+    const bridge = createRemoteBridge({
+      getGateway: () => attachmentGateway(() => ({ ok: true, value, attachments: [attachment] })),
+      createPeer: () => ({ principal: { kind: 'owner' } }),
+      getDevice: () => ({ kind: 'desktop', scopes: ALL_REMOTE }),
+      decideApproval: async () => ({ kind: 'error', code: 'bad-request', message: 'n/a' }),
+      log: () => {},
+    })
+    const channel = bridge.attach(ws, 'dev-malformed-attachment')
+    await channel.call({ requestId: `bad-${label}`, endpoint: 'workspaceFiles/readBytes', args: { path: 'a.bin' } })
+    const reply = sent.at(-1)
+    assert.equal(reply.ok, false, label)
+    assert.deepEqual(reply.error, { code: 'internal', message: 'the Host returned an invalid binary attachment' }, label)
+    assert.equal(JSON.stringify(reply).includes('3q2+7w=='), false, `${label}: the reply carries no bytes`)
+    assert.equal(sent.some((f) => f.kind === 'remote-frame'), false, `${label}: no stream was opened`)
+    channel.close()
+  }
+})
+
+test('T2j (spec 039): a null placeholder keeps its own descriptor flags when bytes are restored', async () => {
+  const bytes = Uint8Array.from([1, 2, 3, 4])
+  const value = { offset: 0, eof: true }
+  Object.defineProperty(value, 'data', { value: null, enumerable: false, writable: true, configurable: false })
+  const sent = []
+  const ws = { readyState: 1, bufferedAmount: 0, send: (text) => sent.push(JSON.parse(text)) }
+  const bridge = createRemoteBridge({
+    getGateway: () => attachmentGateway(() => ({ ok: true, value, attachments: [{ path: ['data'], bytes }] })),
+    createPeer: () => ({ principal: { kind: 'owner' } }),
+    getDevice: () => ({ kind: 'desktop', scopes: ALL_REMOTE }),
+    decideApproval: async () => ({ kind: 'error', code: 'bad-request', message: 'n/a' }),
+    log: () => {},
+  })
+  const channel = bridge.attach(ws, 'dev-descriptor')
+  await channel.call({ requestId: 'descriptor', endpoint: 'workspaceFiles/readBytes', args: { path: 'a.bin' } })
+  const reply = sent.find((f) => f.kind === 'remote-result')
+  assert.equal(reply.ok, true, JSON.stringify(reply).slice(0, 200))
+  const descriptor = Object.getOwnPropertyDescriptor(value, 'data')
+  assert.equal(descriptor.value instanceof Uint8Array, true, 'the null placeholder became bytes')
+  assert.deepEqual(descriptor.value, bytes, 'the bytes are byte-exact')
+  assert.equal(descriptor.enumerable, false, 'the original enumerable flag is preserved')
+  assert.equal(descriptor.writable, true, 'the original writable flag is preserved')
+  assert.equal(descriptor.configurable, false, 'the original configurable flag is preserved')
+  channel.close()
 })
 
 test('T2e: with maxResultBytes configured, a serialized one-shot result above it is refused, a small one is served (unit)', async () => {

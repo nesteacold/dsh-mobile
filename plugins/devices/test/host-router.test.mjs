@@ -400,6 +400,73 @@ test('workspaceFiles/list without a tagged scope stays Local', async () => {
   assert.equal(hostB.calls.length, 0, 'an untagged scope is not sent to a remote')
 })
 
+// Spec 039: a remote readBytes result carries real bytes in `data`. The native
+// gateway cannot put them in JSON, so the router must hand back DSH's attachment
+// envelope with a null placeholder; otherwise the client validates `data: null`
+// and the Document Preview fails with `path:['data'] invalid input`.
+test('a tagged remote workspaceFiles/readBytes wraps Buffer data in an attachment', async () => {
+  const raw = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff])
+  // A function reply keeps the Buffer intact (a cloned reply would lose its class).
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: {
+    'workspaceFiles/readBytes': () => ({
+      offset: 0, eof: true, absolutePath: '/srv/host/files/pic.png', version: 'v3', data: raw,
+    }),
+  } })
+  const harness = createHarness({ remotes: [hostB] })
+
+  const answer = await harness.gateway.dispatchRpc('workspaceFiles/readBytes',
+    { args: { workspaceFileScopeId: 'h:hostB:s1', path: 'pic.png', offset: 0, maxBytes: 65536 } },
+    undefined, {})
+  assert.equal(answer.ok, true)
+  assert.equal(answer.value.data, null, 'the JSON payload keeps the null placeholder')
+  assert.deepEqual(answer.value, {
+    offset: 0, eof: true, absolutePath: '/srv/host/files/pic.png', version: 'v3', data: null,
+  }, 'the other result fields are kept')
+  assert.equal(answer.attachments.length, 1)
+  assert.deepEqual(answer.attachments[0].path, ['data'])
+  const bytes = answer.attachments[0].bytes
+  assert.equal(bytes.constructor, Uint8Array, 'a Buffer is normalized to a plain Uint8Array')
+  assert.deepEqual([...bytes], [...raw], 'the attachment is byte-exact')
+  assert.notEqual(bytes.buffer, raw.buffer, 'the attachment does not alias the remote Buffer')
+  assert.equal(hostB.calls[0].endpoint, 'workspaceFiles/readBytes')
+  assert.deepEqual(hostB.calls[0].args, { workspaceFileScopeId: 's1', path: 'pic.png', offset: 0, maxBytes: 65536 })
+})
+
+test('a root-level binary remote result becomes a root attachment', async () => {
+  const raw = Buffer.from([0, 1, 2, 254, 255])
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'custom/rootBytes': () => raw } })
+  const harness = createHarness({ remotes: [hostB] })
+
+  const answer = await harness.gateway.dispatchRpc('custom/rootBytes',
+    { args: { workspaceFileScopeId: 'h:hostB:s1' } }, undefined, {})
+  assert.deepEqual(Object.keys(answer).sort(), ['attachments', 'ok', 'value'])
+  assert.equal(answer.ok, true)
+  assert.equal(answer.value, null)
+  assert.equal(answer.attachments.length, 1)
+  assert.deepEqual(answer.attachments[0].path, [])
+  assert.equal(answer.attachments[0].bytes.constructor, Uint8Array)
+  assert.deepEqual([...answer.attachments[0].bytes], [...raw])
+  assert.notEqual(answer.attachments[0].bytes.buffer, raw.buffer)
+})
+
+test('a remote result with a null data placeholder and a local binary result stay unchanged', async () => {
+  const plain = { offset: 0, eof: true, absolutePath: '/srv/host/files/pic.png', version: 'v3', data: null }
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'workspaceFiles/readBytes': () => plain } })
+  const harness = createHarness({ remotes: [hostB] })
+  const answer = await harness.gateway.dispatchRpc('workspaceFiles/readBytes',
+    { args: { workspaceFileScopeId: 'h:hostB:s1', path: 'pic.png' } }, undefined, {})
+  assert.deepEqual(answer, { ok: true, value: plain })
+  assert.equal(Object.hasOwn(answer, 'attachments'), false)
+
+  const localValue = { data: Buffer.from([1, 2, 3]), offset: 0 }
+  const localHarness = createHarness({ dispatchRpc: () => ({ ok: true, value: localValue }) })
+  const local = await localHarness.gateway.dispatchRpc('workspaceFiles/readBytes',
+    { args: { workspaceFileScopeId: 's1', path: 'local.png' } }, undefined, {})
+  assert.equal(local.value, localValue, 'Local keeps its exact reply object')
+  assert.equal(Object.hasOwn(local, 'attachments'), false)
+  assert.equal(localHarness.remotes.length, 0)
+})
+
 test('a global call stays Local by default and follows the host hint', async () => {
   const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'llm/listProviders': { providers: ['b-only'] } } })
   const harness = createHarness({ remotes: [hostB] })
