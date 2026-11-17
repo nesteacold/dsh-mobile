@@ -1077,6 +1077,30 @@ function rangeEndOf(value) {
 const isSnapshotFrame = (value) => Number.isSafeInteger(value.cursor) || isPlainObject(value.header)
 
 /**
+ * The part of DSH rc.3's opening contract a cached frame must meet before it may be
+ * handed to a reader in `openState:'loading'` (dsh-api-session-controller
+ * `transport.js`: a `snapshot` without `assistantStream` is a RemoteError;
+ * dsh-api-gateway `journal-stream.js`: the first change must be the opening page).
+ * The event envelope is checked only enough to refuse a torn copy: DSH still runs
+ * its full event validator on every frame, and a bad event fails visibly there.
+ * No snapshot, cursor, revision or event field is invented or repaired here (R3).
+ */
+const WIRE_EVENT_KEYS = new Set(['type', 'seq', 'time', 'data', 'ignorable', 'surfaceOp', 'sourceEventSeqs'])
+const isOpeningSnapshotFrame = (value) => {
+  if (!isPlainObject(value) || value.type !== 'snapshot' || !Number.isSafeInteger(value.cursor)) return false
+  if (!Array.isArray(value.records) || !value.records.every((record) => {
+    const event = isPlainObject(record) ? record.event : null
+    return isPlainObject(event) && Object.keys(event).every((key) => WIRE_EVENT_KEYS.has(key))
+      && typeof event.type === 'string' && Number.isSafeInteger(event.seq) && event.seq >= 0
+      && (event.time === undefined || Number.isSafeInteger(event.time))
+      && Object.hasOwn(event, 'data') && event.data !== undefined
+      && (event.ignorable === undefined || event.ignorable === true)
+  })) return false
+  const baseline = value.assistantStream
+  return isPlainObject(baseline) && Number.isSafeInteger(baseline.revision)
+}
+
+/**
  * What a LIVE frame of an already-open follow contributes. Only a durable event is
  * de-duplicated (by `seq`, the identity the Host commits it under — never its text, * so the same prompt sent twice stays two rows); every other frame is the Host's
  * own live traffic and is delivered as-is. Assistant-stream frames in particular are
@@ -3202,6 +3226,9 @@ export class HostRouter {
     let lastSeq = null
     /** Whether a frame ever reached the reader: a later opening is a RESUME. */
     let opened = false
+    /** R3 boundary: only a delivered opening snapshot ends the LOADING state. Pre-opening
+     * frames are not an opening and must not disable the cache/visible-failure fallback. */
+    let openingSnapshotDelivered = false
     /**
      * The durable sequence the FIRST opening snapshot named: from then on a snapshot
      * must reach exactly that cursor (and only the first one is the reader's opening).
@@ -3216,9 +3243,44 @@ export class HostRouter {
     let opening = null
     // The first attempt is awaited like a plain open always was: a caller that got a
     // stream from here has one open, and a refusal it can never retry still rejects.
+    // Every exit below goes through this once-only settle: a first open may never be
+    // left pending, because DSH rc.3 stays in `openState:'loading'` until it settles.
     let settleFirst
     const firstAttempt = new Promise((resolve, reject) => { settleFirst = { resolve, reject } })
     firstAttempt.catch(() => {})
+    let firstSettled = false
+    const settleFirstOnce = {
+      resolve() { if (firstSettled) return; firstSettled = true; settleFirst.resolve() },
+      reject(error) { if (firstSettled) return; firstSettled = true; settleFirst.reject(error) },
+    }
+    /**
+     * While no opening snapshot has reached the reader, DSH stays in `loading`: a
+     * pre-opening frame does not count. Replay the cached transcript read-only when
+     * it can open a follow, otherwise fail visibly. Only after a real opening snapshot
+     * is this an open follow, whose link failures resume normally (spec 038 R3).
+     */
+    const firstOpenFallback = () => {
+      if (openingSnapshotDelivered) return false
+      const frames = this.#cachedFollowFrames(hostId, args)
+      if (frames) {
+        try {
+          this.#log(`session/follow of ${hostId} is offline: replaying the cached transcript`)
+          for (const frame of frames) queue.push(this.#ingress(hostId, frame, 'cached transcript'))
+          openingSnapshotDelivered = true
+          queue.close()
+          settleFirstOnce.resolve()
+        } catch (error) {
+          settleFirstOnce.reject(error)
+          queue.fail(error)
+        }
+        return true
+      }
+      const terminal = new HostRouterError('remote/host-offline',
+        `remote host ${hostId} is offline and no cached transcript is available; the session history could not be loaded`, { hostId })
+      settleFirstOnce.reject(terminal)
+      queue.fail(terminal)
+      return true
+    }
     void (async () => {
       let attempt = 0
       /** Consecutive attempts that ended in a DESYNC without delivering a frame. */
@@ -3235,14 +3297,22 @@ export class HostRouter {
         countedPageSeqs = new Set()
         try {
           // The host is connected when this pump starts; if it drops in between, the
-          // wait below is bounded by the reader, not by a fixed timeout.
+          // wait below is bounded by the reader, not by a fixed timeout. A FIRST open
+          // whose host vanished there must still settle: waiting for a host that is no
+          // longer in the inventory is exactly the "Loading history..." hang.
           const host = this.#hostById(hostId)
+          if (!host && firstOpenFallback()) return
           if (!host) { await this.#awaitHost(hostId, lifetime.signal); continue }
+          // A listed host can still be mid-drop: `#route` saw an online row, but its
+          // link is no longer usable. `openStream` would then either wait for a dial
+          // that never finishes or resolve a stream that fails before its snapshot.
+          const linkState = typeof host.connection?.state === 'string' ? host.connection.state : null
+          if (linkState !== null && linkState !== 'online' && firstOpenFallback()) return
           const source = await host.connection.openStream(SESSION_FOLLOW_ENDPOINT, args, { signal: lifetime.signal })
           // The attempt counter is NOT reset here: a Host that accepts the open and then
           // immediately DESYNCs would answer "open succeeded" every time and be retried
           // at the minimum 100 ms forever. Only a delivered frame (`progressed` below, // handled after the attempt) counts as the link working.
-          if (first) { first = false; settleFirst.resolve() }
+          if (first) { first = false; settleFirstOnce.resolve() }
           // Whether THIS attempt resumes a stream the reader already holds. A re-open
           // replaces only the replayed opening (`followFrames`); everything after it
           // stays the Host's live traffic, so a new turn streams on that connection too.
@@ -3318,7 +3388,7 @@ export class HostRouter {
             if (overflow) {
               const terminal = resumeOverflowError(hostId, overflow.count)
               this.#log(`session/follow for ${hostId} stopped (${STREAM_RESUME_OVERFLOW_CODE}): ${overflow.count} unseen events in one page`)
-              if (first) { first = false; settleFirst.reject(terminal) }
+              if (first) { first = false; settleFirstOnce.reject(terminal) }
               queue.fail(terminal)
               return
             }
@@ -3338,6 +3408,10 @@ export class HostRouter {
               // must not be replaced by an empty inbox the Host has not sent.
               this.#fallbackInboxProjection(hostId, controlSessionId, frame)
               opened = true
+              // A snapshot-shaped frame is the reader's opening boundary even if a
+              // malformed one lacks the assistant baseline; only NON-snapshot frames
+              // leave DSH loading and allow the R3 fallback (cache validation is stricter).
+              if (isSnapshotFrame(frame)) openingSnapshotDelivered = true
               progressed = true
               queue.push(renamed)
             }
@@ -3405,10 +3479,14 @@ export class HostRouter {
             const terminal = Object.assign(resumeOverflowError(hostId, missing - (lastSeq ?? -1) - 1),
               { message: `the re-joined page left a gap from seq ${missing}; the follow was stopped instead of skipping it` })
             this.#log(`session/follow for ${hostId} stopped (${STREAM_RESUME_OVERFLOW_CODE}): ${terminal.message}`)
-            if (first) { first = false; settleFirst.reject(terminal) }
+            if (first) { first = false; settleFirstOnce.reject(terminal) }
             queue.fail(terminal)
             return
           }
+          // A stream that ends before its opening snapshot is an empty answer to a
+          // first open: settle it from the cache (or visibly) instead of leaving DSH
+          // waiting on a snapshot that will not arrive.
+          if (firstOpenFallback()) return
         } catch (error) {
           if (lifetime.signal.aborted) break
           // A re-opened page left holding an event past a hole, and the Host dropped
@@ -3421,17 +3499,21 @@ export class HostRouter {
             const terminal = Object.assign(resumeOverflowError(hostId, missing - (lastSeq ?? -1) - 1),
               { message: `the re-joined page left a gap from seq ${missing}; the follow was stopped instead of skipping it` })
             this.#log(`session/follow for ${hostId} stopped (${STREAM_RESUME_OVERFLOW_CODE}): ${terminal.message}`)
-            if (first) { first = false; settleFirst.reject(terminal) }
+            if (first) { first = false; settleFirstOnce.reject(terminal) }
             queue.fail(terminal)
             return
           }
           // A refusal the Host itself produced is not going to change by re-opening:
           // report it and end, exactly as a single attempt always did.
           if (!isLinkFailure(error)) {
-            if (first) { first = false; settleFirst.reject(error) }
+            if (first) { first = false; settleFirstOnce.reject(error) }
             queue.fail(error)
             return
           }
+          // The link failed before the reader saw a snapshot. This is still the FIRST
+          // open, not an open follow, so it must not wait for the Host behind an empty
+          // queue: replay the cache or fail with a visible remote error (spec 038 R3).
+          if (firstOpenFallback()) return
           if (error?.code === STREAM_DESYNC_CODE) {
             // Counted only while the reader got nothing: a desync AFTER a delivered frame
             // is the first of a new series, not a continuation of a stuck one.
@@ -3444,7 +3526,7 @@ export class HostRouter {
                 `the remote Host's session stream keeps arriving out of order (${desyncs} times without a frame); the follow was stopped`, { hostId }),
                 { cause: error })
               this.#log(`session/follow for ${hostId} stopped (${STREAM_DESYNC_REPEATED_CODE}) after ${desyncs} out-of-order streams with no frame`)
-              if (first) { first = false; settleFirst.reject(terminal) }
+              if (first) { first = false; settleFirstOnce.reject(terminal) }
               queue.fail(terminal)
               return
             }
@@ -3452,7 +3534,7 @@ export class HostRouter {
             desyncs = 0
           }
           this.#log(`session/follow for ${hostId} stopped (${error?.code ?? error?.closeCode ?? 'link'}); it resumes with the link`)
-          if (first) { first = false; settleFirst.resolve() }
+          if (first) { first = false; settleFirstOnce.resolve() }
         }
         if (lifetime.signal.aborted) break
         // A frame reached the reader: the link works, so the next interruption starts over
@@ -3465,12 +3547,15 @@ export class HostRouter {
       }
     })().catch((error) => {
       if (!lifetime.signal.aborted) queue.fail(error)
-      settleFirst.reject(error)
+      settleFirstOnce.reject(error)
     }).finally(() => {
       signal?.removeEventListener?.('abort', onAbort)
       this.#merges.delete(stop)
       this.#untrackFollow(hostId, stop)
       queue.close()
+      // An already-aborted open exits the pump before its first iteration. Settle
+      // here too, so no path can leave the caller waiting for a snapshot.
+      settleFirstOnce.reject(Object.assign(new Error('the remote session follow was cancelled'), { code: 'cancelled' }))
     })
     await firstAttempt
     // Abandoning the iterator is a cancellation too: the pump must not keep a link,
@@ -3521,16 +3606,29 @@ export class HostRouter {
     })
   }
 
-  /** The local copy of a session whose host is offline, as a read-only stream. */
-  #replayCachedFollow(payload, hostId) {
+  /**
+   * The cached frames that can OPEN a follow: `cache.read` starts at the newest
+   * snapshot, but a torn or partial one must not be handed to a reader that is
+   * waiting for an opening snapshot (spec 038 R3).
+   */
+  #cachedFollowFrames(hostId, args) {
     const cache = this.#cache
     if (!cache || typeof hostId !== 'string') return null
-    const sessionId = followSessionId(this.#forwardArgs(payload, hostId))
+    const sessionId = followSessionId(args)
     if (!sessionId) return null
     let frames
     try { frames = cache.read(hostId, sessionId) } catch { return null }
     if (!Array.isArray(frames) || frames.length === 0) return null
-    this.#log(`session ${sessionId} of ${hostId} is offline: replaying the cached transcript`)
+    if (!isOpeningSnapshotFrame(frames[0])) return null
+    return frames
+  }
+
+  /** The local copy of a session whose host is offline, as a read-only stream. */
+  #replayCachedFollow(payload, hostId) {
+    if (typeof hostId !== 'string') return null
+    const frames = this.#cachedFollowFrames(hostId, this.#forwardArgs(payload, hostId))
+    if (!frames) return null
+    this.#log(`session/follow of ${hostId} is offline: replaying the cached transcript`)
     // Read-only by construction: no request reaches the Host, and the stream ends
     // where the cache ends (the UI shows it behind the offline banner).
     const router = this

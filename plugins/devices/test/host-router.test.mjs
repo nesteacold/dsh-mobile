@@ -3527,6 +3527,215 @@ test('a resumed session/follow honours an overflow marker before walking the Hos
   await iterator.return()
 })
 
+// -- spec 038 R3: the FIRST follow open must settle, never wait loading --------
+
+/** Bound a promise so a first-open hang fails this test instead of the whole run. */
+function bounded(promise, label, ms = 1500) {
+  return Promise.race([
+    promise,
+    new Promise((_resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${label}: still pending after ${ms} ms`)), ms)
+      timer.unref?.()
+    }),
+  ])
+}
+
+const cachedFollow = () => [
+  { type: 'snapshot', header: { version: 4, id: 's1' }, cursor: 1, records: [],
+    projections: { asOfSeq: 1, values: {} }, assistantStream: { revision: 0 } },
+  { type: 'event', event: { seq: 7, type: 'user/message', data: { sessionId: 's1', text: 'cached line' } } },
+]
+
+const followArgs = () => ({ args: { request: { address: { kind: 'session', sessionId: 'h:hostB:s1' } } } })
+
+/**
+ * Router with an in-memory transcript cache and a host that stays in the inventory
+ * while its link state (or its presence) is controlled by the test.
+ */
+function createFirstOpenHarness({ cached = null, state = 'online', present = () => true, openStream } = {}) {
+  const gateway = {
+    // rc.1 arity, so the A1.1 self-test installs the wrapper.
+    async dispatchRpc(endpoint, payload, signal, peer) { // eslint-disable-line no-unused-vars
+      return { ok: true, value: {} }
+    },
+    async openWireStream(endpoint, payload, uplink, peer, signal, control, window) { // eslint-disable-line no-unused-vars
+      throw new Error('the local opener must not serve a remote follow')
+    },
+  }
+  const host = {
+    hostId: 'hostB', hostName: 'Host B', online: true,
+    connection: {
+      state,
+      async openStream(endpoint, args, options) { return openStream(endpoint, args, options) },
+    },
+  }
+  const logs = []
+  const router = createHostRouter({
+    gateway, dshVersion: PINNED_DSH_VERSION,
+    cache: { append() {}, read: () => cached },
+    hosts: () => (present() ? [host] : []),
+    knownHosts: () => [{ hostId: 'hostB', hostName: 'Host B' }],
+    onHostsChanged: () => () => {},
+    log: (line) => logs.push(line),
+  })
+  router.install()
+  return { gateway, router, logs }
+}
+
+test('the first follow open on a still-listed offline Host replays its cache immediately', async () => {
+  let opened = 0
+  const h = createFirstOpenHarness({ cached: cachedFollow(), state: 'offline',
+    openStream: async () => { opened += 1; throw new Error('no stream may be opened on a dead link') } })
+  try {
+    const control = new AbortController()
+    const source = await bounded(h.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, control.signal, control, 64), 'the first open')
+    const iterator = source[Symbol.asyncIterator]()
+    const snapshot = (await nextFrame(iterator, 'cached opening snapshot')).value
+    assert.equal(snapshot.type, 'snapshot')
+    assert.equal(snapshot.header.id, 'h:hostB:s1', 'the cached frame is ingressed once')
+    assert.deepEqual(snapshot.assistantStream, { revision: 0 }, 'the Host frame is used verbatim')
+    const event = (await nextFrame(iterator, 'cached event')).value
+    assert.equal(event.event.seq, 7)
+    assert.equal(event.event.data.sessionId, 'h:hostB:s1')
+    assert.equal((await nextFrame(iterator, 'cache boundary')).done, true, 'the replay ends at the cache boundary')
+    assert.equal(opened, 0, 'the dead link was never asked for a stream')
+    control.abort()
+    await iterator.return()
+  } finally { h.router.uninstall() }
+})
+
+test('a Host vanishing between the route and the stream open settles the first open', async () => {
+  // #isPurelyLocal and #route read the host set before the pump's own #hostById;
+  // the fourth read is the pump, where the Host is already gone.
+  let reads = 0
+  let opened = 0
+  const h = createFirstOpenHarness({ cached: cachedFollow(),
+    present: () => { reads += 1; return reads <= 3 },
+    openStream: async () => { opened += 1; throw new Error('the Host was gone before the open') } })
+  try {
+    const control = new AbortController()
+    const source = await bounded(h.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, control.signal, control, 64), 'the first open')
+    const iterator = source[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'cached snapshot')).value.type, 'snapshot')
+    assert.equal((await nextFrame(iterator, 'cached event')).value.event.seq, 7)
+    assert.equal((await nextFrame(iterator, 'cache boundary')).done, true)
+    assert.equal(opened, 0, 'no stream was opened on a vanished Host')
+    control.abort()
+    await iterator.return()
+  } finally { h.router.uninstall() }
+})
+
+test('a first follow open with no cache fails visibly instead of staying in Loading history', async () => {
+  const offline = createFirstOpenHarness({ state: 'offline' })
+  try {
+    await assert.rejects(() => bounded(offline.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, new AbortController().signal, new AbortController(), 64), 'the offline open'),
+    (error) => error.code === 'remote/host-offline')
+  } finally { offline.router.uninstall() }
+
+  let reads = 0
+  const vanished = createFirstOpenHarness({ present: () => { reads += 1; return reads <= 3 } })
+  try {
+    await assert.rejects(() => bounded(vanished.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, new AbortController().signal, new AbortController(), 64), 'the vanished Host open'),
+    (error) => error.code === 'remote/host-offline')
+  } finally { vanished.router.uninstall() }
+})
+
+test('a cached snapshot without the Host assistantStream baseline fails visibly', async () => {
+  // DSH rc.3 rejects a `snapshot` frame that omits `assistantStream` before it ever
+  // reaches `openState:'open'`; replaying such a cached copy would just move the hang.
+  const torn = cachedFollow().map((frame, index) => index === 0
+    ? { type: 'snapshot', header: { version: 4, id: 's1' }, cursor: 1, records: [] } : frame)
+  const h = createFirstOpenHarness({ cached: torn, state: 'offline' })
+  try {
+    await assert.rejects(() => bounded(h.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, new AbortController().signal, new AbortController(), 64), 'the torn-cache open'),
+    (error) => error.code === 'remote/host-offline')
+  } finally { h.router.uninstall() }
+})
+
+test('a frame before the opening snapshot does not disable the first-open fallback', async () => {
+  let opened = 0
+  const h = createFirstOpenHarness({ cached: cachedFollow(), openStream: async () => {
+    opened += 1
+    return (async function* preOpening() {
+      // A non-snapshot frame can arrive before the opening snapshot; DSH is still
+      // loading here, so a later link failure must settle from the cache.
+      yield { type: 'event', event: { seq: 99, type: 'assistant/message', data: { sessionId: 's1', text: 'early' } } }
+      throw Object.assign(new Error('the link dropped before the snapshot'), { closeCode: 1006 })
+    })()
+  } })
+  try {
+    const control = new AbortController()
+    const source = await h.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, control.signal, control, 64)
+    const iterator = source[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'pre-opening frame')).value.event.seq, 99)
+    assert.equal((await nextFrame(iterator, 'cached snapshot')).value.type, 'snapshot')
+    assert.equal((await nextFrame(iterator, 'cached event')).value.event.seq, 7)
+    assert.equal((await nextFrame(iterator, 'cache boundary')).done, true)
+    assert.equal(opened, 1, 'the pre-opening failure did not reopen the Host stream')
+    control.abort()
+    await iterator.return()
+  } finally { h.router.uninstall() }
+})
+
+test('a pre-opening frame followed by a clean end fails visibly when no cache can open', async () => {
+  let opened = 0
+  const h = createFirstOpenHarness({ openStream: async () => {
+    opened += 1
+    return (async function* preOpening() {
+      yield { type: 'event', event: { seq: 99, type: 'assistant/message', data: { sessionId: 's1', text: 'early' } } }
+    })()
+  } })
+  try {
+    const control = new AbortController()
+    const source = await h.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, control.signal, control, 64)
+    const iterator = source[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'pre-opening frame')).value.event.seq, 99)
+    await assert.rejects(() => nextFrame(iterator, 'the visible first-open failure'),
+      (error) => error.code === 'remote/host-offline')
+    assert.equal(opened, 1, 'no reopen waited behind the unfinished opening')
+    control.abort()
+    await iterator.return()
+  } finally { h.router.uninstall() }
+})
+
+test('an already-open follow still resumes after its link fails', async () => {
+  const live = createQueue()
+  let opened = 0
+  const h = createFirstOpenHarness({ openStream: async () => {
+    opened += 1
+    if (opened === 1) return (async function* first() {
+      yield { type: 'snapshot', header: { version: 4, id: 's1' }, cursor: 1, records: [],
+        projections: { asOfSeq: 1, values: {} }, assistantStream: { revision: 0 } }
+      throw Object.assign(new Error('the link dropped'), { closeCode: 1006 })
+    })()
+    return live
+  } })
+  try {
+    const control = new AbortController()
+    const source = await h.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, control.signal, control, 64)
+    const iterator = source[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'live opening')).value.type, 'snapshot')
+    const deadline = Date.now() + 1500
+    while (opened < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(opened, 2, `the open follow re-opened after the link failure (opens=${opened})`)
+    live.push({ type: 'snapshot', header: { version: 4, id: 's1' }, cursor: 1, records: [],
+      projections: { asOfSeq: 1, values: {} }, assistantStream: { revision: 0 } })
+    live.push({ type: 'event', event: { seq: 2, type: 'user/message', data: { sessionId: 's1', text: 'after reconnect' } } })
+    const resumed = (await nextFrame(iterator, 'the resumed follow')).value
+    assert.equal(resumed.event.seq, 2, 'the reader keeps receiving live frames after reconnect')
+    control.abort()
+    await iterator.return()
+  } finally { h.router.uninstall() }
+})
+
 test('a resumed session/follow bounds an unmarked huge created end at MAX_RESUME_GAP', async () => {
   // The same huge end BEFORE the re-open's snapshot has no marker to short-circuit:
   // the pump's own bound must stop inserting once the page Set crosses the gap.

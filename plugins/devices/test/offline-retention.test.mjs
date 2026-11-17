@@ -42,7 +42,7 @@ function queue() {
   }
 }
 
-function harness({ dir = tempDir(), workspaces = [], sessions = [] } = {}) {
+function harness({ dir = tempDir(), workspaces = [], sessions = [], offlineHostListed = false } = {}) {
   const gateway = {
     async dispatchRpc(endpoint, payload, signal, peer) { // eslint-disable-line no-unused-vars
       return { ok: true, value: { items: endpoint === 'session/list' ? [] : {} } }
@@ -56,6 +56,7 @@ function harness({ dir = tempDir(), workspaces = [], sessions = [] } = {}) {
     },
   }
   const remoteQueue = queue()
+  let remoteOpens = 0
   const connection = {
     state: 'online',
     async call(endpoint) {
@@ -63,6 +64,7 @@ function harness({ dir = tempDir(), workspaces = [], sessions = [] } = {}) {
       return {}
     },
     async openStream(endpoint) {
+      remoteOpens += 1
       const stream = queue()
       if (endpoint === 'workspace/follow') {
         stream.push({ type: 'baseline', value: {
@@ -80,13 +82,20 @@ function harness({ dir = tempDir(), workspaces = [], sessions = [] } = {}) {
   const cache = createSessionCache({ dir: path.join(dir, 'sessions') })
   const router = createHostRouter({
     gateway, dshVersion: PINNED_DSH_VERSION, retention, cache, mergeBaselineTimeoutMs: 30,
-    hosts: () => (connected.has('hostB') ? [{ hostId: 'hostB', hostName: 'Host B', connection, online: true }] : []),
+    // A link can still be in the inventory after it died: the route succeeds, but
+    // its connection state is no longer online. The first open must use the cache.
+    hosts: () => (connected.has('hostB')
+      ? [{ hostId: 'hostB', hostName: 'Host B', connection, online: true }]
+      : (offlineHostListed
+        ? [{ hostId: 'hostB', hostName: 'Host B', connection: { ...connection, state: 'offline' }, online: true }]
+        : [])),
     knownHosts: () => [{ hostId: 'hostB', hostName: 'Host B' }],
     onHostsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener) },
   })
   router.install()
   return {
     dir, router, gateway, connection, retention, cache, remoteQueue,
+    get remoteOpens() { return remoteOpens },
     disconnect() { connected.delete('hostB'); notify() },
     reconnect() { connected.add('hostB'); notify() },
     close() { router.uninstall() },
@@ -203,7 +212,8 @@ test('session rows outlive the link, marked cached, and come from the persisted 
 test('an offline session/follow replays only the cached read-only frames', async () => {
   const h = harness()
   try {
-    h.cache.append('hostB', 's1', { type: 'snapshot', cursor: 1, records: [], projections: { asOfSeq: 1, values: {} } })
+    h.cache.append('hostB', 's1', { type: 'snapshot', cursor: 1, records: [],
+      projections: { asOfSeq: 1, values: {} }, assistantStream: { revision: 0 } })
     h.cache.append('hostB', 's1', { type: 'event', event: { type: 'user/message', seq: 2, data: {} } })
     h.disconnect()
     const stream = await h.gateway.openWireStream('session/follow',
@@ -217,5 +227,26 @@ test('an offline session/follow replays only the cached read-only frames', async
     assert.equal(second.event.seq, 2)
     const end = await nextFrame(iterator, 'cache boundary')
     assert.equal(end.done, true, 'the stream ends where the cache ends')
+  } finally { h.close(); cleanup(h.dir) }
+})
+
+test('a first follow open on a dead link still listed in the inventory replays its cache', async () => {
+  const h = harness({ offlineHostListed: true })
+  try {
+    h.cache.append('hostB', 's1', { type: 'snapshot', header: { version: 4, id: 's1' }, cursor: 1,
+      records: [], projections: { asOfSeq: 1, values: {} }, assistantStream: { revision: 0 } })
+    h.cache.append('hostB', 's1', { type: 'event', event: { type: 'user/message', seq: 2, data: { sessionId: 's1' } } })
+    h.disconnect()
+    const opened = await Promise.race([
+      h.gateway.openWireStream('session/follow',
+        { args: { request: { address: { kind: 'session', sessionId: 'h:hostB:s1' } } } },
+        undefined, {}, new AbortController().signal, new AbortController(), 64),
+      delay(1500).then(() => { throw new Error('the first open stayed pending on the dead link') }),
+    ])
+    assert.equal(h.remoteOpens, 0, 'no stream was opened on the dead link')
+    const iterator = opened[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'cached snapshot')).value.type, 'snapshot')
+    assert.equal((await nextFrame(iterator, 'cached event')).value.event.seq, 2)
+    assert.equal((await nextFrame(iterator, 'cache boundary')).done, true)
   } finally { h.close(); cleanup(h.dir) }
 })

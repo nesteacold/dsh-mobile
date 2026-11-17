@@ -248,6 +248,10 @@ await check('real gateway: offline workspace/session view, pending prompt and on
     services: { typertGateway: desktopCarrier } })
   const workspaceControl = new AbortController()
   let workspace
+  let followControl
+  let cachedFollow
+  let offlineFollowControl
+  let offlineFollow
   try {
     const remoteId = await pairDesktop(gateway, mounted)
     const remote = await until(async () => {
@@ -270,6 +274,20 @@ await check('real gateway: offline workspace/session view, pending prompt and on
     assert.equal(online.ok, true, JSON.stringify(online))
     assert.deepEqual(aliasesOf(online), onlineAliases)
     assert.equal(gateway.prompts.length, 0, 'no prompt has crossed the wire yet')
+
+    // (1b) Open the session's transcript while the link is up. The router caches its
+    // opening snapshot, which is what the offline reopen below must show.
+    const followPayload = { args: { request: { address: { kind: 'session', sessionId: `h:${remoteId}:sess-alpha` } } } }
+    followControl = new AbortController()
+    const follow = await desktopCarrier.openWireStream('session/follow', followPayload,
+      undefined, {}, followControl.signal, followControl, 64)
+    cachedFollow = drain(follow[Symbol.asyncIterator]())
+    const liveSnapshot = await until(() => cachedFollow.frames.find((frame) => frame?.type === 'snapshot'),
+      'the live session snapshot over the real gateway')
+    assert.equal(liveSnapshot.header.id, `h:${remoteId}:sess-alpha`)
+    assert.equal(liveSnapshot.assistantStream?.revision, 0, 'the opening snapshot carries the Host baseline')
+    followControl.abort()
+    cachedFollow.stop()
 
     // (2) Drop the Host link the way the reconnect tests do: stop the gateway's
     // TLS listener. Every frame below comes from the controller's own router.
@@ -295,6 +313,23 @@ await check('real gateway: offline workspace/session view, pending prompt and on
     assert.equal(down.retainedSessions, 2)
     assert.equal(down.retainedWorkspaces, 1)
     assert.equal(routing.hosts.some((host) => host.hostId === remoteId), false, 'no live route to the offline host')
+
+    // (3b) Reopening the session with the link down yields the cached transcript
+    // immediately: an opening snapshot, not an empty queue in DSH's Loading state.
+    offlineFollowControl = new AbortController()
+    const offlineFollow = await Promise.race([
+      desktopCarrier.openWireStream('session/follow', followPayload,
+        undefined, {}, offlineFollowControl.signal, offlineFollowControl, 64),
+      delay(1500).then(() => { throw new Error('the offline session follow stayed pending') }),
+    ])
+    const replay = drain(offlineFollow[Symbol.asyncIterator]())
+    const replaySnapshot = await until(() => replay.frames.find((frame) => frame?.type === 'snapshot'),
+      'the cached transcript snapshot after the link was disabled')
+    assert.equal(replaySnapshot.header.id, `h:${remoteId}:sess-alpha`,
+      'the cached opening snapshot is the one the Host issued, renamed once')
+    assert.deepEqual(replaySnapshot.assistantStream, { revision: 0 }, 'no revision was synthesized')
+    replay.stop()
+    offlineFollowControl.abort()
 
     // (4) Send a plain-text prompt through the NATIVE session/prompt dispatch.
     // The router holds the call open; only the plugin outbox knows about it.
@@ -332,6 +367,9 @@ await check('real gateway: offline workspace/session view, pending prompt and on
     await delay(100)
     assert.equal(gateway.prompts.length, 1, 'no duplicate prompt was delivered')
   } finally {
+    followControl?.abort()
+    cachedFollow?.stop()
+    offlineFollowControl?.abort()
     workspaceControl.abort()
     workspace?.stop()
     try { await setGateway(gateway, 'persistent') } catch { /* the fixture is closing */ }

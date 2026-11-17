@@ -40,10 +40,15 @@ use the real row shape, keep their namespaced `sessionId`, and carry `projection
 with finite `asOfSeq` when a projection value is present. Never emit a session-removed event merely
 because the link dropped. Retention is bounded by host count and row count/byte size.
 
-R3. **Transcript survival.** When `session/follow` cannot reach the Host, replay the existing
-per-session JSONL cache as a read-only stream and end it at the cache boundary. Do not synthesize a
-`session/follow` snapshot, cursor, `assistantStream.revision`, or any event that the Host did not
-issue. If no cache exists, show the offline state without inventing a transcript.
+R3. **Transcript survival.** When `session/follow` cannot reach the Host — whether the Host is absent
+from the inventory or still listed with a dead/reconnecting link — the FIRST stream open must settle
+immediately: replay the existing per-session JSONL cache as a read-only stream if it has an opening
+snapshot, otherwise reject with a remote failure so DSH shows a visible load error. The router must
+never leave the opening snapshot pending, because DSH rc.3 stays in `openState:'loading'` until the
+first `snapshot` frame arrives. Do not synthesize a `session/follow` snapshot, cursor,
+`assistantStream.revision`, or any event that the Host did not issue. Every path of the follow pump,
+including a Host disappearing between the route check and stream open, must settle the first-open
+promise. If no cache exists, show the offline state without inventing a transcript.
 
 R4. **Offline send queue.** When a prompt targets a session owned by a Host that is not online, the
 router keeps the originating `session/prompt` request pending and stores a durable outbox item for
