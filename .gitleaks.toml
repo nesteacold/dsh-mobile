@@ -5,9 +5,20 @@ useDefault = true
 
 [[allowlists]]
 description = "Reviewed fake workspace UUID in client-host-tabs tests (A1.3, 2026-11-17)"
+condition = "AND"
 regexes = [
   '''9f1c2a3e-1111-4b2c-8d3e-5a6b7c8d9e0f''',
 ]
 paths = [
-  '''plugins/devices/test/client-host-tabs\.test\.mjs''',
+  '''^plugins/devices/test/client-host-tabs\.test\.mjs$''',
+]
+
+[[allowlists]]
+description = "Reviewed UUID fixture recorded for git-mode gitleaks scans (A1.3, 2026-11-17)"
+condition = "AND"
+regexes = [
+  '''9f1c2a3e-1111-4b2c-8d3e-5a6b7c8d9e0f''',
+]
+paths = [
+  '''^tools/pii-allowlist\.txt$''',
 ]
