@@ -283,6 +283,11 @@ const MAX_CARRIED_CONTROL_CUTS = 64
  * the other per-session tables here, and cleared on uninstall.
  */
 const MAX_FALLBACK_CONTROL_SEQS = 64
+/**
+ * Bound on the per-merged-session reconstructed inbox table. A remote Host can
+ * open many sessions; without a cap this state would outlive every open stream.
+ */
+const MAX_TRACKED_INBOX_STATES = 64
 /** The Host-generation model catalog the native picker loads (it takes no argument). */
 const MODEL_CATALOG_ENDPOINT = 'session/modelCatalog'
 /**
@@ -320,6 +325,14 @@ const APPROVAL_EVENT = 'approval/request'
 const QUESTION_EVENT = 'user-questions/request'
 /** The native event that carries a session's running dot (sidebar status). */
 const SESSION_STATUS_EVENT = 'api-session/status'
+/** The native events that create and withdraw a sidebar row. */
+const SESSION_ADDED_EVENT = 'api-session/added'
+const SESSION_REMOVED_EVENT = 'api-session/removed'
+/**
+ * How long a status naming an unknown session waits before the one coalesced
+ * `session/list` reload. A burst of statuses in the same window is one reload.
+ */
+const SESSION_STATUS_LIST_REFRESH_MS = 250
 /** How many remote cards one controller keeps addressable (bounded like the buffer). */
 const MAX_TRACKED_CARDS = 128
 /** How many per-host refusals the status keeps for the Devices page (bounded). */
@@ -376,6 +389,46 @@ const isPlainObject = (value) => {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
   const prototype = Object.getPrototypeOf(value)
   return prototype === Object.prototype || prototype === null
+}
+
+/**
+ * DSH's `InboxWireState` is exactly these two hyphenated arrays. An id is the
+ * only identity a splice needs to check; message bodies stay opaque here, so no
+ * content is copied into a log or a synthetic frame beyond the wire value itself.
+ */
+const isInboxMessage = (message) => isPlainObject(message) && typeof message.id === 'string' && message.id !== ''
+
+/** Validate and detach one whole inbox value; duplicate ids mean unknown state. */
+function normalizeInboxValue(value) {
+  if (!isPlainObject(value)) return null
+  const nextTurn = value['next-turn']
+  const nextStep = value['next-step']
+  if (!Array.isArray(nextTurn) || !Array.isArray(nextStep)) return null
+  const ids = new Set()
+  for (const message of [...nextTurn, ...nextStep]) {
+    if (!isInboxMessage(message) || ids.has(message.id)) return null
+    ids.add(message.id)
+  }
+  return { 'next-turn': nextTurn.slice(), 'next-step': nextStep.slice() }
+}
+
+/**
+ * The standard durable-splice fold (dsh-agent-loop/src/inbox.ts `inboxProjectionDefinition`):
+ * validate the whole splice against BOTH queues, then return the full post-state.
+ * A null result means the Host's event cannot be trusted for reconstruction.
+ */
+function foldInboxValue(state, data) {
+  if (!isPlainObject(data) || (data.target !== 'next-turn' && data.target !== 'next-step')) return null
+  const removedCount = data.removedCount ?? 0
+  if (!Number.isSafeInteger(data.start) || data.start < 0) return null
+  if (!Number.isSafeInteger(removedCount) || removedCount < 0 || !Array.isArray(data.inserted)) return null
+  const inbox = state[data.target]
+  if (data.start > inbox.length || data.start + removedCount > inbox.length) return null
+  const next = inbox.slice()
+  next.splice(data.start, removedCount, ...data.inserted)
+  return normalizeInboxValue(data.target === 'next-turn'
+    ? { 'next-turn': next, 'next-step': state['next-step'] }
+    : { 'next-turn': state['next-turn'], 'next-step': next })
 }
 
 /**
@@ -622,6 +675,28 @@ function withoutRemoteCwd(row) {
   if (!isPlainObject(row) || !Object.hasOwn(row, 'cwd')) return row
   const { cwd: _cwd, ...rest } = row
   return rest
+}
+
+/**
+ * The native SessionManager treats a `session/list` row as a `SessionSummary`:
+ * `handleSessionAdded` reads `sessionId`, `running`, `blank` and `projections`,
+ * and `applyListBlock` iterates `projections.values` (dsh-api-session-controller
+ * src/client/sessions/manager.ts:649-653, 664-677). `#ingress` only renames ids —
+ * it is not a shape check. A malformed row must never reach the native UI or a
+ * retained list; fields with the right types are otherwise left verbatim.
+ */
+function isSessionSummaryRow(row) {
+  if (!isPlainObject(row) || typeof row.sessionId !== 'string' || row.sessionId === '') return false
+  for (const key of ['running', 'blank', 'agentAvailable']) {
+    if (row[key] !== undefined && typeof row[key] !== 'boolean') return false
+  }
+  if (row.updatedAt !== undefined && !Number.isFinite(row.updatedAt)) return false
+  if (row.projections === undefined) return true
+  if (!isPlainObject(row.projections)) return false
+  const { kind, asOfSeq, values } = row.projections
+  return (kind === 'sequenced' || kind === 'cached')
+    && typeof asOfSeq === 'number' && Number.isFinite(asOfSeq)
+    && isPlainObject(values)
 }
 
 /**
@@ -1478,6 +1553,15 @@ export class HostRouter {
    */
   #fallbackControlSeqs = new Map()
   /**
+   * Last authoritative inbox value per merged session id, at the seq of the
+   * source that carried it (control baseline, control projection, or a follow
+   * snapshot's projections block). A claim splice folds into this value so the
+   * synthetic frame preserves every OTHER queued message; with no known value
+   * there is nothing safe to synthesize.
+   * @type {Map<string, {seq: number, value: {'next-turn': object[], 'next-step': object[]}}>}
+   */
+  #inboxStates = new Map()
+  /**
    * The connected-host set last announced (`#connectedKey`), so an unchanged SET
    * stays quiet. It is bookkeeping about this stream's own notifications; what the
    * picker is actually told is decided against `#catalogHostKey`.
@@ -1614,6 +1698,7 @@ export class HostRouter {
     this.#eventSinks.clear()
     this.#controlSinks.clear()
     this.#fallbackControlSeqs.clear()
+    this.#inboxStates.clear()
     this.#cards.clear()
     this.#hostErrors.clear()
     // Retention describes hosts this controller was reading a moment ago: a torn-down
@@ -2238,6 +2323,10 @@ export class HostRouter {
       try {
         const value = await host.connection.call('session/list', args, { signal })
         const rows = Array.isArray(value?.items) ? value.items : []
+        if (!rows.every(isSessionSummaryRow)) {
+          this.#log('session/list refused: malformed-session-row')
+          return this.#retainedRows.get(host.hostId) ?? []
+        }
         // Each row is remote data: a row that names a host namespace is refused
         // and takes that host's whole contribution with it.
         const renamed = rows.map((row) => withoutRemoteCwd(this.#ingress(host.hostId, row, 'session/list row')))
@@ -2327,10 +2416,19 @@ export class HostRouter {
   forgetHost(hostId) {
     if (typeof hostId !== 'string' || hostId === '') return false
     this.#hostErrors.delete(hostId)
+    this.#forgetInboxHost(hostId)
     const stops = this.#followStops.get(hostId)
     this.#followStops.delete(hostId)
     if (stops) for (const stop of [...stops]) stop()
     return this.#retainedRows.delete(hostId)
+  }
+
+  /** Drop both namespaced watermarks/values of one forgotten Host. */
+  #forgetInboxHost(hostId) {
+    const prefix = `${HOST_PREFIX}${hostId}:`
+    for (const map of [this.#fallbackControlSeqs, this.#inboxStates]) {
+      for (const key of [...map.keys()]) if (key.startsWith(prefix)) map.delete(key)
+    }
   }
 
   /** Remember one host's follow stop, so `forgetHost` can end it. */
@@ -2710,6 +2808,10 @@ export class HostRouter {
             if (expected !== null && durableSeqOf(value) === expected) expected = null
             // Refuse before anything is cached: a frame that names a namespace must
             // never reach the UI, and it must not survive in the local copy either.
+            // A follow opening snapshot carries the session's own projection cut.
+            // Seed the reconstruction state before any splice from that page is
+            // delivered; an absent block only means "unknown here", never empty.
+            this.#noteInboxFollowSnapshot(controlSessionId, value)
             const frames = followFrames(value, { resumed: resumes, expected, lastSeq, opening })
             // The unseen stretch a part of the page names, counted toward the page's own
             // bound (see `pageUnseen`). An event's fill is already deduplicated against
@@ -3056,31 +3158,100 @@ export class HostRouter {
     }
   }
 
+  /** Forget both the reconstruction value and its last published watermark. */
+  #clearInboxState(sessionId) {
+    this.#inboxStates.delete(sessionId)
+    this.#fallbackControlSeqs.delete(sessionId)
+  }
+
+  /** Store a whole authoritative value under DSH's higher-seq-wins rule. */
+  #setInboxState(sessionId, value, seq) {
+    if (typeof sessionId !== 'string' || sessionId === '') return false
+    if (!Number.isSafeInteger(seq) || seq < -1) return false
+    const normalized = normalizeInboxValue(value)
+    if (normalized === null) return false
+    const row = this.#inboxStates.get(sessionId)
+    if (row !== undefined && row.seq >= seq) return false
+    this.#inboxStates.delete(sessionId)
+    this.#inboxStates.set(sessionId, { seq, value: normalized })
+    while (this.#inboxStates.size > MAX_TRACKED_INBOX_STATES) {
+      this.#inboxStates.delete(this.#inboxStates.keys().next().value)
+    }
+    return true
+  }
+
+  /** Seed from a merged `session/control` baseline block's own cut. */
+  #noteInboxBaseline(sessionId, values, seq) {
+    if (!isPlainObject(values) || !Object.hasOwn(values, 'inbox')) {
+      this.#clearInboxState(sessionId)
+      return
+    }
+    if (!Number.isSafeInteger(seq) || seq < -1) {
+      this.#clearInboxState(sessionId)
+      return
+    }
+    if (normalizeInboxValue(values.inbox) === null) this.#clearInboxState(sessionId)
+    else this.#setInboxState(sessionId, values.inbox, seq)
+  }
+
+  /** Track an ordinary sequenced projection frame on the merged control stream. */
+  #noteInboxProjectionFrame(frame) {
+    if (frame.type !== 'projection' || !Array.isArray(frame.changes)) return
+    const change = frame.changes.find((entry) => isPlainObject(entry) && entry.key === 'inbox')
+    if (change === undefined) return
+    if (!Number.isSafeInteger(frame.seq) || frame.seq < 0 || normalizeInboxValue(change.val) === null) {
+      this.#clearInboxState(frame.sessionId)
+      return
+    }
+    this.#setInboxState(frame.sessionId, change.val, frame.seq)
+  }
+
   /**
-   * Advance the native inbox watermark when a remote claim splice removes the
-   * pending row but its `session/control` projection is missing.
-   *
-   * rc.3 retires an admitted echo with `receipt.index === null` only once
-   * `projections.seqOf('inbox') >= receipt.seq` (session.js `retireAdmittedSubmission`).
-   * The splice is durable and crosses this router on `session/follow`; the
-   * projection that normally carries the same seq crosses a different stream and
-   * can be withheld. A projection frame keyed to the splice's seq unblocks the
-   * controller, and `ProjectionValueStore.apply` drops any later real frame at
-   * the same or a lower seq, so a real projection that does arrive is harmless.
-   *
-   * Only removal splices without a canceled outcome are synthesized: a canceled
-   * splice settles its echo directly, and an insert splice must never overwrite
-   * the Host's real inbox value with an empty one.
+   * A `session/follow` opening snapshot carries the session's projection cut
+   * (`transport.ts`: `page.projections = frame.projections`). Its absence is
+   * "unknown here", not an empty inbox; an explicit block without `inbox` is a
+   * capability-absent cut and clears what this router could otherwise synthesize.
+   */
+  #noteInboxFollowSnapshot(sessionId, value) {
+    if (typeof sessionId !== 'string' || !isSnapshotFrame(value)) return
+    const projections = value.projections
+    if (!isPlainObject(projections)) return
+    const seq = projections.asOfSeq
+    if (!Number.isSafeInteger(seq) || seq < -1 || !isPlainObject(projections.values)
+      || !Object.hasOwn(projections.values, 'inbox') || normalizeInboxValue(projections.values.inbox) === null) {
+      this.#clearInboxState(sessionId)
+      return
+    }
+    this.#setInboxState(sessionId, projections.values.inbox, seq)
+  }
+
+  /**
+   * Reconstruct the whole inbox a remote claim splice leaves behind, then
+   * publish it as a sequenced projection when the Host's own control frame is
+   * missing. The splice folds into known authoritative state with DSH's own
+   * `inboxProjectionDefinition`, so other queued messages survive; a later real
+   * Host frame at the same seq is then identical, and `ProjectionValueStore.apply`
+   * drops it as a replay instead of corrupting the value. Unknown or invalid
+   * state fails closed: no synthetic frame, never an assumed-empty inbox.
    */
   #fallbackInboxProjection(hostId, sessionId, frame) {
     if (typeof sessionId !== 'string' || !isPlainObject(frame) || frame.type !== 'event') return
     const event = frame.event
     if (!isPlainObject(event) || event.type !== 'agent/inbox/spliced') return
     if (!Number.isSafeInteger(event.seq) || event.seq < 0) return
+    const known = this.#inboxStates.get(sessionId)
+    if (known === undefined || known.seq >= event.seq) return
     const data = event.data
+    const folded = foldInboxValue(known.value, data)
+    if (folded === null) {
+      this.#clearInboxState(sessionId)
+      return
+    }
+    this.#setInboxState(sessionId, folded, event.seq)
     if (!isPlainObject(data) || !(Number.isSafeInteger(data.removedCount) && data.removedCount > 0)) return
     if (data.outcome === 'canceled') return
-    // No merged control stream open: drop, never buffer across generations.
+    // No merged control stream open: state still advances, but there is nowhere
+    // to publish and no frame is buffered across generations.
     if (this.#controlSinks.size === 0) return
     const lastSeq = this.#fallbackControlSeqs.get(sessionId)
     if (lastSeq !== undefined && lastSeq >= event.seq) return
@@ -3088,11 +3259,9 @@ export class HostRouter {
     if (this.#fallbackControlSeqs.size > MAX_FALLBACK_CONTROL_SEQS) {
       this.#fallbackControlSeqs.delete(this.#fallbackControlSeqs.keys().next().value)
     }
-    // Wire keys are the hyphenated JSON keys of DSH's InboxWireState, not the
-    // TypeScript camelCase names; empty arrays are enough to advance the watermark.
     this.#publishControl({
       type: 'projection', sessionId, seq: event.seq,
-      changes: [{ key: 'inbox', val: { 'next-turn': [], 'next-step': [] } }],
+      changes: [{ key: 'inbox', val: folded }],
     })
   }
 
@@ -3121,12 +3290,103 @@ export class HostRouter {
     if (dueAtOpen && this.#lastAnnounceAt === 0) this.#lastAnnounceAt = Date.now() - MODEL_CATALOG_ANNOUNCE_INTERVAL_MS
     /** @type {Map<string, () => void>} hostId -> detach its card listeners */
     const watching = new Map()
+    /**
+     * One coalesced `session/list` refresh per host, kept until the call settles so
+     * a burst of unknown statuses cannot stack reloads. The statuses it collected
+     * are replayed once the new rows exist. A watcher generation token is part of
+     * the state: a reconnect reuses the same host object, so `watching.has` alone
+     * cannot tell a new watcher from the one that started an old call.
+     * @type {Map<string, {timer: any, statuses: Map<string, boolean>, inFlight: boolean, token: number, abort?: AbortController}>}
+     */
+    const pendingRefreshes = new Map()
+    const watchTokens = new Map()
+    const tokenOf = (hostId) => watchTokens.get(hostId) ?? 0
+    const bumpToken = (hostId) => { watchTokens.set(hostId, tokenOf(hostId) + 1) }
+    const cancelRefresh = (hostId) => {
+      const pending = pendingRefreshes.get(hostId)
+      if (!pending) return
+      if (pending.timer !== null) clearTimeout(pending.timer)
+      pending.abort?.abort()
+      pendingRefreshes.delete(hostId)
+    }
+    const refreshSessions = async (host, pending) => {
+      const isCurrent = () => !lifetime.signal.aborted
+        && watching.has(host.hostId) && tokenOf(host.hostId) === pending.token
+      if (!isCurrent()) return
+      let renamed
+      const abort = new AbortController()
+      const abortOnLifetime = () => abort.abort()
+      lifetime.signal.addEventListener('abort', abortOnLifetime, { once: true })
+      pending.abort = abort
+      try {
+        // Same call shape as `#mergeSessionList`: the carrier takes the bare args
+        // object, and a session/list without a hint or cursor sends `{}`.
+        const value = await host.connection.call('session/list', {}, { signal: abort.signal })
+        if (!isCurrent()) return
+        if (!Array.isArray(value?.items)) throw new Error('session/list did not return an items array')
+        if (!value.items.every(isSessionSummaryRow)) {
+          // Ignore the whole batch: no retained change, no ids in the log.
+          this.#log('session/list refresh refused: malformed-session-row')
+          return
+        }
+        renamed = value.items.map((row) => withoutRemoteCwd(this.#ingress(host.hostId, row, 'session/list row')))
+      } catch (error) {
+        if (!isCurrent()) return
+        // A refusal or a hostile row leaves the retained list alone: no phantom rows.
+        this.#log(`session/list refresh from ${host.hostId} failed: ${error?.code ?? 'error'}`)
+        return
+      } finally {
+        lifetime.signal.removeEventListener('abort', abortOnLifetime)
+        if (pending.abort === abort) pending.abort = null
+        if (pendingRefreshes.get(host.hostId) === pending) pendingRefreshes.delete(host.hostId)
+      }
+      // Check once more immediately before the commit: a reconnect can land while
+      // the call resolves. No await follows, so this one guard covers the retained
+      // update, added, removed and replayed status together.
+      if (!isCurrent()) return
+      const before = new Set((this.#retainedRows.get(host.hostId) ?? [])
+        .map((row) => row?.sessionId).filter((id) => typeof id === 'string'))
+      const after = new Set(renamed.map((row) => row?.sessionId).filter((id) => typeof id === 'string'))
+      this.#rememberRows(host.hostId, renamed)
+      for (const row of renamed) {
+        if (before.has(row.sessionId)) continue
+        // The status was already published when the row did not exist; the native
+        // UI ignored it. Publish added first, then repeat the last known status
+        // so the running dot survives the row's arrival.
+        this.#publishEvent({ type: 'emit', event: SESSION_ADDED_EVENT, args: [row] })
+        if (pending.statuses.has(row.sessionId)) {
+          this.#publishEvent({ type: 'emit', event: SESSION_STATUS_EVENT, args: [row.sessionId, pending.statuses.get(row.sessionId)] })
+        }
+      }
+      for (const id of before) {
+        if (!after.has(id)) this.#publishEvent({ type: 'emit', event: SESSION_REMOVED_EVENT, args: [id] })
+      }
+    }
+    const scheduleRefresh = (host, sessionId, running) => {
+      let pending = pendingRefreshes.get(host.hostId)
+      if (!pending) {
+        pending = { timer: null, statuses: new Map(), inFlight: false, token: tokenOf(host.hostId) }
+        pendingRefreshes.set(host.hostId, pending)
+      }
+      pending.statuses.set(sessionId, running)
+      if (pending.timer !== null) clearTimeout(pending.timer)
+      pending.timer = setTimeout(() => {
+        pending.timer = null
+        if (pending.inFlight) return
+        pending.inFlight = true
+        void refreshSessions(host, pending)
+      }, SESSION_STATUS_LIST_REFRESH_MS)
+      pending.timer?.unref?.()
+    }
 
     const watch = (host) => {
       if (watching.has(host.hostId)) return
       const connection = host.connection
       // Only a live connection object can be listened to (a stub is not a source).
       if (!connection || typeof connection.on !== 'function' || typeof connection.off !== 'function') return
+      // A reconnect reuses the connection object: this token is what tells an
+      // answer to a call the previous watcher started from this watcher's calls.
+      bumpToken(host.hostId)
       const onCard = (frame) => {
         const injected = this.#injectCard(host, frame)
         if (injected) this.#publishEvent(injected)
@@ -3151,6 +3411,13 @@ export class HostRouter {
           return
         }
         this.#publishEvent({ type: 'emit', event: SESSION_STATUS_EVENT, args: [sessionId, frame.running === true] })
+        // The gateway forwards only the status for a newly created remote session,
+        // not the `api-session/added` summary the sidebar needs for a row. The
+        // retained rows are THIS host's already renamed session/list rows, so an id
+        // missing there has no row to attach the dot to: reload its list once.
+        const known = (this.#retainedRows.get(host.hostId) ?? [])
+          .some((row) => row?.sessionId === sessionId)
+        if (!known) scheduleRefresh(host, sessionId, frame.running === true)
       }
       const onState = (state) => { if (state !== 'online') this.#withdrawHost(host.hostId) }
       connection.on('approval', onCard)
@@ -3213,6 +3480,8 @@ export class HostRouter {
         for (const host of hosts) watch(host)
         for (const hostId of [...watching.keys()]) {
           if (connected.has(hostId)) continue
+          cancelRefresh(hostId)
+          bumpToken(hostId)
           this.#withdrawHost(hostId)
           watching.get(hostId)?.()
           watching.delete(hostId)
@@ -3228,6 +3497,8 @@ export class HostRouter {
       for (const source of watched) source.removeEventListener?.('abort', onAbort)
       unsubscribe?.()
       this.#eventSinks.delete(sink)
+      for (const hostId of [...pendingRefreshes.keys()]) cancelRefresh(hostId)
+      for (const hostId of watching.keys()) bumpToken(hostId)
       for (const detach of watching.values()) detach()
       this.#merges.delete(stop)
       stop()
@@ -3367,6 +3638,11 @@ export class HostRouter {
       target[key] = hostId === null || !isPlainObject(block.values)
         ? { ...block }
         : { ...block, values: this.#ingress(hostId, block.values, 'session/control baseline') }
+      // A Header-only listing's cached block carries a non-comparable seq; only
+      // a sequenced baseline is an authoritative cut for splice reconstruction.
+      if (block.kind !== 'cached' && isPlainObject(target[key].values)) {
+        this.#noteInboxBaseline(key, target[key].values, block.asOfSeq)
+      }
     }
   }
 
@@ -3531,6 +3807,9 @@ export class HostRouter {
       if (frame.type === 'projection' && Array.isArray(frame.changes)) {
         for (const change of frame.changes) if (isPlainObject(change) && typeof change.key === 'string') noteKeys(id, { [change.key]: true })
       }
+      // Every sequenced projection crossing the merged stream is an authoritative
+      // whole value, including a late Host baseline re-sent as projection frames.
+      this.#noteInboxProjectionFrame(frame)
     }
     // A cut that ended the previous generation is folded into THIS generation's
     // ONE opening baseline. Its Host may greet only after that baseline, so the

@@ -726,6 +726,313 @@ test('$events carries remote session statuses in the host namespace, and refuses
   await iterator.return()
 })
 
+// -- the status of a session the sidebar has never listed ------------------
+//
+// The gateway forwards `{kind:'session-status'}` on `api-session/added` but drops
+// the summary: without a list reload the native sidebar never creates the row,
+// so the running dot is delivered to nobody.
+
+/** Give a stub connection the real `RemoteConnection` listener surface. */
+function attachPusher(remote) {
+  const pushed = new EventEmitter()
+  remote.connection.on = pushed.on.bind(pushed)
+  remote.connection.off = pushed.off.bind(pushed)
+  return pushed
+}
+
+async function openEventsStream(harness) {
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('$events', { args: {} }, undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const ready = iterator.next()
+  await new Promise((resolve) => setImmediate(resolve))
+  harness.localStreams[0].queue.push({ type: 'ready', clientId: 'c1', host: { home: '/home/owner' } })
+  assert.equal((await ready).value.type, 'ready')
+  return { control, iterator }
+}
+
+async function waitUntil(check, label, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (check()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.fail(`${label}: condition not met within ${timeoutMs} ms`)
+}
+
+/** One frame within `ms`, or undefined when the stream stayed quiet. */
+function quietFrame(iterator, ms = 150) {
+  return Promise.race([
+    iterator.next(),
+    new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(undefined), ms)
+      timer.unref?.()
+    }),
+  ])
+}
+
+const listCalls = (remote) => remote.calls.filter((call) => call.endpoint === 'session/list')
+
+test('an unknown status reloads the list once: added carries the tagged row before the repeated status, without cwd', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/list': {
+    items: [session('new-session', 300, { cwd: 'C:\\Users\\remote\\REA_Project' })],
+  } } })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 'new-session', running: true })
+    const first = await nextFrame(iterator, 'first status')
+    assert.deepEqual(first.value, { type: 'emit', event: 'api-session/status', args: ['h:hostB:new-session', true] })
+
+    await waitUntil(() => listCalls(hostB).length === 1, 'the debounced session/list call')
+    assert.deepEqual(listCalls(hostB)[0].args, {}, 'the carrier takes the same bare args object as #mergeSessionList')
+    assertNoNamespacedId(hostB)
+
+    const added = await nextFrame(iterator, 'added row')
+    assert.equal(added.value.event, 'api-session/added')
+    const row = added.value.args[0]
+    assert.equal(row.sessionId, 'h:hostB:new-session')
+    assert.equal(Object.hasOwn(row, 'cwd'), false, 'a remote cwd is omitted, never replaced with a local path')
+    assert.deepEqual(row, session('h:hostB:new-session', 300), 'every other field survives ingress')
+    const repeated = await nextFrame(iterator, 'status after added')
+    assert.deepEqual(repeated.value, first.value, 'the status is republished after the row exists')
+    harness.router.uninstall()
+  } finally {
+    control.abort()
+    await iterator.return()
+  }
+})
+
+test('a burst of unknown statuses causes exactly one session/list call', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/list': {
+    items: ['s1', 's2', 's3'].map((id) => session(id, 100)),
+  } } })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    for (const id of ['s1', 's2', 's3']) {
+      pushed.emit('sessionStatus', { kind: 'session-status', sessionId: id, running: true })
+    }
+    for (const id of ['s1', 's2', 's3']) {
+      const frame = await nextFrame(iterator, 'burst status')
+      assert.deepEqual(frame.value, { type: 'emit', event: 'api-session/status', args: [`h:hostB:${id}`, true] })
+    }
+    await waitUntil(() => listCalls(hostB).length === 1, 'the single session/list call')
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(listCalls(hostB).length, 1, 'the rest of the burst shared the one debounce window')
+    harness.router.uninstall()
+  } finally {
+    control.abort()
+    await iterator.return()
+  }
+})
+
+test('a status for a retained row causes no session/list call', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/list': {
+    items: [session('sb1', 200)],
+  } } })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  const listed = await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+  assert.deepEqual(listed.value.items.map((row) => row.sessionId), ['h:hostB:sb1'])
+  const before = listCalls(hostB).length
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 'sb1', running: true })
+    assert.deepEqual((await nextFrame(iterator, 'known status')).value,
+      { type: 'emit', event: 'api-session/status', args: ['h:hostB:sb1', true] })
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(listCalls(hostB).length, before, 'no reload and no added frame for a known row')
+    const extra = await quietFrame(iterator)
+    assert.notEqual(extra?.value?.event, 'api-session/added')
+    harness.router.uninstall()
+  } finally {
+    control.abort()
+    await iterator.return()
+  }
+})
+
+test('a refreshed list withdraws a tagged id that disappeared', async () => {
+  let rows = [session('s1', 300), session('s2', 200)]
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { get 'session/list'() { return { items: rows } } } })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  const listed = await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+  assert.deepEqual(listed.value.items.map((row) => row.sessionId), ['h:hostB:s1', 'h:hostB:s2'])
+  rows = [session('s1', 300), session('s3', 400)]
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 's3', running: false })
+    assert.deepEqual((await nextFrame(iterator, 'new status')).value,
+      { type: 'emit', event: 'api-session/status', args: ['h:hostB:s3', false] })
+    const added = await nextFrame(iterator, 'added s3')
+    assert.deepEqual(added.value, { type: 'emit', event: 'api-session/added', args: [session('h:hostB:s3', 400)] })
+    assert.deepEqual((await nextFrame(iterator, 'repeated status')).value,
+      { type: 'emit', event: 'api-session/status', args: ['h:hostB:s3', false] })
+    const removed = await nextFrame(iterator, 'removed s2')
+    assert.deepEqual(removed.value, { type: 'emit', event: 'api-session/removed', args: ['h:hostB:s2'] })
+    harness.router.uninstall()
+  } finally {
+    control.abort()
+    await iterator.return()
+  }
+})
+
+test('a refresh row with a pre-tagged id is logged and publishes no row', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/list': {
+    items: [session('h:hostX:evil', 300)],
+  } } })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 'fresh', running: true })
+    await nextFrame(iterator, 'first status')
+    await waitUntil(() => harness.logs.some((line) => line.includes('session/list refresh from hostB failed: remote/id-leak')), 'the refusal log')
+    assert.ok(harness.logs.some((line) => line.includes('remote/id-leak')))
+    const extra = await quietFrame(iterator)
+    assert.notEqual(extra?.value?.event, 'api-session/added', 'a hostile row creates no row')
+    assert.equal(JSON.stringify(extra?.value ?? {}).includes('h:hostX:evil'), false, 'no raw remote id leaks')
+    harness.router.uninstall()
+  } finally {
+    control.abort()
+    await iterator.return()
+  }
+})
+
+test('a failed refresh logs and leaves the retained rows alone', async () => {
+  let reply = { items: [session('sb1', 200)] }
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { get 'session/list'() { return reply } } })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+  reply = Object.assign(new Error('offline'), { code: 'remote/host-offline' })
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 'fresh', running: true })
+    await nextFrame(iterator, 'first status')
+    await waitUntil(() => harness.logs.some((line) => line.includes('session/list refresh from hostB failed: remote/host-offline')), 'the failure log')
+    const extra = await quietFrame(iterator)
+    assert.notEqual(extra?.value?.event, 'api-session/added')
+    assert.notEqual(extra?.value?.event, 'api-session/removed', 'the old row was not withdrawn by a failed call')
+    harness.router.uninstall()
+  } finally {
+    control.abort()
+    await iterator.return()
+  }
+})
+
+test('disconnect cancels a pending refresh and detaches the watcher', async () => {
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/list': {
+    items: [session('fresh', 300)],
+  } } })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 'fresh', running: true })
+    await nextFrame(iterator, 'first status')
+    harness.disconnect('hostB')
+    assert.equal(pushed.listenerCount('sessionStatus'), 0)
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(listCalls(hostB).length, 0, 'the debounced call was cancelled with the host')
+    harness.router.uninstall()
+  } finally {
+    control.abort()
+    await iterator.return()
+  }
+})
+
+test('an in-flight refresh resolved after disconnect+reconnect is stale and commits nothing', async () => {
+  let calls = 0
+  let resolveOld
+  const oldAnswer = new Promise((resolve) => { resolveOld = resolve })
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: {
+    'session/list': () => {
+      calls += 1
+      return calls === 2 ? oldAnswer : { items: [session('sb1', 200)] }
+    },
+  } })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  const listed = await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+  assert.deepEqual(listed.value.items.map((row) => row.sessionId), ['h:hostB:sb1'])
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 'fresh', running: true })
+    assert.deepEqual((await nextFrame(iterator, 'first status')).value,
+      { type: 'emit', event: 'api-session/status', args: ['h:hostB:fresh', true] })
+    await waitUntil(() => listCalls(hostB).length === 2, 'the in-flight refresh call')
+    const oldSignal = listCalls(hostB)[1].options.signal
+    assert.equal(oldSignal.aborted, false, 'the call is live while its watcher owns it')
+    harness.disconnect('hostB')
+    assert.equal(oldSignal.aborted, true, 'disconnect cancels the in-flight call')
+    harness.connect('hostB')
+    resolveOld({ items: [session('fresh', 300)] })
+    const emitted = []
+    for (let i = 0; i < 4; i += 1) {
+      const frame = await quietFrame(iterator, 80)
+      if (typeof frame?.value?.event === 'string' && frame.value.event.startsWith('api-session/')) emitted.push(frame.value)
+    }
+    assert.deepEqual(emitted, [], 'the old generation published no added/removed/status frame')
+    // Read retention through the merged list of a PAIRED host that is offline:
+    // dispatching while it was connected would overwrite retention with a new answer.
+    harness.disconnect('hostB')
+    const retained = await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+    assert.deepEqual(retained.value.items.map((row) => row.sessionId), ['h:hostB:sb1'],
+      'the old generation did not replace the retained rows')
+    harness.router.uninstall()
+  } finally {
+    control.abort()
+    await iterator.return()
+  }
+})
+
+test('malformed refresh rows are ignored whole: no events and no retained update', async () => {
+  const badRows = [
+    ['an empty object', {}],
+    ['null', null],
+    ['an empty sessionId', session('', 300)],
+    ['a non-string sessionId', session(42, 300)],
+    ['a malformed projection', session('fresh', 300, { projections: { kind: 'sequenced', values: {} } })],
+  ]
+  for (const [label, badRow] of badRows) {
+    let rows = [session('sb1', 200)]
+    const hostB = createFakeRemote('hostB', 'Host B', { replies: { get 'session/list'() { return { items: rows } } } })
+    const pushed = attachPusher(hostB)
+    const harness = createHarness({ remotes: [hostB] })
+    const listed = await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+    assert.deepEqual(listed.value.items.map((row) => row.sessionId), ['h:hostB:sb1'], `${label}: baseline`)
+    rows = [session('sb1', 200), badRow]
+    const { control, iterator } = await openEventsStream(harness)
+    try {
+      pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 'fresh', running: true })
+      assert.deepEqual((await nextFrame(iterator, `${label}: first status`)).value,
+        { type: 'emit', event: 'api-session/status', args: ['h:hostB:fresh', true] })
+      await waitUntil(() => harness.logs.some((line) => line.includes('malformed-session-row')),
+        `${label}: the malformed batch log`)
+      const log = harness.logs.find((line) => line.includes('malformed-session-row'))
+      assert.equal(/h:hostB:|\bfresh\b/.test(log), false, `${label}: the log names no session id`)
+      const emitted = []
+      for (let i = 0; i < 3; i += 1) {
+        const frame = await quietFrame(iterator, 80)
+        if (typeof frame?.value?.event === 'string' && frame.value.event.startsWith('api-session/')) emitted.push(frame.value)
+      }
+      assert.deepEqual(emitted, [], `${label}: no added/removed/status frame`)
+      harness.disconnect('hostB')
+      const retained = await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+      assert.deepEqual(retained.value.items.map((row) => row.sessionId), ['h:hostB:sb1'],
+        `${label}: retained rows were left untouched`)
+      harness.router.uninstall()
+    } finally {
+      control.abort()
+      await iterator.return()
+    }
+  }
+})
+
 // -- approvals -------------------------------------------------------------
 
 test('a remote $events/result carries the argsHash of the Host card and the right ids', async () => {
@@ -2046,13 +2353,21 @@ test('a successful remote selectModel reaches the native model chip through the 
   control.abort()
 })
 
-test('a remote inbox claim splice publishes an inbox projection fallback on the merged control stream', async () => {
+test('a remote claim splice reconstructs the surviving inbox from authoritative state', async () => {
   // rc.3 retires an admitted echo with receipt.index===null only when
   // seqOf('inbox') reaches the claim's seq. The splice is durable on follow; its
-  // projection can be missing from session/control. The router must advance the
-  // watermark from the splice itself, in the controller's namespace, without
-  // touching the follow frame it also delivers.
-  const hostB = createFakeRemote('hostB', 'Host B')
+  // projection can be missing from session/control. The router must reconstruct
+  // the WHOLE post-splice inbox from a sequenced baseline/snapshot, fold the
+  // splice with DSH's own rules, and publish that value at the claim seq.
+  const turnA = { id: 'turn-a', content: [{ type: 'text', text: 'A' }] }
+  const turnB = { id: 'turn-b', content: [{ type: 'text', text: 'B' }] }
+  const step = { id: 'step-1', content: [{ type: 'text', text: 'step' }] }
+  const baselineInbox = { 'next-turn': [turnA, turnB], 'next-step': [] }
+  const snapshotInbox = { 'next-turn': [turnA, turnB], 'next-step': [step] }
+  const surviving = { 'next-turn': [turnB], 'next-step': [step] }
+  const hostB = createFakeRemote('hostB', 'Host B', {
+    controlProjections: { s1: { asOfSeq: 5, values: { inbox: baselineInbox } } },
+  })
   const harness = createHarness({ remotes: [hostB] })
   const control = new AbortController()
   const controlSource = await harness.gateway.openWireStream('session/control', { args: {} },
@@ -2060,14 +2375,14 @@ test('a remote inbox claim splice publishes an inbox projection fallback on the 
   const controlIterator = controlSource[Symbol.asyncIterator]()
   const opening = (await nextFrame(controlIterator, 'control opening baseline')).value
   assert.equal(opening.type, 'baseline')
+  assert.deepEqual(opening.value.projections['h:hostB:s1'].values.inbox, baselineInbox,
+    'the merged baseline carries the Host\'s sequenced inbox cut under the minted id')
 
   const followAbort = new AbortController()
   const followSource = await harness.gateway.openWireStream('session/follow',
     { args: { request: { address: { kind: 'session', sessionId: 'h:hostB:s1' } } } },
     undefined, {}, followAbort.signal, followAbort, 64)
   const followIterator = followSource[Symbol.asyncIterator]()
-  // The pump opens the remote follow asynchronously; wait for that queue rather
-  // than pushing into the control stream that happened to open first.
   const deadline = Date.now() + 2000
   let remoteFollow = null
   while (!remoteFollow && Date.now() < deadline) {
@@ -2078,6 +2393,15 @@ test('a remote inbox claim splice publishes an inbox projection fallback on the 
   assert.equal(remoteFollow.args.request.address.sessionId, 's1',
     'the Host sees only its own id; the namespace is minted on the way back')
 
+  // A follow opening snapshot is the session's own projection cut; its higher
+  // seq adds the untouched next-step queue the control baseline did not have.
+  remoteFollow.queue.push({ type: 'snapshot', cursor: 6, header: { version: 4, id: 's1' },
+    records: [], projections: { asOfSeq: 6, values: { inbox: snapshotInbox } }, hasMore: false })
+  const opened = (await nextFrame(followIterator, 'follow opening snapshot')).value
+  assert.equal(opened.type, 'snapshot')
+  assert.deepEqual(opened.projections.values.inbox, snapshotInbox,
+    'the follow snapshot carries the session projection block')
+
   const claim = (seq) => ({ type: 'event', event: {
     type: 'agent/inbox/spliced', seq, time: seq,
     data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] },
@@ -2086,20 +2410,68 @@ test('a remote inbox claim splice publishes an inbox projection fallback on the 
   const frame = (await nextFrame(controlIterator, 'fallback inbox projection')).value
   assert.deepEqual(frame, {
     type: 'projection', sessionId: 'h:hostB:s1', seq: 8,
-    changes: [{ key: 'inbox', val: { 'next-turn': [], 'next-step': [] } }],
-  }, 'the claim watermark is published with the installed wire keys, at the event seq')
+    changes: [{ key: 'inbox', val: surviving }],
+  }, 'the splice preserves the other turn and the untouched next-step queue')
   const followed = (await nextFrame(followIterator, 'claim on follow')).value
   assert.equal(followed.event.seq, 8, 'the durable follow frame is unchanged')
   assert.equal(followed.event.data.removedCount, 1)
+
+  // Native-equivalent ProjectionValueStore.apply: a real Host frame at the same
+  // seq is dropped, so an equal-seq value with the surviving queue is harmless.
+  const store = new Map([['inbox', { kind: 'sequenced', seq: frame.seq, value: frame.changes[0].val }]])
+  const nativeApply = (key, value, seq) => {
+    const row = store.get(key)
+    if (row?.kind === 'sequenced' && seq <= row.seq) return
+    store.set(key, { kind: 'sequenced', value, seq })
+  }
+  nativeApply('inbox', { 'next-turn': [], 'next-step': [] }, 8)
+  assert.deepEqual(store.get('inbox').value, surviving,
+    'a real same-seq projection cannot replace the reconstructed full value')
 
   // A replayed older claim is not republished. Even if it were, ProjectionValueStore.apply
   // drops seq <= row.seq, so a lower watermark can never roll the store back.
   remoteFollow.queue.push(claim(5))
   assert.equal(await frameWithin(controlIterator, 50), null, 'an older seq is not republished')
-  let stored = 8
-  const apply = (seq) => { if (seq <= stored) return; stored = seq }
-  apply(5)
-  assert.equal(stored, 8, 'a stale seq cannot regress the native store')
+  nativeApply('inbox', { 'next-turn': [], 'next-step': [] }, 5)
+  assert.deepEqual(store.get('inbox').value, surviving, 'a stale seq cannot regress the native store')
+  assertNoNamespacedId(hostB)
+  control.abort()
+  followAbort.abort()
+  await controlIterator.return()
+  await followIterator.return()
+})
+
+test('a remote inbox splice with no known authoritative state publishes no fallback', async () => {
+  // A baseline/snapshot that never carried `inbox` means UNKNOWN, not empty.
+  // A synthetic empty value here would erase real queued state the router could
+  // not see and no later real frame at the same seq could repair it.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const controlSource = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const controlIterator = controlSource[Symbol.asyncIterator]()
+  assert.equal((await nextFrame(controlIterator, 'control opening baseline')).value.type, 'baseline')
+
+  const followAbort = new AbortController()
+  const followSource = await harness.gateway.openWireStream('session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: 'h:hostB:s1' } } } },
+    undefined, {}, followAbort.signal, followAbort, 64)
+  const followIterator = followSource[Symbol.asyncIterator]()
+  const deadline = Date.now() + 2000
+  let remoteFollow = null
+  while (!remoteFollow && Date.now() < deadline) {
+    remoteFollow = hostB.streams.find((entry) => entry.endpoint === 'session/follow') ?? null
+    if (!remoteFollow) await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.ok(remoteFollow, 'the remote follow stream was opened')
+  remoteFollow.queue.push({ type: 'event', event: {
+    type: 'agent/inbox/spliced', seq: 8, time: 8,
+    data: { target: 'next-turn', start: 0, removedCount: 1, inserted: [] },
+  } })
+  assert.equal((await nextFrame(followIterator, 'claim with unknown state')).value.event.seq, 8)
+  assert.equal(await frameWithin(controlIterator, 80), null,
+    'no fallback is synthesized from unknown state')
   assertNoNamespacedId(hostB)
   control.abort()
   followAbort.abort()
