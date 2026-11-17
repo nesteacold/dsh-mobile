@@ -947,7 +947,9 @@ window.__ModuleLoader__.load({
 .dshdev-pop-row span:first-child{color:${colors.muted};font-size:11px;flex:none}
 .dshdev-pop-actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .dshdev-anchor{position:relative;display:inline-flex}
-.dshdev-dock{display:flex;flex-direction:column;gap:6px;margin-bottom:6px}
+/* The dock is a sibling of DSH's composer card, so it follows the same shared
+   width axis instead of stretching across the whole conversation column. */
+.dshdev-dock{display:flex;flex-direction:column;gap:6px;margin-bottom:6px;box-sizing:border-box;min-width:0;width:min(100%,var(--dsh-composer-card-max-width,100%));margin-inline:auto}
 .dshdev-banner{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;border:1px solid ${colors.border};border-left:3px solid ${colors.danger};border-radius:8px;padding:8px 10px;background:${colors.card}}
 .dshdev-banner.info{border-left-color:${colors.accent}}
 .dshdev-banner strong{display:block;font-weight:600}

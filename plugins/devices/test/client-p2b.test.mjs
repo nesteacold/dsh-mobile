@@ -404,6 +404,14 @@ test('offline host: read-only banner naming the host; "Remove local copy" delete
   const page = await mount(React.createElement(ui.entryOf('conversation.input.dock').component, { sessionId: 'h:r1:s-remote' }))
   const banner = byTestId(page, 'offline-banner')[0]
   assert.ok(banner, 'the offline banner is shown')
+  // The dock sits beside DSH's composer card, not inside it. Its stylesheet must
+  // borrow the composer's own width variable and center, with a 100% cap so small
+  // viewports never overflow (no private 960px copy to drift out of sync).
+  assert.match(byTestId(page, 'session-banners')[0].props.className, /(^|\s)dshdev-dock(\s|$)/,
+    'the banner is wrapped in our own dock class')
+  assert.match(source, /\.dshdev-dock\{[^}]*width:min\(100%,var\(--dsh-composer-card-max-width(?:,[^)]*)?\)\)/,
+    'dock width comes from the composer card max-width variable')
+  assert.match(source, /\.dshdev-dock\{[^}]*margin-inline:auto/, 'the dock centers itself')
   const rendered = text(page)
   assert.match(rendered, /This task is no longer available on Qoder-Sigma/)
   assert.match(rendered, /Read-only/)
