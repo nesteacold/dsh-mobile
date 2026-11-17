@@ -1,8 +1,12 @@
 // Spec 027: plugin self-update ("Check for updates") for the linked @dsh-ext/* checkout.
 //
-// Only these git subcommands are ever run: fetch, tag, log, merge-base, status,
-// merge --ff-only, plus read-only show <tag>:<plugin>/package.json (engines.dsh at the tag)
-// and optional erify-tag (both named by the spec).
+// Only these git subcommands are ever run: fetch, for-each-ref, log, merge-base,
+// status, merge --ff-only, plus read-only show <ref>:<plugin>/package.json
+// (engines.dsh at the tag) and optional verify-tag (both named by the spec).
+// Release tags are fetched into a private remote-tracking namespace, never
+// refs/tags/*: a force-moved upstream tag can then be fetched without clobbering
+// the owner's own tags. The public result keeps the plain vX.Y.Z tag; every git
+// read resolves the private ref instead.
 // Fixed argv (no shell), a timeout, GIT_TERMINAL_PROMPT=0. Never reset/stash/
 // checkout/clean/force; never restarts DSH; never reads credentials.
 import { execFile } from 'node:child_process'
@@ -11,6 +15,9 @@ import { fileURLToPath } from 'node:url'
 
 export const REMOTE_URL = 'https://github.com/nesteacold/dsh-mobile.git'
 export const ALLOWED_REMOTE = /^(?:https:\/\/|ssh:\/\/git@|git@)github\.com[/:]nesteacold\/dsh-mobile(?:\.git)?\/?$/
+const MAIN_REF = 'refs/remotes/origin/main'
+export const TAG_REF_PREFIX = 'refs/remotes/dsh-self-update/tags'
+const privateTagRef = (tag) => `${TAG_REF_PREFIX}/${tag}`
 const PLUGINS = ['plugins/devices', 'plugins/mobile-gateway']
 const LOCKFILES = ['package-lock.json', ...PLUGINS.map((p) => `${p}/package-lock.json`)]
 const SEMVER = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/
@@ -115,29 +122,42 @@ export function createSelfUpdater({ git, dshVersion, npmCi = null, verifySignatu
     const st = await git(['status', '--porcelain=v2', '--branch', '--untracked-files=no'])
     const branch = (/^# branch\.head (.+)$/m.exec(st)?.[1] ?? '').trim()
     const head = (await git(['log', '-1', '--format=%H', 'HEAD'])).trim()
-    await git(['fetch', '--no-write-fetch-head', '--tags', REMOTE_URL, '+refs/heads/main:refs/remotes/origin/main'])
-    const tagOut = await git(['tag', '--list', 'v*', '--merged', 'origin/main'])
-    const tags = tagOut.split('\n').map((t) => t.trim()).filter((t) => parseSemver(t))
+    // A `--tags` fetch writes refs/tags/* and fails when upstream force-moves a
+    // release tag the owner's checkout already has. Both destinations below are
+    // remote-tracking refs. `--no-tags` stops Git's automatic tag following;
+    // `--no-prune-tags` overrides an owner's `fetch.pruneTags=true`, which could
+    // otherwise prune/write refs/tags/* despite those guards. `--prune` still
+    // prunes the private namespace through the explicit tag refspec below.
+    await git(['fetch', '--no-write-fetch-head', '--no-tags', '--prune', '--no-prune-tags', remote,
+      `+refs/heads/main:${MAIN_REF}`,
+      `+refs/tags/v*:${TAG_REF_PREFIX}/v*`])
+    const refOut = await git(['for-each-ref', `--merged=${MAIN_REF}`, '--format=%(refname)',
+      `${TAG_REF_PREFIX}/v*`])
+    const tags = refOut.split('\n').map((r) => r.trim())
+      .filter((r) => r.startsWith(`${TAG_REF_PREFIX}/`))
+      .map((r) => r.slice(TAG_REF_PREFIX.length + 1))
+      .filter((t) => parseSemver(t))
       .sort((a, b) => compareSemver(b, a))
     const current = {}
     for (const p of PLUGINS) { const m = await readManifest('HEAD', p); current[p] = m?.version ?? null }
     const result = { remote, branch, head, current, dshVersion: dshVersion ?? null, latest: null, upToDate: true }
     if (!tags.length) { result.reason = 'no-tags'; return result }
     const tag = tags[0]
-    const tagCommit = (await git(['log', '-1', '--format=%H', tag])).trim()
-    const notes = tagCommit === head ? [] : (await git(['log', '--oneline', `HEAD..${tag}`])).split('\n').filter(Boolean)
+    const ref = privateTagRef(tag)
+    const tagCommit = (await git(['log', '-1', '--format=%H', ref])).trim()
+    const notes = tagCommit === head ? [] : (await git(['log', '--oneline', `HEAD..${ref}`])).split('\n').filter(Boolean)
     const plugins = []
     for (const p of PLUGINS) {
-      const m = await readManifest(tag, p)
+      const m = await readManifest(ref, p)
       const range = m?.engines?.dsh ?? null
       plugins.push({ dir: p, version: m?.version ?? null, enginesDsh: range,
         accepts: range && dshVersion ? satisfies(dshVersion, range) : null })
     }
     let ff = false
-    try { await git(['merge-base', '--is-ancestor', 'HEAD', tag]); ff = true } catch { ff = false }
+    try { await git(['merge-base', '--is-ancestor', 'HEAD', ref]); ff = true } catch { ff = false }
     let signature = 'unsigned'
     if (verifySignatures) {
-      try { await git(['verify-tag', tag]); signature = 'verified' } catch { signature = 'unverified' }
+      try { await git(['verify-tag', ref]); signature = 'verified' } catch { signature = 'unverified' }
     }
     Object.assign(result, { latest: { tag, commit: tagCommit, notes, plugins, fastForward: ff, signature },
       upToDate: tagCommit === head || notes.length === 0 })
@@ -164,9 +184,10 @@ export function createSelfUpdater({ git, dshVersion, npmCi = null, verifySignatu
         ? `${reject.dir} requires DSH ${reject.enginesDsh}`
         : `${reject.dir} declares no readable engines.dsh at ${info.latest.tag}`)
       const before = info.head
-      const changed = (await git(['log', '--format=', '--name-only', `HEAD..${info.latest.tag}`]))
+      const ref = privateTagRef(info.latest.tag)
+      const changed = (await git(['log', '--format=', '--name-only', `HEAD..${ref}`]))
         .split('\n').map((s) => s.trim()).filter(Boolean)
-      await git(['merge', '--ff-only', info.latest.tag])
+      await git(['merge', '--ff-only', ref])
       previousHead = before
       const npm = []
       if (npmCi) {

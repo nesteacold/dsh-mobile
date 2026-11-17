@@ -9,10 +9,16 @@ The plugins are installed as `link:` checkouts, so DSH's Plugin Manager never sh
 ## Behaviour
 1. **Check** (manual button in Devices settings; optional check on start, off by default):
    - read local checkout: current branch, HEAD, `package.json` versions of devices/mobile-gateway;
-   - `git fetch --tags origin` (read-only on the working tree);
-   - latest release = highest semver tag `v*` on origin; show current vs latest and the release notes
-     (`git log --oneline HEAD..<tag>`), plus each plugin's `engines.dsh` at that tag and whether it
-     accepts the running DSH version.
+   - fetch `main` and `v*` tags from the fixed URL with `--no-tags --prune` into
+     `refs/remotes/origin/main` and `refs/remotes/dsh-self-update/tags/v*` (read-only on the working
+     tree; never write or follow into local `refs/tags/*`, so a force-moved upstream tag cannot make
+     the fetch fail with "would clobber existing tag", and deleted upstream releases leave the
+     private namespace);
+   - latest release = highest semver tag `v*` on origin that is merged into `origin/main`; show the
+     plain tag name and current vs latest plus release notes (`git log --oneline HEAD..<fetch-ref>`),
+     with each plugin's `engines.dsh` read at that fetched ref and whether it accepts the running DSH
+     version. All git reads and the later merge use the fetched private ref, never a possibly stale
+     local tag.
 2. **Update** (explicit click + confirm dialog):
    - refuse when: working tree dirty, HEAD not an ancestor of the tag (no fast-forward), target
      `engines.dsh` rejects the running DSH, or a check is already running;

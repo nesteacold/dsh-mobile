@@ -1,6 +1,6 @@
 {
   "name": "@dsh-ext/devices",
-  "version": "0.4.3",
+  "version": "0.4.6",
   "private": true,
   "description": "Devices page inside DSH Settings (Qoder-style): allow this Host to be controlled from other devices (pairing, authorized devices) and connect this Host to other Hosts' mobile-gateway as a desktop client. Spec 008.",
   "type": "module",

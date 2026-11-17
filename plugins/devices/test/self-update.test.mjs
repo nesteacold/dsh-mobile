@@ -1,11 +1,12 @@
 // Spec 027: self-update with a fake git runner (no real git, no network).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createSelfUpdater, satisfies, compareSemver, SelfUpdateError, handleSelfUpdateRoute } from '../lib/self-update.mjs'
+import { createSelfUpdater, satisfies, compareSemver, SelfUpdateError, handleSelfUpdateRoute, TAG_REF_PREFIX } from '../lib/self-update.mjs'
 
 const HEAD = 'a'.repeat(40)
 const TAGC = 'b'.repeat(40)
-const ALLOWED = new Set(['fetch', 'tag', 'log', 'merge-base', 'status', 'merge', 'show', 'verify-tag'])
+const ALLOWED = new Set(['fetch', 'for-each-ref', 'log', 'merge-base', 'status', 'merge', 'show', 'verify-tag'])
+const MAIN_REF = 'refs/remotes/origin/main'
 
 function fakeGit({ tags = ['v0.1.0', 'v0.2.0', 'v0.10.0-rc.1', 'nope'], dirty = false, ff = true,
   engines = '>=0.2.2-rc.3 <0.3.0-0', hang = false, changed = '' } = {}) {
@@ -14,9 +15,22 @@ function fakeGit({ tags = ['v0.1.0', 'v0.2.0', 'v0.10.0-rc.1', 'nope'], dirty = 
     calls.push(args)
     assert.ok(ALLOWED.has(args[0]), `forbidden git ${args[0]}`)
     if (args[0] === 'merge') assert.deepEqual(args.slice(0, 2), ['merge', '--ff-only'])
-    if (args[0] === 'fetch' && hang) {
-      await new Promise((r) => setTimeout(r, 20))
-      throw new SelfUpdateError('timeout', 'git fetch failed (timeout)')
+    if (args[0] === 'fetch') {
+      // This checkout already holds an old v0.4.3 tag. A `--tags` fetch of the
+      // force-moved upstream tag is rejected with exactly the owner's error.
+      if (args.includes('--tags')) throw new SelfUpdateError('git-failed',
+        'git fetch failed: ! [rejected] v0.4.3 -> v0.4.3 (would clobber existing tag)')
+      // Git follows advertised tags by default; only --no-tags keeps every fetched
+      // ref inside our private remote-tracking namespace.
+      assert.ok(args.includes('--no-tags'), 'automatic local tag following is still on')
+      assert.ok(args.includes('--no-prune-tags'), 'owner fetch.pruneTags=true must not prune local tags')
+      assert.ok(args.includes('--prune'), 'deleted upstream release tags must leave the private namespace')
+      assert.ok(args.includes(`+refs/heads/main:${MAIN_REF}`), 'main refspec missing')
+      assert.ok(args.includes(`+refs/tags/v*:${TAG_REF_PREFIX}/v*`), 'private tag refspec missing')
+      if (hang) {
+        await new Promise((r) => setTimeout(r, 20))
+        throw new SelfUpdateError('timeout', 'git fetch failed (timeout)')
+      }
     }
     switch (args[0]) {
       case 'status':
@@ -25,9 +39,11 @@ function fakeGit({ tags = ['v0.1.0', 'v0.2.0', 'v0.10.0-rc.1', 'nope'], dirty = 
         if (args[1] === '-1') return args[3] === 'HEAD' ? HEAD : TAGC
         if (args[1] === '--format=') return changed
         return 'b1 feat: one\nb2 fix: two\n'
-      case 'tag': return tags.join('\n')
+      case 'for-each-ref':
+        assert.ok(args.includes(`--merged=${MAIN_REF}`), 'candidates must be merged into origin/main')
+        return tags.map((t) => `${TAG_REF_PREFIX}/${t}`).join('\n')
       case 'show': {
-        const tagRef = !args[1].startsWith('HEAD:')
+        const tagRef = args[1].startsWith(`${TAG_REF_PREFIX}/`)
         if (tagRef && engines === 'ABSENT') return JSON.stringify({ version: '0.10.0-rc.1' })
         return JSON.stringify({ version: tagRef ? '0.10.0-rc.1' : '0.1.0', engines: { dsh: engines } })
       }
@@ -56,7 +72,9 @@ test('check picks highest semver tag and reports notes + engines', async () => {
   assert.equal(r.latest.signature, 'unsigned')
   const fetch = calls.find((c) => c[0] === 'fetch')
   assert.ok(fetch.includes('https://github.com/nesteacold/dsh-mobile.git'))
-  assert.ok(calls.find((c) => c[0] === 'tag').includes('origin/main'))
+  assert.ok(!fetch.includes('--tags'), 'fetch must not write local tags')
+  assert.ok(calls.find((c) => c[0] === 'for-each-ref').includes(`${TAG_REF_PREFIX}/v*`))
+  assert.equal(r.latest.commit, TAGC)
   assert.ok(!calls.some((c) => c[0] === 'merge'))
 })
 
@@ -75,7 +93,7 @@ test('clean + ff updates with merge --ff-only and reports restart', async () => 
   assert.equal(r.message, 'Restart DSH to load v0.10.0-rc.1')
   assert.equal(r.previousHead, HEAD)
   assert.deepEqual(npm, ['plugins/devices'])
-  assert.deepEqual(calls.find((c) => c[0] === 'merge'), ['merge', '--ff-only', 'v0.10.0-rc.1'])
+  assert.deepEqual(calls.find((c) => c[0] === 'merge'), ['merge', '--ff-only', `${TAG_REF_PREFIX}/v0.10.0-rc.1`])
   assert.equal(u.status().previousHead, HEAD)
 })
 
@@ -119,6 +137,31 @@ test('concurrent check refused as busy', async () => {
 test('stale tag refused', async () => {
   const u = createSelfUpdater({ git: fakeGit().git, dshVersion: '0.2.2-rc.3' })
   await assert.rejects(u.update('v0.2.0'), { code: 'stale' })
+})
+
+test('a force-moved remote tag is fetched without clobbering local tags', async () => {
+  // The fake fetch rejects `--tags` with the owner's exact "would clobber
+  // existing tag" error. Only the private refspec can complete this check.
+  const { git, calls } = fakeGit({ tags: ['v0.4.3'] })
+  const u = createSelfUpdater({ git, dshVersion: '0.2.2-rc.3' })
+  const r = await u.check()
+  assert.equal(r.latest.tag, 'v0.4.3')
+  assert.equal(r.latest.commit, TAGC)
+  const ref = `${TAG_REF_PREFIX}/v0.4.3`
+  const reads = calls.filter((c) => ['log', 'show', 'merge-base', 'verify-tag'].includes(c[0]))
+  assert.ok(reads.some((c) => c.some((a) => typeof a === 'string' && a.includes(ref))),
+    'reads resolve the private ref')
+  assert.ok(!reads.some((c) => c.some((a) => a === 'v0.4.3' || a.startsWith('v0.4.3:'))),
+    'no read uses a bare local tag')
+  assert.ok(!calls.some((c) => c[0] === 'fetch' && c.includes('--tags')))
+})
+
+test('signature verification checks the fetched tag ref, not a local tag', async () => {
+  const { git, calls } = fakeGit()
+  const u = createSelfUpdater({ git, dshVersion: '0.2.2-rc.3', verifySignatures: true })
+  const r = await u.check()
+  assert.equal(r.latest.signature, 'verified')
+  assert.deepEqual(calls.find((c) => c[0] === 'verify-tag'), ['verify-tag', `${TAG_REF_PREFIX}/v0.10.0-rc.1`])
 })
 
 for (const [label, engines] of [['absent', 'ABSENT'], ['empty', ''], ['null', null]]) {
