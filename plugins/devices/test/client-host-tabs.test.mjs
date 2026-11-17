@@ -70,11 +70,11 @@ const PLACEMENT_SEAT = 'shell.overlay'
  * Session row above, then the `Workspaces` section header, then the scrolling list
  * area, which is what `bindScrollerRef` is bound to.
  */
-function makeDocument({ header = true, listArea = true, rows = [] } = {}) {
+function makeDocument({ header = true, listArea = true, rows = [], headerPadding = '12px' } = {}) {
   // A1.3: the capture-phase click listener and the row clicks it observes are counted
   // here, so "one synthetic click", "owner toggle remembered" and "dispose removes the
   // listener" are all provable without a browser.
-  const doc = { mutations: [], listeners: new Map(), clicks: [] }
+  const doc = { mutations: [], listeners: new Map(), clicks: [], headerPadding }
   const mk = (tag, attrs = {}) => ({
     tagName: tag.toUpperCase(),
     attrs,
@@ -173,6 +173,9 @@ function makeDocument({ header = true, listArea = true, rows = [] } = {}) {
     },
   })
   doc.mk = mk
+  // The placement reads the LIVE header's padding: a re-render replaces the node, so
+  // the reader resolves `doc.header` when called, not when the fake document is built.
+  doc.getComputedStyle = (element) => ({ paddingLeft: element === doc.header ? doc.headerPadding : '' })
   doc.body = mk('body')
   doc.sidebar = mk('div', { class: 'sidebar' })
   doc.body.appendChild(doc.sidebar)
@@ -250,7 +253,7 @@ const sidebarOrder = (doc) => doc.sidebar.children.map((node) => {
  * key registry is handed over, `dom` is the fake document — a shell with no sidebar
  * header passes `header: false`, which is the collapsed rail's shape.
  */
-function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'ok', stored = null, dom, seatRefuses = false, rows = [], storageGetterThrows = false } = {}) {
+function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'ok', stored = null, dom, seatRefuses = false, rows = [], storageGetterThrows = false, headerPadding, computedStyle = 'global' } = {}) {
   let api
   const calls = []
   const fetch = async (url, options = {}) => {
@@ -261,7 +264,8 @@ function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'o
   }
   storage.clear()
   if (stored !== null) storage.set(STORAGE_KEY, stored)
-  const doc = dom ?? makeDocument({ rows })
+  const doc = dom ?? makeDocument({ rows, headerPadding: headerPadding ?? '12px' })
+  if (dom && headerPadding !== undefined) doc.headerPadding = headerPadding
   // Every `console.warn` the bundle raises, so "one warn, once" is provable.
   const warnings = []
   const pageConsole = { ...console, warn: (...args) => { warnings.push(args.map(String).join(' ')) } }
@@ -293,9 +297,14 @@ function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'o
       get() { throw new Error('SecurityError: localStorage is unavailable') },
     })
   }
-  vm.runInNewContext(source, { window, document: doc, fetch, URL, console: pageConsole, Date, MutationObserver: FakeObserver,
+  // 'global' is the Electron renderer's own getComputedStyle; 'window' is the same call
+  // reached through `window`; 'none' is a shell that offers neither (the fallback path).
+  if (computedStyle === 'window') window.getComputedStyle = doc.getComputedStyle
+  const context = { window, document: doc, fetch, URL, console: pageConsole, Date, MutationObserver: FakeObserver,
     setTimeout: window.setTimeout, clearTimeout: window.clearTimeout,
-    navigator: { language: locale, clipboard: { writeText: async () => {} } } })
+    navigator: { language: locale, clipboard: { writeText: async () => {} } } }
+  if (computedStyle === 'global') context.getComputedStyle = doc.getComputedStyle
+  vm.runInNewContext(source, context)
   const entries = []
   const kinds = { 'shell.overlay': 'list' }
   for (const name of ['settings.section', 'settings.section.icon', 'conversation.input.left', 'conversation.input.dock',
@@ -426,6 +435,8 @@ const glyphOf = (tab) => {
   return svgs[0]
 }
 const clickTab = (tab) => { tab.fire('click') }
+/** The inline style an element paints itself with, independent of any stylesheet. */
+const styleOf = (element) => element.getAttribute('style') ?? ''
 
 // ------------------------------------------------------------------- the placement
 await check('the strip is ONE node, the sidebar header\'s previous sibling: after "New Session", above "Workspaces", outside the list area', async () => {
@@ -640,6 +651,69 @@ await check('the selected tab uses fixed mockup blue and a pale chip, never the 
   const ui = load()
   for (const tab of tabsOf(ui)) glyphOf(tab)
   ui.dispose()
+})
+
+await check('presentation is INLINE on the strip and both buttons: no host CSS can repaint the blue chip', async () => {
+  const ui = load({ stored: 'local' })
+  const callsBefore = ui.calls.length
+  const strip = allOf(ui.stripNode()).find((node) => node.getAttribute('role') === 'tablist')
+  assert.ok(strip, 'one tablist')
+  const box = styleOf(strip)
+  for (const part of ['display:inline-flex', 'gap:2px', 'padding:2px', 'border:1px solid ', 'border-radius:8px',
+    'background:rgba(79,124,255,.16)']) {
+    assert.ok(box.includes(part), `the strip paints ${part} inline, not only in the stylesheet`)
+  }
+  const [local, remote] = tabsOf(ui)
+  for (const tab of [local, remote]) {
+    for (const part of ['width:28px', 'height:24px', 'display:grid', 'place-items:center', 'padding:0', 'border:0',
+      'border-radius:6px', 'cursor:pointer']) {
+      assert.ok(styleOf(tab).includes(part), `the button paints ${part} inline`)
+    }
+    assert.equal(textOf(tab), '', 'still icon-only')
+    glyphOf(tab)
+  }
+  assert.match(styleOf(local), /background:rgba\(79,124,255,\.16\)/, 'selected has the pale chip')
+  assert.match(styleOf(local), /color:#4f7cff/, 'selected ink is the fixed mockup blue')
+  assert.match(styleOf(remote), /background:transparent/, 'inactive has no chip')
+  assert.match(styleOf(remote), /color:var\(--dsw-alias-label-secondary/, 'inactive ink is the muted alias')
+  clickTab(remote)
+  // A tab change repaints the buttons in place, so re-read the strip, not the old nodes.
+  const [localAfter, remoteAfter] = tabsOf(ui)
+  assert.match(styleOf(remoteAfter), /background:rgba\(79,124,255,\.16\)/)
+  assert.match(styleOf(remoteAfter), /color:#4f7cff/)
+  assert.match(styleOf(localAfter), /background:transparent/)
+  assert.match(styleOf(localAfter), /color:var\(--dsw-alias-label-secondary/, 'the repaint follows the selected tab')
+  assert.equal(ui.calls.length, callsBefore, 'an inline repaint still asks the Host nothing')
+  ui.dispose()
+})
+
+await check('the left inset comes from the header\'s computed padding; missing/zero fall back to 11px, never negative', async () => {
+  const ui = load()
+  assert.equal(styleOf(ui.stripNode()), 'margin-left:11px', '12px header padding minus the 1px label shift')
+  // Only the left margin is inline: the stylesheet's other three margins stay in force.
+  assert.match(source, /\.dshdev-hosttabs\{[^}]*margin:1px 10px 6px calc\(var\(--dsh-sidebar-row-padding, 12px\) - 1px\)\}/)
+  const wide = load({ headerPadding: '18px' })
+  assert.equal(styleOf(wide.stripNode()), 'margin-left:17px', 'a themed header is measured, not assumed')
+  const zero = load({ headerPadding: '0px' })
+  assert.equal(styleOf(zero.stripNode()), 'margin-left:11px', 'a zero padding is no measurement: keep the shipped inset')
+  const missing = load({ computedStyle: 'none' })
+  assert.equal(styleOf(missing.stripNode()), 'margin-left:11px', 'a shell with no getComputedStyle falls back too')
+  const tiny = load({ headerPadding: '0.5px' })
+  assert.equal(styleOf(tiny.stripNode()), 'margin-left:0px', 'a sub-pixel padding is clamped, never negative')
+  const windowOnly = load({ computedStyle: 'window', headerPadding: '16px' })
+  assert.equal(styleOf(windowOnly.stripNode()), 'margin-left:15px', 'window.getComputedStyle works when the global is absent')
+  // Every pass refreshes the inset, including the pass that re-inserts a dropped node.
+  wide.doc.headerPadding = '8px'
+  wide.pulse(); wide.flushTimers()
+  assert.equal(styleOf(wide.stripNode()), 'margin-left:7px', 'a theme change is picked up without an insertion')
+  const node = wide.stripNode()
+  node.remove()
+  wide.doc.headerPadding = '24px'
+  wide.pulse(); wide.flushTimers()
+  assert.equal(wide.stripNode(), node, 'the same node comes back')
+  assert.equal(styleOf(node), 'margin-left:23px', 'and its inset is refreshed on re-insert')
+  assert.equal(wide.inserts(), 2, 'one original placement, one re-insert, never a duplicate')
+  ui.dispose(); wide.dispose(); zero.dispose(); missing.dispose(); tiny.dispose(); windowOnly.dispose()
 })
 
 // The `data-row-key` values the owner measured on the live DSH window (flat, in

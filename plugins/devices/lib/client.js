@@ -891,7 +891,8 @@ window.__ModuleLoader__.load({
    pale blue chip, the inactive one in muted gray on the shell's hover wash. The selected
    chip uses the fixed palette above: the shell's button-primary alias can resolve gray,
    which makes the selected glyph look inactive. The name stays in title/aria-label,
-   never as text in the 28x24 button. */
+   never as text in the 28x24 button. These rules are the fallback; renderHostTabs
+   writes the same box and button states inline so host/user CSS cannot repaint them. */
 .dshdev-hosttabs{display:flex;flex:none;width:max-content;justify-content:flex-start;margin:1px 10px 6px calc(var(--dsh-sidebar-row-padding, 12px) - 1px)}
 .dshdev-hosttabs-strip{display:inline-flex;gap:2px;margin:0;padding:2px;border:1px solid ${colors.border};border-radius:8px;background:${colors.hover}}
 .dshdev-hosttabs-strip button{flex:none;width:28px;height:24px;display:grid;place-items:center;padding:0;border:0;border-radius:6px;background:transparent;color:${colors.muted};cursor:pointer}
@@ -3185,12 +3186,17 @@ window.__ModuleLoader__.load({
       const tab = hostTabSnapshot()
       setAttr(node, 'class', 'dshdev-hosttabs')
       const strip = doc.createElement('div')
-      setAttrs(strip, { class: 'dshdev-hosttabs-strip dshdev-seg', role: 'tablist', 'aria-label': tr('hostTabs') })
+      // A host or user stylesheet can outrank our class rules, so the mockup box and
+      // both button states are painted in the elements' own style attributes.
+      setAttrs(strip, { class: 'dshdev-hosttabs-strip dshdev-seg', role: 'tablist', 'aria-label': tr('hostTabs'),
+        style: `display:inline-flex;gap:2px;padding:2px;border:1px solid ${colors.border};border-radius:8px;background:${HOST_TAB_ACCENT_PALE}` })
       for (const [id, label, keys] of TAB_BUTTONS) {
         const button = doc.createElement('button')
         const name = `${tr(label)} (${tr(keys)})`
         setAttrs(button, { type: 'button', role: 'tab', 'data-tab': id, 'data-testid': `sidebar-host-tab-${id}`,
-          'aria-selected': String(tab === id), 'aria-pressed': String(tab === id), 'aria-label': name, title: name })
+          'aria-selected': String(tab === id), 'aria-pressed': String(tab === id), 'aria-label': name, title: name,
+          style: `width:28px;height:24px;display:grid;place-items:center;padding:0;border:0;border-radius:6px;cursor:pointer;` +
+            `background:${tab === id ? HOST_TAB_ACCENT_PALE : 'transparent'};color:${tab === id ? HOST_TAB_ACCENT : colors.muted}` })
         const glyph = tabGlyph(doc, id)
         if (glyph) button.appendChild(glyph)
         if (typeof button.addEventListener === 'function') button.addEventListener('click', () => publishHostTab(id))
@@ -3219,6 +3225,18 @@ window.__ModuleLoader__.load({
       const header = doc.querySelector(HOST_TABS_HEADER)
       const parent = header === null ? null : header.parentNode
       if (!parent) return false
+      // The header's own padding is the alignment source: a theme that changes
+      // --dsh-sidebar-row-padding must not leave the strip flush to the sidebar edge.
+      // Refreshed on every pass, since padding can change without moving a node.
+      let inset = 11
+      try {
+        const computed = typeof getComputedStyle === 'function' ? getComputedStyle(header)
+          : (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function' ? window.getComputedStyle(header) : null)
+        const padding = Number.parseFloat(computed?.paddingLeft)
+        // Zero or an unreadable value is no usable measurement: keep the shipped 11px.
+        if (Number.isFinite(padding) && padding > 0) inset = Math.max(0, padding - 1)
+      } catch { /* a shell that refuses style reads keeps the fallback */ }
+      setAttr(node, 'style', `margin-left:${inset}px`)
       const strays = [...doc.querySelectorAll(`[data-testid="${HOST_TABS_TESTID}"]`)].filter((found) => found !== node)
       // Nothing to move and nothing to remove: this pass changes no DOM, so it raises no
       // observer record of its own — which is what keeps a feedback loop impossible.
