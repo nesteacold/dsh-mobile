@@ -119,6 +119,7 @@ export const ID_FIELDS = Object.freeze({
   // `user/message`. An approval/question card's `rpcId` is namespaced as before.
   source: 'source',
   rpcId: 'id',
+  fileId: 'id',
   eventId: 'id',
   approvalId: 'id',
   // The ANCHOR of a reorder: the row the moved one lands before
@@ -263,6 +264,32 @@ const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 const EVENTS_ENDPOINT = '$events'
 /** The per-session history stream: one opening snapshot, then increments. */
 const SESSION_FOLLOW_ENDPOINT = 'session/follow'
+/** The native composer's write endpoint (spec 038 R4-R6). */
+const PROMPT_ENDPOINT = 'session/prompt'
+/**
+ * The only prompt arguments a plain-text offline item may carry. Anything else —
+ * a file receipt, an attachment, `mode:'steer'`, an unfamiliar field — is refused
+ * visibly instead of being silently dropped from the replay.
+ */
+const PROMPT_QUEUE_ARGS = new Set(['sessionId', 'text', 'content', 'requestId', 'mode'])
+/** The two plain-text wire forms DSH accepts; recorded in the outbox's `mode` slot. */
+const PROMPT_WIRE_TEXT = 'text'
+const PROMPT_WIRE_CONTENT = 'plain'
+/** Refusal codes for a prompt the outbox must never see (visible to the caller). */
+const PROMPT_REFUSALS = Object.freeze({
+  attachment: 'attachment-bearing',
+  steer: 'steer-not-queueable',
+  unsupported: 'unsupported-field',
+  mode: 'unsupported-mode',
+  payload: 'non-text-payload',
+  request: 'bad-request-id',
+  target: 'bad-target',
+})
+const ATTACHMENT_PROMPT_FIELDS = new Set([
+  'attachments', 'attachment', 'files', 'file', 'fileIds', 'fileId', 'fileReceipts', 'fileReceipt',
+  'receipts', 'receipt', 'uploads', 'upload', 'blobs', 'blob', 'images', 'image', 'media',
+  'parts', 'binary', 'bytes', 'path', 'uri', 'url', 'dataUrl',
+])
 /**
  * The Host-wide projection control stream. DSH's client folds each
  * `{type:'projection', sessionId, seq, changes}` frame into the per-session
@@ -697,6 +724,75 @@ function isSessionSummaryRow(row) {
   return (kind === 'sequenced' || kind === 'cached')
     && typeof asOfSeq === 'number' && Number.isFinite(asOfSeq)
     && isPlainObject(values)
+}
+
+/**
+ * A Host's row as it is held for offline use (spec 038 R2). The native
+ * `SessionManager` keys rows by `sessionId` and applies a sequenced projection
+ * over a cached one, so a retained row is still the real row (same namespaced
+ * id, same values) with a `cached` projection and a finite watermark. No
+ * session-removed frame is produced by retention: the Host's next baseline
+ * replaces the row in place.
+ */
+function cachedSessionRows(rows) {
+  return (Array.isArray(rows) ? rows : []).filter(isSessionSummaryRow).map((row) => {
+    if (!isPlainObject(row.projections)) return row
+    const projections = { ...row.projections, kind: 'cached' }
+    // `isSessionSummaryRow` already required a finite asOfSeq for a projection.
+    // Keep it finite even if a persisted snapshot was written by an older build.
+    if (!Number.isFinite(projections.asOfSeq)) projections.asOfSeq = 0
+    return { ...row, projections }
+  })
+}
+
+/**
+ * Reduce a native `session/prompt` to the plain text the outbox can replay (spec 038 R4).
+ * DSH sends either a `text` slot or one `content:[{type:'text'}]` part; both are kept in
+ * their original wire form so a replay sends the SAME args, only later. A file part, a
+ * receipt, `mode:'steer'` or any unfamiliar field is refused here instead of losing its
+ * bytes in a queue that can only carry text.
+ * @returns {{text: string, mode: string}|{reason: string}} the queue input or a refusal
+ */
+function queueablePrompt(args) {
+  if (!isPlainObject(args)) return { reason: 'bad-input' }
+  for (const key of Object.keys(args)) {
+    if (ATTACHMENT_PROMPT_FIELDS.has(key)) return { reason: PROMPT_REFUSALS.attachment }
+    if (!PROMPT_QUEUE_ARGS.has(key)) return { reason: PROMPT_REFUSALS.unsupported }
+  }
+  if (args.mode === 'steer') return { reason: PROMPT_REFUSALS.steer }
+  if (args.mode !== undefined && !['text', 'plain', 'instant'].includes(args.mode)) {
+    return { reason: PROMPT_REFUSALS.mode }
+  }
+  // Keep the native mode verbatim when it has wire meaning (`instant`); otherwise
+  // the outbox's mode slot records the text form so a replay sends the SAME args.
+  const mode = args.mode === 'instant' ? 'instant' : undefined
+  if (typeof args.requestId !== 'string' || args.requestId === '') return { reason: PROMPT_REFUSALS.request }
+  if (typeof args.sessionId !== 'string' || args.sessionId === '') return { reason: PROMPT_REFUSALS.target }
+  const hasText = typeof args.text === 'string'
+  const parts = Array.isArray(args.content) ? args.content : null
+  if (hasText && parts !== null) return { reason: PROMPT_REFUSALS.unsupported }
+  if (hasText) {
+    if (args.text.trim() === '') return { reason: 'empty-text' }
+    return mode ? { text: args.text, mode, wire: 'text' }
+      : { text: args.text, mode: PROMPT_WIRE_TEXT, wire: 'text' }
+  }
+  if (parts === null) return { reason: PROMPT_REFUSALS.payload }
+  if (parts.length !== 1 || !isPlainObject(parts[0]) || parts[0].type !== 'text'
+    || typeof parts[0].text !== 'string') return { reason: PROMPT_REFUSALS.payload }
+  if (parts[0].text.trim() === '') return { reason: 'empty-text' }
+  return mode ? { text: parts[0].text, mode, wire: 'content' }
+    : { text: parts[0].text, mode: PROMPT_WIRE_CONTENT, wire: 'content' }
+}
+
+/** Rebuild the SAME plain-text args form that was queued (review finding 8). */
+function replayPromptArgs(item) {
+  const wire = item.wire ?? (item.mode === PROMPT_WIRE_CONTENT ? 'content' : 'text')
+  const args = { sessionId: item.replay.sessionId, requestId: item.replay.requestId }
+  if (wire === 'content') args.content = [{ type: 'text', text: item.replay.text }]
+  else args.text = item.replay.text
+  // A native mode that changes send semantics is kept; wire markers are internal.
+  if (item.mode === 'instant') args.mode = 'instant'
+  return args
 }
 
 /**
@@ -1293,6 +1389,7 @@ function binaryResultEnvelope(value) {
   }
   return null
 }
+
 /** Bounded FIFO the merged streams deliver through. */
 class ValueQueue {
   constructor(max = 4096) {
@@ -1416,6 +1513,8 @@ class MergeState {
       order,
       archived: this.#renameList(host, value?.archivedSessionIds),
       pinned: this.#renameList(host, value?.pinnedSessionIds),
+      // A fresh baseline is the authoritative replacement for a stale entry.
+      stale: false,
     })
     // A (re)connected host changes the merged picture: republish the whole state.
     return this.#emit([{ type: 'replace', value: this.baseline() }])
@@ -1454,6 +1553,54 @@ class MergeState {
 
   dropHost(hostId) {
     if (!this.hosts.delete(hostId)) return []
+    return this.#emit([{ type: 'replace', value: this.baseline() }])
+  }
+
+  /** Restore an already-renamed snapshot, before the merged baseline is published. */
+  restoreWorkspace(snapshot) {
+    const hostId = snapshot?.hostId
+    if (typeof hostId !== 'string' || hostId === '') return
+    const items = new Map()
+    const order = []
+    for (const item of Array.isArray(snapshot.items) ? snapshot.items : []) {
+      if (!isPlainObject(item) || typeof item.workspaceId !== 'string') continue
+      items.set(item.workspaceId, item)
+      order.push(item.workspaceId)
+    }
+    this.hosts.set(hostId, {
+      hostId,
+      hostName: typeof snapshot.hostName === 'string' && snapshot.hostName !== '' ? snapshot.hostName : hostId,
+      items,
+      order,
+      archived: Array.isArray(snapshot.archived) ? [...snapshot.archived] : [],
+      pinned: Array.isArray(snapshot.pinned) ? [...snapshot.pinned] : [],
+      stale: true,
+    })
+  }
+
+  /** The persisted form of one host's already-renamed workspace rows. */
+  snapshotWorkspace(hostId) {
+    const entry = this.hosts.get(hostId)
+    if (!entry) return null
+    return {
+      hostId,
+      hostName: entry.hostName,
+      items: [...entry.items.values()],
+      order: [...entry.order],
+      archived: [...entry.archived],
+      pinned: [...entry.pinned],
+    }
+  }
+
+  /**
+   * A link failure keeps the rows and flips only the internal stale bit. The
+   * republished `replace` is byte-for-byte the same workspace shape the owner
+   * already saw: no `dropHost`, no empty baseline and no DSH field named `stale`.
+   */
+  markHostStale(hostId) {
+    const entry = this.hosts.get(hostId)
+    if (!entry || entry.stale) return []
+    entry.stale = true
     return this.#emit([{ type: 'replace', value: this.baseline() }])
   }
 
@@ -1523,6 +1670,8 @@ export class HostRouter {
   #onHostsChanged
   #approvals
   #cache
+  #retention
+  #outbox
   #log
   #baselineTimeoutMs
   #dshVersion
@@ -1649,6 +1798,25 @@ export class HostRouter {
    * @type {Map<string, object[]>}
    */
   #retainedRows = new Map()
+  /** Active merged workspace states, so an explicit forget can drop a stale row. */
+  #workspaceMerges = new Set()
+  /** Row counts of the last persisted workspace snapshot, for the Devices page. */
+  #retainedWorkspaces = new Map()
+  /**
+   * Native `session/prompt` calls whose Host was offline. The map key is the outbox
+   * item key; the value keeps the call pending until replay settles or cancels it.
+   * @type {Map<string, object>}
+   */
+  #promptWaiters = new Map()
+  /** Hosts online at the last link-state notification, for offline -> online edges. */
+  #onlineHosts = new Set()
+  #hostChangeUnsub = null
+  /** Hosts with a replay loop in flight: one loop per host keeps per-session FIFO. */
+  #replayingHosts = new Set()
+  /** Backoff timers keyed `hostId\0sessionId` so a queued retry is bounded. */
+  #replayTimers = new Map()
+  /** In-flight replay calls, so forget/revoke can abort them (review finding 3). */
+  #replayAborts = new Map()
 
   constructor(deps = {}) {
     this.#gateway = deps.gateway
@@ -1657,7 +1825,23 @@ export class HostRouter {
     this.#onHostsChanged = typeof deps.onHostsChanged === 'function' ? deps.onHostsChanged : () => () => {}
     this.#approvals = deps.approvals ?? null
     this.#cache = deps.cache ?? null
+    this.#retention = deps.retention ?? null
+    this.#outbox = deps.outbox ?? null
     this.#log = typeof deps.log === 'function' ? deps.log : () => {}
+    // Hydrate session rows before any connected host can update them: a merged list
+    // opened during startup must show the persisted rows from the previous session.
+    for (const snapshot of this.#retention?.list() ?? []) {
+      const rows = cachedSessionRows(snapshot?.sessions)
+      if (rows.length > 0) this.#retainedRows.set(snapshot.hostId, rows)
+      if (snapshot?.workspace) this.#retainedWorkspaces.set(snapshot.hostId, (snapshot.workspace.items ?? []).length)
+    }
+    while (this.#retainedRows.size > MAX_RETAINED_HOSTS) {
+      this.#retainedRows.delete(this.#retainedRows.keys().next().value)
+    }
+    // A replay is triggered by an OFFLINE -> ONLINE edge, never by merely seeing a
+    // host online at construction (its queued items, if any, wait for the next link).
+    this.#onlineHosts = new Set(this.#connectedHosts().map((host) => host.hostId))
+    if (this.#outbox) this.#hostChangeUnsub = this.#onHostsChanged(() => this.#onLinkStateChanged())
     this.#baselineTimeoutMs = Number.isFinite(deps.mergeBaselineTimeoutMs) ? deps.mergeBaselineTimeoutMs : 3000
     // A1.1: the wrap is gated on the declared `engines.dsh` range (not the pinned version), so the running version is
     // part of the self-test. A caller that cannot detect it gets no wrap.
@@ -1719,9 +1903,31 @@ export class HostRouter {
     this.#inboxStates.clear()
     this.#cards.clear()
     this.#hostErrors.clear()
+    this.#hostChangeUnsub?.()
+    this.#hostChangeUnsub = null
+    for (const timer of this.#replayTimers.values()) clearTimeout(timer)
+    this.#replayTimers.clear()
+    for (const controller of this.#replayAborts.values()) controller.abort()
+    this.#replayAborts.clear()
+    // Spec 038 R5 (clarified): ordinary teardown is NOT terminal. Abandon the
+    // callers — they belong to the process going away — but leave every eligible
+    // queued item in plugin storage for the next instance. Only terminal outcomes
+    // (failure, expiry, caller cancel, forget/revoke) remove an item. A call we DO
+    // settle terminally always has its item removed first (see #settlePrompt's
+    // callers), so no settled call can ever be replayed by a later router.
+    for (const waiter of this.#promptWaiters.values()) {
+      if (waiter.ttlTimer) clearTimeout(waiter.ttlTimer)
+      if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener('abort', waiter.onAbort)
+    }
+    this.#promptWaiters.clear()
+    this.#onlineHosts.clear()
     // Retention describes hosts this controller was reading a moment ago: a torn-down
-    // router must not replay them out of its own state on the next install.
+    // router must not replay them out of its own state on the next install. The
+    // persisted files are untouched — a new router hydrates them from disk.
     this.#retainedRows.clear()
+    this.#retainedWorkspaces.clear()
+    this.#workspaceMerges.clear()
+    this.#replayingHosts.clear()
     this.#lastHostSet = null
     this.#catalogHostKey = null
     this.#catalogAnnouncedKey = null
@@ -1760,6 +1966,9 @@ export class HostRouter {
    * @returns {{remote: boolean, reason: string|null, hosts: object[], disconnected: object[], merged: string[]}}
    */
   status() {
+    // Expiry is a terminal outcome for a pending call: reconcile before reporting
+    // counts so a silently pruned item never leaves the native echo hanging.
+    this.#reconcileWaiters()
     let hosts = []
     try {
       hosts = this.#hosts().map((host) => {
@@ -1769,6 +1978,14 @@ export class HostRouter {
           hostId,
           hostName: String(host?.hostName ?? host?.hostId ?? ''),
           online: host?.online !== false,
+          // Counts, never prompt bodies: the Devices page only needs to know that a
+          // send is waiting and how much is still visible from this host. Callers
+          // without plugin-owned storage keep the pre-038 status shape.
+          ...(this.#retention || this.#outbox ? {
+            retainedSessions: (this.#retainedRows.get(hostId) ?? []).length,
+            retainedWorkspaces: this.#retainedWorkspaces.get(hostId) ?? 0,
+            queuedPrompts: this.#outbox?.list(hostId).queuedCount ?? 0,
+          } : {}),
           // Only when there is something to say: an entry stays exactly as before
           // for a host that never refused a call.
           ...(error ? { error } : {}),
@@ -1782,6 +1999,8 @@ export class HostRouter {
       // Rows the merged list still carries for it: 0 means the user simply has none
       // listed yet, which is not a failure.
       retainedSessions: (this.#retainedRows.get(host.hostId) ?? []).length,
+      retainedWorkspaces: this.#retainedWorkspaces.get(host.hostId) ?? 0,
+      queuedPrompts: this.#outbox?.list(host.hostId).queuedCount ?? 0,
     }))
     return {
       remote: this.#installed, reason: this.#installed ? null : this.#reason,
@@ -2100,6 +2319,13 @@ export class HostRouter {
       this.#assertSameReorderList(endpoint, payload)
       target = this.#route(payload)
     } catch (error) {
+      // R4: an offline PAIRED host keeps a plain-text send in the plugin outbox and
+      // holds the native call open. NO remote call is made here: the 10 s
+      // `RemoteConnection.call` timeout must never govern a queued prompt. The
+      // controlled waiter below is created only after storage accepted the item.
+      if (endpoint === PROMPT_ENDPOINT && this.#outbox && error?.code === 'remote/host-offline') {
+        return this.#queueOfflinePrompt(error.details?.hostId, payloadArgs(payload), signal)
+      }
       return { ok: false, error: failureOf(error) }
     }
     // A model selection names a provider, and a provider belongs to the Host that
@@ -2118,6 +2344,18 @@ export class HostRouter {
       // Unchanged for Local.
       return this.#localDispatch(endpoint, args, signal, peer)
     }
+    // Spec 038 R6: an ONLINE host may still have an ordered lane of queued or
+    // in-flight prompts for this session. A new native send joins that lane; only
+    // a session with no backlog takes the normal direct dispatch path.
+    if (endpoint === PROMPT_ENDPOINT && this.#outbox) {
+      const callArgs = payloadArgs(payload)
+      const rawSessionId = stripHostIds(callArgs, target.hostId)?.sessionId
+      if (typeof rawSessionId === 'string' && this.#outbox.list(target.hostId, rawSessionId).count > 0) {
+        const queued = this.#queueOfflinePrompt(target.hostId, callArgs, signal)
+        this.#replayHostPrompts(target.hostId)
+        return queued
+      }
+    }
     try {
       if (endpoint === APPROVAL_RESULT_ENDPOINT) return { ok: true, value: await this.#answerCard(target, payload, signal) }
       const forwarded = this.#forwardArgs(args, target.hostId)
@@ -2127,6 +2365,206 @@ export class HostRouter {
     } catch (error) {
       return { ok: false, error: failureOf(error) }
     }
+  }
+
+  // -- offline prompt outbox (spec 038 R4-R6) --------------------------------
+
+  /** A caller-visible failure with a stable code, in the carrier's error shape. */
+  #promptError(code, message) {
+    return new HostRouterError(code, message)
+  }
+
+  /**
+   * Settle a native prompt that was held for queueing. The stored item is NOT
+   * touched here: the replay/cancel path owns storage, and a torn-down router must
+   * leave a still-queued item for the next one. Once settled, no replay can revive
+   * the call — the waiter is gone.
+   */
+  #settlePrompt(key, status, error, result) {
+    const waiter = this.#promptWaiters.get(key)
+    if (!waiter) return false
+    this.#promptWaiters.delete(key)
+    if (waiter.ttlTimer) { clearTimeout(waiter.ttlTimer); waiter.ttlTimer = null }
+    if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener('abort', waiter.onAbort)
+    if (status === 'acked' || status === 'sent') waiter.resolve(result ?? { ok: true, value: { accepted: true } })
+    else waiter.resolve({ ok: false, error: failureOf(error ?? this.#promptError('cancelled', 'the queued prompt was cancelled')) })
+    return true
+  }
+
+  /**
+   * Hold one plain-text prompt open until its Host answers or refuses it. The
+   * returned promise is created AFTER the outbox accepted the item; no remote call
+   * (with its own short timeout) is involved while the link is down.
+   */
+  #queueOfflinePrompt(hostId, args, signal) {
+    const refusal = (code, message) => ({ ok: false, error: failureOf(this.#promptError(code, message)) })
+    // A paired host may be offline (the usual case) or online with a backlog
+    // (spec 038 R6: new sends join the ordered lane rather than overtake it).
+    const paired = this.#hostById(hostId) || this.#disconnectedHosts().some((host) => host.hostId === hostId)
+    if (typeof hostId !== 'string' || hostId === '' || !paired) {
+      return refusal('remote/host-offline', 'only a paired Host may hold a queued prompt')
+    }
+    const prepared = queueablePrompt(args)
+    if (prepared.reason) return refusal(`remote/${prepared.reason}`, `this prompt cannot be queued offline (${prepared.reason})`)
+    const sessionId = stripHostIds(args, hostId)?.sessionId
+    if (typeof sessionId !== 'string' || sessionId === '') return refusal('remote/bad-target', 'the prompt has no queueable session id')
+    if (signal?.aborted) return refusal('cancelled', 'the prompt was cancelled before it was queued')
+
+    const receipt = this.#outbox.enqueue({
+      hostId, sessionId, requestId: args.requestId, text: prepared.text,
+      mode: prepared.mode, wire: prepared.wire,
+    })
+    // A storage failure is never a silent pending call: reject the native send now.
+    if (receipt.status === 'refused' || receipt.persisted !== true) {
+      return refusal(`remote/${receipt.reason ?? 'persist-failed'}`, 'the prompt could not be queued')
+    }
+    const key = receipt.key
+    const existing = this.#promptWaiters.get(key)
+    if (existing) return existing.promise
+
+    let resolve
+    const promise = new Promise((done) => { resolve = done })
+    const waiter = { hostId, sessionId, requestId: args.requestId, signal, promise, resolve }
+    const onAbort = () => {
+      this.#outbox.mark(hostId, sessionId, args.requestId, 'cancelled')
+      this.#settlePrompt(key, 'cancelled', this.#promptError('cancelled', 'the prompt was cancelled by its caller'))
+    }
+    waiter.onAbort = onAbort
+    signal?.addEventListener('abort', onAbort, { once: true })
+    this.#promptWaiters.set(key, waiter)
+    // No network timeout: the native echo stays pending for the queue lifetime.
+    // A TTL is a terminal outcome, so it gets its OWN timer that settles the waiter
+    // with a visible expiry reason instead of letting storage prune in silence.
+    const ttlMs = Number(this.#outbox.limits?.ttlMs)
+    if (Number.isFinite(ttlMs) && ttlMs > 0) {
+      const remaining = ttlMs - (Date.now() - Number(receipt.createdAt || Date.now())) + 25
+      const timer = setTimeout(() => this.#reconcileWaiters(), Math.min(2_147_483_647, Math.max(0, remaining)))
+      timer.unref?.()
+      waiter.ttlTimer = timer
+    }
+    return promise
+  }
+
+  /** Settle waiters whose item vanished from storage (TTL expiry, review finding 5). */
+  #reconcileWaiters() {
+    if (!this.#outbox) return
+    for (const [key, waiter] of [...this.#promptWaiters]) {
+      const listed = this.#outbox.list(waiter.hostId, waiter.sessionId)
+      if (listed.items.some((item) => item.key === key)) continue
+      this.#settlePrompt(key, 'failed', this.#promptError('remote/prompt-expired', 'the queued prompt expired before it could be sent'))
+    }
+  }
+
+  /** A link-state change is the only replay trigger; edge-triggered, never polled. */
+  #onLinkStateChanged() {
+    const online = this.#connectedHosts()
+    const next = new Set(online.map((host) => host.hostId))
+    for (const hostId of next) if (!this.#onlineHosts.has(hostId)) this.#replayHostPrompts(hostId)
+    this.#onlineHosts = next
+  }
+
+  /** One replay loop per host; sessions run in sequence so per-session FIFO holds. */
+  #replayHostPrompts(hostId) {
+    if (!this.#outbox || this.#replayingHosts.has(hostId) || !this.#hostById(hostId)) return
+    const sessions = [...new Set(this.#outbox.list(hostId).items.map((item) => item.sessionId))]
+    if (sessions.length === 0) return
+    this.#replayingHosts.add(hostId)
+    const abort = new AbortController()
+    this.#replayAborts.set(hostId, abort)
+    void (async () => {
+      try {
+        for (const sessionId of sessions) {
+          if (abort.signal.aborted || !this.#hostById(hostId)) break
+          await this.#replaySessionPrompts(hostId, sessionId, abort.signal)
+        }
+      } catch (error) {
+        this.#log(`queued prompt replay stopped [${error?.code ?? 'error'}]`)
+      } finally {
+        if (this.#replayAborts.get(hostId) === abort) this.#replayAborts.delete(hostId)
+        this.#replayingHosts.delete(hostId)
+      }
+    })()
+  }
+
+  /** Claim and send one item at a time; a transient failure keeps its backoff. */
+  async #replaySessionPrompts(hostId, sessionId, replaySignal) {
+    for (;;) {
+      const host = this.#hostById(hostId)
+      if (!host || replaySignal.aborted) return
+      const item = this.#outbox.claimNext(hostId, sessionId)
+      if (!item) { this.#scheduleReplay(hostId, sessionId); return }
+      const waiter = this.#promptWaiters.get(item.key)
+      const signals = [replaySignal, waiter?.signal].filter(Boolean)
+      const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0]
+      try {
+        // The original requestId is the Host's de-duplication key for its durable
+        // user/message, so an already-accepted replay is acknowledged, not sent twice.
+        const value = await host.connection.call(PROMPT_ENDPOINT, replayPromptArgs(item), { signal })
+        if (value?.ok === false) {
+          const error = value.error ?? {}
+          throw Object.assign(new Error(typeof error.message === 'string' ? error.message : 'the host refused the prompt'),
+            { code: typeof error.code === 'string' ? error.code : 'remote/refused', permanent: true })
+        }
+        this.#outbox.mark(hostId, sessionId, item.requestId, 'acked')
+        this.#settlePrompt(item.key, 'acked', null, { ok: true, value: this.#ingress(hostId, value, PROMPT_ENDPOINT) })
+      } catch (error) {
+        if (replaySignal.aborted) {
+          // Teardown aborted a replay: the native call is abandoned, NOT terminal,
+          // so the item stays replayable. Undo the transient `sending` claim for a
+          // router reused in the same process (a reload's load() also does this).
+          if (!waiter?.signal?.aborted) this.#outbox.mark(hostId, sessionId, item.requestId, 'queued')
+          return
+        }
+        if (waiter?.signal?.aborted) return
+        const released = this.#outbox.releaseOnFailure(item, error)
+        if (released.status === 'failed') this.#settlePrompt(item.key, 'failed', error)
+        else this.#scheduleReplay(hostId, sessionId)
+        if (isLinkFailure(error) && !/forbidden|denied|scope|auth\//i.test(String(error?.code ?? ''))) return
+      }
+    }
+  }
+
+  /** One bounded retry timer per (host, session), driven by the item's nextAt. */
+  #scheduleReplay(hostId, sessionId) {
+    const key = `${hostId}\u0000${sessionId}`
+    if (this.#replayTimers.has(key)) return
+    const queued = this.#outbox.list(hostId, sessionId).items
+      .filter((item) => item.status === 'queued' && item.nextAt > 0).map((item) => item.nextAt)
+    if (queued.length === 0) return
+    const waitMs = Math.min(60_000, Math.max(0, Math.min(...queued) - Date.now()))
+    const timer = setTimeout(() => {
+      this.#replayTimers.delete(key)
+      this.#replayHostPrompts(hostId)
+    }, waitMs)
+    timer.unref?.()
+    this.#replayTimers.set(key, timer)
+  }
+
+  /**
+   * Forget/revoke/teardown ends EVERY stored item of that host — including ones
+   * with no live waiter — aborts its in-flight replay, then settles its native
+   * calls with a visible reason (review finding 3 and 6).
+   */
+  #cancelHostPrompts(hostId, code = 'remote/host-gone', message = 'this host is no longer available') {
+    this.#replayAborts.get(hostId)?.abort()
+    this.#outbox?.cancelHost(hostId)
+    for (const [key, waiter] of [...this.#promptWaiters]) {
+      if (waiter.hostId !== hostId) continue
+      this.#settlePrompt(key, 'cancelled', this.#promptError(code, message))
+    }
+    for (const [key, timer] of [...this.#replayTimers]) {
+      if (!key.startsWith(`${hostId}\u0000`)) continue
+      clearTimeout(timer)
+      this.#replayTimers.delete(key)
+    }
+  }
+
+  /** Persist the already-renamed workspace rows of a live merged stream. */
+  #rememberWorkspace(host, state) {
+    const snapshot = state.snapshotWorkspace(host.hostId)
+    if (!snapshot) return
+    this.#retainedWorkspaces.set(host.hostId, snapshot.items.length)
+    this.#retention?.setWorkspace(host.hostId, snapshot, host.hostName ?? host.hostId)
   }
 
   /**
@@ -2381,11 +2819,21 @@ export class HostRouter {
    */
   #rememberRows(hostId, rows) {
     if (typeof hostId !== 'string' || hostId === '') return
+    const retained = cachedSessionRows(rows)
     this.#retainedRows.delete(hostId)
-    this.#retainedRows.set(hostId, rows)
+    this.#retainedRows.set(hostId, retained)
     while (this.#retainedRows.size > MAX_RETAINED_HOSTS) {
       this.#retainedRows.delete(this.#retainedRows.keys().next().value)
     }
+    this.#retention?.setSessions(hostId, retained, this.#hostNameOf(hostId))
+  }
+
+  /** The display name already shown for a paired host, connected or not. */
+  #hostNameOf(hostId) {
+    for (const host of [...this.#connectedHosts(), ...this.#disconnectedHosts()]) {
+      if (host.hostId === hostId) return String(host.hostName ?? hostId)
+    }
+    return hostId
   }
 
   /**
@@ -2433,12 +2881,22 @@ export class HostRouter {
    */
   forgetHost(hostId) {
     if (typeof hostId !== 'string' || hostId === '') return false
+    const removed = this.#retainedRows.has(hostId) || this.#retainedWorkspaces.has(hostId)
     this.#hostErrors.delete(hostId)
     this.#forgetInboxHost(hostId)
+    // A forgotten/revoked grant ends every queued prompt and drops the persisted
+    // workspace/session copy with the in-memory one.
+    this.#cancelHostPrompts(hostId)
+    this.#retention?.removeHost(hostId)
+    this.#retainedWorkspaces.delete(hostId)
+    this.#retainedRows.delete(hostId)
+    for (const record of [...this.#workspaceMerges]) {
+      record.forward(record.state.dropHost(hostId))
+    }
     const stops = this.#followStops.get(hostId)
     this.#followStops.delete(hostId)
     if (stops) for (const stop of [...stops]) stop()
-    return this.#retainedRows.delete(hostId)
+    return removed
   }
 
   /** Drop both namespaced watermarks/values of one forgotten Host. */
@@ -3565,12 +4023,31 @@ export class HostRouter {
     // Which side the sidebar shows is a DISPLAY decision (client.js), never a filter
     // of this stream: DSH resolves a new chat's workspace from what is merged here.
     this.#merges.add(stop)
+    const record = { state, forward }
+    this.#workspaceMerges.add(record)
+    // A persisted snapshot is stale on purpose: it is the last merged view the
+    // owner saw, restored before the first baseline. A host that links now republishes
+    // a fresh baseline through setHost(), which replaces the entry in place.
+    for (const snapshot of this.#retention?.list() ?? []) {
+      if (!snapshot?.workspace) continue
+      state.restoreWorkspace(snapshot.workspace)
+      this.#retainedWorkspaces.set(snapshot.hostId, (snapshot.workspace.items ?? []).length)
+    }
     /** @type {Map<string, AbortController>} */
     const pumps = new Map()
     const drop = (hostId) => {
       pumps.get(hostId)?.abort()
       pumps.delete(hostId)
-      forward(state.dropHost(hostId))
+      // R1: a link failure is NOT a forget. Keep the rows under an internal stale
+      // bit and republish the same DSH shape so the sidebar does not empty.
+      forward([...state.markHostStale(hostId)])
+    }
+    const reconnect = (host) => {
+      // The old pump was aborted on link loss; its rows remain stale in state.
+      // The Host's fresh baseline emits its own `replace`, which is the authoritative
+      // replacement (including durable order). Do not prepend a stale snapshot here:
+      // it steals the next frame from the reader and can replay an obsolete order.
+      start(host)
     }
 
     const start = (host) => {
@@ -3589,16 +4066,26 @@ export class HostRouter {
             // the only way to refuse one without writing half of it.
             if (type === 'baseline' || type === 'replace') {
               forward(state.setHost(host, this.#refuseTagged(host.hostId, frame.value, 'workspace/follow baseline')))
+              this.#rememberWorkspace(host, state)
               continue
             }
             forward(state.applyHost(host, this.#refuseTagged(host.hostId, frame, 'workspace/follow')))
+            this.#rememberWorkspace(host, state)
           }
         } catch (error) {
           if (hostControl.signal.aborted || lifetime.signal.aborted) return
-          // A broken follow stream is a dead host as far as the sidebar cares.
+          // A dropped LINK keeps the last rows (stale); a Host that broke the
+          // protocol (`remote/id-leak`) or refused the stream has no rows here.
           this.#noteHostError(host.hostId, error)
           this.#log(`workspace/follow from ${host.hostId} stopped: ${error?.code ?? 'error'}`)
-          if (pumps.get(host.hostId) === hostControl) drop(host.hostId)
+          if (pumps.get(host.hostId) === hostControl) {
+            if (isLinkFailure(error)) drop(host.hostId)
+            else {
+              pumps.delete(host.hostId)
+              forward(state.dropHost(host.hostId))
+              this.#retainedWorkspaces.delete(host.hostId)
+            }
+          }
         }
       })()
     }
@@ -3649,7 +4136,10 @@ export class HostRouter {
       unsubscribe = this.#onHostsChanged(() => {
         const hosts = this.#connectedHosts()
         const connected = new Set(hosts.map((host) => host.hostId))
-        for (const host of hosts) start(host)
+        for (const host of hosts) {
+          if (state.hosts.has(host.hostId) && !pumps.has(host.hostId)) reconnect(host)
+          else start(host)
+        }
         for (const hostId of [...pumps.keys()]) if (!connected.has(hostId)) drop(hostId)
       })
 
@@ -3663,6 +4153,7 @@ export class HostRouter {
       for (const source of watched) source.removeEventListener?.('abort', onAbort)
       unsubscribe?.()
       this.#merges.delete(stop)
+      this.#workspaceMerges.delete(record)
       stop()
     }
   }

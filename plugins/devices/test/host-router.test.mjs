@@ -1199,13 +1199,13 @@ test('workspace/follow merges Local plus each host: baseline, renamed upsert, re
   const removed = await nextFrame(iterator, 'remove')
   assert.deepEqual(removed.value, { type: 'remove', workspaceId: 'h:hostB:wb1' })
 
-  // Disconnect: the host's workspaces leave the merged state and the UI is told
-  // to republish everything (a `replace`, not a silent drop).
+  // Disconnect (spec 038 R1): the host's workspaces STAY in the merged state —
+  // only an internal stale bit changes, never a DSH field or a `dropHost` frame.
   harness.disconnect('hostC')
   const dropped = await nextFrame(iterator, 'replace after disconnect')
   assert.equal(dropped.value.type, 'replace')
-  assert.deepEqual(dropped.value.value.items.map((item) => item.workspaceId), ['w1', 'h:hostB:wb2'])
-  assert.deepEqual(dropped.value.value.archivedSessionIds, ['s9', 'h:hostB:sb1'])
+  assert.deepEqual(dropped.value.value.items.map((item) => item.workspaceId), ['w1', 'h:hostB:wb2', 'h:hostC:wc1'])
+  assert.deepEqual(dropped.value.value.archivedSessionIds, ['s9', 'h:hostB:sb1', 'h:hostC:sc9'])
 
   // Reconnect: the host's baseline comes back and the merged state is republished.
   harness.connect('hostC')
@@ -1558,7 +1558,8 @@ test('a reorder survives as the merged `order` frame, and each list keeps its ow
   // so a refresh does not undo the move.
   harness.disconnect('hostB')
   const dropped = await nextFrame(iterator, 'replace after disconnect')
-  assert.deepEqual(dropped.value.value.items.map((item) => item.workspaceId), ['w1', 'w2'])
+  // Spec 038 R1: a link drop keeps the last merged rows visible while stale.
+  assert.deepEqual(dropped.value.value.items.map((item) => item.workspaceId), ['w1', 'w2', 'h:hostB:wb2', 'h:hostB:wb1'])
   harness.connect('hostB')
   const back = await nextFrame(iterator, 'replace after reconnect')
   assert.deepEqual(back.value.value.items.map((item) => item.workspaceId), ['w1', 'w2', 'h:hostB:wb1', 'h:hostB:wb2'],

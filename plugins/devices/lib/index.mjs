@@ -20,7 +20,8 @@ import {
 import { assertCleanCard, createHostRouter } from './host-router.mjs'
 import { createAgentBrowserPool } from './agent-browser.mjs'
 import { resolveDshRuntimeVersion } from './dsh-runtime-version.mjs'
-import { createSessionCache } from './session-cache.mjs'
+import { createPromptOutbox } from './prompt-outbox.mjs'
+import { createRetentionStore, createSessionCache } from './session-cache.mjs'
 import { createUploadRoute } from './upload-route.mjs'
 import { advertisedPairAddress, pairQrPayload, qrSvg, resolvePwaOrigin, tailscaleDnsName } from './pair-qr.mjs'
 import { createGitRunner, createNpmCi, createSelfUpdater, defaultRepoRoot, handleSelfUpdateRoute } from './self-update.mjs'
@@ -288,6 +289,11 @@ export const plugin = {
       maxBytes: options.sessionCacheMaxBytes,
       rotations: options.sessionCacheRotations,
     })
+    // Spec 038: plugin-owned snapshots of the merged workspace/session rows and the
+    // durable plain-text prompt outbox. Neither touches a DSH file or state; both
+    // live entirely under dataDir and survive a DSH reload.
+    const retention = createRetentionStore({ dir: dataDir, log })
+    const outbox = createPromptOutbox({ dir: path.join(dataDir, 'outbox'), log })
     /** @type {Map<string, {connection: RemoteConnection, state: string, detail: string|null, approvals: Map<string, object>}>} */
     const live = new Map()
     // Multi-host routing (spec 008 P2a) subscribes here: a merged workspace/follow
@@ -713,6 +719,9 @@ export const plugin = {
       },
       // Every remote `session/follow` frame lands here (spec 008 P2c).
       cache: sessionCache,
+      // Spec 038: retention/outbox are plugin-owned; no DSH object is wrapped.
+      retention,
+      outbox,
       // Constitution A1.1: the wrapper is enabled only on the pinned `engines.dsh`
       // the self-test was written for; an unknown or different version means no
       // wrap and a reason the Devices page shows.

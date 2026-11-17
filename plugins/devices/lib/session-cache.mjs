@@ -19,7 +19,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { SECRET_FILE_MODE, ensureOwnerOnlyDirectory, restrictToOwnerSync } from './secure-file.mjs'
+import { SECRET_FILE_MODE, ensureOwnerOnlyDirectory, restrictToOwnerSync, writeSecretFile } from './secure-file.mjs'
 
 /** Current file budget before it rotates (one transcript file). */
 export const SESSION_CACHE_MAX_BYTES = 2 * 1024 * 1024
@@ -249,3 +249,171 @@ export function createSessionCache({ dir, log = () => {}, maxBytes = SESSION_CAC
 }
 
 export default createSessionCache
+
+// -- bounded retention snapshots (spec 038 R1/R2/R7) -------------------------
+//
+// The merged workspace and session rows of a paired Host are kept in ONE
+// plugin-owned JSON file, beside the transcript files. No DSH state or file is
+// touched. Ids are values in that file, never file names, and nothing here logs
+// a row body, an id, or a prompt.
+
+/** Defaults from spec 038 R7. */
+export const RETENTION_MAX_HOSTS = 32
+export const RETENTION_MAX_SESSION_ROWS = 200
+export const RETENTION_MAX_WORKSPACE_ROWS = 200
+export const RETENTION_MAX_BYTES = 2 * 1024 * 1024
+export const RETENTION_MAX_HOST_BYTES = 256 * 1024
+export const RETENTION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+const RETENTION_FILE = 'retention.json'
+const isRetentionObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
+const isRetentionId = (value) => typeof value === 'string' && value.length > 0 && value.length <= 256
+const cloneRetention = (value) => value === undefined ? undefined : JSON.parse(JSON.stringify(value))
+
+/**
+ * @param {object} options
+ * @param {string} options.dir plugin data dir (the file is `<dir>/retention.json`)
+ * @param {(line: string) => void} [options.log]
+ * @param {number} [options.maxHosts]
+ * @param {number} [options.maxSessionRows]
+ * @param {number} [options.maxWorkspaceRows]
+ * @param {number} [options.maxBytes]
+ * @param {number} [options.maxHostBytes]
+ * @param {number} [options.ttlMs]
+ * @param {() => number} [options.now] test seam
+ */
+export function createRetentionStore({ dir, log = () => {}, maxHosts = RETENTION_MAX_HOSTS,
+  maxSessionRows = RETENTION_MAX_SESSION_ROWS, maxWorkspaceRows = RETENTION_MAX_WORKSPACE_ROWS,
+  maxBytes = RETENTION_MAX_BYTES, maxHostBytes = RETENTION_MAX_HOST_BYTES,
+  ttlMs = RETENTION_TTL_MS, now = Date.now } = {}) {
+  const root = String(dir ?? '')
+  const file = path.join(root, RETENTION_FILE)
+  const hostLimit = Number.isSafeInteger(maxHosts) && maxHosts > 0 ? maxHosts : RETENTION_MAX_HOSTS
+  const sessionLimit = Number.isSafeInteger(maxSessionRows) && maxSessionRows > 0 ? maxSessionRows : RETENTION_MAX_SESSION_ROWS
+  const workspaceLimit = Number.isSafeInteger(maxWorkspaceRows) && maxWorkspaceRows > 0 ? maxWorkspaceRows : RETENTION_MAX_WORKSPACE_ROWS
+  const byteLimit = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : RETENTION_MAX_BYTES
+  const hostByteLimit = Number.isFinite(maxHostBytes) && maxHostBytes > 0 ? Math.floor(maxHostBytes) : RETENTION_MAX_HOST_BYTES
+  const ttl = Number.isFinite(ttlMs) && ttlMs >= 0 ? ttlMs : RETENTION_TTL_MS
+  const nowOf = () => {
+    const value = Number(now())
+    return Number.isFinite(value) ? value : Date.now()
+  }
+
+  const sessionRows = (value) => (Array.isArray(value) ? value : [])
+    .filter((row) => isRetentionObject(row) && isRetentionId(row.sessionId))
+    .slice(0, sessionLimit)
+
+  const workspaceSnapshot = (value, hostId, hostName) => {
+    if (!isRetentionObject(value)) return null
+    const items = (Array.isArray(value.items) ? value.items : [])
+      .filter((item) => isRetentionObject(item) && isRetentionId(item.workspaceId))
+      .slice(0, workspaceLimit)
+    const ids = new Set(items.map((item) => item.workspaceId))
+    const boundedList = (input) => (Array.isArray(input) ? input : [])
+      .filter((id) => isRetentionId(id) && ids.has(id))
+      .slice(0, workspaceLimit)
+    return {
+      hostId,
+      hostName: typeof value.hostName === 'string' && value.hostName !== '' ? value.hostName : hostName,
+      items,
+      order: boundedList(value.order),
+      archived: boundedList(value.archived),
+      pinned: boundedList(value.pinned),
+    }
+  }
+
+  const normaliseHost = (value) => {
+    if (!isRetentionObject(value) || !isRetentionId(value.hostId)) return null
+    const hostId = value.hostId
+    const hostName = typeof value.hostName === 'string' && value.hostName !== '' ? value.hostName : hostId
+    const sessions = sessionRows(value.sessions)
+    const workspace = workspaceSnapshot(value.workspace, hostId, hostName)
+    if (sessions.length === 0 && workspace === null) return null
+    const savedAt = Number.isFinite(value.savedAt) ? value.savedAt : 0
+    return { hostId, hostName, savedAt, sessions, workspace }
+  }
+
+  let hosts = []
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const at = nowOf()
+    hosts = (Array.isArray(parsed?.hosts) ? parsed.hosts : [])
+      .map(normaliseHost)
+      .filter((host) => host && (ttl === 0 || at - host.savedAt <= ttl))
+  } catch (error) {
+    if (error?.code !== 'ENOENT') log(`retention snapshot unreadable, starting empty [${error?.code ?? 'parse error'}]`)
+  }
+
+  const bytesOf = (value) => Buffer.byteLength(JSON.stringify(value), 'utf8')
+
+  const shrinkHost = (host) => {
+    const trim = () => {
+      if (host.workspace) {
+        const ids = new Set(host.workspace.items.map((item) => item.workspaceId))
+        host.workspace.order = host.workspace.order.filter((id) => ids.has(id))
+      }
+    }
+    while (host.workspace && host.workspace.items.length > 0 && bytesOf(host) > hostByteLimit) {
+      host.workspace.items.pop()
+      trim()
+    }
+    if (host.workspace && bytesOf(host) > hostByteLimit) host.workspace = null
+    while (host.sessions.length > 0 && bytesOf(host) > hostByteLimit) host.sessions.pop()
+  }
+
+  const prune = () => {
+    for (const host of hosts) shrinkHost(host)
+    hosts = hosts.filter((host) => host && (host.sessions.length > 0 || host.workspace !== null))
+    hosts.sort((a, b) => b.savedAt - a.savedAt)
+    hosts = hosts.slice(0, hostLimit)
+    while (hosts.length > 0 && bytesOf({ version: 1, hosts }) > byteLimit) hosts.pop()
+  }
+
+  prune()
+
+  const save = () => {
+    prune()
+    try {
+      ensureOwnerOnlyDirectory(root)
+      writeSecretFile(file, JSON.stringify({ version: 1, savedAt: nowOf(), hosts }, null, 2))
+    } catch (error) {
+      log(`retention snapshot write failed [${error?.code ?? 'error'}]`)
+    }
+  }
+
+  const hostOf = (hostId) => hosts.find((host) => host.hostId === hostId) ?? null
+  const put = (hostId, patch, hostName) => {
+    if (!isRetentionId(hostId)) return false
+    const old = hostOf(hostId)
+    const next = normaliseHost({
+      ...(old ?? {}),
+      ...patch,
+      hostId,
+      hostName: typeof hostName === 'string' && hostName !== '' ? hostName : (old?.hostName ?? hostId),
+      savedAt: nowOf(),
+    })
+    hosts = next ? [next, ...hosts.filter((host) => host.hostId !== hostId)] : hosts.filter((host) => host.hostId !== hostId)
+    save()
+    return true
+  }
+
+  return {
+    file,
+    /** All usable snapshots, detached from the store's own state. */
+    list: () => hosts.map((host) => ({ ...cloneRetention(host), sessions: cloneRetention(host.sessions), workspace: cloneRetention(host.workspace) })),
+    readHost(hostId) {
+      const host = hostOf(hostId)
+      if (!host) return null
+      return { sessions: cloneRetention(host.sessions), workspace: cloneRetention(host.workspace), savedAt: host.savedAt }
+    },
+    setSessions(hostId, rows, hostName) { return put(hostId, { sessions: sessionRows(rows), workspace: hostOf(hostId)?.workspace ?? null }, hostName) },
+    setWorkspace(hostId, snapshot, hostName) { return put(hostId, { workspace: workspaceSnapshot(snapshot, hostId, hostName), sessions: hostOf(hostId)?.sessions ?? [] }, hostName) },
+    removeHost(hostId) {
+      if (!isRetentionId(hostId)) return false
+      const before = hosts.length
+      hosts = hosts.filter((host) => host.hostId !== hostId)
+      if (hosts.length !== before) save()
+      return hosts.length !== before
+    },
+  }
+}
