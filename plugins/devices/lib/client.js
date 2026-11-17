@@ -31,28 +31,6 @@ window.__ModuleLoader__.load({
       // shell that simply has no chunk loader, and the failure is already visible.
       : Promise.resolve(null)
 
-    // The sidebar host tabs need an imperative React root: the strip is placed in the
-    // sidebar's DOM, outside this bundle's own React tree. `react` carries no
-    // `createRoot` (React 19), so the root renderer comes from the shell's module loader
-    // the same way every surface in this file gets React — `react-dom/client` first, and
-    // `react-dom` for a shell whose mapping exposes only the package root. Resolved ONCE,
-    // lazily, and only when the strip is actually installed; a shell that cannot hand it
-    // over gets no strip and the Devices page says so — never a hand-built second strip.
-    let reactRootCache
-    const reactRoot = () => {
-      if (reactRootCache !== undefined) return reactRootCache
-      reactRootCache = null
-      for (const id of ['react-dom/client', 'react-dom']) {
-        try {
-          const loaded = typeof require === 'function' ? require(id) : null
-          if (typeof loaded?.createRoot !== 'function') continue
-          reactRootCache = loaded.createRoot
-          break
-        } catch { /* the next id may be the one this shell maps */ }
-      }
-      return reactRootCache
-    }
-
     // ---------------------------------------------------------------- i18n
     // vi/en; Vietnamese when the DSH locale is vi*, English otherwise (the
     // gateway reads the same ctx.locale snapshot: `getSnapshot().active`).
@@ -355,13 +333,9 @@ window.__ModuleLoader__.load({
         tabSwitchRemote: 'Show remote workspaces',
         tabShortcutLocal: 'Ctrl+Alt+1',
         tabShortcutRemote: 'Ctrl+Alt+2',
-        sidebarReasonNoTabs: 'This shell renders no sidebar workspace header to place the tabs under.',
-        // A seat was declared and the strip is installed and watching, but the sidebar's
-        // workspace header has not been drawn (yet, or at all). Kept apart from the line
-        // above so "the shell has no such seat" and "the sidebar has not drawn it" are not
-        // read as the same fact.
+        // The strip is installed and watching, but the sidebar's workspace header has not
+        // been drawn (yet, or at all). The only tab reason the page can show.
         sidebarReasonNoHeader: 'The sidebar workspace header did not appear, so there is nowhere to place the tabs yet.',
-        sidebarReasonNoRenderer: 'This shell handed over no root renderer, so the tabs cannot be drawn.',
         sidebarReasonShortcut: 'The sidebar tabs are on, but Ctrl+Alt+1 / 2 could not be registered',
         // --- spec 033 (A1.2): a file picked for a remote session reaches that Host as bytes ---
         attachTitle: 'Remote file attach',
@@ -698,9 +672,7 @@ window.__ModuleLoader__.load({
         tabSwitchRemote: 'Xem workspace từ xa',
         tabShortcutLocal: 'Ctrl+Alt+1',
         tabShortcutRemote: 'Ctrl+Alt+2',
-        sidebarReasonNoTabs: 'Giao diện này không dựng tiêu đề danh sách workspace để đặt thẻ bên dưới.',
         sidebarReasonNoHeader: 'Tiêu đề danh sách workspace của thanh bên chưa xuất hiện nên chưa có chỗ đặt thẻ.',
-        sidebarReasonNoRenderer: 'Giao diện này không cung cấp bộ dựng gốc nên không vẽ được các thẻ.',
         sidebarReasonShortcut: 'Thẻ thanh bên đang bật, nhưng không đăng ký được Ctrl+Alt+1 / 2',
         // --- spec 033 (A1.2): tệp chọn cho phiên từ xa đến host đó dưới dạng byte ---
         attachTitle: 'Đính kèm tệp từ xa',
@@ -3013,11 +2985,10 @@ window.__ModuleLoader__.load({
       if (value === 'the shell provides no client services') return tr('sidebarReasonNoServices')
       if (value === 'no remote host is connected') return tr('sidebarReasonNoHost')
       if (value === 'the shell provides no workspace actions') return tr('sidebarReasonNoActions')
-      // The three tab facts, each with its own sentence so the owner can tell which one
-      // it is (owner report 2026-11-16: "nothing renders" named none of them).
-      if (value === 'no-seat') return tr('sidebarReasonNoTabs')
+      // The tab facts: a header that never arrived, or keys that could not be registered.
+      // Placement no longer depends on a slot seat or a React root renderer, so neither
+      // is a reason the page can report.
       if (value === 'no-header') return tr('sidebarReasonNoHeader')
-      if (value === 'no-renderer') return tr('sidebarReasonNoRenderer')
       if (value === 'shortcuts') return tr('sidebarReasonShortcut')
       const routing = /^multi-host routing is off(?:: (.*))?$/.exec(value)
       if (routing) {
@@ -3028,11 +2999,10 @@ window.__ModuleLoader__.load({
     function RemoteGroupingStatus() {
       useLang()
       const status = useRemoteUI()
-      // "Installed" and "on screen" are two facts. A placement that has a seat and a
-      // renderer but no header yet is installed (`tabs: true`) and NOT visible, so the
-      // line must not promise two tabs it cannot draw: those two reasons read as
-      // `not installed — <why>` and the strip appears by itself once the header does.
-      const unplaced = status.tabsReason === 'no-header' || status.tabsReason === 'no-renderer'
+      // "Installed" and "on screen" are two facts. A placement that has no header yet is
+      // installed (`tabs: true`) and NOT visible, so the line must not promise two tabs it
+      // cannot draw: it reads as `not installed — <why>` until the header appears.
+      const unplaced = status.tabsReason === 'no-header'
       const tabsLine = status.tabs && !unplaced
         ? `${tr('hostTabsOn')}${status.tabsReason ? ` — ${groupingReasonText(status.tabsReason)}` : ''}`
         : `${tr('hostTabsOff')}${status.tabsReason ? ` — ${groupingReasonText(status.tabsReason)}` : ''}`
@@ -3122,14 +3092,13 @@ window.__ModuleLoader__.load({
     const HOST_TABS_STORAGE = 'dsh-ext.devices.sidebar-tab'
     const HOST_TABS_DEFAULT = 'local'
     // Declared in `apply` so `installRemoteSurfaces` can report it on the Devices page.
-    // `tabs: false` means "not installed"; `tabsReason` explains WHY, with the three
-    // facts the owner has to be able to tell apart (owner report 2026-11-16):
-    //  - `no-seat`     — the shell never declared `shell.overlay` (nothing to hook into);
-    //  - `no-renderer` — a seat but no root renderer, so no strip can be built;
+    // `tabs: false` means "not installed"; `tabsReason` names only a REAL failure:
+    //  - `no-document` / `no-observer` — the page cannot host a placement at all;
     //  - `no-header`   — installed and watching, but the sidebar's workspace header never
     //                    appeared, so there is nowhere to put the strip;
     //  - `shortcuts`   — the tabs work, only Ctrl+Alt+1/2 could not be registered.
     // A fourth state has no reason at all: placed, which is `tabs: true, tabsReason: null`.
+    // A missing `shell.overlay` seat or root renderer is no longer a reason: neither is needed.
     const syncHostTabsStatus = () => remoteUI.set({
       tabs: toggles.registered,
       tabsReason: toggles.reason || null,
@@ -3143,7 +3112,6 @@ window.__ModuleLoader__.load({
     }
     const subscribeHostTab = (listener) => { toggles.listeners.add(listener); return () => toggles.listeners.delete(listener) }
     const hostTabSnapshot = () => toggles.tab
-    const useHostTab = () => React.useSyncExternalStore(subscribeHostTab, hostTabSnapshot, hostTabSnapshot)
     const storedHostTab = () => {
       try {
         const value = window.localStorage.getItem(HOST_TABS_STORAGE)
@@ -3160,43 +3128,74 @@ window.__ModuleLoader__.load({
       return true
     }
 
-    // The two tab glyphs, drawn once in the package's own 24-unit stroke style (the
-    // same inline-SVG pattern as `IconMonitor`/`deviceGlyph`, React's SVG namespace):
-    // a compact monitor with a check for THIS computer, a compact cloud with a link
-    // dot for a REMOTE workspace — the shapes from artifacts/host-tabs-mockup.html.
-    // `icon()` strokes with `currentColor`, so CSS paints the selected one accent blue
-    // and the inactive one muted gray; the filled link dot uses currentColor too, so
-    // neither glyph carries a colour of its own.
-    const IconTabLocal = () => icon(16, [
-      h('rect', { key: 's', x: 2.5, y: 4.5, width: 19, height: 12.5, rx: 2 }),
-      h('path', { key: 'p', d: 'M9 20.5h6M12 17v3.5' }),
-      h('path', { key: 'c', d: 'M8.5 10.5l2.5 2.5 4.5-4.5' }),
-    ])
-    const IconTabRemote = () => icon(16, [
-      h('path', { key: 'c', d: 'M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z' }),
-      h('circle', { key: 'd', cx: 12, cy: 15, r: 1.5, fill: 'currentColor', stroke: 'none' }),
-    ])
-
+    // The two tab glyphs, drawn in the package's own 24-unit stroke style (the same
+    // shapes as IconMonitor/deviceGlyph): a compact monitor with a check for THIS computer,
+    // a compact cloud with a link dot for a REMOTE workspace. The strip lives in the
+    // sidebar's DOM, outside this bundle's React tree, so it is built with plain DOM and
+    // the SVG namespace — no React root, no `react-dom/client`, no second render path.
+    // `stroke: currentColor` lets the existing CSS paint the selected tab accent blue
+    // and the inactive one muted gray; the filled link dot uses currentColor too.
+    const setAttr = (element, name, value) => {
+      if (!element) return
+      if (typeof element.setAttribute === 'function') element.setAttribute(name, String(value))
+      else if (element.dataset && name.startsWith('data-')) element.dataset[name.slice(5)] = String(value)
+      else element.attrs = { ...(element.attrs ?? {}), [name]: String(value) }
+    }
+    const setAttrs = (element, attrs) => {
+      for (const [name, value] of Object.entries(attrs)) setAttr(element, name, value)
+      return element
+    }
+    const TAB_GLYPHS = {
+      local: [
+        ['rect', { x: 2.5, y: 4.5, width: 19, height: 12.5, rx: 2 }],
+        ['path', { d: 'M9 20.5h6M12 17v3.5' }],
+        ['path', { d: 'M8.5 10.5l2.5 2.5 4.5-4.5' }],
+      ],
+      remote: [
+        ['path', { d: 'M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z' }],
+        ['circle', { cx: 12, cy: 15, r: 1.5, fill: 'currentColor', stroke: 'none' }],
+      ],
+    }
+    const tabGlyph = (doc, id) => {
+      if (typeof doc.createElementNS !== 'function') return null
+      const svg = setAttrs(doc.createElementNS(SVG_NS, 'svg'), { width: 16, height: 16, viewBox: '0 0 24 24',
+        fill: 'none', stroke: 'currentColor', 'stroke-width': 1.7, 'stroke-linecap': 'round',
+        'stroke-linejoin': 'round', 'aria-hidden': 'true', focusable: 'false' })
+      for (const [tag, attrs] of TAB_GLYPHS[id] ?? []) {
+        const child = doc.createElementNS(SVG_NS, tag)
+        setAttrs(child, attrs)
+        svg.appendChild(child)
+      }
+      return svg
+    }
+    const TAB_BUTTONS = [['local', 'tabThisComputer', 'tabShortcutLocal'], ['remote', 'tabRemoteWorkspace', 'tabShortcutRemote']]
     /**
-     * The strip itself: two compact ICON buttons, nothing else — the localized name
-     * and its shortcut live in `title`/`aria-label`, never as text inside the button.
-     * It is a real box in the sidebar's flow, inserted by `installSidebarTabStrip`, so
-     * it takes no children and wraps nothing of the shell's — the New Session button
-     * stays exactly where and as big as it ships.
+     * Paint the two compact ICON buttons into the one container node. The localized name
+     * and its shortcut live in `title`/`aria-label`, never as text inside the button. The
+     * selected tab is rewritten in place on every store or locale change, so a click and
+     * a key press stay on the same store and the strip follows the owner's language.
      */
-    function SidebarHostTabs() {
-      useLang()
-      const tab = useHostTab()
-      const choose = (next) => { publishHostTab(next) }
-      return h('div', { className: 'dshdev-hosttabs', 'data-testid': HOST_TABS_TESTID },
-        h('div', { className: 'dshdev-hosttabs-strip dshdev-seg', role: 'tablist', 'aria-label': tr('hostTabs') },
-          [['local', 'tabThisComputer', 'tabShortcutLocal', IconTabLocal],
-            ['remote', 'tabRemoteWorkspace', 'tabShortcutRemote', IconTabRemote]].map(([id, label, keys, Glyph]) => {
-            const name = `${tr(label)} (${tr(keys)})`
-            return h('button', { key: id, type: 'button', role: 'tab', 'data-tab': id, 'data-testid': `sidebar-host-tab-${id}`,
-              'aria-selected': tab === id, 'aria-pressed': tab === id, 'aria-label': name, title: name,
-              onClick: () => choose(id) }, h(Glyph))
-          })))
+    function renderHostTabs(doc, node) {
+      // A lightweight host that never provides a writable DOM gets no strip (it also
+      // has no sidebar to place it in); a real element always offers appendChild.
+      if (typeof doc.createElement !== 'function' || typeof node.appendChild !== 'function') return
+      const tab = hostTabSnapshot()
+      setAttr(node, 'class', 'dshdev-hosttabs')
+      const strip = doc.createElement('div')
+      setAttrs(strip, { class: 'dshdev-hosttabs-strip dshdev-seg', role: 'tablist', 'aria-label': tr('hostTabs') })
+      for (const [id, label, keys] of TAB_BUTTONS) {
+        const button = doc.createElement('button')
+        const name = `${tr(label)} (${tr(keys)})`
+        setAttrs(button, { type: 'button', role: 'tab', 'data-tab': id, 'data-testid': `sidebar-host-tab-${id}`,
+          'aria-selected': String(tab === id), 'aria-pressed': String(tab === id), 'aria-label': name, title: name })
+        const glyph = tabGlyph(doc, id)
+        if (glyph) button.appendChild(glyph)
+        if (typeof button.addEventListener === 'function') button.addEventListener('click', () => publishHostTab(id))
+        else button.onclick = () => publishHostTab(id)
+        strip.appendChild(button)
+      }
+      if (typeof node.replaceChildren === 'function') node.replaceChildren(strip)
+      else { node.textContent = ''; node.appendChild(strip) }
     }
 
     /**
@@ -3229,21 +3228,20 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The invisible `shell.overlay` helper: the seat is an ordinary root-scope `list`
-     * entry, so it renders inside the app frame — the box it must produce is the
-     * sidebar's, though, which no overlay can reach. So it renders nothing, and a
-     * MutationObserver on the document places a React root of `SidebarHostTabs` immediately
-     * before the sidebar's section header. One debounced pass per burst of
-     * mutations; the observer stays on because the sidebar re-renders (a re-render that
-     * drops our node is re-inserted, and every one of those re-inserts is skipped while
-     * ours is already in place, so the loop cannot run away).
+     * The placement helper: one plain-DOM box in the sidebar's own flow. It needs no
+     * slot seat and no React root — `shell.overlay` is an OPTIONAL invisible helper,
+     * never a gate. A MutationObserver on the document places the box immediately
+     * before the sidebar's section header. One debounced pass per burst of mutations;
+     * the observer stays on because the sidebar re-renders (a re-render that drops our
+     * node is re-inserted, and every one of those re-inserts is skipped while ours is
+     * already in place, so the loop cannot run away).
      *
      * `apply()` runs BEFORE the sidebar's workspace browser mounts, so the first pass
      * normally finds no header at all. That is not a failure: the placement stays
-     * installed, the observer catches the header when it appears, and `HOST_TABS_HEADER_WAIT_MS`
-     * later a header that still has not shown up is reported once (a single `console.warn`
-     * plus a `tabsReason` on the Devices page) so "no header", "no seat" and "no renderer"
-     * are telling apart. The wait is a diagnostic only — the observer keeps looking after it.
+     * installed, the observer catches the header when it appears, and
+     * `HOST_TABS_HEADER_WAIT_MS` later a header that still has not shown up is reported
+     * once (a single `console.warn` plus a `tabsReason` on the Devices page). The wait
+     * is a diagnostic only — the observer keeps looking afterwards.
      *
      * `deps` is a test seam only: production passes nothing, so the document is the
      * page's own.
@@ -3254,12 +3252,6 @@ window.__ModuleLoader__.load({
       const Observer = 'MutationObserver' in deps ? deps.MutationObserver : (typeof MutationObserver === 'undefined' ? null : MutationObserver)
       const delay = 'setTimeout' in deps ? deps.setTimeout : (typeof setTimeout === 'function' ? setTimeout : null)
       const cancel = 'clearTimeout' in deps ? deps.clearTimeout : (typeof clearTimeout === 'function' ? clearTimeout : null)
-      // The renderer hands over the root renderer it read from the module loader (React 19
-      // carries none itself); `deps.createRoot` is the test seam. There is no hand-built
-      // DOM fallback on purpose: a second rendering path would lose the tab store, the
-      // locale subscription and React's own event ownership, so a shell without a root
-      // renderer is REPORTED instead.
-      const createRoot = deps.createRoot ?? deps.reactRoot ?? null
       const warn = typeof deps.warn === 'function' ? deps.warn : (typeof console !== 'undefined' && typeof console.warn === 'function' ? (...args) => console.warn(...args) : null)
       // Called when the placement's own visibility changes (placed late, or given up on):
       // the Devices page reads this through `toggles`, so it must not stay stale.
@@ -3269,21 +3261,24 @@ window.__ModuleLoader__.load({
       // owning a second one — the sidebar re-renders in the same bursts that move the
       // strip, so one pass per burst is enough for both jobs.
       const onPass = typeof deps.onPass === 'function' ? deps.onPass : null
-      // What a shell without a document, an observer or a root renderer gets: nothing is
-      // installed, and the page names the missing piece (`unavailable`, never `no-tabs`).
+      const subscribeLocale = typeof deps.localeSubscribe === 'function' ? deps.localeSubscribe : null
+      // What a shell without a document or an observer gets: nothing is installed, and
+      // the page names the missing piece. No slot seat or root renderer is required.
       if (!doc || typeof doc.querySelector !== 'function') return { status: () => 'unavailable', reason: () => 'no-document', dispose() {} }
       if (typeof Observer !== 'function' || !delay) return { status: () => 'unavailable', reason: () => 'no-observer', dispose() {} }
-      if (typeof createRoot !== 'function') return { status: () => 'unavailable', reason: () => 'no-renderer', dispose() {} }
       const node = doc.createElement('div')
-      // The node is found by a test id, and the sidebar re-renders through React, which
-      // may drop a sibling it never rendered: the id goes on the container the root
-      // owns, the same way the plugin's other elements name themselves (`setAttribute`,
-      // else `dataset`, else the attribute map — whichever the element offers).
-      if (typeof node.setAttribute === 'function') node.setAttribute('data-testid', HOST_TABS_TESTID)
-      else if (node.dataset) node.dataset.testid = HOST_TABS_TESTID
-      else node.attrs = { ...(node.attrs ?? {}), 'data-testid': HOST_TABS_TESTID }
-      const root = createRoot(node)
+      // The container is found by a test id and filled with plain DOM. `setAttribute`
+      // is a real element's own contract, with the dataset/attribute-map fallbacks a
+      // lightweight host can offer.
+      setAttr(node, 'data-testid', HOST_TABS_TESTID)
+      renderHostTabs(doc, node)
+      // The strip reads the SAME store the clicks and shortcuts write, and repaints on
+      // a locale change. The shell's language effect subscribed first, so `tr` is fresh.
+      const repaint = () => { try { renderHostTabs(doc, node) } catch { /* keep the last paint */ } }
+      const unsubscribeTab = subscribeHostTab(repaint)
+      const unsubscribeLocale = subscribeLocale ? subscribeLocale(repaint) : null
       let placed = false
+      let placedAnnounced = false
       let timer = null
       let waitTimer = null
       let headerWarned = false
@@ -3313,11 +3308,8 @@ window.__ModuleLoader__.load({
         } catch { /* a document mid-teardown: the next pass retries */ }
         // A row scan is a separate job and must never stop the placement it rides on.
         if (onPass !== null) { try { onPass() } catch { /* a bad row is not a lost strip */ } }
-        // The strip is only useful once it is in the page: render the tree on the first
-        // pass that finds a seat, so a header that arrives late still gets its tabs.
-        if (placed && !published) {
-          published = true
-          try { root.render(h(SidebarHostTabs)) } catch { /* a broken root is reported by the shell */ }
+        if (placed && !placedAnnounced) {
+          placedAnnounced = true
           // `no-header` was a fact about the past: the page must stop saying it.
           if (toggles.reason === 'no-header') { toggles.reason = null; syncHostTabsStatus() }
           announce()
@@ -3362,7 +3354,6 @@ window.__ModuleLoader__.load({
       } catch {
         observer = null
       }
-      let published = false
       // The first pass runs now: a sidebar that is already drawn must not wait 80ms.
       place()
       // `place()` above armed the wait when it found no header. One warn, once, after
@@ -3380,9 +3371,9 @@ window.__ModuleLoader__.load({
           // A shell that refused the observer took nothing to disconnect, and one that
           // refused it also has no re-insert to lose: the box it holds is final.
           try { observer?.disconnect() } catch { /* a disconnected observer needs nothing */ }
-          // Rendering into an unmounted root throws; a root that was never published has
-          // nothing of ours in the page to take back.
-          if (published) { try { root.unmount() } catch { /* already unmounted */ } }
+          // The store and locale listeners belong to this placement, not to the page.
+          try { unsubscribeTab() } catch { /* an already-released listener needs nothing */ }
+          if (unsubscribeLocale) { try { unsubscribeLocale() } catch { /* same */ } }
           try { node.remove() } catch { /* already gone */ }
         },
       }
@@ -3604,105 +3595,80 @@ window.__ModuleLoader__.load({
     }
 
     // One effect owns the strip, the style and the two Ctrl+Alt+1 / 2 commands, so a
-    // reload removes exactly what this installed. A shell that declares no
-    // `shell.overlay` seat degrades to "no tabs" with `no-seat` on the Devices page, and
-    // the native sidebar is then exactly as shipped. A declared seat whose header has not
-    // been drawn YET is NOT a refusal: the placement stays installed and watching (that
-    // was the 2026-11-16 defect — it disposed itself at apply() and the tabs never came
-    // back), reporting `no-header` only if the header never shows up.
-    function installSidebarTabStrip(ctx, options = {}) {
+    // reload removes exactly what this installed. The placement needs no declared slot
+    // and no React root renderer: `shell.overlay` is an OPTIONAL invisible helper, kept
+    // only for shells that still declare it. A header that has not been drawn YET is NOT
+    // a refusal: the placement stays installed and watching (that was the 2026-11-16
+    // defect — it disposed itself at apply() and the tabs never came back), reporting
+    // `no-header` only if the header never shows up.
+    function installSidebarTabStrip(ctx) {
       const disposers = []
       toggles.tab = storedHostTab()
-      // Structure first: the strip is this feature's only switch, so a shell that does
-      // not declare its seat gets no filter at all (a filter with no way back would hide
-      // half the list) and the Devices page states the reason. The factory is the
-      // countable fact: an undeclared seat may still hand back an inert disposer.
-      let declared = false
+      // The invisible helper is best effort: a shell that declares `shell.overlay` gets
+      // it (the registration stays countable in the slot ledger), a shell that does not
+      // still gets the strip from the DOM placement below.
       let seat = null
-      try {
-        seat = ctx.slots.inject(HOST_TABS_SLOT, () => {
-          // An invisible render helper: the seat is a root-scope list entry, and the box
-          // the user sees is the sidebar's, placed by `installHostTabPlacement`. The
-          // helper renders nothing, so nothing of this plugin floats over the shell.
-          // `id` is the one option a `list` slot requires (the cell key: a fresh id is
-          // added beside the shipped entries); the shape is the one every shipped
-          // `shell.overlay` occupant uses, `{ name, id, order }`.
-          const registration = ctx.slots.register(
-            { name: HOST_TABS_SLOT, id: 'dsh-ext.devices.tabs', order: 100 }, () => null)
-          declared = true
-          return registration
-        })
-      } catch (cause) {
-        declared = false
+      if (ctx && ctx.slots && typeof ctx.slots.inject === 'function') {
+        try {
+          seat = ctx.slots.inject(HOST_TABS_SLOT, () => ctx.slots.register(
+            { name: HOST_TABS_SLOT, id: 'dsh-ext.devices.tabs', order: 100 }, () => null))
+        } catch { seat = null }
       }
       let placement = null
-      // A1.3 exists only while the strip exists: no seat / no renderer means the native
-      // sidebar is exactly as shipped, including its workspace rows' expansion.
       let expansion = null
       // `place()` can announce synchronously from inside `installHostTabPlacement` (a
       // header already in the page at apply time), before the helpers below exist. The
       // hook is assigned after them; an early announcement only syncs the page status,
       // and the apply()-tail call installs the filter and keys for that placed case.
       let onPlaced = null
-      // Why a placement could not be installed, when it could not be: the reason the page
-      // has to show, kept out of the `try` so a throw cannot turn `no-renderer` into
-      // `no-seat` (they are different facts for the owner).
-      let missReason = 'no-seat'
-      if (declared) {
-        // The root renderer: the seam the shell's renderer supplies, else the module
-        // loader's `react-dom/client`.
-        const createRoot = options.createRoot ?? reactRoot()
-        missReason = 'no-renderer'
-        // The helper is created BEFORE the placement: its pass is called on the
-        // placement's very first (synchronous) pass, so a row already in the page is
-        // handled without waiting for another mutation.
-        expansion = installWorkspaceExpansion()
-        try {
-          placement = installHostTabPlacement({
-            reactRoot: createRoot,
-            // One observer, one debounce: the strip's own pass drives the row scan.
-            onPass: expansion.pass,
-            // The strip appearing (or the wait giving up) is a status change the page reads;
-            // the filter AND the keys come with the strip, on the first pass that places it.
-            onChange: () => {
-              const now = placement !== null && placement.status() === 'placed'
-              toggles.reason = now ? null : toggles.reason
-              if (now && onPlaced) onPlaced()
-              syncHostTabsStatus()
-            },
-          })
-        } catch { placement = null }
-        // A missing header at THIS instant is the normal case, not a refusal: `apply()`
-        // runs while the shell is still assembling, and the sidebar's workspace browser
-        // mounts after it. The placement owns an observer, so a header that arrives later
-        // still gets the strip; tearing the placement down here is what made the two tabs
-        // never appear (measured 2026-11-16: header absent at apply → placement disposed →
-        // observer gone → nothing could ever place it again). Only a placement that could
-        // not be installed at all (no document, no observer, no root renderer) is a miss.
-        if (placement !== null && placement.status() === 'unavailable') {
-          const why = typeof placement.reason === 'function' ? placement.reason() : null
-          if (why === 'no-document' || why === 'no-observer') missReason = 'no-seat'
-          try { placement.dispose() } catch { /* nothing was installed */ }
-          placement = null
-        }
+      // A1.3 is created before the placement: its pass is called on the placement's very
+      // first (synchronous) pass, so a row already in the page is handled without waiting
+      // for another mutation.
+      expansion = installWorkspaceExpansion()
+      // The locale hook comes from this shell's own context; the placement repaints the
+      // strip through it (the language effect subscribed first, so `tr` is already fresh).
+      const localeSubscribe = ctx && ctx.locale && typeof ctx.locale.subscribe === 'function'
+        ? (listener) => ctx.locale.subscribe(listener) : null
+      try {
+        placement = installHostTabPlacement({
+          localeSubscribe,
+          onPass: expansion.pass,
+          // The strip appearing (or the wait giving up) is a status change the page reads;
+          // the filter AND the keys come with the strip, on the first pass that places it.
+          onChange: () => {
+            const now = placement !== null && placement.status() === 'placed'
+            toggles.reason = now ? null : toggles.reason
+            if (now && onPlaced) onPlaced()
+            syncHostTabsStatus()
+          },
+        })
+      } catch { placement = null }
+      // Only a placement that could not be installed at all (no document, no observer)
+      // is a miss; a missing header is a waiting state the placement owns and watches.
+      let missReason = null
+      if (placement !== null && placement.status() === 'unavailable') {
+        const why = typeof placement.reason === 'function' ? placement.reason() : null
+        missReason = why || 'no-document'
+        try { placement.dispose() } catch { /* nothing was installed */ }
+        placement = null
       }
-      if (!declared || placement === null) {
-        // Nothing was installed: the owner's rows keep their native behaviour.
+      if (placement === null) {
+        // Nothing was installed: the owner's rows keep their native behaviour. The page
+        // names only the real failure the placement reported.
         if (expansion) expansion.dispose()
         expansion = null
         toggles.registered = false
-        // Two different facts, told apart on the page: no seat at all, or a seat whose
-        // renderer the shell could not hand over (`installHostTabPlacement` names it).
-        toggles.reason = declared ? missReason : 'no-seat'
+        toggles.reason = missReason || 'no-document'
         // An inert injector at an undeclared seat is usually not invoked at all, so a
         // disposer it returned must still be released here.
         if (typeof seat === 'function') { try { seat() } catch { /* nothing was installed */ } }
+        syncHostTabsStatus()
         return null
       }
       toggles.registered = true
-      // The placement has a seat declared and a renderer; a header it has not seen yet is
-      // `no-header`, which it reports itself once its own wait expires (or immediately
-      // clears when the header shows up).
+      // The placement is installed; a header it has not seen yet is `no-header`, which it
+      // reports itself once its own wait expires (or immediately clears when the header
+      // shows up).
       toggles.reason = placement.status() === 'placed' ? null : 'no-header'
       if (typeof seat === 'function') disposers.push(seat)
       disposers.push(() => placement.dispose())
@@ -4332,11 +4298,8 @@ window.__ModuleLoader__.load({
     const isMobileBundleSubject = (subject) => !!subject && subject.kind === 'bundle' && !!subject.pkg && subject.pkg.name === MOBILE_BUNDLE
 
     const inject = ['slots', 'locale']
-    /**
-     * `options` is a renderer-supplied seam, not a public API: it carries the root
-     * renderer (`createRoot`) the shell's module loader would otherwise be asked for. The
-     * renderer passes it; nothing else does.
-     */
+    // `options` stays in the signature for renderers that still pass the old root-renderer
+    // seam; the sidebar strip no longer needs it (plain DOM, no React root).
     function apply(ctx, options = {}) {
       ctx.effect(() => {
         const sync = () => setHostLanguage(ctx.locale.getSnapshot().active)
@@ -4398,37 +4361,20 @@ window.__ModuleLoader__.load({
         remoteUI.set({ grouped: false, reason: 'the shell provides no client services' })
       }
 
-      // The sidebar's two tabs: a display filter plus one box placed between the
-      // sidebar's section header and its list area. It owns the same `remoteUI` snapshot
-      // as the surfaces above, so it is installed AFTER them and reports the tab half of
-      // it; a seat this shell refuses is stated on the Devices page instead of ending the
-      // whole bundle, and a header that has not been drawn yet is reported there as its own
-      // fact (`no-header`) while the placement keeps watching for it.
-      if (typeof ctx.slots === 'object' && ctx.slots !== null) {
-        // Install synchronously, from apply(): a shell that defers its effects must
-        // still get the strip (or an observer watching for the header) on this tick.
-        // The effect only owns teardown; a shell that hands back an inert injector
-        // gets no filter at all (a filter with no switch would hide half the list).
-        const disposeTabs = installSidebarTabStrip(ctx, { createRoot: options.createRoot })
-        const register = disposeTabs
-        ctx.effect(() => () => {
-          if (typeof disposeTabs === 'function') disposeTabs()
-          syncHostTabsStatus()
-        }, 'devices: sidebar host tabs')
-        if (register === null) {
-          // `installSidebarTabStrip` already wrote the specific reason (`no-seat` /
-          // `no-renderer`) into `toggles`; publish it even when the P2b surfaces wrote
-          // their own `no-seat` into the shared snapshot first — otherwise the owner
-          // sees the generic reason instead of the actual missing piece. A shell that
-          // never ran the installer keeps the plain `no-seat`.
-          if (remoteUI.getSnapshot().tabsReason === null) remoteUI.set({ tabs: false, tabsReason: 'no-seat' })
-          syncHostTabsStatus()
-        } else {
-          syncHostTabsStatus()
-        }
-      } else {
-        remoteUI.set({ tabs: false, tabsReason: 'no-seat' })
-      }
+      // The sidebar's two tabs: a display filter plus one plain-DOM box placed between
+      // the sidebar's section header and its list area. It owns the same `remoteUI`
+      // snapshot as the surfaces above, so it is installed AFTER them and reports the tab
+      // half of it. No slot declaration and no root renderer are needed: install from
+      // apply() on every shell, and let the placement name the only real failures (no
+      // document, no observer, or a header that never arrived).
+      // Install synchronously, from apply(): a shell that defers its effects must still
+      // get the strip (or an observer watching for the header) on this tick.
+      const disposeTabs = installSidebarTabStrip(ctx)
+      ctx.effect(() => () => {
+        if (typeof disposeTabs === 'function') disposeTabs()
+        syncHostTabsStatus()
+      }, 'devices: sidebar host tabs')
+      syncHostTabsStatus()
     }
 
     exports.apply = apply
@@ -4441,10 +4387,10 @@ window.__ModuleLoader__.load({
       HostChip, SessionBanners, OfflineBanner, ModelStatusBanner, RemoteTerminalEntry,
       SessionHostBadge, PermissionsEditor, scopesForKind, gatewayScopesFor,
       RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText, hostLinkOf,
-      // The sidebar's two tabs: the component the placement helper renders, the exact
-      // rule text each tab installs, and the tab store, so a test proves both filters,
-      // the insertion point, and the small data surface (one <style>).
-      SidebarHostTabs, hostTabsStyle, HOST_TABS_STYLE, HOST_TABS_STYLE_ID, HOST_TABS_SELECTORS,
+      // The sidebar's two tabs: the exact rule text each tab installs and the tab store,
+      // so a test proves both filters, the insertion point, and the small data surface
+      // (one <style>). The strip itself is plain DOM in the sidebar, not a React export.
+      hostTabsStyle, HOST_TABS_STYLE, HOST_TABS_STYLE_ID, HOST_TABS_SELECTORS,
       installSidebarTabStrip, installHostTabPlacement, placeHostTabsNode, hostTabsStyleWriter,
       publishHostTab, storedHostTab, HOST_TABS_STORAGE, HOST_TABS_SLOT, HOST_TABS_HEADER, HOST_TABS_LIST,
       HOST_TABS_TESTID, HOST_TABS_DEBOUNCE_MS, HOST_TABS_HEADER_WAIT_MS, HOST_TABS_NO_HEADER_WARN,

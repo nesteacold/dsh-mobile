@@ -6,23 +6,25 @@
 //    `<div … data-sidebar-list-area>` (it owns the sidebar's `100cqh` scroll contract).
 //    New Session keeps its exact position and size (owner decision 2026-11-16, order
 //    refined 2026-11-17);
-//  - the seat that carries the placement helper is the root-scope `shell.overlay` list
-//    slot, and the helper renders nothing — no floating box, no second root tree in
-//    this bundle's React;
+//  - the strip is PLAIN DOM with inline SVG (createElementNS), not a React root. It needs
+//    no `shell.overlay` declaration and no `react-dom/client`: an optional invisible
+//    helper may still register when the shell declares the seat, but placement proceeds
+//    either way;
 //  - the two tabs are compact ICON buttons (monitor+check / cloud+link-dot), never text:
 //    the localized name and its Ctrl+Alt+1/2 shortcut live in `title`/`aria-label`, the
-//    glyph strokes with `currentColor` so the active accent ink draws it;
+//    glyph strokes with `currentColor` so the selected accent ink (or inactive gray)
+//    draws it;
 //  - the insertion is idempotent: one node per header however many observer passes run,
 //    re-inserted after a re-render drops it, and never duplicated;
 //  - the filter is ONE <style data-plugin="dsh-ext.devices.host-tabs">, swapped (never
 //    stacked) on a tab change, holding the exact rules for each tab on the shipped
 //    `data-row-key` shapes and never hiding the empty state;
-//  - the choice is persisted (localStorage, default `local`) and unpublished to the
-//    strip; Ctrl+Alt+1 / 2 switch it;
-//  - a shell with no header (the collapsed rail draws none) or a refused seat says so on
-//    the Devices page;
-//  - dispose removes the node, the style, the observer and every registration, and
-//    leaves the host store as it was;
+//  - the choice is persisted (localStorage, default `local`) and published to the strip;
+//    Ctrl+Alt+1 / 2 switch it; a locale change repaints the labels in place;
+//  - a shell with no header (the collapsed rail draws none), no document or no observer
+//    says so on the Devices page — a missing seat is no longer a reason;
+//  - dispose removes the node, the style, the observer, the store/locale subscriptions,
+//    the shortcuts and every registration, and leaves the host store as it was;
 //  - and the whole feature makes no HTTP call at all: the tab switch writes a style,
 //    nothing else — the native streams are the browser's own business.
 // Loads lib/client.js in a vm with a fake __ModuleLoader__ + a fake slot host and a fake
@@ -81,6 +83,7 @@ function makeDocument({ header = true, listArea = true, rows = [] } = {}) {
     removed: false,
     textContent: '',
     dataset: {},
+    listeners: new Map(),
     get nextElementSibling() {
       if (this.parentNode === null) return null
       const at = this.parentNode.children.indexOf(this)
@@ -145,7 +148,29 @@ function makeDocument({ header = true, listArea = true, rows = [] } = {}) {
       const testid = /^\[data-testid="(.+)"\]$/.exec(selector)
       return testid ? this.attrs['data-testid'] === testid[1] : false
     },
-    setAttribute() {},
+    setAttribute(name, value) { this.attrs[name] = String(value) },
+    // The strip's buttons are plain DOM with their own listeners; a click on one is
+    // dispatched here, just as a browser would dispatch it on a real button.
+    addEventListener(type, listener) {
+      const list = this.listeners.get(type) ?? []
+      list.push(listener)
+      this.listeners.set(type, list)
+    },
+    removeEventListener(type, listener) {
+      const list = this.listeners.get(type) ?? []
+      const at = list.indexOf(listener)
+      if (at >= 0) list.splice(at, 1)
+    },
+    fire(type) {
+      for (const listener of this.listeners.get(type) ?? []) {
+        try { listener({ type, target: this }) } catch { /* one listener must not stop another */ }
+      }
+    },
+    replaceChildren(...children) {
+      for (const child of this.children) child.parentNode = null
+      this.children.length = 0
+      for (const child of children) this.appendChild(child)
+    },
   })
   doc.mk = mk
   doc.body = mk('body')
@@ -178,12 +203,12 @@ function makeDocument({ header = true, listArea = true, rows = [] } = {}) {
   doc.all = () => walk(doc.body)
   doc.querySelector = (selector) => doc.all().find((node) => node.matches(selector)) ?? null
   doc.querySelectorAll = (selector) => doc.all().filter((node) => node.matches(selector))
-  doc.createElement = (tag) => {
+  doc.createElement = (tag) => mk(tag)
+  // The strip's glyphs are real SVG elements made with createElementNS; the fake keeps
+  // the namespace so a test can prove the DOM renderer did not use HTML elements.
+  doc.createElementNS = (namespace, tag) => {
     const node = mk(tag)
-    // The strip's node is found by its `data-testid`; the filter by `data-plugin`, which
-    // the writer sets through `setAttribute` OR `dataset` — the fake supports both, as a
-    // real element does, so either branch lands in `attrs`.
-    node.setAttribute = (name, value) => { node.attrs[name] = String(value) }
+    node.namespaceURI = namespace
     return node
   }
   doc.head = {
@@ -225,7 +250,7 @@ const sidebarOrder = (doc) => doc.sidebar.children.map((node) => {
  * key registry is handed over, `dom` is the fake document — a shell with no sidebar
  * header passes `header: false`, which is the collapsed rail's shape.
  */
-function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'ok', stored = null, dom, rootRenderer = 'ok', rows = [], storageGetterThrows = false } = {}) {
+function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'ok', stored = null, dom, seatRefuses = false, rows = [], storageGetterThrows = false } = {}) {
   let api
   const calls = []
   const fetch = async (url, options = {}) => {
@@ -240,25 +265,6 @@ function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'o
   // Every `console.warn` the bundle raises, so "one warn, once" is provable.
   const warnings = []
   const pageConsole = { ...console, warn: (...args) => { warnings.push(args.map(String).join(' ')) } }
-  // What the strip's React root is handed: the SAME element the plugin rendered, so a
-  // test mounts the strip's real tree. The counters are how "unmounted, not orphaned"
-  // and "rendered once" are provable without a browser.
-  const rendered = []
-  const roots = []
-  const createRoot = (node) => {
-    const root = {
-      node, renders: 0, unrenders: 0, unmounted: false, element: null,
-      render(element) {
-        if (this.unmounted) throw new Error('render on an unmounted root')
-        this.renders += 1
-        this.element = element
-        rendered.push(element)
-      },
-      unmount() { this.unrenders += 1; this.unmounted = true },
-    }
-    roots.push(root)
-    return root
-  }
   // One head per page: a reload starts from an empty document. Timers are keyed so
   // `clearTimeout` really cancels (the placement debounces its passes).
   const timers = new Map()
@@ -307,11 +313,9 @@ function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'o
     effect(fn) { effects.push(fn()) },
     slots: {
       inject(slot, factory) {
-        // `ctx.slots.inject` is inert until the parent entry declares the seat; the
-        // factory (and with it `register`) never runs against an undeclared one. Every
-        // other seat this bundle fills is declared by its OWN package, so only the
-        // placement seat is on trial here.
-        if (slot === PLACEMENT_SEAT && !declared.includes(slot)) return () => {}
+        // A shell may not declare the optional helper seat at all, or may refuse the
+        // injection even when declared. Neither may stop the DOM placement.
+        if (slot === PLACEMENT_SEAT && (!declared.includes(slot) || seatRefuses)) return () => {}
         const registration = factory()
         const entry = { slot, meta: registration.meta, component: registration.component }
         entries.push(entry)
@@ -340,10 +344,8 @@ function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'o
       },
     }),
   }
-  // The root renderer is the seam `installHostTabPlacement` takes in production too
-  // (`reactRoot()` → `deps.reactRoot`); `createRoot` here is that seam. `rootRenderer:
-  // 'missing'` is the shell that hands over no root renderer at all.
-  api.apply(ctx, rootRenderer === 'ok' ? { createRoot } : {})
+  // No root renderer is handed over: the strip is plain DOM and must not need one.
+  api.apply(ctx)
   const stripNode = () => doc.querySelector('[data-testid="sidebar-host-tabs"]')
   const flushTimers = () => { for (const [id, fn] of [...timers]) { timers.delete(id); if (typeof fn === 'function') fn() } }
   // "The sidebar re-rendered": one batch of childList records that are NOT ours, which is
@@ -375,17 +377,11 @@ function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'o
     const batch = [{ type: 'childList', target: doc.sidebar, addedNodes: asNodeList(added), removedNodes: asNodeList(removed) }]
     for (const observer of observers) if (observer.observing) observer.callback(batch)
   }
-  const stripElement = () => {
-    const root = roots.find((item) => item.node === stripNode()) ?? roots.at(-1)
-    return root?.element ?? null
-  }
   return {
-    api, calls, entries, registered, doc, roots, rows: doc.rows, flushTimers, pulse, pulseOwn, pulseRemovedOnly, pulseNodeList, warnings,
+    api, calls, entries, registered, doc, rows: doc.rows, flushTimers, pulse, pulseOwn, pulseRemovedOnly, pulseNodeList, warnings,
     shortcuts: registeredShortcuts,
     stripNode,
-    stripElement,
-    stripRoot: () => roots.at(-1) ?? null,
-    renderedRoots: () => rendered,
+    localeSubscribers: () => localeListeners.size,
     observers: () => observers.length,
     disconnected: () => disconnected,
     // A1.3 observability: the capture listener, the row clicks (in dispatch order) and
@@ -410,23 +406,26 @@ async function mount(reactElement) {
 }
 const find = (renderer, predicate) => renderer.root.findAll((node) => typeof node.type === 'string' && predicate(node))
 const byTestId = (renderer, id) => find(renderer, (node) => node.props['data-testid'] === id)
-/** Every text node under a test instance, recursively: an icon-only button has none. */
-const textOf = (instance) => instance.children.map((child) => (typeof child === 'string' ? child : textOf(child))).join('')
+/** Walk a plain-DOM subtree (the fake nodes expose `children`). */
+const allOf = (node) => [node, ...node.children.flatMap(allOf)]
+/** The two tab buttons inside the one placed strip. */
+const tabsOf = (ui) => {
+  const node = ui.stripNode()
+  assert.ok(node, 'the placement helper rendered the strip')
+  return allOf(node).filter((element) => element.attrs?.role === 'tab')
+}
+/** Every text node under a plain-DOM element: an icon-only button has none. */
+const textOf = (element) => allOf(element).map((node) => node.textContent ?? '').join('')
 /** The one inline SVG glyph a tab button carries, with the ink that follows its state. */
 const glyphOf = (tab) => {
-  const svgs = tab.findAll((node) => typeof node.type === 'string' && node.type === 'svg')
+  const svgs = allOf(tab).filter((element) => element.tagName === 'SVG')
   assert.equal(svgs.length, 1, 'one inline SVG glyph per tab')
-  assert.equal(svgs[0].props.stroke, 'currentColor', 'the glyph follows the button ink (active accent / inactive muted)')
-  assert.equal(svgs[0].props['aria-hidden'], true, 'the glyph is decorative; the button names itself')
+  assert.equal(svgs[0].namespaceURI, 'http://www.w3.org/2000/svg', 'it is a real SVG element')
+  assert.equal(svgs[0].getAttribute('stroke'), 'currentColor', 'the glyph follows the button ink (active accent / inactive muted)')
+  assert.equal(svgs[0].getAttribute('aria-hidden'), 'true', 'the glyph is decorative; the button names itself')
   return svgs[0]
 }
-const click = async (node) => { await act(async () => { await node.props.onClick({ preventDefault() {}, target: {} }) }) }
-/** The strip's own tree: the element the placement helper handed its React root. */
-const stripOf = async (ui) => {
-  const element = ui.stripElement()
-  assert.ok(element, 'the placement helper rendered the strip')
-  return mount(element)
-}
+const clickTab = (tab) => { tab.fire('click') }
 
 // ------------------------------------------------------------------- the placement
 await check('the strip is ONE node, the sidebar header\'s previous sibling: after "New Session", above "Workspaces", outside the list area', async () => {
@@ -439,9 +438,10 @@ await check('the strip is ONE node, the sidebar header\'s previous sibling: afte
   assert.equal(ui.doc.newSession.nextElementSibling, node, 'and directly after New Session')
   assert.equal(ui.strips().length, 1, 'one strip')
   assert.equal(ui.doc.listArea.children.length, 0, 'the scrolling area holds nothing of ours')
-  // The seat: the root-scope overlay list, and a helper that draws nothing at all.
+  // The optional seat is still taken when the shell declares it, and its helper renders
+  // nothing — but nothing here depends on it.
   const entry = ui.entries.find((item) => item.slot === PLACEMENT_SEAT)
-  assert.ok(entry, `the helper took the ${PLACEMENT_SEAT} seat`)
+  assert.ok(entry, `the helper took the ${PLACEMENT_SEAT} seat when it was offered`)
   assert.equal(entry.meta.name, PLACEMENT_SEAT)
   assert.equal(entry.meta.id, 'dsh-ext.devices.tabs', 'a fresh id, so nothing shipped is shadowed')
   const page = await mount(h(entry.component, {}))
@@ -449,58 +449,68 @@ await check('the strip is ONE node, the sidebar header\'s previous sibling: afte
   page.unmount()
   assert.equal(ui.entries.filter((item) => item.slot === 'sidebar.session.action').length, 0,
     'the New Session seat is not asked for any more')
-  assert.equal(ui.roots.length, 1, 'one React root for the strip')
+  assert.equal(tabsOf(ui).length, 2, 'the strip itself is plain DOM with two buttons')
   ui.dispose()
 })
 
-await check('the strip is a tablist of two ICON buttons — "This Computer" / "Remote Workspace" (vi: "Máy này" / "Workspace từ xa") in title/aria-label, local selected', async () => {
+await check('the strip is a tablist of two plain-DOM ICON buttons — "This Computer" / "Remote Workspace" (vi: "Máy này" / "Workspace từ xa") in title/aria-label, local selected', async () => {
   const ui = load()
-  const page = await stripOf(ui)
   const { DICT } = ui.api.testing
-  const tabs = find(page, (node) => node.props.role === 'tab')
-  assert.equal(tabs.length, 2, 'two tabs')
-  assert.deepEqual(tabs.map((tab) => tab.props['data-tab']), ['local', 'remote'])
-  assert.deepEqual(tabs.map((tab) => tab.props['data-testid']), ['sidebar-host-tab-local', 'sidebar-host-tab-remote'])
+  const tabs = tabsOf(ui)
+  assert.equal(tabs.length, 2, 'two tabs, built without any React root')
+  assert.deepEqual(tabs.map((tab) => tab.getAttribute('data-tab')), ['local', 'remote'])
+  assert.deepEqual(tabs.map((tab) => tab.getAttribute('data-testid')), ['sidebar-host-tab-local', 'sidebar-host-tab-remote'])
+  assert.deepEqual(tabs.map((tab) => tab.getAttribute('role')), ['tab', 'tab'])
+  assert.deepEqual(tabs.map((tab) => tab.getAttribute('type')), ['button', 'button'])
   // Icon-only: no text anywhere inside the button — the name is in title/aria-label.
   for (const tab of tabs) {
     assert.equal(textOf(tab), '', 'the button carries no text label')
     glyphOf(tab)
   }
-  assert.deepEqual(tabs.map((tab) => tab.props['aria-selected']), [true, false], 'local is the default')
-  assert.deepEqual(tabs.map((tab) => tab.props['aria-pressed']), [true, false], 'aria-pressed agrees')
+  assert.deepEqual(tabs.map((tab) => tab.getAttribute('aria-selected')), ['true', 'false'], 'local is the default')
+  assert.deepEqual(tabs.map((tab) => tab.getAttribute('aria-pressed')), ['true', 'false'], 'aria-pressed agrees')
   for (const [tab, label, keys] of [[tabs[0], DICT.en.tabThisComputer, DICT.en.tabShortcutLocal],
     [tabs[1], DICT.en.tabRemoteWorkspace, DICT.en.tabShortcutRemote]]) {
-    assert.ok(tab.props.title.includes(label), 'title names the tab in the owner\'s words')
-    assert.ok(tab.props.title.includes(`(${keys})`), 'title names its key')
-    assert.ok(tab.props['aria-label'].includes(label), 'aria-label names the tab')
-    assert.ok(tab.props['aria-label'].includes(`(${keys})`), 'aria-label names its key')
+    assert.ok(tab.getAttribute('title').includes(label), 'title names the tab in the owner\'s words')
+    assert.ok(tab.getAttribute('title').includes(`(${keys})`), 'title names its key')
+    assert.ok(tab.getAttribute('aria-label').includes(label), 'aria-label names the tab')
+    assert.ok(tab.getAttribute('aria-label').includes(`(${keys})`), 'aria-label names its key')
   }
-  assert.match(tabs[0].props.title, /\(Ctrl\+Alt\+1\)$/, 'each tab names its key')
-  assert.match(tabs[1].props.title, /\(Ctrl\+Alt\+2\)$/)
-  // No children of the shell are wrapped any more: the box is the strip and the strip only.
-  assert.deepEqual(page.toJSON().children.map((child) => child.props.role), ['tablist'])
-  page.unmount()
-  const vi = load({ locale: 'vi' })
-  const viPage = await stripOf(vi)
-  const viTabs = find(viPage, (node) => node.props.role === 'tab')
-  for (const [tab, label] of [[viTabs[0], vi.api.testing.DICT.vi.tabThisComputer],
-    [viTabs[1], vi.api.testing.DICT.vi.tabRemoteWorkspace]]) {
+  assert.match(tabs[0].getAttribute('title'), /\(Ctrl\+Alt\+1\)$/, 'each tab names its key')
+  assert.match(tabs[1].getAttribute('title'), /\(Ctrl\+Alt\+2\)$/)
+  // The local glyph is a monitor + check; the remote one a cloud + filled link dot.
+  const localPaths = allOf(tabs[0]).filter((node) => node.tagName === 'PATH').map((node) => node.getAttribute('d'))
+  assert.ok(localPaths.includes('M9 20.5h6M12 17v3.5'), 'local has a monitor stand')
+  assert.ok(localPaths.includes('M8.5 10.5l2.5 2.5 4.5-4.5'), 'local has a check')
+  const remote = allOf(tabs[1])
+  assert.ok(remote.some((node) => node.tagName === 'PATH' && node.getAttribute('d').startsWith('M18 10h-1.26A8 8')), 'remote has a cloud')
+  assert.ok(remote.some((node) => node.tagName === 'CIRCLE' && node.getAttribute('fill') === 'currentColor'), 'remote has a filled dot')
+  // No shell child is wrapped: the strip holds one tablist with exactly two buttons.
+  const strip = ui.stripNode()
+  const list = allOf(strip).find((node) => node.getAttribute('role') === 'tablist')
+  assert.ok(list, 'one tablist')
+  assert.equal(list.getAttribute('class'), 'dshdev-hosttabs-strip dshdev-seg', 'the shipped CSS classes stay')
+  assert.equal(strip.getAttribute('class'), 'dshdev-hosttabs', 'outer node keeps its class')
+  // A locale change repaints the SAME node, in the owner's language.
+  ui.setLocale('vi')
+  const viTabs = tabsOf(ui)
+  assert.equal(ui.stripNode(), strip, 'no new node on a locale change')
+  for (const [tab, label] of [[viTabs[0], DICT.vi.tabThisComputer], [viTabs[1], DICT.vi.tabRemoteWorkspace]]) {
     assert.equal(textOf(tab), '', 'the vi buttons are icon-only too')
     glyphOf(tab)
-    assert.ok(tab.props['aria-label'].includes(label), 'the vi label is in aria-label')
-    assert.ok(tab.props.title.includes(label), 'and in title')
+    assert.ok(tab.getAttribute('aria-label').includes(label), 'the vi label is in aria-label')
+    assert.ok(tab.getAttribute('title').includes(label), 'and in title')
   }
-  viPage.unmount()
-  // Both dictionaries carry the new strings, and neither is a copy of the other.
+  // Both dictionaries still carry the same keys, translated.
   const { DICT: EN } = load().api.testing
-  const { DICT: VI } = vi.api.testing
+  const { DICT: VI } = ui.api.testing
   assert.deepEqual(Object.keys(VI.en).sort(), Object.keys(EN.en).sort(), 'vi and en stay twins')
   assert.deepEqual(Object.keys(VI.vi).sort(), Object.keys(EN.en).sort(), 'and both tables hold the same keys as en')
-  for (const key of ['tabThisComputer', 'tabRemoteWorkspace', 'hostTabs', 'sidebarReasonNoTabs', 'sidebarReasonShortcut', 'hostTabsOn', 'hostTabsOff']) {
+  for (const key of ['tabThisComputer', 'tabRemoteWorkspace', 'hostTabs', 'sidebarReasonShortcut', 'hostTabsOn', 'hostTabsOff']) {
     assert.ok(EN.en[key], `en.${key}`)
     assert.notEqual(EN.en[key], VI.vi[key], `${key} is translated`)
   }
-  ui.dispose(); vi.dispose()
+  ui.dispose()
 })
 
 await check('many observer passes insert the node ONCE; a re-render that drops it gets it back, never a second copy', async () => {
@@ -526,11 +536,11 @@ await check('many observer passes insert the node ONCE; a re-render that drops i
   assert.equal(ui.stripNode(), null, 'gone')
   ui.pulse()
   ui.flushTimers()
-  assert.equal(ui.stripNode(), node, 'the same node comes back (its root was never unmounted)')
+  assert.equal(ui.stripNode(), node, 'the same node comes back (its buttons were never rebuild elsewhere)')
   assert.equal(ui.doc.header.previousElementSibling, node, 'and in the same place')
   assert.equal(ui.strips().length, 1, 'never a copy')
   assert.deepEqual(ui.doc.listArea.children, [], 'and still nothing inside the list area')
-  assert.equal(ui.roots[0].unrenders, 0, 'the root was not torn down for a re-insert')
+  assert.equal(tabsOf(ui).length, 2, 'and its two buttons are still there')
   ui.dispose()
 })
 
@@ -693,24 +703,23 @@ await check('the remote tab\'s style text is exact and hides exactly the local r
   ui.dispose()
 })
 
-await check('a tab click writes the style text and persists the choice; no request, no timer, no stream', async () => {
+await check('a plain-DOM tab click writes the style text and persists the choice; no request, no timer, no stream', async () => {
   const ui = load()
-  const page = await stripOf(ui)
   const callsBefore = ui.calls.length
-  const [localTab, remoteTab] = find(page, (node) => node.props.role === 'tab')
-  await click(remoteTab)
+  const node = ui.stripNode()
+  clickTab(tabsOf(ui)[1])
   assert.equal(ui.style().textContent, ui.api.testing.HOST_TABS_STYLE.remote, 'the same element, new text')
-  assert.equal(ui.doc.head.children.filter((node) => node.attrs?.['data-plugin'] === STYLE_ID).length, 1, 'never a second element')
-  assert.deepEqual(find(page, (node) => node.props.role === 'tab').map((tab) => tab.props['aria-selected']), [false, true], 'the strip follows')
-  assert.deepEqual(find(page, (node) => node.props.role === 'tab').map((tab) => tab.props['aria-pressed']), [false, true], 'aria-pressed follows too')
+  assert.equal(ui.doc.head.children.filter((item) => item.attrs?.['data-plugin'] === STYLE_ID).length, 1, 'never a second element')
+  assert.equal(ui.stripNode(), node, 'the one strip node is reused, only its buttons are repainted')
+  assert.deepEqual(tabsOf(ui).map((tab) => tab.getAttribute('aria-selected')), ['false', 'true'], 'the strip follows')
+  assert.deepEqual(tabsOf(ui).map((tab) => tab.getAttribute('aria-pressed')), ['false', 'true'], 'aria-pressed follows too')
   assert.equal(storage.get(STORAGE_KEY), 'remote', 'the choice is remembered')
   assert.equal(ui.calls.length, callsBefore, 'a tab click asks the Host nothing')
-  await click(localTab)
+  clickTab(tabsOf(ui)[0])
   assert.equal(ui.style().textContent, ui.api.testing.HOST_TABS_STYLE.local)
-  assert.deepEqual(find(page, (node) => node.props.role === 'tab').map((tab) => tab.props['aria-selected']), [true, false], 'and back again')
+  assert.deepEqual(tabsOf(ui).map((tab) => tab.getAttribute('aria-selected')), ['true', 'false'], 'and back again')
   assert.equal(storage.get(STORAGE_KEY), 'local')
   assert.equal(ui.api.testing.hostTabsStore.getSnapshot(), 'local')
-  page.unmount()
   ui.dispose()
 })
 
@@ -771,25 +780,33 @@ await check('a refused shortcut registration keeps the tabs and says so on the D
   ui.dispose()
 })
 
-// --------------------------------------------------------- refusal / honesty line
-await check('a shell that declares no shell.overlay seat: no strip, no style, reason on the Devices page', async () => {
+// ------------------------------------------------- no seat is not a failure any more
+await check('a shell that never declares shell.overlay still gets the strip, the filter, the keys and a placed status', async () => {
   const ui = load({ declared: [] })
-  assert.equal(ui.entries.filter((item) => item.slot === 'shell.overlay').length, 0, 'nothing registered')
-  assert.equal(ui.strips().length, 0, 'and no node placed')
-  // Only the bundle's own stylesheet is in the head: a shell without the seat gets no
-  // filter either, because a filter with no way to switch tabs would hide half the list.
-  assert.equal(ui.style(), undefined, 'no tab filter injected')
-  assert.equal(ui.shortcuts.length, 0, 'and no keys pointing at nothing')
+  assert.equal(ui.entries.filter((item) => item.slot === 'shell.overlay').length, 0, 'no helper seat taken')
+  assert.equal(ui.strips().length, 1, 'but the plain-DOM strip is placed anyway')
+  assert.equal(tabsOf(ui).length, 2, 'with both icon buttons')
+  assert.ok(ui.style(), 'the filter is installed')
+  assert.equal(ui.shortcuts.length, 2, 'and the keys work')
   const status = ui.api.testing.remoteUI.getSnapshot()
-  assert.equal(status.tabs, false)
-  assert.equal(status.tabsReason, 'no-seat', 'and the page can say which fact it is')
+  assert.equal(status.tabs, true)
+  assert.equal(status.tabsReason, null, 'no invented "no-seat" reason')
   const page = await mount(h(ui.api.testing.RemoteGroupingStatus))
   const rendered = text(page)
-  assert.ok(rendered.includes(ui.api.testing.DICT.en.hostTabsOff), 'the page says the tabs are not installed')
+  assert.ok(rendered.includes(ui.api.testing.DICT.en.hostTabsOn), 'the page says the tabs are on')
+  assert.ok(!rendered.includes('no-seat'), 'and never prints a seat reason')
   assert.ok(byTestId(page, 'sidebar-tabs-state').length === 1)
   page.unmount()
   // The rest of the bundle is untouched: the devices surfaces still registered.
   assert.ok(ui.registered.includes('settings.section'))
+  ui.dispose()
+})
+
+await check('a shell whose slot host REFUSES the optional seat still gets the strip', async () => {
+  const ui = load({ seatRefuses: true })
+  assert.equal(ui.entries.filter((item) => item.slot === 'shell.overlay').length, 0, 'the helper was refused')
+  assert.equal(ui.strips().length, 1, 'the strip did not depend on it')
+  assert.equal(ui.api.testing.remoteUI.getSnapshot().tabsReason, null)
   ui.dispose()
 })
 
@@ -822,15 +839,12 @@ await check('a header that arrives AFTER apply() still gets the strip: installed
   assert.equal(node.parentNode, doc.sidebar, 'in the sidebar, never inside the list area')
   assert.equal(doc.listArea.children.length, 0, 'the scrolling area holds nothing of ours')
   assert.equal(ui.strips().length, 1, 'exactly one node')
-  // It is a real React tree now, not an empty container: the tabs are drawn.
-  assert.ok(ui.stripElement(), 'the strip\'s root was rendered on the first successful pass')
-  const strip = await stripOf(ui)
-  const tabs = find(strip, (item) => item.props.role === 'tab')
-  assert.deepEqual(tabs.map((tab) => tab.props['data-tab']), ['local', 'remote'], 'both tabs')
+  // The strip is real DOM now, with both icon buttons (no React root anywhere).
+  const tabs = tabsOf(ui)
+  assert.deepEqual(tabs.map((tab) => tab.getAttribute('data-tab')), ['local', 'remote'], 'both tabs')
   for (const tab of tabs) { assert.equal(textOf(tab), '', 'icon-only, no text'); glyphOf(tab) }
-  assert.ok(tabs[0].props['aria-label'].includes(ui.api.testing.DICT.en.tabThisComputer), 'the name lives in aria-label')
-  assert.ok(tabs[1].props['aria-label'].includes(ui.api.testing.DICT.en.tabRemoteWorkspace), 'both tabs, in the owner\'s words')
-  strip.unmount()
+  assert.ok(tabs[0].getAttribute('aria-label').includes(ui.api.testing.DICT.en.tabThisComputer), 'the name lives in aria-label')
+  assert.ok(tabs[1].getAttribute('aria-label').includes(ui.api.testing.DICT.en.tabRemoteWorkspace), 'both tabs, in the owner\'s words')
   // The status followed: `no-header` was about the past, and it is gone.
   assert.equal(ui.api.testing.remoteUI.getSnapshot().tabsReason, null, 'the reason clears itself once placed')
   assert.equal(ui.style().textContent, ui.api.testing.HOST_TABS_STYLE.local, 'and the filter is installed now')
@@ -868,20 +882,19 @@ await check('a header that never arrives: ONE warn after the wait, reason no-hea
   ui.dispose()
 })
 
-await check('a shell that hands over no root renderer: reason no-renderer, nothing installed', async () => {
-  const ui = load({ rootRenderer: 'missing' })
-  assert.equal(ui.strips().length, 0, 'no strip')
-  assert.equal(ui.roots.length, 0, 'no React root was made')
-  assert.equal(ui.style(), undefined, 'no filter')
-  assert.equal(ui.shortcuts.length, 0, 'no keys')
-  const status = ui.api.testing.remoteUI.getSnapshot()
-  assert.equal(status.tabs, false)
-  assert.equal(status.tabsReason, 'no-renderer', 'the third fact, told apart from no-seat and no-header')
-  const page = await mount(h(ui.api.testing.RemoteGroupingStatus))
-  assert.ok(text(page).includes(ui.api.testing.DICT.en.sidebarReasonNoRenderer))
-  page.unmount()
-  // The seat was released again, so a later shell re-declaration does not inherit it.
-  assert.equal(ui.entries.filter((item) => item.slot === PLACEMENT_SEAT).length, 0, 'the helper let its seat go')
+await check('only real placement failures are reported: no-document and no-observer, never a seat or renderer', async () => {
+  const ui = load()
+  const place = ui.api.testing.installHostTabPlacement
+  const noDoc = place({ doc: null })
+  assert.equal(noDoc.status(), 'unavailable')
+  assert.equal(noDoc.reason(), 'no-document', 'the page can name an unplaceable shell')
+  const noObserver = place({ doc: ui.doc, MutationObserver: null })
+  assert.equal(noObserver.reason(), 'no-observer', 'or a shell with no observer')
+  // No createRoot / seat input is needed to install against a real document.
+  const ok = place({ doc: ui.doc })
+  assert.equal(ok.status(), 'placed', 'plain DOM is enough')
+  assert.equal(ok.reason(), null)
+  ok.dispose()
   ui.dispose()
 })
 
@@ -901,22 +914,28 @@ await check('the registration passes the exact options a list slot requires, lik
 })
 
 // ------------------------------------------------------------------------- dispose
-await check('dispose removes node + style + keys + observer; the host store is as it was', async () => {
+await check('dispose removes node + style + keys + observer + subscriptions; the host store is as it was', async () => {
   const ui = load({ stored: 'remote' })
   const before = { ...ui.api.testing.hostsStore.getSnapshot() }
   assert.ok(ui.style(), 'installed')
   assert.equal(ui.shortcuts.length, 2, 'two commands')
-  const root = ui.stripRoot()
-  assert.ok(root, 'the strip has its own React root')
-  assert.equal(root.unrenders, 0, 'still mounted')
+  const node = ui.stripNode()
+  assert.ok(node, 'the strip node is in the sidebar')
+  assert.deepEqual(tabsOf(ui).map((tab) => tab.getAttribute('aria-selected')), ['false', 'true'], 'remote is painted')
   assert.equal(ui.observers(), 1, 'one observer watches the document')
+  assert.equal(ui.localeSubscribers(), 2, 'the page language and the strip both listen')
   ui.dispose()
   assert.equal(ui.style(), undefined, 'the style is gone from the head')
   assert.equal(ui.shortcuts.length, 0, 'both commands are unregistered')
   assert.equal(ui.entries.filter((item) => item.slot === 'shell.overlay').length, 0, 'and the helper with them')
   assert.equal(ui.stripNode(), null, 'the node left the sidebar')
-  assert.equal(root.unrenders, 1, 'the React root was unmounted, not orphaned')
   assert.equal(ui.disconnected(), 1, 'the observer was disconnected')
+  assert.equal(ui.localeSubscribers(), 0, 'both locale subscriptions were released')
+  // A store or locale change after dispose cannot repaint a node we no longer own.
+  ui.api.testing.publishHostTab('local')
+  ui.setLocale('vi')
+  assert.deepEqual(allOf(node).filter((item) => item.attrs?.role === 'tab').map((item) => item.getAttribute('aria-selected')),
+    ['false', 'true'], 'the disposed strip did not repaint')
   // A mutation the sidebar would still trigger changes nothing after dispose.
   ui.pulse()
   ui.flushTimers()
@@ -928,15 +947,12 @@ await check('dispose removes node + style + keys + observer; the host store is a
 
 await check('the whole feature makes no HTTP call: a tab click only writes the style', async () => {
   const ui = load()
-  const page = await stripOf(ui)
-  const [localTab, remoteTab] = find(page, (node) => node.props.role === 'tab')
   // The host store fetches only while something subscribes to it — as in the shell,
   // where its surface is mounted; nothing here does, and the tabs need it not to.
   ui.api.testing.hostsStore.subscribe(() => {})
   const baseline = [...ui.calls]
-  await click(remoteTab); await click(localTab); await click(remoteTab)
+  clickTab(tabsOf(ui)[1]); clickTab(tabsOf(ui)[0]); clickTab(tabsOf(ui)[1])
   assert.deepEqual(ui.calls, baseline, 'three tab switches, not one request')
-  page.unmount()
   ui.dispose()
 })
 

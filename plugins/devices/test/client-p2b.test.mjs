@@ -83,9 +83,9 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
     'sidebar.session.row.trailing': 'list',
     'sidebar.session.row.hover': 'list',
     // dsh-client-ui-layout declares `shell.overlay` in the `root` slot's children, a
-    // root-scope `list` slot: it carries the sidebar tab strip's placement helper (a
-    // component that renders nothing and inserts the strip into the sidebar's DOM). The
-    // sidebar's own `sidebar.session.action` seat is NOT asked for any more — the owner
+    // root-scope `list` slot. The sidebar tabs now place a plain-DOM strip without it;
+    // the invisible helper is only registered when the shell still offers the seat. The
+    // sidebar's own `sidebar.session.action` seat is NOT asked for either — the owner
     // decision of 2026-11-16 keeps the New Session button exactly as it ships.
     'shell.overlay': 'list',
   }
@@ -110,10 +110,19 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
     setTimeout: (fn) => { fn(); return 0 },
     confirm: () => { confirmations += 1; return true },
   }
+  // The tab strip is installed against this document too (no slot seat or React root
+  // needed). The fake has no sidebar header, so the placement reports `no-header`; the
+  // richer element shape keeps the plain-DOM renderer from throwing while it paints.
   const document = { baseURI: 'http://127.0.0.1:3080/', head: { appendChild() {} },
-    createElement: () => ({ dataset: {}, textContent: '', remove() {} }) }
-  vm.runInNewContext(source, { window, document, fetch, URL, console, setTimeout, clearTimeout, Date,
-    navigator: { language: locale, clipboard: { writeText: async () => {} } } })
+    createElement: () => ({ dataset: {}, attrs: {}, textContent: '', children: [],
+      setAttribute(name, value) { this.attrs[name] = String(value) },
+      appendChild(child) { this.children.push(child); return child },
+      remove() {} }),
+    querySelector: () => null, querySelectorAll: () => [],
+    addEventListener() {}, removeEventListener() {} }
+  class FakeObserver { observe() {} disconnect() {} }
+  vm.runInNewContext(source, { window, document, fetch, URL, console: { ...console, warn() {} }, setTimeout, clearTimeout, Date,
+    MutationObserver: FakeObserver, navigator: { language: locale, clipboard: { writeText: async () => {} } } })
   // Fake host: the slot ledger (inject waits for a declaration, register returns a
   // disposer), the optional Cordis services P2b asks for, and the locale face.
   const localeListeners = new Set()
@@ -235,12 +244,11 @@ test('the stock sidebar keeps its seat in every routing state; the plugin only f
   }
   // The Devices page reads: the badge seats are in, and an off routing says so.
   // No connected host is not a failure — the seats are still there. The tab strip is
-  // its own half of the same line (`tabs`/`tabsReason`): this fake declares no
-  // `shell.overlay` seat and hands over no root renderer, so the strip reports the
-  // exact missing piece — `no-seat`, the shell's refused placement seat. The strip's
-  // own placement (and its `no-header`/`no-renderer` facts) is proven in
-  // test/client-host-tabs.test.mjs, against a fake sidebar.
-  const TABS = { tabs: false, tabsReason: 'no-seat' }
+  // its own half of the same line (`tabs`/`tabsReason`): placement needs no slot seat
+  // and no React root now, so this fake DOES install it, but its document has no sidebar
+  // header — the only real failure it reports is `no-header` (installed, still watching).
+  // The strip's own placement facts are proven in test/client-host-tabs.test.mjs.
+  const TABS = { tabs: true, tabsReason: 'no-header' }
   assert.deepEqual({ ...off.api.testing.remoteUI.getSnapshot() },
     { grouped: false, reason: 'multi-host routing is off: disabled', hosts: 0, ...TABS })
   assert.deepEqual({ ...noHost.api.testing.remoteUI.getSnapshot() }, { grouped: true, reason: null, hosts: 0, ...TABS })
