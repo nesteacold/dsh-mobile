@@ -80,7 +80,11 @@ const page = (cursor, records, own = []) => ({
 })
 
 /** The same records as the `created` fill of a relative request: no events of its own. */
-const fill = (records) => ({ records: [...records.map(record)], created: true })
+const fill = (records) => {
+  const rows = records.map(record)
+  const seqs = rows.map((row) => row.event.seq)
+  return { records: rows, created: true, firstLiveSeq: Math.min(...seqs), end: Math.max(...seqs) }
+}
 
 function createHarness({ withCache = false } = {}) {
   const remote = { hostId: HOST, hostName: 'Sigma-Remote', streams: [] }
@@ -243,6 +247,54 @@ test('a re-joined page is written to the offline copy once, in commit order', as
     const cached = harness.cache.history(HOST, SESSION)
     assert.deepEqual(cached.events.map((event) => event.seq), [1, 2, 4, 5],
       'a transcript replayed for an offline host reads in the order it happened, once')
+  } finally { reader.stop() }
+  harness.router.uninstall()
+})
+
+test('a newest-only part is held until the older records arrive, then handed over in order', async () => {
+  const harness = createHarness()
+  const reader = createReader(harness)
+  try {
+    await reader.started
+    await until(() => harness.remote.streams.length === 1, 'the follow to open')
+    harness.remote.streams[0].queue.push(page(2, [userTurn(1, 'first prompt'), assistantTurn(2)]))
+    await until(() => reader.rows().length === 2, 'the opening snapshot')
+
+    // The Host writes its own region FIRST: only the reply (seq 5) is in the snapshot,
+    // while the prompt it answers (seq 4) is in the records that arrive afterwards.
+    // Delivering 5 first would move the reader past 4 forever.
+    const reopened = await reconnect(harness)
+    reopened.queue.push(page(5, [], [assistantTurn(5)]))
+    await settle()
+    assert.deepEqual(reader.events().map((event) => event.seq), [], 'the reply is held, not shown alone')
+
+    reopened.queue.push(fill([userTurn(4, 'final prompt'), assistantTurn(5)]))
+    await until(() => reader.events().length === 2, 'the held turn')
+    assert.deepEqual(reader.events().map((event) => event.seq), [4, 5],
+      'the prompt arrives before its reply, once')
+    assert.equal(reader.error, null)
+  } finally { reader.stop() }
+  harness.router.uninstall()
+})
+
+test('a re-joined page with an unfilled gap ends the follow instead of skipping it', async () => {
+  const harness = createHarness()
+  const reader = createReader(harness)
+  try {
+    await reader.started
+    await until(() => harness.remote.streams.length === 1, 'the follow to open')
+    harness.remote.streams[0].queue.push(page(2, [userTurn(1, 'first prompt'), assistantTurn(2)]))
+    await until(() => reader.rows().length === 2, 'the opening snapshot')
+
+    const reopened = await reconnect(harness)
+    // Only seq 5 arrives; the Host never sends the seq 4 it sits on. The reader must
+    // be told, not silently carried past the hole on a later reconnect.
+    reopened.queue.push(page(5, [], [assistantTurn(5)]))
+    reopened.queue.fail(1006)
+    await until(() => reader.error !== null, 'the visible refusal')
+    assert.match(String(reader.error?.code ?? reader.error), /resume-overflow|stream-resume-overflow/,
+      'the gap is reported as an overflow, not dropped')
+    assert.deepEqual(reader.events().map((event) => event.seq), [], 'no event past the gap was delivered')
   } finally { reader.stop() }
   harness.router.uninstall()
 })

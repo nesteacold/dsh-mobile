@@ -45,9 +45,10 @@
 //    the controller's own UI answers, with every id namespaced, so the native
 //    approval/question card appears inside a remote conversation. The answer
 //    travels back to the Host that issued the card with its original ids: an
-//    approval through the bridge's hash-bound `$events/result`, a question through
-//    the bridge's `userQuestions/answer` (the companion channel's `question-answer`
-//    is ADMIN_ONLY and must never be used for a device).
+//    approval through the bridge's hash-bound `$events/result`, an ACTIVE question
+//    through the `question-answer` companion frame to the gateway that owns its
+//    pending card. Only a CONTINUED late answer falls back to `userQuestions/answer`;
+//    that service finds no open question (dsh-user-questions/src/index.ts:170-173).
 //  - offline transcript cache: every frame of a remote `session/follow` is
 //    appended to `deps.cache` (lib/session-cache.mjs) and replayed read-only
 //    when that host is offline, so a conversation survives a dead Host.
@@ -165,8 +166,22 @@ const REORDER_ANCHOR_FIELDS = Object.freeze({
 const APPROVAL_RESULT_ENDPOINT = '$events/result'
 const APPROVAL_HASH = /^[a-f0-9]{64}$/
 
-/** The bridge call that answers a question card on rc.1 (`approval:respond`). */
-const QUESTION_ANSWER_ENDPOINT = 'userQuestions/answer'
+/**
+ * The companion frames that answer/cancel an ACTIVE (open) question. The gateway
+ * that minted the card owns `pendingQuestions[rpcId]` and settles the tool call;
+ * `RemoteConnection.request()` sends the frame and correlates the `question-response`
+ * receipt by `requestId` (lib/remote-client.mjs).
+ */
+const QUESTION_ANSWER_TYPE = 'question-answer'
+const QUESTION_CANCEL_TYPE = 'question-cancel'
+/** Only an explicit user "skip" sends the cancel frame; a timeout/abort is already settled. */
+const QUESTION_CANCEL_CODES = new Set(['ASK_CANCELLED'])
+/**
+ * Bridge call for a CONTINUED question only (`dsh-user-questions/src/index.ts:170`
+ * looks in `continued(agent)` and returns false otherwise). Used solely after the
+ * gateway has evidenced that it no longer holds the question as pending.
+ */
+const QUESTION_CONTINUED_ENDPOINT = 'userQuestions/answer'
 
 /**
  * The DSH release this wrapper was last self-tested against. Informational only
@@ -1438,6 +1453,14 @@ export class HostRouter {
    * cannot tell whether that history already cost the user a section.
    */
   #catalogHostKey = null
+  /**
+   * The connected-host set for which a stale catalog was ALREADY announced. A host
+   * whose catalog keeps failing is stale on every reload; announcing that same state
+   * again (a rate-limited retry included) would make the picker reload forever, ask
+   * the failing host twice each time and log it. A NEW set, or a set that became
+   * fresh, re-arms the announcement.
+   */
+  #catalogAnnouncedKey = null
   /** When the picker was last told to reload (`#announceHostSet`, rate-limited). */
   #lastAnnounceAt = 0
   /**
@@ -1556,6 +1579,7 @@ export class HostRouter {
     this.#retainedRows.clear()
     this.#lastHostSet = null
     this.#catalogHostKey = null
+    this.#catalogAnnouncedKey = null
     this.#lastAnnounceAt = 0
     this.#catalogRefreshPending = false
     if (this.#catalogTimer !== null) {
@@ -1716,7 +1740,7 @@ export class HostRouter {
       if (changed) this.#emitCatalogRefresh()
       return
     }
-    if (key !== '' && !this.#catalogStale()) this.#catalogRefreshPending = false
+    if (!this.#catalogRefreshDue()) this.#catalogRefreshPending = false
     else this.#catalogRefreshPending = !this.#emitCatalogRefresh()
   }
 
@@ -1737,7 +1761,11 @@ export class HostRouter {
    * held back by the rate limit.
    */
   #catalogRefreshDue(connected = this.#connectedHosts()) {
-    return this.#catalogRefreshPending || this.#catalogStale(connected)
+    if (this.#catalogRefreshPending) return true
+    if (!this.#catalogStale(connected)) return false
+    // Already told the picker about THIS missing section: a picker reload is not a
+    // new host set, so it must not re-arm the announcement (see #catalogAnnouncedKey).
+    return catalogKey(connected) !== this.#catalogAnnouncedKey
   }
 
   /**
@@ -1972,8 +2000,9 @@ export class HostRouter {
 
   /**
    * `$events/result` for a remote `$events` card: an approval goes through the
-   * bridge's hash-bound decision path, a question through the bridge's
-   * `userQuestions/answer`. Both carry the original ids of the card the Host issued.
+   * bridge's hash-bound decision path, a question through the `question-answer`
+   * companion frame to the gateway that minted it. Both carry the original ids of
+   * the card the Host issued.
    */
   async #answerCard(target, payload, signal) {
     const args = this.#forwardArgs(payload, target.hostId)
@@ -2019,56 +2048,120 @@ export class HostRouter {
   }
 
   /**
-   * A question card is answered on the Host through the bridge's scope-gated
-   * `userQuestions/answer` call (`approval:respond`), with the rc.1 argument shape
-   * `{ agentId, callId, answer: { answers } }` (dsh-user-questions typert remote).
+   * An ACTIVE question is answered on the GATEWAY that minted the card, with the
+   * `question-answer` companion frame: the gateway owns `pendingQuestions[rpcId]`
+   * and settles the Host's tool call when it accepts a response
+   * (plugins/mobile-gateway/lib/index.mjs:2678-2729, 4670-4677). The ids and the
+   * answer come only from the tracked card and the native submit — nothing is
+   * guessed. `RemoteConnection.request()` echoes `requestId` on the receipt, which
+   * is how this one answer is correlated (lib/remote-client.mjs:866-893).
    *
-   * The companion channel's `question-answer` frame is ADMIN_ONLY and is never used
-   * for a device; the bridge forwards the same answer through the Host's own
-   * question service, which refuses one that is not continuable (`false`). A
-   * `next`-style outcome means the native UI declined to answer: nothing is applied
-   * and the card stays with the Host.
+   * `userQuestions/answer` is NOT the active path: the Host's question service
+   * looks only in `continued(agent)` and returns false for an open question
+   * (dsh-user-questions/src/index.ts:152-173). It is a CONTINUED-only fallback, and
+   * only runs after the gateway has evidenced `not-pending` — and the Host's own
+   * `true` reply then verifies the continued state. Anything else is a visible
+   * refusal that keeps the card tracked and retryable, never a silent drop.
    */
   async #answerQuestion(target, card, args, signal) {
     const outcome = isPlainObject(args.outcome) ? args.outcome : {}
     const value = isPlainObject(outcome.value) ? outcome.value : {}
     const answers = Array.isArray(value.answers) ? value.answers : (Array.isArray(outcome.answers) ? outcome.answers : null)
-    if (outcome.kind !== 'result' || answers === null) {
-      return this.#ingress(target.hostId, { kind: 'question-response', rpcId: card.rpcId, sessionId: card.sessionId, action: 'answer', accepted: false, reason: 'no-answer' }, QUESTION_ANSWER_ENDPOINT)
+    /** One normal receipt. A refusal never closes the card on the native stream. */
+    const receipt = (accepted, action = 'answer', reason) => this.#ingress(target.hostId, {
+      kind: 'question-response', rpcId: card.rpcId, sessionId: card.sessionId, action, accepted,
+      ...(accepted ? {} : { reason: reason ?? 'not-accepted' }),
+    }, QUESTION_ANSWER_TYPE)
+    /** An `error` frame (bad-request/bad-response) is surfaced, never rewritten into acceptance. */
+    const errorCode = (frame) => typeof frame?.code === 'string' && frame.code !== '' ? frame.code : 'refused'
+
+    // An explicit user "skip" ends the same pending card with `question-cancel`.
+    // A timeout/abort (ASK_ABORTED/ASK_TIMED_OUT) is already settled on the Host,
+    // so it must not spend a second response on the gateway.
+    if (outcome.kind === 'rejected' && QUESTION_CANCEL_CODES.has(outcome.error?.code)) {
+      let cancelled
+      try {
+        cancelled = await target.connection.request({
+          type: QUESTION_CANCEL_TYPE, rpcId: card.rpcId, sessionId: card.sessionId,
+        }, { signal })
+      } catch (error) {
+        if (error?.code === 'cancelled') return receipt(false, 'cancel', 'cancelled')
+        throw error
+      }
+      if (cancelled?.kind === 'error') return receipt(false, 'cancel', errorCode(cancelled))
+      if (cancelled?.accepted !== true) return receipt(false, 'cancel', cancelled?.reason)
+      this.#forgetCard(card, false)
+      return receipt(true, 'cancel')
     }
-    // The tool-call id the Host's question service keys the question by. It comes
-    // from the card the Host pushed; without it nothing can be answered — and that is
-    // a RECEIPT (`accepted:false, reason:'unbound'`), not a transport failure: the
-    // native card must stay on screen with its reason instead of being torn down as if
-    // the answer had been delivered.
+
+    if (outcome.kind !== 'result' || answers === null) return receipt(false, 'answer', 'no-answer')
+
+    let reply
+    try {
+      reply = await target.connection.request({
+        type: QUESTION_ANSWER_TYPE, rpcId: card.rpcId, sessionId: card.sessionId, answers,
+      }, { signal })
+    } catch (error) {
+      // A caller that cancelled its own wait is still a receipt, not a link failure.
+      if (error?.code === 'cancelled') return receipt(false, 'answer', 'cancelled')
+      throw error
+    }
+    // The gateway's refusal shapes stay visible. In particular its device-only
+    // answer policy (`index.mjs:2525-2567`) refuses a custom/empty selection with
+    // `bad-response`: the router MUST NOT relax that here, so it forwards the code.
+    if (reply?.kind === 'error') return receipt(false, 'answer', errorCode(reply))
+    if (reply?.kind !== 'question-response') return receipt(false, 'answer', 'invalid-response')
+    if (reply.accepted === true) {
+      // Accepted ⇒ the card is spent. The duplicate cannot reach the gateway again.
+      this.#forgetCard(card, false)
+      return receipt(true)
+    }
+    const reason = typeof reply.reason === 'string' && reply.reason !== '' ? reply.reason : 'not-accepted'
+    if (reason === 'not-pending') {
+      // The gateway no longer holds the card. Only now may the Host's CONTINUED
+      // service be asked: its `true` is the verification that the question is in
+      // `continued` state (a settled open question returns false). A refusal here
+      // is reported as-is, never retried against the gateway a second time.
+      return this.#answerContinued(target, card, answers, signal)
+    }
+    return receipt(false, 'answer', reason)
+  }
+
+  /**
+   * CONTINUED-only fallback. `userQuestions/answer` returns false unless the Host
+   * still holds this call in `continued` state, so `true` is both the application
+   * and the verification. Its two error codes mean "nothing was applied" and stay
+   * retryable refusals, as does a missing tool-call id (the only id this service
+   * keys by) — none of them is a transport failure that tears down the card.
+   */
+  async #answerContinued(target, card, answers, signal) {
+    const receipt = (accepted, reason) => this.#ingress(target.hostId, {
+      kind: 'question-response', rpcId: card.rpcId, sessionId: card.sessionId,
+      action: 'answer', accepted, ...(accepted ? {} : { reason }),
+    }, QUESTION_ANSWER_TYPE)
     if (typeof card.callId !== 'string' || card.callId === '') {
-      this.#log(`question answer for ${target.hostId} not sent: the card carries no tool-call id`)
-      return this.#ingress(target.hostId, { kind: 'question-response', rpcId: card.rpcId, sessionId: card.sessionId,
-        action: 'answer', accepted: false, reason: 'unbound' }, QUESTION_ANSWER_ENDPOINT)
+      this.#log(`continued question answer for ${target.hostId} not sent: the card carries no tool-call id`)
+      return receipt(false, 'unbound')
     }
     let answered
     try {
-      answered = await target.connection.call(QUESTION_ANSWER_ENDPOINT, {
+      answered = await target.connection.call(QUESTION_CONTINUED_ENDPOINT, {
         agentId: card.sessionId, callId: card.callId, answer: { answers },
       }, { signal })
     } catch (error) {
-      // The Host's question service signals "nothing was applied" with these two codes
-      // (a queued reply, a malformed answer). They are refusals the user can retry, not
-      // link failures: reported as the normal receipt so the card stays tracked and a
-      // second attempt still binds.
       const code = typeof error?.code === 'string' ? error.code : ''
-      if (code === 'REPLY_QUEUED' || code === 'BAD_ANSWER') {
-        this.#log(`question answer for ${target.hostId} not accepted by the Host: ${code}`)
-        return this.#ingress(target.hostId, { kind: 'question-response', rpcId: card.rpcId, sessionId: card.sessionId,
-          action: 'answer', accepted: false, reason: code }, QUESTION_ANSWER_ENDPOINT)
+      if (code === 'REPLY_QUEUED' || code === 'BAD_ANSWER' || code === 'cancelled') {
+        this.#log(`continued question answer for ${target.hostId} not accepted: ${code}`)
+        return receipt(false, code)
       }
       throw error
     }
-    const accepted = answered === true
-    if (accepted) this.#forgetCard(card, false)
-    else this.#log(`question answer for ${target.hostId} not accepted by the Host`)
-    return this.#ingress(target.hostId, { kind: 'question-response', rpcId: card.rpcId, sessionId: card.sessionId,
-      action: 'answer', accepted, ...(accepted ? {} : { reason: 'not-accepted' }) }, QUESTION_ANSWER_ENDPOINT)
+    if (answered !== true) {
+      this.#log(`continued question answer for ${target.hostId} not accepted by the Host`)
+      return receipt(false, 'not-continued')
+    }
+    this.#forgetCard(card, false)
+    return receipt(true)
   }
 
   /**
@@ -2272,8 +2365,18 @@ export class HostRouter {
     // and the picker must be told to reload once it can answer.
     const included = answered.filter((entry) => isPlainObject(entry.value)).map((entry) => entry.host)
     this.#catalogHostKey = catalogKey(included)
-    if (this.#catalogRefreshDue(hosts) && this.#eventSinks.size > 0) this.#catalogRefreshPending = !this.#emitCatalogRefresh()
-    else this.#catalogRefreshPending = false
+    // Announce the ENTRY into a stale state, not the state itself: a host whose
+    // catalog keeps failing is stale again on every picker reload, so re-announcing
+    // it here would drive a reload → merge → emit → reload loop. A different set (a
+    // new or recovered host) or a fresh catalog re-arms the one announcement.
+    const staleKey = this.#catalogStale(hosts) ? catalogKey(hosts) : null
+    if (staleKey === null) {
+      this.#catalogAnnouncedKey = null
+      this.#catalogRefreshPending = false
+    } else if (staleKey !== this.#catalogAnnouncedKey) {
+      this.#catalogAnnouncedKey = staleKey
+      this.#catalogRefreshPending = this.#eventSinks.size > 0 ? !this.#emitCatalogRefresh() : true
+    }
     return { ...local, value: { ...localValue, groups, routableProviders } }
   }
 
@@ -2500,9 +2603,15 @@ export class HostRouter {
       /** Consecutive attempts that ended in a DESYNC without delivering a frame. */
       let desyncs = 0
       let first = true
+      /** Held events of the CURRENT attempt, visible to its catch (which can run before init). */
+      let held = new Map()
+      /** Seqs already counted toward this attempt's page bound. */
+      let countedPageSeqs = new Set()
       while (!lifetime.signal.aborted) {
         /** Did this attempt put a frame in front of the reader? That, not the open, is progress. */
         let progressed = false
+        held = new Map()
+        countedPageSeqs = new Set()
         try {
           // The host is connected when this pump starts; if it drops in between, the
           // wait below is bounded by the reader, not by a fixed timeout.
@@ -2528,7 +2637,15 @@ export class HostRouter {
           // dense fill) each arrive on their own, so the bound is the PAGE's, not one
           // frame's — a page refused once it crosses MAX_RESUME_GAP (`followFrames`
           // refuses a single part that crosses it by itself).
-          let pageUnseen = 0
+          /**
+           * Events of a RE-OPENED page that arrived ahead of the seqs they sit on. A
+           * Host may write its own region first (seq 5) and the older records after
+           * (seqs 3, 4): delivering 5 first moves `lastSeq` past the hole, and the
+           * later 3 and 4 are then dropped as "already seen" — a permanent gap no
+           * later reconnect can fill. Held here until the missing stretch arrives (or
+           * the page ends visibly unfinished), then delivered in Host seq order.
+           */
+          /** Every seq this page's parts have already counted (idempotent across parts). */
           for await (const value of source) {
             if (lifetime.signal.aborted) break
             // The OPENING is the snapshot: the frame that reaches the cursor `expected`
@@ -2552,14 +2669,17 @@ export class HostRouter {
             // the reader (`lastSeq`), and a snapshot's cursor is never counted: its value
             // is the page's cut, not a fill this reader lacks.
             if (resumes && isCreatedRecordFrame(value)) {
-              pageUnseen += Math.max(0, value.end - Math.max(value.firstLiveSeq, (lastSeq ?? -1) + 1) + 1)
+              for (let seq = Math.max(value.firstLiveSeq, (lastSeq ?? -1) + 1); seq <= value.end; seq += 1) countedPageSeqs.add(seq)
             } else if (resumes && isSnapshotFrame(value)) {
-              pageUnseen += unseenSnapshotEvents(value, lastSeq).length
+              for (const frame of unseenSnapshotEvents(value, lastSeq)) {
+                const seq = followSeqOf(frame)
+                if (seq !== null) countedPageSeqs.add(seq)
+              }
             }
             // A repair this window cannot take is refused VISIBLY and ends the follow
             // here, before a later live frame of this connection is accepted: `lastSeq`
             // stays exactly where the reader is, so nothing can be skipped silently.
-            const overflow = pageUnseen > MAX_RESUME_GAP ? { count: pageUnseen } : frames.find((frame) => frame?.type === 'resume-overflow')
+            const overflow = countedPageSeqs.size > MAX_RESUME_GAP ? { count: countedPageSeqs.size } : frames.find((frame) => frame?.type === 'resume-overflow')
             if (overflow) {
               const terminal = resumeOverflowError(hostId, overflow.count)
               this.#log(`session/follow for ${hostId} stopped (${STREAM_RESUME_OVERFLOW_CODE}): ${overflow.count} unseen events in one page`)
@@ -2567,7 +2687,8 @@ export class HostRouter {
               queue.fail(terminal)
               return
             }
-            for (const frame of frames) {
+            /** Deliver one frame (the single path that advances the durable cursor). */
+            const deliver = (frame) => {
               const renamed = this.#ingress(hostId, frame, SESSION_FOLLOW_ENDPOINT)
               if (sessionId) cache?.append(hostId, sessionId, frame)
               const seq = followSeqOf(frame)
@@ -2576,9 +2697,90 @@ export class HostRouter {
               progressed = true
               queue.push(renamed)
             }
+            // A page part that carries older events (a `created` fill, or the records
+            // region of a snapshot) names the stretch the page starts at. An event held
+            // above that floor is not a hole: the Host has just said the page starts
+            // there, so the reader may continue at that seq (a fill bringing seq 4 after
+            // the reader's seq 2 does not owe seq 3).
+            if (resumes && held.size > 0) {
+              const earliest = Math.min(...held.keys())
+              let floor = Infinity
+              for (const frame of frames) {
+                const seq = followSeqOf(frame)
+                if (seq !== null && seq < earliest && seq < floor) floor = seq
+              }
+              if (Number.isSafeInteger(floor) && (lastSeq ?? -1) < floor - 1) lastSeq = floor - 1
+            }
+            /** Deliver the held events that continue the durable run, in seq order. */
+            const drainHeld = () => {
+              for (;;) {
+                const next = (lastSeq ?? -1) + 1
+                const frame = held.get(next)
+                if (frame === undefined) return
+                held.delete(next)
+                deliver(frame)
+              }
+            }
+            // A frame that CARRIES several events has already gathered its whole stretch
+            // (a snapshot with its records, or a dense fill): its events are in Host seq
+            // order, so holding them would stall a page that is complete on arrival.
+            // Merge anything held from an earlier, newer-only part into that order.
+            if (resumes && frames.filter((frame) => followSeqOf(frame) !== null).length > 1) {
+              const ordered = [...held.values(), ...frames.filter((frame) => followSeqOf(frame) !== null)]
+                .sort((left, right) => followSeqOf(left) - followSeqOf(right))
+              held.clear()
+              const rest = frames.filter((frame) => followSeqOf(frame) === null)
+              for (const frame of [...ordered, ...rest]) {
+                const seq = followSeqOf(frame)
+                if (seq !== null && seq <= (lastSeq ?? -1)) continue
+                deliver(frame)
+              }
+              continue
+            }
+            for (const frame of frames) {
+              const seq = followSeqOf(frame)
+              if (resumes && seq !== null) {
+                // A first open has no reader-held cursor to jump past; a resumed page
+                // that names a seq beyond the next one has left a hole. Hold it until
+                // the missing seqs arrive, instead of advancing past them forever.
+                if (seq > (lastSeq ?? -1) + 1) {
+                  if (!held.has(seq)) held.set(seq, frame)
+                  continue
+                }
+                if (seq <= (lastSeq ?? -1)) continue
+              }
+              deliver(frame)
+              if (resumes) drainHeld()
+            }
+          }
+          // A re-opened page that still holds events when its stream ends had a hole
+          // the Host never filled. End visibly rather than dropping them: a later
+          // reconnect would carry the reader past the missing stretch permanently.
+          if (held.size > 0) {
+            const missing = Math.min(...held.keys())
+            const terminal = Object.assign(resumeOverflowError(hostId, missing - (lastSeq ?? -1) - 1),
+              { message: `the re-joined page left a gap from seq ${missing}; the follow was stopped instead of skipping it` })
+            this.#log(`session/follow for ${hostId} stopped (${STREAM_RESUME_OVERFLOW_CODE}): ${terminal.message}`)
+            if (first) { first = false; settleFirst.reject(terminal) }
+            queue.fail(terminal)
+            return
           }
         } catch (error) {
           if (lifetime.signal.aborted) break
+          // A re-opened page left holding an event past a hole, and the Host dropped
+          // the link before filling it. Do not carry the held state into a new attempt:
+          // that would hand the reader a reply whose prompt never arrived. A DESYNC is
+          // different — that is a frame-ordering protocol error the link repairs by
+          // re-opening, so it keeps the existing backoff path below.
+          if (typeof held !== 'undefined' && held.size > 0 && error?.closeCode === 1006) {
+            const missing = Math.min(...held.keys())
+            const terminal = Object.assign(resumeOverflowError(hostId, missing - (lastSeq ?? -1) - 1),
+              { message: `the re-joined page left a gap from seq ${missing}; the follow was stopped instead of skipping it` })
+            this.#log(`session/follow for ${hostId} stopped (${STREAM_RESUME_OVERFLOW_CODE}): ${terminal.message}`)
+            if (first) { first = false; settleFirst.reject(terminal) }
+            queue.fail(terminal)
+            return
+          }
           // A refusal the Host itself produced is not going to change by re-opening:
           // report it and end, exactly as a single attempt always did.
           if (!isLinkFailure(error)) {
@@ -2731,8 +2933,8 @@ export class HostRouter {
     /** @type {{hostId: string, sessionId: string, rpcId: string, callId?: string,
      *   approvalId?: string, argsHash?: string, kind: 'approval'|'question'}} */
     const card = { hostId: host.hostId, sessionId, rpcId, kind: approval ? 'approval' : 'question' }
-    // The tool-call id identifies a question for the Host's question service; it is
-    // what `userQuestions/answer` needs (the gateway publishes it with the card).
+    // The tool-call id is what the CONTINUED fallback needs; the active answer
+    // frame keys by the card's rpcId, so a Host that omits it stays answerable.
     if (typeof frame.callId === 'string' && frame.callId !== '') card.callId = frame.callId
     if (typeof frame.approvalId === 'string' && frame.approvalId !== '') card.approvalId = frame.approvalId
     if (typeof frame.argsHash === 'string' && APPROVAL_HASH.test(frame.argsHash)) card.argsHash = frame.argsHash
@@ -3041,14 +3243,40 @@ export class HostRouter {
   }
 
   /**
+   * A baseline that arrives after the merged stream has opened is not a second
+   * opening snapshot: DSH's snapshot stream ends on one (`snapshot-stream.ts`
+   * checks `snapshotSeen`). Re-send its blocks as ordinary per-session projection
+   * frames, preserving the Host's watermark. `ProjectionValueStore.apply` drops
+   * a sequenced write whose `seq` is not newer, so an equal/old watermark cannot
+   * roll a newer value back.
+   */
+  #controlBaselineFrames(baseline, hostId) {
+    const blocks = isPlainObject(baseline?.value?.projections) ? baseline.value.projections : {}
+    const frames = []
+    for (const [sessionId, block] of Object.entries(blocks)) {
+      if (!isPlainObject(block) || !isPlainObject(block.values)) continue
+      const frame = {
+        type: 'projection',
+        sessionId,
+        seq: block.asOfSeq,
+        changes: Object.entries(block.values).map(([key, val]) => ({ key, val })),
+      }
+      frames.push(hostId === null ? frame : this.#ingress(hostId, frame, 'session/control baseline'))
+    }
+    return frames
+  }
+
+  /**
    * `session/control` merged: one Local stream plus one per connected remote.
    *
    * DSH's client holds one projection store for all sessions; every host has its
-   * own control stream and its own seq space. Each host's baseline is folded into
-   * one combined baseline, and each later `{type:'projection'}` frame keeps its
-   * own (per-session) seq — a session id is namespaced, so seqs never collide.
-   * Without this, a remote `model/selection` append is durable on that Host but
-   * the native model chip never sees the `modelSelection` projection frame.
+   * own control stream and its own seq space. The ONE opening baseline folds in
+   * whatever arrived before the merge started; every later baseline (local or
+   * remote, late or re-opened) is re-sent as per-session projection frames, and
+   * every ordinary `{type:'projection'}` frame keeps its own (per-session) seq.
+   * A session id is namespaced, so seqs never collide. Without this, a remote
+   * `model/selection` append is durable on that Host but the native model chip
+   * never sees the `modelSelection` projection frame.
    */
   async *#mergeSessionControl(call) {
     const { payload, uplink, peer, signal, control, uplinkWindow } = call
@@ -3084,7 +3312,9 @@ export class HostRouter {
       for (const pump of pumps.values()) Object.assign(projections, pump.blocks)
       return { type: 'baseline', value: { projections } }
     }
-    const publishBaseline = () => { if (started) queue.push(combinedBaseline()) }
+    // Only the generator below publishes the opening baseline, once. Before that,
+    // a folded-in baseline is picked up by `combinedBaseline()`; after that, a
+    // re-baseline rides as projection frames, never as a second opening snapshot.
     // An obsolete pump must never remove the one that replaced it: `expected`
     // binds this removal to the pump whose error or backoff actually ended.
     const drop = (hostId, expected) => {
@@ -3092,7 +3322,8 @@ export class HostRouter {
       if (!pump || (expected && pump !== expected)) return
       pump.abort()
       pumps.delete(hostId)
-      publishBaseline()
+      // A host dropping out does not withdraw its projections from the store,
+      // and publishing a baseline here would be a second opening snapshot.
     }
 
     const start = (host) => {
@@ -3129,9 +3360,12 @@ export class HostRouter {
               if (hostControl.signal.aborted || lifetime.signal.aborted) break
               if (!isPlainObject(frame)) continue
               if (frame.type === 'baseline') {
-                pump.blocks = {}
-                this.#mergeControlBaseline(pump.blocks, frame, host.hostId)
-                publishBaseline()
+                if (started) {
+                  for (const projection of this.#controlBaselineFrames(frame, host.hostId)) emit(projection)
+                } else {
+                  pump.blocks = {}
+                  this.#mergeControlBaseline(pump.blocks, frame, host.hostId)
+                }
                 progressed = true
                 continue
               }
@@ -3211,10 +3445,13 @@ export class HostRouter {
           for await (const frame of localSource) {
             if (lifetime.signal.aborted) break
             if (isPlainObject(frame) && frame.type === 'baseline') {
-              localBlocks = {}
-              this.#mergeControlBaseline(localBlocks, frame, null)
+              if (started) {
+                for (const projection of this.#controlBaselineFrames(frame, null)) emit(projection)
+              } else {
+                localBlocks = {}
+                this.#mergeControlBaseline(localBlocks, frame, null)
+              }
               settleLocal.resolve()
-              publishBaseline()
               continue
             }
             // Local frames are already in the controller's namespace.
@@ -3242,7 +3479,11 @@ export class HostRouter {
 
       await Promise.race([localReady, this.#delay(this.#baselineTimeoutMs)])
       started = true
-      queue.push(combinedBaseline())
+      // Snapshot this exact cut: a pump/local baseline buffered by `emit` while
+      // the timeout settled must still be re-sent as a projection, not folded
+      // into a second opening baseline here.
+      const openingBaseline = combinedBaseline()
+      queue.push(openingBaseline)
       for (const frame of pending) queue.push(frame)
       pending.length = 0
       for await (const frame of queue) yield frame

@@ -95,7 +95,7 @@ const workspaceView = (workspaceId, sessionIds, extra = {}) => ({
   createdAt: '2026-11-09T00:00:00.000Z', updatedAt: '2026-11-09T00:00:00.000Z', ...extra,
 })
 
-function createHarness({ remotes = [], dispatchRpc, connected: connectedIds, baseline = { items: [], archivedSessionIds: [], pinnedSessionIds: [] } } = {}) {
+function createHarness({ remotes = [], dispatchRpc, connected: connectedIds, baseline = { items: [], archivedSessionIds: [], pinnedSessionIds: [] }, controlBaseline = { projections: {} } } = {}) {
   const localCalls = []
   const localStreams = []
   const logs = []
@@ -117,7 +117,7 @@ function createHarness({ remotes = [], dispatchRpc, connected: connectedIds, bas
       const queue = createQueue()
       localStreams.push({ endpoint, payload: clone(payload), payloadSeen: payload, window, queue })
       if (endpoint === 'workspace/follow') queue.push({ type: 'baseline', value: baseline })
-      if (endpoint === 'session/control') queue.push({ type: 'baseline', value: { projections: {} } })
+      if (endpoint === 'session/control' && controlBaseline !== null) queue.push({ type: 'baseline', value: controlBaseline })
       return queue
     },
   }
@@ -1280,11 +1280,25 @@ const localCatalog = (groups) => (endpoint) => (endpoint === 'session/modelCatal
   : { ok: true, value: {} })
 /** The selection a remote Host projects for a session (`{lastUsed, next}`). */
 const selection = (provider, model) => ({ provider, model })
-const projectedSelection = (provider, model) => ({
+const projectedSelection = (provider, model, asOfSeq = 7) => ({
   kind: 'sequenced',
-  asOfSeq: 7,
+  asOfSeq,
   values: { modelSelection: { lastUsed: selection(provider, model), next: selection(provider, model) } },
 })
+/** DSH's snapshot-stream rule, applied to the frames this test reads from `session/control`. */
+const createControlProtocolReader = () => {
+  let baselineSeen = false
+  return async (iterator, label = 'control frame') => {
+    const frame = (await nextFrame(iterator, label)).value
+    if (frame.type === 'baseline') {
+      assert.equal(baselineSeen, false, `${label}: a second opening baseline ends the stream`)
+      baselineSeen = true
+    } else {
+      assert.equal(baselineSeen, true, `${label}: an update arrived before the opening baseline`)
+    }
+    return frame
+  }
+}
 
 test('session/modelCatalog keeps every host as its own section, tagged by host', async () => {
   const hostB = createFakeRemote('hostB', 'Host B', { replies: {
@@ -1461,6 +1475,57 @@ test('session/selectModel strips the host tag from the provider the picker match
     { sessionId: 's1', provider: 'deepseek-official', model: 'm' })
 })
 
+test('session/control emits one opening baseline: a delayed remote baseline becomes projection frames', async () => {
+  // DSH's snapshot stream ends on a second opening baseline (snapshot-stream.ts:
+  // `snapshotSeen`). A remote whose baseline arrives after the merged stream
+  // started must therefore be folded in as ordinary projections, never as a
+  // second baseline.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const controlQueues = []
+  const originalOpenStream = hostB.connection.openStream.bind(hostB.connection)
+  hostB.connection.openStream = async (endpoint, args, options) => {
+    if (endpoint !== 'session/control') return originalOpenStream(endpoint, args, options)
+    const queue = createQueue()
+    controlQueues.push(queue)
+    return queue
+  }
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const nextControl = createControlProtocolReader()
+  const opening = await nextControl(iterator, 'opening baseline')
+  assert.equal(opening.type, 'baseline')
+  assert.deepEqual(opening.value.projections, {}, 'the late remote is not in the one opening baseline')
+
+  const oldSelection = selection('r9-fallback', 'old-model')
+  controlQueues[0].push({ type: 'baseline', value: { projections: {
+    s1: projectedSelection('r9-fallback', 'old-model'),
+    s2: { kind: 'sequenced', asOfSeq: 5, values: { title: 'Host B title' } },
+  } } })
+  const first = await nextControl(iterator, 'late baseline projection for s1')
+  const second = await nextControl(iterator, 'late baseline projection for s2')
+  assert.deepEqual([first, second], [
+    {
+      type: 'projection', sessionId: 'h:hostB:s1', seq: 7,
+      changes: [{ key: 'modelSelection', val: {
+        lastUsed: { ...oldSelection, provider: 'r9-fallback@hostB' },
+        next: { ...oldSelection, provider: 'r9-fallback@hostB' },
+      } }],
+    },
+    {
+      type: 'projection', sessionId: 'h:hostB:s2', seq: 5,
+      changes: [{ key: 'title', val: 'Host B title' }],
+    },
+  ], 'each block is re-sent as one per-session frame, with ids and provider ingress-applied')
+  const extra = await frameWithin(iterator, 50)
+  assert.equal(extra, null, 'no second baseline was emitted after the late remote baseline')
+  assertNoNamespacedId(hostB)
+  control.abort()
+  await iterator.return()
+})
+
 test('a successful remote selectModel reaches the native model chip through the control projection', async () => {
   // The RPC answer alone never moves the chip: dsh-client-ui-model-selection's
   // ModelDirectory current is derived from the `modelSelection` projection face
@@ -1539,8 +1604,10 @@ test('a normally-ended remote control stream is reopened and republishes the mod
   const control = new AbortController()
   const source = await harness.gateway.openWireStream('session/control', { args: {} },
     undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const nextControl = createControlProtocolReader()
   // The opening baseline carries the remote session, tagged into this controller.
-  const baseline = (await nextFrame(source, 'session/control baseline')).value
+  const baseline = await nextControl(iterator, 'session/control baseline')
   assert.equal(baseline.type, 'baseline')
   assert.deepEqual(Object.keys(baseline.value.projections), ['h:hostB:s1'])
   assert.deepEqual(baseline.value.projections['h:hostB:s1'].values.modelSelection,
@@ -1563,23 +1630,32 @@ test('a normally-ended remote control stream is reopened and republishes the mod
   assert.equal(harness.router.status().hosts.find((host) => host.hostId === 'hostB').online, true,
     'the Host was never disconnected')
 
-  // A fresh baseline on the re-opened stream replaces the old one in the merged
-  // stream. The re-open greets with the old baseline first, so read until the new
-  // (mid) selection shows up; both are tagged for the Host.
-  hostB.send({ type: 'baseline', value: { projections: { s1: projectedSelection('r9-fallback', 'mid-model') } } })
+  // A fresh baseline on the re-opened stream is a projection frame, not a second
+  // opening snapshot. The test advances its watermark to 8: ProjectionValueStore
+  // drops an equal-seq write, so a same-watermark baseline cannot model a newer
+  // selection. The re-open also greets with the old seq-7 block first; read past
+  // that until the mid selection shows up.
+  hostB.send({ type: 'baseline', value: { projections: {
+    s1: projectedSelection('r9-fallback', 'mid-model', 8),
+  } } })
   let republished
   const baselineDeadline = Date.now() + 1500
   while (Date.now() < baselineDeadline) {
-    const frame = (await nextFrame(source, 'republished session/control baseline')).value
-    if (frame.type === 'baseline'
-        && frame.value.projections['h:hostB:s1']?.values?.modelSelection?.next?.model === 'mid-model') {
+    const frame = await nextControl(iterator, 'control frame after re-open')
+    if (frame.type === 'projection' && frame.sessionId === 'h:hostB:s1'
+        && frame.changes.some((entry) => entry.key === 'modelSelection' && entry.val?.next?.model === 'mid-model')) {
       republished = frame
       break
     }
   }
-  assert.ok(republished, 'the re-opened stream republished the new baseline')
-  assert.deepEqual(republished.value.projections['h:hostB:s1'].values.modelSelection,
-    { lastUsed: { ...midSelection, provider: 'r9-fallback@hostB' }, next: { ...midSelection, provider: 'r9-fallback@hostB' } })
+  assert.ok(republished, 'the re-opened stream republished the new selection as a projection')
+  assert.deepEqual(republished, {
+    type: 'projection', sessionId: 'h:hostB:s1', seq: 8,
+    changes: [{ key: 'modelSelection', val: {
+      lastUsed: { ...midSelection, provider: 'r9-fallback@hostB' },
+      next: { ...midSelection, provider: 'r9-fallback@hostB' },
+    } }],
+  })
 
   // A projection increment (seq past the baseline) still reaches the chip after
   // the re-open, and folds into the face whose `next` the model directory reads.
@@ -1587,7 +1663,7 @@ test('a normally-ended remote control stream is reopened and republishes the mod
     type: 'projection', sessionId: 's1', seq: 9,
     changes: [{ key: 'modelSelection', val: { lastUsed: midSelection, next: newSelection } }],
   })
-  const frame = (await nextFrame(source, 'modelSelection projection frame after re-open')).value
+  const frame = await nextControl(iterator, 'modelSelection projection frame after re-open')
   assert.deepEqual(frame, {
     type: 'projection', sessionId: 'h:hostB:s1', seq: 9,
     changes: [{ key: 'modelSelection', val: {
@@ -1595,13 +1671,52 @@ test('a normally-ended remote control stream is reopened and republishes the mod
       next: { ...newSelection, provider: 'r9-fallback@hostB' },
     } }],
   })
-  const face = { ...republished.value.projections['h:hostB:s1'].values.modelSelection }
-  const change = frame.changes.find((entry) => entry.key === 'modelSelection')
-  face.next = change.val.next
+  const face = { ...baseline.value.projections['h:hostB:s1'].values.modelSelection }
+  for (const update of [republished, frame]) {
+    const change = update.changes.find((entry) => entry.key === 'modelSelection')
+    face.lastUsed = change.val.lastUsed
+    face.next = change.val.next
+  }
   assert.deepEqual(face.next, { provider: 'r9-fallback@hostB', model: 'ds41-cmc-ccsonnet' })
   assert.notDeepEqual(face.next, face.lastUsed, 'the chip reads a new selection, not the mid one')
   assertNoNamespacedId(hostB)
   control.abort()
+})
+
+test('a host drop emits no baseline; only the reopened baseline rides as projections', async () => {
+  // The store does not withdraw a session's projections when a Host disappears,
+  // so `drop()` must never publish a replacement baseline. A reopen is allowed,
+  // but its greeting baseline is still a projection frame in the one open stream.
+  const hostB = createFakeRemote('hostB', 'Host B', {
+    controlProjections: { s1: projectedSelection('r9-fallback', 'old-model') },
+  })
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const nextControl = createControlProtocolReader()
+  const opening = await nextControl(iterator, 'opening baseline')
+  assert.equal(opening.type, 'baseline')
+
+  hostB.closeStream()
+  let reopened = false
+  const deadline = Date.now() + 1500
+  while (Date.now() < deadline) {
+    if (hostB.streams.filter((stream) => stream.endpoint === 'session/control').length >= 2) { reopened = true; break }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(reopened, true, 'the control stream re-opened before the drop')
+  const reopenedGreeting = await nextControl(iterator, 're-opened baseline projection')
+  assert.equal(reopenedGreeting.type, 'projection', 'the reopen greeting is not a second baseline')
+  assert.equal(reopenedGreeting.sessionId, 'h:hostB:s1')
+  assert.deepEqual(reopenedGreeting.changes.map((entry) => entry.key), ['modelSelection'])
+
+  harness.disconnect('hostB')
+  const afterDrop = await frameWithin(iterator, 100)
+  assert.equal(afterDrop, null, 'a host drop emitted no replacement baseline')
+  control.abort()
+  await iterator.return()
 })
 
 test('a Host that greets with a baseline then closes stops reopening, and abort leaves no pending timer', async () => {
@@ -2134,6 +2249,40 @@ test('a host whose catalog keeps failing is announced exactly once, then recover
   harness.localStreams[0].queue.push({ type: 'emit', event: 'local/marker', args: [] })
   assert.deepEqual((await nextFrame(iterator, 'local marker after recovery')).value,
     { type: 'emit', event: 'local/marker', args: [] })
+  control.abort()
+  await iterator.return()
+})
+
+test('a permanently failing catalog does not re-arm the refresh timer on each picker reload', async () => {
+  // Reviewer finding 3: #catalogHostKey stays short of the connected host, so a
+  // reload the previous emit asked for used to look "stale" again and schedule the
+  // next timer — a permanent once-a-second reload loop. Across a FULL interval the
+  // picker must stay quiet about the same failure.
+  const refusal = Object.assign(new Error('no catalog'), { code: 'auth/forbidden-scope', scope: 'prompt:send' })
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/modelCatalog': refusal } })
+  const harness = createHarness({
+    remotes: [hostB],
+    dispatchRpc: localCatalog([providerGroup('deepseek-official', 'DeepSeek', ['deepseek-chat'])]),
+  })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('$events', { args: {} }, undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const ready = iterator.next()
+  await new Promise((resolve) => setImmediate(resolve))
+  harness.localStreams[0].queue.push({ type: 'ready', clientId: 'c1', host: { home: '/home/owner' } })
+  assert.equal((await ready).value.type, 'ready')
+
+  await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})
+  assert.deepEqual((await nextFrame(iterator, 'the one refresh')).value,
+    { type: 'emit', event: 'llm/models-updated', args: [] })
+  // Two more picker reloads, spanning the whole rate-limit window: the SAME stale
+  // state is already announced and must not emit a second frame or schedule a retry.
+  await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})
+  await new Promise((resolve) => setTimeout(resolve, 1200))
+  await harness.gateway.dispatchRpc('session/modelCatalog', { args: {} }, undefined, {})
+  harness.localStreams[0].queue.push({ type: 'emit', event: 'local/marker', args: [] })
+  assert.deepEqual((await nextFrame(iterator, 'the marker after a full interval')).value,
+    { type: 'emit', event: 'local/marker', args: [] }, 'the failing catalog stayed quiet')
   control.abort()
   await iterator.return()
 })
