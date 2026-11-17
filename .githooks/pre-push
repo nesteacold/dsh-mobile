@@ -22,7 +22,7 @@ fi
 
 # Second opinion when gitleaks is installed; absence is not a failure.
 if command -v gitleaks >/dev/null 2>&1; then
-  if ! gitleaks detect --no-banner --redact --source . >/dev/null 2>&1; then
+  if ! gitleaks detect --no-banner --redact --config .gitleaks.toml --source . >/dev/null 2>&1; then
     echo "pre-push: gitleaks reported a leak; run 'gitleaks detect --source .' to see it." >&2
     exit 1
   fi
