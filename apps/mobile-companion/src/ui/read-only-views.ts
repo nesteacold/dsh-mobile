@@ -72,6 +72,21 @@ export function contextPercent(pressure: ContextPressure | null): string | null 
   return `${trimDecimal(percent, 1)}%`;
 }
 
+/**
+ * Spec 041 FR-3 — the header ring's 0…1 fill from the SAME numbers the stats sheet shows.
+ * `null` means "no reading to draw" (unknown window, unknown usage, or a non-positive window):
+ * the ring is then drawn neutral, never full and never empty-as-zero.
+ */
+export function contextRingRatio(pressure: ContextPressure | null): number | null {
+  if (pressure === null) return null;
+  const window = pressure.contextWindow;
+  const used = pressure.pressureTokens;
+  if (window === null || used === null || window <= 0) return null;
+  const ratio = used / window;
+  if (!Number.isFinite(ratio)) return null;
+  return Math.min(1, Math.max(0, ratio));
+}
+
 function tokenRows(usage: TokenUsage | null): StatsRow[] {
   const totals = usage?.totals ?? null;
   if (totals === null) return [];

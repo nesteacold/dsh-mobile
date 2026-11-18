@@ -89,6 +89,31 @@ export type {
   TokenTotals,
   TokenUsage,
 } from './stats';
+// Spec 041 FR-2: the narrow app-side remote-upload frames (`attachments:write`).
+export {
+  ATTACHMENTS_WRITE_SCOPE,
+  CLIENT_UPLOAD_MAX_BYTES,
+  CoreUploadError,
+  admitClientUploadSize,
+  cancelUpload,
+  REMOTE_UPLOAD_MAX_CHUNK_BYTES,
+  REMOTE_UPLOAD_RESULT_KIND,
+  canonicalBase64,
+  chunkParams,
+  openParams,
+  remoteUpload,
+  toChunkView,
+  toFinishView,
+  toOpenView,
+  uploadSha256,
+} from './remote-upload';
+export type {
+  RemoteUploadCancel,
+  RemoteUploadInput,
+  RemoteUploadKind,
+  RemoteUploadOpenView,
+  RemoteUploadReceipt,
+} from './remote-upload';
 // Spec 018 item 3: the read-only schedule frames (`schedule:read`) — never a mutation.
 export {
   SCHEDULE_PAGE_LIMIT,

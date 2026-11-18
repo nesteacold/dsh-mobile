@@ -293,6 +293,22 @@ export type MessageKey =
   | 'session.permissionCustomCurrent'
   | 'session.permissionRaced'
   | 'session.permissionError'
+  | 'session.permissionPicker'
+  | 'session.permissionDisabled'
+  | 'session.contextUsage'
+  | 'session.contextUnavailable'
+  | 'session.attach'
+  | 'session.attachTitle'
+  | 'session.attachImage'
+  | 'session.attachFile'
+  | 'session.attachUnavailable'
+  | 'session.attachTooLarge'
+  | 'session.attachProgress'
+  | 'session.attachCancel'
+  | 'session.attachFailed'
+  | 'session.attachReceipt'
+  | 'session.attachNoFile'
+  | 'session.attachBusy'
   // Spec 018 — the session's agent preset, view only (the phone never sets it).
   | 'session.agentPreset'
   // Spec 018 item 5 — read-only goal line and task checklist (the Host's `goal` / `todos`).
@@ -669,6 +685,22 @@ const en = {
   'session.permissionCustomCurrent': 'This session uses a custom permission setting, so it cannot be compared with a preset. Nothing changed.',
   'session.permissionRaced': 'The preset changed before this phone could confirm the switch. Check it on your computer.',
   'session.permissionError': 'The computer did not confirm the change. Check the preset on your computer.',
+  'session.permissionPicker': 'Choose permissions',
+  'session.permissionDisabled': 'Permission changes are not enabled for this device',
+  'session.contextUsage': 'Context usage',
+  'session.contextUnavailable': 'Context usage is not available on this device. Pair this phone again with stats:read.',
+  'session.attach': 'Attach a file',
+  'session.attachTitle': 'Add attachment',
+  'session.attachImage': 'Image / Photo',
+  'session.attachFile': 'File',
+  'session.attachUnavailable': 'File attachments are not enabled for this device',
+  'session.attachTooLarge': 'This file is too large for this computer.',
+  'session.attachProgress': 'Uploading {name}… {percent}%',
+  'session.attachCancel': 'Cancel upload',
+  'session.attachFailed': 'The upload failed. Try again.',
+  'session.attachReceipt': 'Attached: {name}',
+  'session.attachNoFile': 'No file was selected.',
+  'session.attachBusy': 'Wait for the current upload to finish before sending.',
   'session.goal': 'Goal',
   'session.goalPhase': '{phase}',
   'session.tasksTitle': 'Tasks',
@@ -1016,6 +1048,22 @@ const vi = {
   'session.permissionCustomCurrent': 'Phiên này dùng thiết lập quyền tuỳ chỉnh nên không so được với preset. Không có gì thay đổi.',
   'session.permissionRaced': 'Preset đã đổi trước khi điện thoại xác nhận được. Hãy kiểm tra trên máy tính.',
   'session.permissionError': 'Máy tính chưa xác nhận thay đổi. Hãy kiểm tra preset trên máy tính.',
+  'session.permissionPicker': 'Chọn quyền',
+  'session.permissionDisabled': 'Thiết bị này không được phép đổi quyền',
+  'session.contextUsage': 'Mức dùng ngữ cảnh',
+  'session.contextUnavailable': 'Không xem được mức dùng ngữ cảnh trên thiết bị này. Hãy ghép đôi lại điện thoại với quyền stats:read.',
+  'session.attach': 'Đính kèm tệp',
+  'session.attachTitle': 'Thêm tệp đính kèm',
+  'session.attachImage': 'Hình ảnh',
+  'session.attachFile': 'Tệp',
+  'session.attachUnavailable': 'Thiết bị này không được phép đính kèm tệp',
+  'session.attachTooLarge': 'Tệp này quá lớn đối với máy tính này.',
+  'session.attachProgress': 'Đang tải {name}… {percent}%',
+  'session.attachCancel': 'Huỷ tải lên',
+  'session.attachFailed': 'Tải lên thất bại. Hãy thử lại.',
+  'session.attachReceipt': 'Đã đính kèm: {name}',
+  'session.attachNoFile': 'Chưa chọn tệp nào.',
+  'session.attachBusy': 'Đợi tải lên hiện tại xong rồi mới gửi.',
   'session.goal': 'Mục tiêu',
   'session.goalPhase': '{phase}',
   'session.tasksTitle': 'Việc cần làm',

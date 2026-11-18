@@ -28,6 +28,13 @@ export interface PromptItem extends OutboxItemBase {
   op: 'prompt';
   text: string;
   mode?: 'queue' | 'steer';
+  /**
+   * Spec 041 — Host-issued upload receipts carried with the NEXT prompt. The gateway's
+   * `admitMessage` converts each `{receiptId}` into a native file content block; the bytes never
+   * travel in the prompt. Part of the item so a retry re-sends the SAME receipt with the same
+   * `clientMsgId` (idempotent submission).
+   */
+  files?: readonly { readonly receiptId: string }[];
 }
 
 export interface CancelItem extends OutboxItemBase {
@@ -52,6 +59,12 @@ export interface OutboxDeps {
    * unusable value surfaces as a typed `CoreError` from `enqueue*`, never as a raw exception.
    */
   newClientMsgId?: () => string;
+  /**
+   * Spec 041: called at the MOMENT an item reaches a terminal status, keyed by its clientMsgId.
+   * Lets each `sendPrompt` caller resolve its own wait independently of which drain call happens
+   * to reconcile history/prune (overlapping drains and reconnects are normal).
+   */
+  onTerminal?: (clientMsgId: string, status: 'acked' | 'failed') => void;
 }
 
 type Listener = (items: OutboxItem[]) => void;
@@ -195,7 +208,9 @@ export class Outbox {
   private readonly listeners = new Set<Listener>();
   private readonly send: OutboxDeps['send'];
   private readonly newId: () => string;
+  private readonly onTerminal: OutboxDeps['onTerminal'];
   private draining = false;
+  private readonly idleWaiters: Array<() => void> = [];
   private drainRequested = false;
   private drainChain: Promise<void> | null = null;
 
@@ -208,6 +223,7 @@ export class Outbox {
   constructor(deps: OutboxDeps) {
     this.send = deps.send;
     this.newId = deps.newClientMsgId ?? defaultClientMsgId;
+    this.onTerminal = deps.onTerminal;
   }
 
   /**
@@ -238,13 +254,19 @@ export class Outbox {
   }
 
   /** Queue a follow-up prompt. The text is kept until acked. */
-  enqueuePrompt(sessionId: string, text: string, mode?: 'queue' | 'steer'): PromptItem {
+  enqueuePrompt(
+    sessionId: string,
+    text: string,
+    mode?: 'queue' | 'steer',
+    files?: readonly { readonly receiptId: string }[],
+  ): PromptItem {
     const item: PromptItem = {
       op: 'prompt',
       clientMsgId: this.nextClientMsgId(),
       sessionId,
       text,
       ...(mode === undefined ? {} : { mode }),
+      ...(files === undefined || files.length === 0 ? {} : { files: files.map((file) => ({ receiptId: file.receiptId })) }),
       status: 'queued',
       attempts: 0,
     };
@@ -301,6 +323,24 @@ export class Outbox {
     return this.inFlight.has(clientMsgId);
   }
 
+  /**
+   * Resolves when no drain is active. A `drain()` call made while another drain is running returns
+   * early (the active loop picks up the new item instead), so a caller waiting for ITS OWN ack must
+   * wait for the whole loop to settle before deciding "not confirmed". Never cancels or retries.
+   */
+  async whenIdle(): Promise<void> {
+    // Include CHAINED drains: a second drain() returns early while the first is running, and its
+    // work runs in a .then() AFTER the first loop finishes (too late for a simple `draining` flag).
+    while (this.draining || this.drainChain !== null) {
+      const chain = this.drainChain;
+      if (chain !== null) {
+        await chain;
+        continue;
+      }
+      await new Promise<void>((resolve) => this.idleWaiters.push(resolve));
+    }
+  }
+
   /** Deps.send payload for an item; stable across retries (same clientMsgId). */
   frameFor(item: OutboxItem): OutboxFrame {
     if (item.op === 'prompt') {
@@ -311,6 +351,7 @@ export class Outbox {
           text: item.text,
           clientMsgId: item.clientMsgId,
           ...(item.mode === undefined ? {} : { mode: item.mode }),
+          ...(item.files === undefined ? {} : { files: item.files.map((file) => ({ receiptId: file.receiptId })) }),
         },
       };
     }
@@ -328,7 +369,10 @@ export class Outbox {
       this.drainRequested = true;
       const previous = this.drainChain ?? Promise.resolve();
       const chained = previous.then(() => this.runDrain());
-      this.drainChain = chained.catch(() => undefined);
+      const wrapped: Promise<void> = chained.catch(() => undefined).finally(() => {
+        if (this.drainChain === wrapped) this.drainChain = null;
+      });
+      this.drainChain = wrapped;
       return chained;
     }
     return this.runDrain();
@@ -374,6 +418,7 @@ export class Outbox {
     } finally {
       this.draining = false;
       this.drainRequested = false;
+      for (const resolve of this.idleWaiters.splice(0)) resolve();
     }
   }
 
@@ -453,12 +498,14 @@ export class Outbox {
     const next: OutboxItem = { ...item, status: 'acked' };
     delete next.lastError;
     this.items.set(item.clientMsgId, next);
+    this.onTerminal?.(item.clientMsgId, 'acked');
     this.bump();
   }
 
   private markFailed(item: OutboxItem, code: CoreErrorCode): void {
     this.inFlight.delete(item.clientMsgId);
     this.items.set(item.clientMsgId, { ...item, status: 'failed', lastError: code });
+    this.onTerminal?.(item.clientMsgId, 'failed');
     this.bump();
   }
 

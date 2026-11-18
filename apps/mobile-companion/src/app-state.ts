@@ -89,6 +89,13 @@ import {
 import { PERMISSION_LOWER_CAPABILITY } from '@dsh-ext/mobile-protocol';
 import { hasScheduleReadScope, readScheduleCatalog, readScheduleList, readScheduleView, type ScheduleCatalog, type ScheduleList, type ScheduleViewResult } from './core/schedules';
 import { hasStatsReadScope, readSessionStats, type SessionStatsRead } from './core/stats';
+import {
+  ATTACHMENTS_WRITE_SCOPE,
+  cancelUpload,
+  remoteUpload,
+  type RemoteUploadInput,
+  type RemoteUploadReceipt,
+} from './core/remote-upload';
 import { archiveFrame, renameFrame } from './ui/conversation/session-actions';
 import {
   EMPTY_SESSION_PANEL,
@@ -741,6 +748,12 @@ export class AppController {
    * any socket. `null` for a normal build (which reads and persists the id as before).
    */
   private readonly demoInstallId: string | null = null;
+  /**
+   * Spec 041 review — one waiter per CALLER, keyed by its own clientMsgId. Concurrent sends and
+   * overlapping reconnect/retry drains must never let one caller's receipt resolve another's promise.
+   * A field (not a `drainOutbox` parameter) keeps that method's no-arg shape pinned by the suite.
+   */
+  private readonly promptAckWaiters = new Map<string, (acked: boolean) => void>();
   private readonly outgoing = new Outbox({
     send: async (frame) => {
       const client = this.client;
@@ -752,6 +765,8 @@ export class AppController {
     // Stable per installation, so a prompt enqueued after a restart or on another device cannot
     // collide with an old one (the host would treat that as a replay and drop it).
     newClientMsgId: createInstallScopedClientMsgId(() => this.installId),
+    // Resolve each caller at ITS OWN terminal transition, never by another drain's timing.
+    onTerminal: (clientMsgId, status) => this.resolvePromptAck(clientMsgId, status === 'acked'),
   });
   private readonly listeners = new Set<(snapshot: AppStateSnapshot) => void>();
   private readonly localeFor: () => Locale;
@@ -2245,14 +2260,37 @@ export class AppController {
     return error.details?.resetRequired === true;
   }
 
-  /** Send a prompt with a stable clientMsgId; retried by the outbox after a reconnect. */
-  async sendPrompt(text: string): Promise<void> {
+  /**
+   * Send a prompt with a stable clientMsgId; retried by the outbox after a reconnect.
+   * Spec 041 — `files` are Host-issued upload receipts, not bytes: the gateway converts them to
+   * native file content blocks for the NEXT prompt (`host-commands.mjs:192-201`). Returns true ONLY
+   * on the contract's `sent` receipt for THIS item, so the screen may clear its pending chip only
+   * after a successful submission (a refused send keeps the receipt for a retry).
+   */
+  async sendPrompt(
+    text: string,
+    options: { files?: readonly { readonly receiptId: string }[] } = {},
+  ): Promise<boolean> {
     const sessionId = this.openSessionId;
-    if (sessionId === null || text.trim() === '') return;
-    const item = this.outgoing.enqueuePrompt(sessionId, text);
+    if (sessionId === null || text.trim() === '') return false;
+    const item = this.outgoing.enqueuePrompt(sessionId, text, undefined, options.files);
+    const acked = new Promise<boolean>((resolve) => this.promptAckWaiters.set(item.clientMsgId, resolve));
     this.history.addPendingPrompt(item.clientMsgId, text);
     this.bump();
     await this.drainOutbox();
+    // A drain() made while another is running returns early; the ACTIVE loop may still be about to
+    // send this caller's item. Wait for that loop to settle before deciding "not confirmed".
+    await this.outgoing.whenIdle();
+    this.resolvePromptAck(item.clientMsgId, false);
+    return acked;
+  }
+
+  /** Resolve one caller's waiter by its own clientMsgId (idempotent, safe under overlapping drains). */
+  private resolvePromptAck(clientMsgId: string, acked: boolean): void {
+    const resolve = this.promptAckWaiters.get(clientMsgId);
+    if (resolve === undefined) return;
+    this.promptAckWaiters.delete(clientMsgId);
+    resolve(acked);
   }
 
   async retryPrompt(clientMsgId: string): Promise<void> {
@@ -3043,9 +3081,10 @@ export class AppController {
     this.bump();
   }
 
-  private async drainOutbox(): Promise<void> {
+  private async drainOutbox(): Promise<boolean> {
     this.outgoing.gateClosed = () => this.client?.connected !== true;
     await this.outgoing.drain();
+    let acked = false;
     // Confirm/flag BEFORE pruning. `prune()` then DELETES the `acked` items, so the old order (prune,
     // then look for acked) found an empty list and every delivered prompt kept rendering "đang gửi…"
     // forever — the device defect. `'acked'` is set when the contract's `sent {sessionId,clientMsgId}`
@@ -3053,6 +3092,8 @@ export class AppController {
     for (const item of this.outgoing.list()) {
       if (item.op !== 'prompt') continue;
       if (item.status === 'acked') {
+        acked = true;
+        this.resolvePromptAck(item.clientMsgId, true);
         this.history.confirmPending(item.clientMsgId, {
           id: item.clientMsgId,
           role: 'user',
@@ -3060,12 +3101,14 @@ export class AppController {
           createdAt: Date.now(),
         });
       } else if (item.status === 'failed') {
+        this.resolvePromptAck(item.clientMsgId, false);
         // A refused send must say why instead of staying in "sending" (silent-failure class).
         this.history.markPromptFailed(item.clientMsgId, item.lastError ?? 'client/unknown');
       }
     }
     this.outgoing.prune();
     this.bump();
+    return acked;
   }
 
   private async loadSession(sessionId: string): Promise<void> {
@@ -3626,6 +3669,54 @@ export class AppController {
   hasReadScope(scope: 'stats:read' | 'schedule:read'): boolean {
     const scopes = this.client?.device?.scopes;
     return scope === 'stats:read' ? hasStatsReadScope(scopes) : hasScheduleReadScope(scopes);
+  }
+
+  /**
+   * Spec 041 FR-2 — a generic scope check for NON-read grants. `hasReadScope` above is deliberately
+   * named for its two read scopes; widening its signature to `attachments:write` would suggest a
+   * read where there is a write. This answers the same "did this pairing actually grant it" question
+   * from `hello.device.scopes`, fail-closed on an absent/malformed list.
+   */
+  hasScope(scope: string): boolean {
+    const scopes = this.client?.device?.scopes;
+    return Array.isArray(scopes) && scopes.some((granted) => granted === scope);
+  }
+
+  /**
+   * Spec 041 FR-2 — send an attachment through the contract's `remote-upload-*` frames. The caller
+   * (the session screen) checks `hasScope(ATTACHMENTS_WRITE_SCOPE)` before opening a picker; this
+   * guard is repeated here so a future screen cannot send a forbidden frame by accident.
+   */
+  async uploadAttachment(
+    input: RemoteUploadInput,
+    options: {
+      progress?: (sent: number, total: number) => void;
+      cancelled?: () => boolean;
+      onUploadId?: (uploadId: string) => void;
+    } = {},
+  ): Promise<RemoteUploadReceipt> {
+    const client = this.client;
+    if (client === null || client.state !== 'ready') {
+      throw new CoreError({ code: 'client/bad-state', message: 'Not connected; the upload was not sent' });
+    }
+    if (!this.hasScope(ATTACHMENTS_WRITE_SCOPE)) {
+      throw new CoreError({ code: 'auth/forbidden-scope', message: 'This device has no attachments:write grant' });
+    }
+    return remoteUpload(client, input, {
+      ...(options.progress === undefined ? {} : { progress: options.progress }),
+      ...(options.cancelled === undefined ? {} : { cancel: { cancelled: options.cancelled } }),
+      ...(options.onUploadId === undefined ? {} : { onUploadId: options.onUploadId }),
+    });
+  }
+
+  /**
+   * Spec 041 review — cancel a live transfer from the screen's session-change/unmount path. Still
+   * gated by the same scope so a stale UI cannot send a forbidden frame after a revoke.
+   */
+  async cancelRemoteUpload(uploadId: string): Promise<void> {
+    const client = this.client;
+    if (client === null || client.state !== 'ready' || !this.hasScope(ATTACHMENTS_WRITE_SCOPE)) return;
+    await cancelUpload(client, uploadId);
   }
 
   /**

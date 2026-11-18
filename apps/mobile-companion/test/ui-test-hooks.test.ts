@@ -138,6 +138,24 @@ describe('session screen hooks', () => {
     assert.equal(count(ids, 'session-send'), 1);
   });
 
+  it('exposes the three spec 041 controls (permission picker, context ring, attach)', () => {
+    // Static hooks: the three owner-reported missing controls must stay addressable by Maestro.
+    for (const id of ['session-permission-picker', 'session-context-ring', 'session-attach']) {
+      assert.equal(count(ids, id), 1, `${id} is rendered exactly once`);
+    }
+    // The attach sheet's choices and cancel control stay static: no filename or Host receipt id
+    // ever reaches a testID (FR-011). They are rendered once each in their own branches.
+    for (const id of [
+      'session-attach-sheet', 'session-attach-image', 'session-attach-file',
+      'session-attach-cancel', 'session-attach-receipt',
+    ]) {
+      assert.equal(count(ids, id), 1, `${id} is rendered exactly once`);
+    }
+    assert.match(source, /testID="session-permission-picker"\s*$/m);
+    assert.match(source, /testID="session-context-ring"\s*$/m);
+    assert.match(source, /testID="session-attach"\s*$/m);
+  });
+
   it('exposes per-card, per-decision and per-state hooks keyed by the approval id', () => {
     assert.equal(count(ids, 'approval-card-${card.approvalId}'), 1);
     assert.equal(count(ids, 'approval-approve-${card.approvalId}'), 1);

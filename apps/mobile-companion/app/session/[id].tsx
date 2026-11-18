@@ -36,20 +36,27 @@ import {
   View,
 } from 'react-native';
 import { useLocalSearchParams, useNavigation, useRouter } from 'expo-router';
+import * as DocumentPicker from 'expo-document-picker';
+import { File } from 'expo-file-system';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import Svg, { Circle } from 'react-native-svg';
 import {
   ArrowUp,
   Check,
   ChevronLeft,
   Ellipsis,
   Monitor,
+  Plus,
   RotateCcw,
+  Shield,
   ShieldCheck,
   X,
 } from 'lucide-react-native';
 
 import type { ApprovalCardView } from '../../src/app-state';
+import { ATTACHMENTS_WRITE_SCOPE, admitClientUploadSize } from '../../src/core';
 import { isSubagentSession } from '../../src/core/sessions';
+import { isCurrentUpload, ownsUpload, shouldClearReceipt, type UploadIdentity } from '../../src/ui/conversation/upload-lifecycle';
 import { sessionDisplayTitle } from '../../src/ui/session-title';
 import { promptSendLabel, promptSendState } from '../../src/ui/prompt-state';
 import { redactArgsPreview } from '../../src/core';
@@ -58,7 +65,7 @@ import { elevation, monoFont, useTheme } from '../../src/ui/theme';
 import { MicHintButton, MicHintLine } from '../../src/ui/conversation/MicHintButton';
 import { AgentTeamPanel } from '../../src/ui/conversation/AgentTeamPanel';
 import { SessionStatsPanel } from '../../src/ui/components/stats-panel';
-import { statsErrorCopy, toSessionPanelView, toStatsView, type StatsView } from '../../src/ui/read-only-views';
+import { contextRingRatio, statsErrorCopy, toSessionPanelView, toStatsView, type StatsView } from '../../src/ui/read-only-views';
 // Spec 018 item 5 — the Host's goal line and task checklist, read-only.
 import { SessionPanelStrip } from '../../src/ui/conversation/SessionPanel';
 import {
@@ -142,6 +149,34 @@ export default function SessionScreen() {
   const composerRef = useRef<ComponentRef<typeof TextInput>>(null);
   const [micHint, setMicHint] = useState(false);
 
+  // Spec 041 FR-2: one transfer at a time, never bytes in the prompt text. The scope is a DEVICE
+  // grant (not a hello capability), so an older pairing keeps a visible button that explains itself.
+  const [attachSheetOpen, setAttachSheetOpen] = useState(false);
+  const [attachMessage, setAttachMessage] = useState<string | null>(null);
+  const [attachTransfer, setAttachTransfer] = useState<{ name: string; sent: number; total: number } | null>(null);
+  // Per-transfer identity: a generation bumped on session change/unmount and a UNIQUE token per
+  // upload, plus that transfer's own cancellation flag. Every post-await update checks all three.
+  const uploadGen = useRef(0);
+  const activeUpload = useRef<{
+    generation: number; token: object; cancelled: boolean; uploadId: string | null;
+  } | null>(null);
+  // Synchronous single-flight: React state lags a tap burst, so the guard must be a ref set BEFORE
+  // the picker opens. It also guards Send in the handler (not only the button's disabled prop).
+  const attachInFlight = useRef(false);
+  const [attachReceipt, setAttachReceipt] = useState<{ sessionId: string; name: string; receiptId: string } | null>(null);
+  const canAttach = controller.hasScope(ATTACHMENTS_WRITE_SCOPE);
+
+  /** Invalidate the live transfer and cancel a reserved gateway slot, if one was named yet. */
+  const invalidateUpload = useCallback(() => {
+    uploadGen.current += 1;
+    const active = activeUpload.current;
+    activeUpload.current = null;
+    attachInFlight.current = false;
+    if (active === null) return;
+    active.cancelled = true;
+    if (active.uploadId !== null) void controller.cancelRemoteUpload(active.uploadId).catch(() => {});
+  }, [controller]);
+
   const sessionSummary = snapshot.sessions.find((session) => session.id === sessionId) ?? null;
   /** MEASURED: `models` for a subagent session fails with `session/agent-busy`, so never send it. */
   const subagentSession = sessionSummary !== null && isSubagentSession(sessionSummary);
@@ -160,6 +195,18 @@ export default function SessionScreen() {
     if (sessionId !== '') controller.openSession(sessionId);
     return () => controller.closeSession();
   }, [controller, sessionId]);
+
+  // Spec 041: an upload receipt belongs to ONE session. Never carry it (or a stale transfer/error)
+  // into another session's composer — the gateway would reject a receipt from a different session.
+  useEffect(() => {
+    invalidateUpload();
+    setAttachReceipt(null);
+    setAttachTransfer(null);
+    setAttachMessage(null);
+    setAttachSheetOpen(false);
+  }, [invalidateUpload, sessionId]);
+
+  useEffect(() => () => invalidateUpload(), [invalidateUpload]);
 
   // One header, drawn below: the native one is hidden for this route only.
   useEffect(() => {
@@ -194,16 +241,131 @@ export default function SessionScreen() {
 
   const send = useCallback(async () => {
     const value = text.trim();
-    if (value === '' || sending) return;
+    // Spec 041: the handler itself refuses a transfer in flight (the ref is synchronous), and a
+    // receipt is only consumed when the Host confirms this exact prompt.
+    if (value === '' || sending || attachInFlight.current) return;
+    const receipt = attachReceipt !== null && attachReceipt.sessionId === sessionId ? attachReceipt : null;
     setSending(true);
     // Wave 1 (ComposerReplyPreview.kt): a reply carries the quoted excerpt to the Host as a markdown
     // blockquote, so the model sees what is being answered. The quote is cleared with the draft.
     const payload = replyTo === null ? value : buildQuotePrompt(replyTo.text, value);
     setText('');
     setReplyTo(null);
-    await controller.sendPrompt(payload);
-    setSending(false);
-  }, [controller, replyTo, sending, text]);
+    try {
+      const sent = await controller.sendPrompt(payload, {
+        ...(receipt === null ? {} : { files: [{ receiptId: receipt.receiptId }] }),
+      });
+      if (sent && receipt !== null) {
+        const expected = { sessionId, receiptId: receipt.receiptId };
+        // Functional update: a newer session or a replaced receipt must never be cleared here.
+        setAttachReceipt((current) => shouldClearReceipt(current, expected) ? null : current);
+      }
+    } finally {
+      setSending(false);
+    }
+  }, [attachReceipt, controller, replyTo, sending, sessionId, text]);
+
+  /**
+   * Spec 041 FR-2: pick one item, read its bytes through expo-file-system, then hand those exact
+   * bytes to the controller's contract upload. The picker is opened ONLY with the scope present;
+   * without it the sheet stays open with an honest refusal and no frame is sent. A permission or
+   * picker failure keeps the sheet open so the reason is readable rather than a silent no-op.
+   */
+  const pickAndUpload = useCallback(async (kind: 'file' | 'image') => {
+    // Claim the single slot SYNCHRONOUSLY, before any picker or file read can be awaited.
+    if (attachInFlight.current) return;
+    attachInFlight.current = true;
+    setAttachSheetOpen(false);
+    if (!canAttach) {
+      setAttachMessage(tr('session.attachUnavailable'));
+      setAttachSheetOpen(true);
+      attachInFlight.current = false;
+      return;
+    }
+    // One identity for THIS transfer. Session change/unmount bumps the generation, sets `cancelled`
+    // and clears the active slot; every post-await update below is gated by the pure identity rule.
+    const active = {
+      generation: uploadGen.current,
+      token: {} as object,
+      cancelled: false,
+      uploadId: null as string | null,
+    };
+    activeUpload.current = active;
+    const current = (): boolean => isCurrentUpload(
+      { generation: uploadGen.current, token: activeUpload.current?.token ?? null },
+      active,
+    );
+    const fail = (copy: string): void => {
+      if (!current()) return;
+      setAttachMessage(copy);
+      setAttachSheetOpen(true);
+    };
+    try {
+      const picked = await DocumentPicker.getDocumentAsync({
+        type: kind === 'image' ? 'image/*' : '*/*',
+        multiple: false,
+        copyToCacheDirectory: true,
+      });
+      if (!current()) return;
+      if (picked.canceled || picked.assets.length === 0) {
+        fail(tr('session.attachNoFile'));
+        return;
+      }
+      const asset = picked.assets[0] as (typeof picked.assets)[number];
+      if (kind === 'image' && asset.mimeType !== undefined && !asset.mimeType.startsWith('image/')) {
+        fail(tr('session.attachFailed'));
+        return;
+      }
+      // Admission BEFORE arrayBuffer(): the picker's reported size (when present) and the file's
+      // own metadata both gate the whole-file read. Missing/nonfinite/negative/oversize fail closed.
+      if (asset.size !== undefined) admitClientUploadSize(asset.size);
+      const file = new File(asset.uri);
+      const info = file.info();
+      if (!info.exists) {
+        fail(tr('session.attachNoFile'));
+        return;
+      }
+      admitClientUploadSize(info.size);
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (!current()) return;
+      // Defense in depth: never trust metadata over the bytes actually read.
+      if (bytes.length === 0) {
+        fail(tr('session.attachNoFile'));
+        return;
+      }
+      admitClientUploadSize(bytes.length);
+      setAttachTransfer({ name: asset.name, sent: 0, total: bytes.length });
+      setAttachMessage(null);
+      const receipt = await controller.uploadAttachment({
+        sessionId,
+        kind,
+        bytes,
+        name: asset.name,
+        ...(kind === 'image' && asset.mimeType !== undefined ? { mediaType: asset.mimeType } : {}),
+      }, {
+        progress: (sent, total) => {
+          if (current()) setAttachTransfer({ name: asset.name, sent, total });
+        },
+        cancelled: () => active.cancelled,
+        onUploadId: (uploadId) => { if (current()) active.uploadId = uploadId; },
+      });
+      if (!current()) return;
+      setAttachReceipt({ sessionId, name: asset.name, receiptId: receipt.receiptId });
+    } catch (error) {
+      if (!current()) return;
+      const code = (error as { code?: string } | null)?.code;
+      fail(code === 'file-too-large' ? tr('session.attachTooLarge') : tr('session.attachFailed'));
+    } finally {
+      // Cleanup is an OWNERSHIP act, not a publishing act: a user-cancelled upload still owns its
+      // slot and MUST release it (otherwise Send stays locked and progress is stuck). A stale
+      // transfer (old generation/token) still may not release a newer transfer's slot.
+      if (ownsUpload({ generation: uploadGen.current, token: activeUpload.current?.token ?? null }, active)) {
+        setAttachTransfer(null);
+        attachInFlight.current = false;
+        if (activeUpload.current === active) activeUpload.current = null;
+      }
+    }
+  }, [canAttach, controller, sessionId, tr]);
 
   const confirmCancel = useCallback(() => {
     Alert.alert(
@@ -256,8 +418,14 @@ export default function SessionScreen() {
   // the field was `editable` only when `connection === 'ready'`, so while the link was down (and in
   // a session mid-turn on a flaky link) the field took no focus and no keyboard — nothing could be
   // typed or dictated — in direct contradiction of its own copy, "Connecting… you can type meanwhile".
-  const deliveryImpossible = isDeliveryImpossible(snapshot.connection);
-  const sendReason = ready ? null : sendUnavailableCopy(tr, snapshot.connection);
+  // Spec 041 FR-2: Send is withheld while a transfer is live, otherwise a prompt could race an
+  // unfinished upload and the Host would never see the receipt it needs to resolve the attachment.
+  // The existing `canSend` expression is kept verbatim: its source shape is pinned by the suite.
+  const uploadInFlight = attachTransfer !== null;
+  const deliveryImpossible = isDeliveryImpossible(snapshot.connection) || uploadInFlight;
+  const sendReason = uploadInFlight
+    ? tr('session.attachBusy')
+    : ready ? null : sendUnavailableCopy(tr, snapshot.connection);
   const canSend = !deliveryImpossible && text.trim() !== '' && !sending;
   /**
    * Read the team on demand each time the screen opens (op `agent-team` + `subagents`).
@@ -414,6 +582,31 @@ export default function SessionScreen() {
   const [statsView, setStatsView] = useState<StatsView>({ state: 'loading', sections: [] });
   const canReadStats = controller.hasReadScope('stats:read');
 
+  // Spec 041 FR-3: the header ring reads the SAME `session-stats` reply the sheet does, through the
+  // same scoped accessor. `null` is the truthful "no reading yet" state — it is never drawn as 0%.
+  const [contextFill, setContextFill] = useState<number | null>(null);
+  // A fire-and-forget read can resolve after a session change or unmount. The generation token is
+  // the ONLY authority for applying its answer; failures restore the neutral ring, never a guess.
+  const contextRingGen = useRef(0);
+  const loadContextRing = useCallback(async () => {
+    const generation = contextRingGen.current;
+    try {
+      const read = await controller.readSessionStats(sessionId);
+      if (contextRingGen.current !== generation) return;
+      setContextFill(read.state === 'ready' ? contextRingRatio(read.contextPressure) : null);
+    } catch {
+      if (contextRingGen.current === generation) setContextFill(null);
+    }
+  }, [controller, sessionId]);
+
+  useEffect(() => {
+    contextRingGen.current += 1;
+    setContextFill(null);
+    if (canReadStats && sessionId !== '') void loadContextRing();
+  }, [canReadStats, sessionId, loadContextRing]);
+
+  useEffect(() => () => { contextRingGen.current += 1; }, []);
+
   const loadStats = useCallback(async () => {
     setStatsView({ state: 'loading', sections: [] });
     try {
@@ -536,6 +729,64 @@ export default function SessionScreen() {
             )}
           </View>
         </View>
+
+        {/* Spec 041 FR-3: a small context-usage ring beside "more". The value comes from the
+            scoped `session-stats` read; with no reading it stays a neutral track, and a tap opens
+            the stats sheet (which states the honest "unavailable" reason when the scope is absent). */}
+        <TouchableOpacity
+          style={[
+            styles.roundButton,
+            { minWidth: hit, minHeight: hit, alignItems: 'center', justifyContent: 'center' },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel={tr('session.contextUsage')}
+          hitSlop={8}
+          onPress={() => {
+            setStatsOpen(true);
+            if (canReadStats) void loadContextRing();
+          }}
+          testID="session-context-ring"
+        >
+          <Svg width={20} height={20} viewBox="0 0 20 20" accessibilityLabel={tr('session.contextUsage')}>
+            <Circle cx={10} cy={10} r={8} stroke={colors.text} strokeOpacity={0.22} strokeWidth={3} fill="none" />
+            {contextFill === null ? null : (
+              <Circle
+                cx={10}
+                cy={10}
+                r={8}
+                stroke={colors.accent}
+                strokeWidth={3}
+                strokeLinecap="round"
+                fill="none"
+                strokeDasharray={`${(2 * Math.PI * 8) * contextFill} ${2 * Math.PI * 8}`}
+                transform="rotate(-90 10 10)"
+              />
+            )}
+          </Svg>
+        </TouchableOpacity>
+
+        {/* Spec 041 FR-1: a dedicated permission control. It stays visible without the
+            `permission-lower` capability — the sheet then says why it cannot change anything. */}
+        <TouchableOpacity
+          style={[
+            styles.roundButton,
+            {
+              backgroundColor: colors.surface,
+              minWidth: hit,
+              minHeight: hit,
+              width: hit,
+              height: hit,
+              borderRadius: radius.circle,
+            },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel={tr('session.permissionPicker')}
+          hitSlop={8}
+          onPress={() => setPermissionSheetOpen(true)}
+          testID="session-permission-picker"
+        >
+          <Shield size={22} color={colors.text} accessibilityLabel={tr('session.permissionPicker')} />
+        </TouchableOpacity>
 
         <TouchableOpacity
           style={[
@@ -876,6 +1127,36 @@ export default function SessionScreen() {
               />
             )}
             <View style={{ flex: 1 }} />
+            {/* Spec 041 FR-2: the attach control is always visible; a missing `attachments:write`
+                grant is explained by the sheet instead of hiding the button. */}
+            <TouchableOpacity
+              style={[
+                styles.sendRound,
+                {
+                  backgroundColor: colors.surface,
+                  borderColor: colors.border,
+                  borderWidth: StyleSheet.hairlineWidth,
+                  minWidth: hit,
+                  minHeight: hit,
+                  width: hit,
+                  height: hit,
+                  borderRadius: radius.circle,
+                },
+              ]}
+              accessibilityRole="button"
+              accessibilityLabel={tr('session.attach')}
+              accessibilityState={{ disabled: uploadInFlight }}
+              disabled={uploadInFlight}
+              hitSlop={8}
+              onPress={() => {
+                // No scope ⇒ the sheet opens with the honest refusal, never a blank or dead sheet.
+                setAttachMessage(canAttach ? null : tr('session.attachUnavailable'));
+                setAttachSheetOpen(true);
+              }}
+              testID="session-attach"
+            >
+              <Plus size={22} color={colors.text} accessibilityLabel={tr('session.attach')} />
+            </TouchableOpacity>
             {/* Đợt 3: does NOT record. It focuses the field so the keyboard's own mic key transcribes
                 into it, and says so — no recording library, no microphone permission. */}
             <MicHintButton
@@ -926,6 +1207,53 @@ export default function SessionScreen() {
             <Text style={[type.captionSmall, { color: colors.textMuted }]}>
               {tr(modelUnavailableReasonKey(snapshot.modelsError))}
             </Text>
+          )}
+          {/* One transfer at a time: progress and cancel live in the composer, not in the prompt. */}
+          {attachTransfer === null ? null : (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.xs }} testID="session-attach-progress">
+              <Text style={[type.captionSmall, { color: colors.textMuted, flexShrink: 1 }]} numberOfLines={1}>
+                {tr('session.attachProgress', {
+                  name: attachTransfer.name,
+                  percent: attachTransfer.total === 0 ? 0 : Math.round((attachTransfer.sent / attachTransfer.total) * 100),
+                })}
+              </Text>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel={tr('session.attachCancel')}
+                hitSlop={8}
+                onPress={() => {
+                  const active = activeUpload.current;
+                  if (active === null) return;
+                  active.cancelled = true;
+                  if (active.uploadId !== null) void controller.cancelRemoteUpload(active.uploadId).catch(() => {});
+                }}
+                testID="session-attach-cancel"
+                style={{ minWidth: hit, minHeight: hit, alignItems: 'center', justifyContent: 'center' }}
+              >
+                <X size={20} color={colors.danger} accessibilityLabel={tr('session.attachCancel')} />
+              </TouchableOpacity>
+            </View>
+          )}
+          {/* The Host's receipt, not the bytes: the next prompt can name these attachments. */}
+          {attachReceipt === null ? null : (
+            <View
+              style={{
+                backgroundColor: colors.surface,
+                borderColor: colors.border,
+                borderWidth: StyleSheet.hairlineWidth,
+                borderRadius: radius.pill,
+                paddingHorizontal: space.sm,
+                paddingVertical: space.xxs,
+              }}
+              testID="session-attach-receipt"
+            >
+              <Text style={[type.captionSmall, { color: colors.text }]} numberOfLines={1}>
+                {tr('session.attachReceipt', { name: attachReceipt.name })}
+              </Text>
+              <Text style={[type.captionSmall, { color: colors.textFaint }]} numberOfLines={1}>
+                {attachReceipt.receiptId}
+              </Text>
+            </View>
           )}
         </GlassSurface>
       </View>
@@ -1079,13 +1407,85 @@ export default function SessionScreen() {
             labels={{
               current: tr('session.permissionCurrent', { preset: permissionSheetCurrent(permissionView) }),
               empty: tr('session.permissionEmpty'),
-              unavailable: tr('session.permissionUnavailable'),
+              // Spec 041 FR-1: without the capability the sheet must say THAT, not just
+              // "not right now" — the button stays visible either way.
+              unavailable: tr(canLowerPermission(snapshot.capabilities) ? 'session.permissionUnavailable' : 'session.permissionDisabled'),
               failed: tr('session.permissionLoadFailed'),
             }}
             onRetry={() => void loadPermissionOptions()}
             onChoose={confirmPermissionLower}
           />
         </View>
+      </Modal>
+      {/* Spec 041 FR-2: the attach action sheet. With no scope it shows only the refusal sentence —
+          there are no dead Image/File rows that would promise an upload the gateway would refuse.
+          Placement: a bottom sheet like the other sheets, NOT a native popover under the Dynamic
+          Island — the top-anchored menu clipped its heading and overlapped the status bar. */}
+      <Modal visible={attachSheetOpen} transparent animationType="slide" onRequestClose={() => setAttachSheetOpen(false)}>
+        <Pressable
+          style={[styles.scrim, { backgroundColor: colors.overlay, justifyContent: 'flex-end', alignItems: 'stretch' }]}
+          onPress={() => setAttachSheetOpen(false)}
+          accessibilityRole="button"
+          accessibilityLabel={tr('common.cancel')}
+        >
+          <View
+            style={[
+              styles.menu,
+              {
+                backgroundColor: colors.surfaceRaised,
+                borderColor: colors.border,
+                borderRadius: radius.xl,
+                marginHorizontal: space.lg,
+                marginBottom: insets.bottom + space.lg,
+                ...elevation(colors, 'sheet'),
+              },
+            ]}
+            testID="session-attach-sheet"
+          >
+            <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: space.lg, paddingVertical: space.sm }}>
+              <Text style={[type.subheading, { color: colors.text, flex: 1 }]}>{tr('session.attachTitle')}</Text>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel={tr('common.cancel')}
+                onPress={() => setAttachSheetOpen(false)}
+                testID="session-attach-close"
+                style={{ minWidth: hit, minHeight: hit, alignItems: 'center', justifyContent: 'center' }}
+              >
+                <X size={22} color={colors.textMuted} accessibilityLabel={tr('common.cancel')} />
+              </TouchableOpacity>
+            </View>
+            {attachMessage === null && canAttach ? null : (
+              <Text
+                style={[type.bodySmall, { color: colors.textMuted, paddingHorizontal: space.lg, paddingBottom: space.sm }]}
+                testID="session-attach-message"
+              >
+                {attachMessage ?? tr('session.attachUnavailable')}
+              </Text>
+            )}
+            {canAttach && attachMessage === null ? (
+              <>
+                <TouchableOpacity
+                  style={[styles.menuItem, { minHeight: hit, paddingHorizontal: space.lg }]}
+                  accessibilityRole="button"
+                  accessibilityLabel={tr('session.attachImage')}
+                  onPress={() => void pickAndUpload('image')}
+                  testID="session-attach-image"
+                >
+                  <Text style={[type.body, { color: colors.text }]}>{tr('session.attachImage')}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.menuItem, { minHeight: hit, paddingHorizontal: space.lg }]}
+                  accessibilityRole="button"
+                  accessibilityLabel={tr('session.attachFile')}
+                  onPress={() => void pickAndUpload('file')}
+                  testID="session-attach-file"
+                >
+                  <Text style={[type.body, { color: colors.text }]}>{tr('session.attachFile')}</Text>
+                </TouchableOpacity>
+              </>
+            ) : null}
+          </View>
+        </Pressable>
       </Modal>
     </KeyboardAvoidingView>
   );
