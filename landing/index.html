@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#06172B">
+  <meta name="description" content="Ba công cụ mở rộng cho DeepSeek Harness: điều khiển từ xa đa nền tảng, wiki codebase với MCP và tích hợp VS Code." data-i18n-content="meta.description">
+  <title>DSH Extensions — Máy tính chạy tác vụ. Bạn điều khiển từ mọi nơi.</title>
+  <link rel="icon" type="image/svg+xml" href="assets/orbit-icon.svg">
+  <link rel="stylesheet" href="vendor/glasswork/glass.css">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="liquid-glass.css">
+  <script defer src="i18n.js"></script>
+  <script defer src="main.js"></script>
+  <script defer src="liquid-glass.js"></script>
+</head>
+<body>
+  <div class="ambient-background" aria-hidden="true"></div>
+  <a class="skip-link" href="#main" data-i18n="skip">Chuyển đến nội dung chính</a>
+
+  <header class="header glass" data-kind="dark">
+    <div class="wrap header-inner">
+      <a class="brand" href="#top" aria-label="DSH Extensions — đầu trang">
+        <img class="brand-mark" src="assets/orbit-icon.svg" alt="" width="32" height="32">
+        <span class="brand-name">DSH Extensions</span>
+      </a>
+      <nav class="desktop-nav" aria-label="Điều hướng chính" data-i18n-aria="nav.main">
+        <a href="#ecosystem" data-i18n="nav.ecosystem">Sản phẩm</a>
+        <a href="#experience" data-i18n="nav.experience">Xem giao diện</a>
+        <a href="#architecture" data-i18n="nav.architecture">Bảo mật</a>
+        <a href="#setup" data-i18n="nav.setup">Cài đặt</a>
+        <a href="#tailscale" data-i18n="nav.tailscale">Tailscale</a>
+        <a href="#faq" data-i18n="nav.faq">Hỏi đáp</a>
+        <a href="https://github.com/nesteacold" target="_blank" rel="noopener noreferrer" class="github-nav-link"><svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+      <div class="header-actions">
+        <button class="lang-toggle" type="button" id="lang-toggle" aria-label="Switch to English" data-i18n-aria="lang.switch">
+          <span class="lang-current" id="lang-current" aria-hidden="true">VI</span><span class="lang-sep" aria-hidden="true">/</span><span class="lang-other" id="lang-other" aria-hidden="true">EN</span>
+        </button>
+        <a class="btn btn-primary btn-small" href="#setup" data-i18n="nav.cta">Cài đặt ngay</a>
+        <button class="menu-toggle" type="button" id="menu-toggle" aria-expanded="false" aria-controls="mobile-nav" aria-label="Mở menu" data-i18n-aria="menu.open">
+          <span class="menu-bars" aria-hidden="true"></span>
+        </button>
+      </div>
+    </div>
+    <nav class="mobile-nav" id="mobile-nav" aria-label="Điều hướng di động" data-i18n-aria="nav.mobile" hidden>
+      <a href="#ecosystem" data-i18n="nav.ecosystem">Sản phẩm</a>
+      <a href="#experience" data-i18n="nav.experience">Xem giao diện</a>
+      <a href="#architecture" data-i18n="nav.architecture">Bảo mật</a>
+      <a href="#setup" data-i18n="nav.setup">Cài đặt</a>
+      <a href="#tailscale" data-i18n="nav.tailscale">Tailscale</a>
+      <a href="#faq" data-i18n="nav.faq">Hỏi đáp</a>
+      <a href="https://github.com/nesteacold" target="_blank" rel="noopener noreferrer" class="github-nav-link"><svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>GitHub <span aria-hidden="true">↗</span></a>
+      <a class="btn btn-primary btn-small" href="#setup" data-i18n="nav.cta">Cài đặt ngay</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero section" id="top" aria-labelledby="hero-title">
+      <div class="wrap hero-grid">
+        <div class="hero-copy">
+          <p class="eyebrow" data-i18n="hero.eyebrow">Bộ công cụ mở rộng cho DeepSeek Harness</p>
+          <h1 id="hero-title" data-i18n="hero.title">Máy tính chạy tác vụ.<br>Bạn điều khiển từ mọi nơi.</h1>
+          <p class="lead" data-i18n="hero.lead">Bộ 3 công cụ mở rộng cho DeepSeek Harness: điều khiển phiên làm việc từ xa đa nền tảng (Android, iOS, trình duyệt Web và DSH Desktop), tự động tạo trang tài liệu kiến trúc cho codebase, và làm việc trực tiếp ngay trong VS Code — kết nối thẳng tới máy của bạn, không qua máy chủ trung gian.</p>
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="#ecosystem" data-i18n="hero.cta.products">Xem 3 bộ công cụ</a>
+            <a class="btn btn-secondary" href="#architecture" data-i18n="hero.cta.security">Mô hình bảo mật</a>
+          </div>
+          <div class="hero-repos">
+            <a href="https://github.com/nesteacold/dsh-mobile" target="_blank" rel="noopener noreferrer">GitHub: dsh-mobile <span aria-hidden="true">↗</span></a>
+            <a href="https://github.com/nesteacold/dsh-wiki" target="_blank" rel="noopener noreferrer">dsh-wiki <span aria-hidden="true">↗</span></a>
+          </div>
+          <ul class="hero-facts" aria-label="Đặc điểm bảo mật" data-i18n-aria="hero.facts">
+            <li data-i18n="hero.fact.1">Không sửa mã nguồn lõi DSH</li>
+            <li data-i18n="hero.fact.2">Mặc định chỉ mở cổng nội bộ 127.0.0.1</li>
+            <li data-i18n="hero.fact.3">Mã nguồn mở trên GitHub</li>
+          </ul>
+        </div>
+
+        <div class="hero-visual">
+          <div class="hero-backdrop" aria-hidden="true"></div>
+          <div class="phone-bezel" role="img" aria-label="Ảnh chụp màn hình DSH Orbit: danh sách phiên trên iPhone" data-i18n-aria="hero.phone">
+            <div class="phone-screen">
+              <img src="assets/screens/03-session-list.png" width="1206" height="2622" alt="DSH Orbit — danh sách phiên làm việc với các tác tử con" data-i18n-alt="hero.screen.alt">
+            </div>
+          </div>
+          <ul class="status-pills" aria-label="Trạng thái sản phẩm" data-i18n-aria="hero.pills">
+            <li class="status-pill pill-mobile" data-i18n="hero.pill.1">DSH Mobile · Android &amp; iOS</li>
+            <li class="status-pill pill-webdesktop" data-i18n="hero.pill.2">DSH Mobile · Web &amp; Desktop</li>
+            <li class="status-pill pill-wiki" data-i18n="hero.pill.3">Repo Wiki · v0.3.3</li>
+            <li class="status-pill pill-vscode" data-i18n="hero.pill.4">DSH for VS Code · v0.1.0 Dev</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="ecosystem" aria-labelledby="ecosystem-title">
+      <div class="wrap">
+        <header class="section-head">
+          <p class="eyebrow" data-i18n="ecosystem.eyebrow">3 sản phẩm · 3 kho mã nguồn</p>
+          <h2 id="ecosystem-title" data-i18n="ecosystem.title">Hệ sinh thái mở rộng cho DeepSeek Harness</h2>
+          <p class="section-intro" data-i18n="ecosystem.intro">Mỗi sản phẩm giải quyết trọn vẹn một bài toán thực tế: điều khiển phiên DSH từ xa trên mọi thiết bị bạn có, dựng tài liệu kiến trúc repo để người và AI tra cứu offline, hoặc code và duyệt diff ngay trong VS Code.</p>
+        </header>
+        <div class="product-grid">
+          <article class="product-card product-card-featured glass" data-kind="dark" data-glass-lens>
+            <div class="product-head"><img class="product-icon" src="assets/orbit-icon.svg" alt="" width="36" height="36"><span class="status-badge badge-shipped" data-i18n="product.1.badge">Đa nền tảng · Android · iOS · Web · Desktop</span></div>
+            <h3 data-i18n="product.1.title">DSH Mobile (DSH Orbit &amp; Desktop Remote)</h3>
+            <p class="product-surface" data-i18n="product.1.surface">Điều khiển DeepSeek Harness từ xa trên điện thoại, trình duyệt Web và máy tính khác</p>
+            <div class="platform-chips" aria-label="Nền tảng hỗ trợ" data-i18n-aria="product.1.platforms">
+              <span data-i18n="product.1.platform.1">Android</span>
+              <span data-i18n="product.1.platform.2">iOS</span>
+              <span data-i18n="product.1.platform.3">Web App</span>
+              <span data-i18n="product.1.platform.4">Desktop Remote</span>
+            </div>
+            <p data-i18n="product.1.desc">Máy tính hoặc server chạy DeepSeek Harness đảm nhận toàn bộ việc thực thi; bạn mở điện thoại, trình duyệt trên iPad/laptop phụ, hoặc một cửa sổ DSH Desktop khác để theo dõi tiến độ, chat tiếp, gửi file và duyệt lệnh từ bất cứ đâu.</p>
+            <ul class="product-points product-points-grid">
+              <li data-i18n="product.1.point.1"><strong>Theo dõi phiên làm việc theo thời gian thực:</strong> xem đúng danh sách workspace và phiên đang chạy trên máy chủ (kể cả các phiên tác tử con sub-agent), lọc và tìm kiếm nhanh trên mọi thiết bị.</li>
+              <li data-i18n="product.1.point.2"><strong>Đọc hội thoại, gửi chỉ dẫn &amp; truyền file từ xa:</strong> hiển thị đầy đủ Markdown, khối code, kết quả chạy công cụ; gửi prompt tiếp theo, đính kèm file sang máy đích (trên Desktop) và tự gửi lại tin nhắn nếu rớt mạng.</li>
+              <li data-i18n="product.1.point.3"><strong>Duyệt hoặc từ chối lệnh trong 1 chạm:</strong> nhận thông báo đẩy khi agent dừng chờ xin chạy shell, sửa file hoặc hỏi thêm thông tin để bấm Allow once / Reject ngay từ điện thoại, trình duyệt hoặc máy phụ.</li>
+              <li data-i18n="product.1.point.4"><strong>Gộp nhiều máy trạm &amp; server vào một cửa sổ DSH Desktop:</strong> chuyển tức thì giữa tab This Computer và Remote Workspace ngay trên thanh bên gốc của DSH; mất mạng tạm thời vẫn giữ danh sách phiên và đọc được lịch sử lưu đệm.</li>
+              <li data-i18n="product.1.point.5"><strong>Chạy đa nền tảng không phụ thuộc chợ ứng dụng:</strong> dùng app native trên Android &amp; iOS (React Native + Expo SDK 58; bản ký App Store iOS đang chờ), hoặc mở thẳng bản Web App (PWA) trên trình duyệt qua mạng riêng Tailscale.</li>
+              <li data-i18n="product.1.point.6"><strong>Tạo phiên mới, chọn model &amp; kiểm soát thiết bị tập trung:</strong> khởi tạo phiên từ xa, đổi model, ghép đôi bằng mã QR / mã 5 phút và thu hồi quyền từng thiết bị tức thì trong Settings → Devices (bảo vệ sẵn bằng ghim chứng chỉ TLS, Face ID/vân tay hoặc Passkey).</li>
+            </ul>
+            <div class="product-footer">
+              <a class="repo-link" href="https://github.com/nesteacold/dsh-mobile" target="_blank" rel="noopener noreferrer">github.com/nesteacold/dsh-mobile <span aria-hidden="true">↗</span></a>
+              <a class="repo-link" href="https://github.com/nesteacold/dsh-mobile/tree/main/apps/mobile-companion" target="_blank" rel="noopener noreferrer">Mobile &amp; Web App <span aria-hidden="true">↗</span></a>
+              <a class="repo-link" href="https://github.com/nesteacold/dsh-mobile/tree/main/plugins/devices" target="_blank" rel="noopener noreferrer">Desktop Remote <span aria-hidden="true">↗</span></a>
+              <a class="repo-link" href="https://github.com/nesteacold/dsh-mobile/tree/main/plugins/mobile-gateway" target="_blank" rel="noopener noreferrer">Host Gateway <span aria-hidden="true">↗</span></a>
+            </div>
+          </article>
+
+          <article class="product-card glass" data-kind="dark" data-glass-lens>
+            <div class="product-head"><img class="product-icon" src="assets/wiki-logo.svg" alt="" width="36" height="36"><span class="status-badge badge-shipped" data-i18n="product.2.badge">v0.3.3</span></div>
+            <h3 data-i18n="product.2.title">Repo Wiki</h3>
+            <p class="product-surface" data-i18n="product.2.surface">@dsh-ext/dsh-wiki v0.3.3 · Plugin DSH + MCP</p>
+            <p data-i18n="product.2.desc">Tự động đọc mã nguồn dự án và dựng thành một website tài liệu kiến trúc kiểu DeepWiki lưu ngay trong thư mục <code>.dsh-wiki/</code> trên máy bạn — không tải bất kỳ dòng code nào lên mạng.</p>
+            <ul class="product-points">
+              <li data-i18n="product.2.point.1"><strong>Tạo trọn bộ wiki chỉ với /wiki generate:</strong> lập cây mục lục, viết bài giải thích từng module, vẽ sơ đồ kiến trúc Mermaid và xuất ra 1 file HTML tự chứa đọc offline (sáng/tối, tìm kiếm toàn văn).</li>
+              <li data-i18n="product.2.point.2"><strong>Trích dẫn file:dòng được kiểm tra tự động:</strong> mọi mô tả đều gắn kèm đường dẫn file và số dòng thật trong repo; bước self-check báo lỗi ngay nếu trích dẫn sai hoặc lệch dòng.</li>
+              <li data-i18n="product.2.point.3"><strong>Thẻ tóm tắt (Knowledge Cards) &amp; cập nhật theo git diff:</strong> lọc nhanh từng API/module dạng thẻ; khi code thay đổi chỉ cần cập nhật lại đúng những trang bị ảnh hưởng.</li>
+              <li data-i18n="product.2.point.4"><strong>5 công cụ tra cứu cho DSH &amp; MCP cho Claude Code / VS Code:</strong> cung cấp wiki_search, wiki_page, wiki_cards, wiki_impact, wiki_status để AI nắm bản đồ dự án và biết ngay wiki còn mới hay đã cũ.</li>
+            </ul>
+            <div class="product-footer">
+              <a class="repo-link" href="https://github.com/nesteacold/dsh-wiki" target="_blank" rel="noopener noreferrer">github.com/nesteacold/dsh-wiki <span aria-hidden="true">↗</span></a>
+            </div>
+          </article>
+
+          <article class="product-card glass" data-kind="dark" data-glass-lens>
+            <div class="product-head"><img class="product-icon" src="assets/vscode-icon.svg" alt="" width="36" height="36"><span class="status-badge badge-dev" data-i18n="product.3.badge">v0.1.0 · Đang phát triển</span></div>
+            <h3 data-i18n="product.3.title">DSH for VS Code</h3>
+            <p class="product-surface" data-i18n="product.3.surface">VS Code Extension · ACP v1 · Node ≥ 22</p>
+            <p data-i18n="product.3.desc">Tích hợp DeepSeek Harness trực tiếp vào VS Code theo mô hình của Claude Code: vừa viết code vừa giao việc cho agent và kiểm duyệt từng dòng thay đổi ngay trong trình soạn thảo.</p>
+            <ul class="product-points">
+              <li data-i18n="product.3.point.1"><strong>Khung chat mở thành tab Editor hoặc thanh bên phải:</strong> dùng chung bảng màu và biểu tượng gốc của VS Code, thu gọn bước suy nghĩ/gọi tool thành 1 dòng để dễ theo dõi hội thoại.</li>
+              <li data-i18n="product.3.point.2"><strong>Xem trước Diff thật &amp; Hoàn tác cả lượt chạy:</strong> mở bảng so sánh diff gốc của VS Code trước khi cho phép sửa file; tự lưu snapshot đầu lượt để bấm Revert là khôi phục sạch.</li>
+              <li data-i18n="product.3.point.3"><strong>Tự động gửi ngữ cảnh đang code cho Agent:</strong> đính kèm file đang mở, vùng code đang bôi đen và danh sách lỗi Diagnostics thông qua máy chủ IDE MCP nội bộ.</li>
+              <li data-i18n="product.3.point.4"><strong>Kết nối qua chuẩn ACP v1 bền vững:</strong> chạy tiến trình <code>dsh --profile acp</code> độc lập để không bị gãy khi nâng cấp DSH; đang hoàn thiện tính năng nối tới máy chủ từ xa qua gateway.</li>
+            </ul>
+            <div class="product-footer">
+              <span class="repo-pending" data-i18n="product.3.repo">Repo nội bộ · Sắp mở mã nguồn trên GitHub</span>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="experience" aria-labelledby="experience-title">
+      <div class="wrap">
+        <header class="section-head">
+          <p class="eyebrow" data-i18n="experience.eyebrow">Xem trước thao tác</p>
+          <h2 id="experience-title" data-i18n="experience.title">Bốn góc nhìn thực tế của bộ công cụ</h2>
+          <p class="section-intro" data-i18n="experience.intro">Chuyển tab để xem DSH Mobile trên điện thoại và Web, bản Desktop Remote nhiều máy, Repo Wiki tra cứu offline và luồng duyệt diff trong VS Code. Dữ liệu trên trang chỉ là mô phỏng.</p>
+        </header>
+
+        <div class="showcase glass" data-kind="dark" data-glass-lens>
+          <div class="tablist-wrap">
+            <div class="tablist" role="tablist" aria-label="Chọn giao diện" data-i18n-aria="experience.tabs">
+              <button class="tab" type="button" role="tab" id="tab-mobile" aria-controls="panel-mobile" aria-selected="true" tabindex="0" data-i18n="experience.tab.mobile">DSH Mobile · Phone &amp; Web</button>
+              <button class="tab" type="button" role="tab" id="tab-desktop" aria-controls="panel-desktop" aria-selected="false" tabindex="-1" data-i18n="experience.tab.desktop">DSH Mobile · Desktop Remote</button>
+              <button class="tab" type="button" role="tab" id="tab-wiki" aria-controls="panel-wiki" aria-selected="false" tabindex="-1" data-i18n="experience.tab.wiki">Repo Wiki</button>
+              <button class="tab" type="button" role="tab" id="tab-vscode" aria-controls="panel-vscode" aria-selected="false" tabindex="-1" data-i18n="experience.tab.vscode">DSH for VS Code</button>
+            </div>
+          </div>
+
+          <div class="tabpanel" role="tabpanel" id="panel-mobile" aria-labelledby="tab-mobile" tabindex="0">
+            <div class="panel-copy">
+              <h3 data-i18n="mobile.title">Điều khiển phiên từ Điện thoại &amp; Trình duyệt Web</h3>
+              <p data-i18n="mobile.desc">Cùng một giao diện DSH Orbit chạy trên Android, iOS và trình duyệt Web (PWA): xem danh sách phiên của máy tính, đọc luồng hội thoại, bấm duyệt lệnh công cụ, quét QR ghép đôi và quản lý kết nối. Bấm vào ảnh để phóng to.</p>
+              <div class="screen-switcher" role="group" aria-label="Chọn ảnh chụp màn hình" data-i18n-aria="mobile.switcher">
+                <button type="button" class="chip is-active" data-screen="03-session-list" aria-pressed="true" data-i18n="mobile.screen.1">Danh sách phiên</button>
+                <button type="button" class="chip" data-screen="04-session-detail" aria-pressed="false" data-i18n="mobile.screen.2">Chi tiết phiên</button>
+                <button type="button" class="chip" data-screen="05-approval-card" aria-pressed="false" data-i18n="mobile.screen.3">Thẻ phê duyệt</button>
+                <button type="button" class="chip" data-screen="02-pairing" aria-pressed="false" data-i18n="mobile.screen.4">Ghép đôi QR</button>
+                <button type="button" class="chip" data-screen="06-settings" aria-pressed="false" data-i18n="mobile.screen.5">Cài đặt</button>
+              </div>
+            </div>
+            <div class="phone-bezel phone-bezel-small">
+              <div class="phone-screen">
+                <button type="button" class="screen-zoom" id="screen-zoom" aria-label="Phóng to ảnh chụp màn hình" data-i18n-aria="mobile.zoom">
+                  <img id="mobile-screen-img" src="assets/screens/03-session-list.png" width="1206" height="2622" alt="DSH Orbit — danh sách phiên" data-i18n-alt="mobile.screen.alt.1">
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="tabpanel" role="tabpanel" id="panel-desktop" aria-labelledby="tab-desktop" tabindex="0" hidden>
+            <div class="panel-copy">
+              <h3 data-i18n="desktop.title">Chuyển máy ngay trong cùng cửa sổ DSH</h3>
+              <p data-i18n="desktop.desc">Thanh bên liệt kê cả máy đang ngồi (This Computer) lẫn các máy đã ghép đôi (Remote Workspace). Đính kèm file sang máy đích từ ô chat, và khi rớt mạng vẫn đọc được lịch sử lưu đệm — tin nhắn soạn lúc offline sẽ tự gửi lại theo thứ tự.</p>
+              <div class="sim-actions" role="group" aria-label="Chọn Host" data-i18n-aria="desktop.switcher">
+                <button type="button" class="chip is-active" data-host="local" aria-pressed="true" data-i18n="desktop.local">This Computer</button>
+                <button type="button" class="chip" data-host="remote" aria-pressed="false" data-i18n="desktop.remote">Remote Workspace</button>
+              </div>
+            </div>
+            <div class="window-mock desktop-mock" aria-label="Mô phỏng thanh bên Desktop Remote" data-i18n-aria="desktop.mock">
+              <div class="window-bar"><span class="window-dot"></span><span class="window-dot"></span><span class="window-dot"></span><span class="window-title" data-i18n="desktop.window">DSH · Remote</span></div>
+              <div class="desktop-body">
+                <aside class="mock-sidebar">
+                  <div class="sidebar-group" data-i18n="desktop.group.local">HOST · LOCAL</div>
+                  <div class="sidebar-row is-current" id="host-local-row"><span class="row-dot dot-local"></span><span data-i18n="desktop.row.local">This Computer</span></div>
+                  <div class="sidebar-group" data-i18n="desktop.group.remote">HOSTS · PAIRED</div>
+                  <div class="sidebar-row" id="host-remote-row"><span class="row-dot dot-remote"></span><span>Remote Workspace</span></div>
+                </aside>
+                <div class="mock-content">
+                  <span class="scope-label" id="desktop-scope" data-i18n="desktop.scope.local">SCOPE · full local session access</span>
+                  <code id="desktop-route" data-i18n="desktop.route.local">session:local / agent:default</code>
+                  <p id="desktop-note" data-i18n="desktop.note.local">Phiên trên máy này chạy trực tiếp qua cổng nội bộ 127.0.0.1.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tabpanel" role="tabpanel" id="panel-wiki" aria-labelledby="tab-wiki" tabindex="0" hidden>
+            <div class="panel-copy">
+              <h3 data-i18n="wiki.title">Tra cứu Repo Wiki ngay trên máy</h3>
+              <p data-i18n="wiki.desc">Toàn bộ tài liệu và thẻ tóm tắt nằm trong <code>.dsh-wiki/</code>, mọi đoạn giải thích đều gắn kèm trích dẫn <code>path:line</code> có thật. Gõ thử từ khóa bên dưới (ví dụ: <code>argsHash</code>, <code>pairing</code>, <code>gateway</code>).</p>
+              <label class="field-label" for="wiki-search" data-i18n="wiki.search.label">Tìm trong wiki mẫu</label>
+              <input class="wiki-search" id="wiki-search" type="search" placeholder="pairing, argsHash, gateway…" data-i18n-placeholder="wiki.search.placeholder" data-i18n-aria="wiki.search">
+              <p class="sim-note" data-i18n="wiki.note">MCP mặc định dùng stdio; 5 công cụ tra cứu: wiki_search, wiki_page, wiki_cards, wiki_impact, wiki_status.</p>
+            </div>
+            <div class="window-mock wiki-mock" aria-label="Mô phỏng trang Repo Wiki" data-i18n-aria="wiki.mock">
+              <div class="window-bar"><span class="window-dot"></span><span class="window-dot"></span><span class="window-dot"></span><span class="window-title" data-i18n="wiki.window">.dsh-wiki / knowledge</span></div>
+              <div class="wiki-body">
+                <article class="knowledge-card">
+                  <span class="card-kind" data-i18n="wiki.card.kind">KNOWLEDGE CARD</span>
+                  <h4 id="wiki-card-title" data-i18n="wiki.card.title">Phê duyệt gắn với argsHash</h4>
+                  <p id="wiki-card-desc" data-i18n="wiki.card.desc">Lệnh phê duyệt gửi từ điện thoại phải khớp đúng mã băm của tham số đang hiển thị; nếu lệch, Host từ chối áp dụng và giữ nguyên trạng thái chờ.</p>
+                  <code class="citation" id="wiki-citation">src/approval.ts:42</code>
+                </article>
+                <div class="freshness" data-i18n="wiki.freshness">FRESHNESS · up to date · commit a1b2c3d</div>
+                <div class="wiki-result" id="wiki-result" aria-live="polite" data-i18n="wiki.result.idle">Gõ từ khóa để xem kết quả mẫu...</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tabpanel" role="tabpanel" id="panel-vscode" aria-labelledby="tab-vscode" tabindex="0" hidden>
+            <div class="panel-copy">
+              <h3 data-i18n="vscode.title">Chat và duyệt Diff ngay trong VS Code</h3>
+              <p><span class="dev-badge" data-i18n="vscode.badge">v0.1.0 · Đang phát triển</span> <span data-i18n="vscode.arch">Bản mô phỏng giao diện — chưa phát hành trên VS Code Marketplace.</span></p>
+              <p data-i18n="vscode.desc">Mở khung chat ACP v1 cạnh file code, xem trước diff thật do agent đề xuất và bấm Revert để trả về snapshot đầu lượt nếu cần.</p>
+              <div class="sim-actions">
+                <button type="button" class="btn btn-primary btn-small" id="vscode-approve" data-i18n="vscode.approve">Duyệt thay đổi</button>
+                <button type="button" class="btn btn-secondary btn-small" id="vscode-revert" data-i18n="vscode.revert">Hoàn tác lượt</button>
+              </div>
+            </div>
+            <div class="window-mock ide-mock" aria-label="Mô phỏng giao diện IDE" data-i18n-aria="vscode.mock">
+              <div class="window-bar"><span class="window-dot"></span><span class="window-dot"></span><span class="window-dot"></span><span class="window-title" data-i18n="vscode.window">DSH · ACP Session</span></div>
+              <div class="ide-body">
+                <aside class="ide-sessions">
+                  <span class="ide-label" data-i18n="vscode.sessions">SESSIONS</span>
+                  <div class="ide-row is-current"><img src="assets/vscode-icon.svg" alt="" width="14" height="14"><span>feature/acp</span></div>
+                  <div class="ide-row"><img src="assets/vscode-icon.svg" alt="" width="14" height="14"><span>fix/scope</span></div>
+                  <span class="ide-label ide-label-gap" data-i18n="vscode.tools">MCP · LOOPBACK</span>
+                  <div class="ide-row ide-row-muted">openFile · selection</div>
+                </aside>
+                <div class="ide-chat">
+                  <span class="ide-label" data-i18n="vscode.chat">ACP v1 · CHAT</span>
+                  <div class="chat-bubble" data-i18n="vscode.bubble.user">Cập nhật kiểm tra argsHash trong handler phê duyệt.</div>
+                  <div class="chat-bubble chat-bubble-agent" data-i18n="vscode.bubble.agent">Đã đề xuất 1 thay đổi. Chờ bạn duyệt diff.</div>
+                  <div class="diff-block">
+                    <code class="diff-line diff-add">+ const approved = checkArgsHash(request);</code>
+                    <code class="diff-line diff-context">&nbsp; return decide(approved);</code>
+                  </div>
+                  <span class="ide-status" id="vscode-status" data-i18n="vscode.status.pending">PENDING · turn snapshot saved</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="architecture" aria-labelledby="architecture-title">
+      <div class="wrap">
+        <header class="section-head">
+          <p class="eyebrow" data-i18n="architecture.eyebrow">Nguyên tắc bảo mật</p>
+          <h2 id="architecture-title" data-i18n="architecture.title">Host thực thi. Thiết bị chỉ gửi lệnh điều khiển.</h2>
+          <p class="section-intro" data-i18n="architecture.intro">Không có máy chủ trung gian, không tự động quét thiết bị trong mạng. Điện thoại hay máy phụ chỉ nhìn thấy dữ liệu được cấp phép và mọi kết nối đều đi qua cổng đã ghim chứng chỉ hoặc cổng nội bộ.</p>
+        </header>
+        <ol class="flow" aria-label="Luồng bảo mật" data-i18n-aria="architecture.flow">
+          <li class="flow-node glass" data-kind="dark">
+            <span class="flow-index">01</span>
+            <h3 data-i18n="architecture.node.1.title">Thiết bị điều khiển</h3>
+            <p data-i18n="architecture.node.1.desc">Android · iOS · Web · Desktop Remote · VS Code</p>
+          </li>
+          <li class="flow-arrow" aria-hidden="true"><span>→</span></li>
+          <li class="flow-node flow-node-gateway glass" data-kind="dark">
+            <span class="flow-index">02</span>
+            <h3 data-i18n="architecture.node.2.title">Host Gateway</h3>
+            <p data-i18n="architecture.node.2.desc">Ghim TLS / Loopback <code>127.0.0.1</code> · mã ghép đôi 5 phút · phân quyền từng thiết bị</p>
+          </li>
+          <li class="flow-arrow" aria-hidden="true"><span>→</span></li>
+          <li class="flow-node glass" data-kind="dark">
+            <span class="flow-index">03</span>
+            <h3 data-i18n="architecture.node.3.title">DSH Host</h3>
+            <p data-i18n="architecture.node.3.desc">Máy tính &amp; Repo cục bộ — mã nguồn và phiên làm việc luôn ở lại máy bạn</p>
+          </li>
+        </ol>
+        <div class="guarantees">
+          <div class="guarantee"><span class="guarantee-mark" aria-hidden="true">✓</span><h3 data-i18n="architecture.g.1.title">Không sửa lõi DSH</h3><p data-i18n="architecture.g.1.desc">Mọi tính năng đều cài dưới dạng plugin và app rời; mã nguồn DeepSeek Harness nguyên vẹn.</p></div>
+          <div class="guarantee"><span class="guarantee-mark" aria-hidden="true">✓</span><h3 data-i18n="architecture.g.2.title">Ghim chứng chỉ + argsHash</h3><p data-i18n="architecture.g.2.desc">App từ chối kết nối ngay nếu chứng chỉ TLS sai lệch; lệnh phê duyệt gắn chặt với đúng nội dung đã xem.</p></div>
+          <div class="guarantee"><span class="guarantee-mark" aria-hidden="true">✓</span><h3 data-i18n="architecture.g.3.title">Không relay công cộng</h3><p data-i18n="architecture.g.3.desc">Không tunnel public-IP hay P2P ẩn; bạn tự kiểm soát kết nối LAN hoặc Tailscale của riêng mình.</p></div>
+          <div class="guarantee"><span class="guarantee-mark" aria-hidden="true">✓</span><h3 data-i18n="architecture.g.4.title">Wiki chạy hoàn toàn offline</h3><p data-i18n="architecture.g.4.desc">Repo Wiki mặc định không gọi mạng ngoài; toàn bộ kết quả nằm trong <code>.dsh-wiki/</code>.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="setup" aria-labelledby="setup-title">
+      <div class="wrap">
+        <header class="section-head">
+          <p class="eyebrow" data-i18n="setup.eyebrow">Hướng dẫn cài đặt</p>
+          <h2 id="setup-title" data-i18n="setup.title">5 bước thiết lập trên máy của bạn</h2>
+          <p class="section-intro" data-i18n="setup.intro">Chọn từng bước hoặc bấm Previous / Next để xem cấu hình và lệnh chạy thật từ các repo.</p>
+        </header>
+        <div class="setup-shell glass" data-kind="dark" data-glass-lens>
+          <div class="setup-steps" role="tablist" aria-label="Các bước cài đặt" data-i18n-aria="setup.steps">
+            <button type="button" class="step-tab" role="tab" id="step-tab-1" aria-controls="setup-panel" aria-selected="true" tabindex="0"><span class="step-num">1</span><span data-i18n="setup.step.1">Host Gateway</span></button>
+            <button type="button" class="step-tab" role="tab" id="step-tab-2" aria-controls="setup-panel" aria-selected="false" tabindex="-1"><span class="step-num">2</span><span data-i18n="setup.step.2">Mobile &amp; Web</span></button>
+            <button type="button" class="step-tab" role="tab" id="step-tab-3" aria-controls="setup-panel" aria-selected="false" tabindex="-1"><span class="step-num">3</span><span data-i18n="setup.step.3">Desktop Remote</span></button>
+            <button type="button" class="step-tab" role="tab" id="step-tab-4" aria-controls="setup-panel" aria-selected="false" tabindex="-1"><span class="step-num">4</span><span data-i18n="setup.step.4">Repo Wiki &amp; MCP</span></button>
+            <button type="button" class="step-tab" role="tab" id="step-tab-5" aria-controls="setup-panel" aria-selected="false" tabindex="-1"><span class="step-num">5</span><span data-i18n="setup.step.5">VS Code ACP</span></button>
+          </div>
+          <div class="setup-stage" id="setup-panel" role="tabpanel" aria-labelledby="step-tab-1" tabindex="0">
+            <span class="setup-kicker" id="setup-kicker" data-i18n="setup.content.1.kicker">BƯỚC 1 / 5</span>
+            <h3 id="setup-heading" data-i18n="setup.content.1.title">Bật Host Gateway trên máy chủ</h3>
+            <p id="setup-desc" data-i18n="setup.content.1.desc">Mặc định gateway chỉ lắng nghe tại 127.0.0.1 cho tới khi bạn bật kết nối LAN/VPN có TLS. Cài plugin mobile-gateway và chọn chế độ Persistent trong phần Devices.</p>
+            <div class="code-shell">
+              <div class="code-head"><span class="code-label" id="setup-code-label" data-i18n="setup.content.1.label">plugin config · mobile-gateway</span><button class="copy-btn" type="button" id="copy-snippet" aria-label="Sao chép lệnh" data-i18n-aria="setup.copy"><span id="copy-icon" aria-hidden="true">⧉</span> <span id="copy-text" data-i18n="setup.copy">Sao chép</span></button></div>
+              <pre><code id="setup-code">gatewayMode: persistent
+requireAuth: true
+endpoints:
+  - ws://127.0.0.1:3081/ws/mobile</code></pre>
+            </div>
+            <p class="setup-hint" id="setup-hint" data-i18n="setup.content.1.hint">Mỗi mã ghép đôi chỉ dùng được 1 lần và tự hết hạn sau 5 phút.</p>
+          </div>
+          <div class="setup-nav">
+            <button type="button" class="btn btn-secondary btn-small" id="setup-prev" data-i18n="setup.prev">Previous</button>
+            <span class="setup-counter" id="setup-counter" aria-live="polite" data-i18n="setup.counter.1">1 / 5</span>
+            <button type="button" class="btn btn-primary btn-small" id="setup-next" data-i18n="setup.next">Next</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="tailscale" aria-labelledby="tailscale-title">
+      <div class="wrap">
+        <header class="section-head">
+          <p class="eyebrow" data-i18n="tailscale.eyebrow">Kết nối từ bên ngoài</p>
+          <h2 id="tailscale-title" data-i18n="tailscale.title">Cài Tailscale để điều khiển Host qua Internet</h2>
+          <p class="section-intro" data-i18n="tailscale.intro">Hướng dẫn ngắn gọn, thực tế bằng Tailscale — Host vẫn chỉ nghe nội bộ; bạn không mở cổng ra Internet, không dùng relay công cộng.</p>
+        </header>
+        <div class="tailscale-guide glass" data-kind="dark">
+          <div class="tailscale-step">
+            <span class="step-num">1</span>
+            <div>
+              <h3 data-i18n="tailscale.step.1.title">Cài Tailscale trên máy chạy DeepSeek Harness</h3>
+              <p data-i18n="tailscale.step.1.desc">Tải và cài theo đúng hệ điều hành của Host (Windows/macOS/Linux) tại https://tailscale.com/download, sau đó đăng nhập cùng tài khoản Tailnet với các thiết bị của bạn.</p>
+            </div>
+          </div>
+          <div class="tailscale-step">
+            <span class="step-num">2</span>
+            <div>
+              <h3 data-i18n="tailscale.step.2.title">Bật VPN trên điện thoại / laptop / máy phụ</h3>
+              <p data-i18n="tailscale.step.2.desc">Cài Tailscale trên iOS, Android, Windows, macOS hoặc Linux phụ rồi bật kết nối; mọi thiết bị phải cùng Tailnet. Không cần IP công cộng hay mở port trên router.</p>
+            </div>
+          </div>
+          <div class="tailscale-step">
+            <span class="step-num">3</span>
+            <div>
+              <h3 data-i18n="tailscale.step.3.title">Cấu hình Gateway &amp; PWA nội bộ Tailnet</h3>
+              <p data-i18n="tailscale.step.3.desc">Chạy Gateway TLS trên Host và trỏ WSS của PWA qua cùng một origin HTTPS của Tailscale (<code>*.ts.net</code>). Chỉ route <code>/ws/mobile</code> tới Gateway; thêm origin chính xác của PWA vào <code>allowedOrigins</code> để WebAuthn hoạt động.</p>
+            </div>
+          </div>
+          <div class="tailscale-step">
+            <span class="step-num">4</span>
+            <div>
+              <h3 data-i18n="tailscale.step.4.title">Ghép đôi từ xa &amp; kiểm tra kết nối</h3>
+              <p data-i18n="tailscale.step.4.desc">Trên Host mở Settings → Devices → Allow connections → tạo mã ghép đôi 5 phút. Nhập địa chỉ <code>&lt;tên-máy&gt;.ts.net:&lt;cổng&gt;</code> trên thiết bị điều khiển (app native có thể dùng QR), bấm Approve trên desktop; thử xem danh sách phiên và gửi một lệnh nhỏ.</p>
+            </div>
+          </div>
+        </div>
+        <div class="tailscale-links">
+          <a href="https://tailscale.com/download" target="_blank" rel="noopener noreferrer"><span data-i18n="tailscale.link.download">Tải Tailscale chính thức</span> <span aria-hidden="true">↗</span></a>
+          <a href="https://tailscale.com/kb/1080/cli/" target="_blank" rel="noopener noreferrer"><span data-i18n="tailscale.link.cli">Tailscale CLI</span> <span aria-hidden="true">↗</span></a>
+        </div>
+        <p class="section-note" data-i18n="tailscale.note">Lưu ý: đây là hướng dẫn về mạng Tailscale (liên kết ngoài). Trang web này vẫn zero telemetry, zero CDN, zero script từ bên ngoài.</p>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="faq" aria-labelledby="faq-title">
+      <div class="wrap wrap-narrow">
+        <header class="section-head">
+          <p class="eyebrow" data-i18n="faq.eyebrow">Hỏi đáp nhanh</p>
+          <h2 id="faq-title" data-i18n="faq.title">Những câu hỏi thường gặp</h2>
+        </header>
+        <div class="faq-list">
+          <div class="faq-item glass" data-kind="dark">
+            <h3><button type="button" class="faq-q" aria-expanded="false" aria-controls="faq-a-1" id="faq-b-1" data-i18n="faq.q.1">Các tiện ích này có sửa hay fork lõi DeepSeek Harness không?</button></h3>
+            <div class="faq-a" id="faq-a-1" role="region" aria-labelledby="faq-b-1" hidden><p data-i18n="faq.a.1">Không. Toàn bộ chạy dưới dạng plugin hoặc ứng dụng độc lập bên ngoài; lõi DSH giữ nguyên. Mỗi plugin đều khai báo dải phiên bản <code>engines.dsh</code> rõ ràng.</p></div>
+          </div>
+          <div class="faq-item glass" data-kind="dark">
+            <h3><button type="button" class="faq-q" aria-expanded="false" aria-controls="faq-a-2" id="faq-b-2" data-i18n="faq.q.2">DSH Mobile chạy trên Điện thoại, Web và Desktop khác nhau ở điểm nào?</button></h3>
+            <div class="faq-a" id="faq-a-2" role="region" aria-labelledby="faq-b-2" hidden><p data-i18n="faq.a.2">Cả 4 nền tảng đều nối vào cùng một Host Gateway trên máy chủ để xem phiên, gửi lệnh và duyệt công cụ. App Android/iOS dùng kết nối ghim chứng chỉ TLS trực tiếp và lưu khóa trong Keychain/Keystore; bản Web (PWA) chạy qua HTTPS của mạng riêng Tailscale để mở nhanh trên mọi trình duyệt (kèm khóa Passkey và lưu token bằng WebCrypto); còn bản Desktop Remote tích hợp thẳng vào thanh bên của DSH Desktop để gộp nhiều máy chủ và truyền file trực tiếp.</p></div>
+          </div>
+          <div class="faq-item glass" data-kind="dark">
+            <h3><button type="button" class="faq-q" aria-expanded="false" aria-controls="faq-a-3" id="faq-b-3" data-i18n="faq.q.3">Dữ liệu phiên hay code có đi qua máy chủ trung gian nào không?</button></h3>
+            <div class="faq-a" id="faq-a-3" role="region" aria-labelledby="faq-b-3" hidden><p data-i18n="faq.a.3">Không. Không có relay công cộng hay telemetry. Mặc định gateway chỉ nghe ở <code>127.0.0.1</code>; khi dùng qua LAN hoặc Tailscale, thiết bị nối thẳng vào máy của bạn bằng TLS.</p></div>
+          </div>
+          <div class="faq-item glass" data-kind="dark">
+            <h3><button type="button" class="faq-q" aria-expanded="false" aria-controls="faq-a-4" id="faq-b-4" data-i18n="faq.q.4">Có dùng được dữ liệu Repo Wiki từ Claude Code hoặc VS Code không?</button></h3>
+            <div class="faq-a" id="faq-a-4" role="region" aria-labelledby="faq-b-4" hidden><p data-i18n="faq.a.4">Có. Repo Wiki đi kèm máy chủ MCP (mặc định stdio, tùy chọn HTTP loopback) để Claude Code hoặc VS Code tra cứu trực tiếp cùng kho dữ liệu <code>.dsh-wiki/</code>.</p></div>
+          </div>
+          <div class="faq-item glass" data-kind="dark">
+            <h3><button type="button" class="faq-q" aria-expanded="false" aria-controls="faq-a-5" id="faq-b-5" data-i18n="faq.q.5">Tiện ích DSH for VS Code đã tải về dùng được chưa?</button></h3>
+            <div class="faq-a" id="faq-a-5" role="region" aria-labelledby="faq-b-5" hidden><p data-i18n="faq.a.5">Chưa phát hành. Hiện đang ở mức <code>v0.1.0 · Đang phát triển</code> trong repo nội bộ; bản xem trước trên trang chỉ mô phỏng kiến trúc ACP v1 và giao diện diff/revert, chưa có trên VS Code Marketplace.</p></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-grid">
+      <div>
+        <a class="brand" href="#top"><img class="brand-mark" src="assets/orbit-icon.svg" alt="" width="28" height="28"><span class="brand-name">DSH Extensions</span></a>
+        <p data-i18n="footer.summary">DSH Mobile (Android · iOS · Web · Desktop Remote), Repo Wiki và DSH for VS Code — bộ công cụ mở rộng cho DeepSeek Harness, không relay trung gian, không telemetry.</p>
+      </div>
+      <div>
+        <h3 data-i18n="footer.repos.title">Kho mã nguồn</h3>
+        <ul class="footer-links">
+          <li><a href="https://github.com/nesteacold/dsh-mobile" target="_blank" rel="noopener noreferrer">github.com/nesteacold/dsh-mobile ↗</a> · <span data-i18n="footer.repo.1">điều khiển từ xa đa nền tảng</span></li>
+          <li><a href="https://github.com/nesteacold/dsh-wiki" target="_blank" rel="noopener noreferrer">github.com/nesteacold/dsh-wiki ↗</a> · <span data-i18n="footer.repo.2">wiki cục bộ &amp; MCP</span></li>
+          <li><code>dsh-vscode</code> · <span data-i18n="footer.repo.3">(đang phát triển nội bộ)</span></li>
+          <li><a href="https://github.com/nesteacold" target="_blank" rel="noopener noreferrer">@nesteacold <span data-i18n="footer.profile">trên GitHub</span> ↗</a></li>
+        </ul>
+      </div>
+      <div>
+        <h3 data-i18n="footer.attribution.title">Ghi công &amp; bản quyền</h3>
+        <p data-i18n="footer.attribution">Vật liệu kính glasswork v1.1.0 · MIT · © Kubai087. Ngoài thư viện glasswork, trang không dùng CDN, font ngoài hay công cụ phân tích nào.</p>
+      </div>
+    </div>
+    <div class="wrap footer-bottom" data-i18n="footer.bottom">Host executes. Your devices control. · Zero telemetry · Zero public relay.</div>
+  </footer>
+
+  <dialog class="screenshot-dialog glass" id="lightbox-dialog" data-kind="dark" aria-labelledby="lightbox-title">
+    <div class="lightbox-inner">
+      <div class="lightbox-head">
+        <h2 id="lightbox-title" data-i18n="lightbox.title">Ảnh chụp màn hình DSH Orbit</h2>
+        <button type="button" class="lightbox-close" id="lightbox-close" aria-label="Đóng" data-i18n-aria="lightbox.close">✕</button>
+      </div>
+      <img id="lightbox-img" src="assets/screens/03-session-list.png" width="1206" height="2622" alt="Ảnh chụp màn hình DSH Orbit phóng to" data-i18n-alt="lightbox.alt">
+    </div>
+  </dialog>
+</body>
+</html>
