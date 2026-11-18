@@ -51,16 +51,10 @@
   approval in this spec.
 - Reduced motion: `AccessibilityInfo.isReduceMotionEnabled()` must disable the drift/animation.
 
-## Dependencies — lead decision (recorded 2026-11-18)
+## Dependencies — lead decision (fill before implementation)
 
-Lead approval before install: `expo-blur` 58.0.0 (MIT) supplies the real per-view `BlurView` used by
-`GlassSurface`; `react-native-svg` 15.16.1 (MIT) supplies the mesh primitives and satisfies lucide's
-SVG peer; `lucide-react-native` 1.74.0 (ISC) supplies the vector icons, replacing the glyph/View
-substitutes. `@expo/vector-icons` was considered and rejected: it would add a second icon stack
-without the explicit, tree-shakeable component API the screens need. All three packages pin exact
-versions in `apps/mobile-companion/package.json` and `package-lock.json`; transitive lock entries are
-their declared dependencies only. No upstream VectorDrawable XML, whale mark, mascot or logo asset is
-copied; icons carry explicit `size`, `color` and `accessibilityLabel`.
+_Pending: coder audit reports `expo-blur`, `react-native-svg`, `@expo/vector-icons`, `lucide-react-native`
+are all absent from `package.json`. Lead to choose and record exact names/versions/licences here._
 
 ## Gates (literal commands, exported staged tree)
 
@@ -84,4 +78,4 @@ copied; icons carry explicit `size`, `color` and `accessibilityLabel`.
 
 ## Status
 
-Spec written 2026-11-18. No code yet.
+Implemented and verified on iPhone 17 Pro simulator 2026-11-18. Owner decided to keep the already-reviewing store submissions; signed builds with this UI are prepared for the next submission round (iOS TestFlight build #2 VALID; Android versionCode 2).
