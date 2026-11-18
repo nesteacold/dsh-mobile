@@ -144,6 +144,8 @@
 
     'vscode.title': 'Chat và duyệt Diff ngay trong VS Code',
     'vscode.badge': 'v0.1.0 · Đang phát triển',
+    'shot.desktop-remote.alt': 'Minh họa DSH Desktop Remote: thanh bên có This Computer và Remote Workspace, phiên chat trên máy từ xa với tệp đính kèm và WSS ghim chứng chỉ',
+    'shot.desktop-remote.cap': 'Hình minh họa do chúng tôi dựng, không phải ảnh chụp màn hình DSH Desktop thật. Bố cục và nhãn (This Computer, HOSTS · PAIRED, h:<hostId>, pinned TLS) lấy từ tài liệu plugin.',
     'shot.wiki-page.alt': 'Trang Repo Wiki mẫu: cây điều hướng bên trái, ô tìm kiếm, trích dẫn auth.py:6 và sơ đồ luồng đăng nhập',
     'shot.wiki-page.cap': 'Ảnh chụp site do trình dựng dsh-wiki thật tạo từ một repo mẫu nhỏ (tự kiểm tra: 4/4 trích dẫn path:line hợp lệ, không liên kết ngoài).',
     'shot.vscode-chat.alt': 'Bản xem trước DSH for VS Code: thanh bên phiên, đoạn chat và thẻ duyệt thay đổi file với nút Reject và Allow once',
@@ -411,6 +413,8 @@
 
     'vscode.title': 'Chat and review diffs right inside VS Code',
     'vscode.badge': 'v0.1.0 · In Development',
+    'shot.desktop-remote.alt': 'DSH Desktop Remote illustration: sidebar with This Computer and Remote Workspace, a chat on the remote machine with an attached file and pinned WSS',
+    'shot.desktop-remote.cap': 'An illustration we drew, not a screenshot of the real DSH Desktop. Layout and labels (This Computer, HOSTS · PAIRED, h:<hostId>, pinned TLS) follow the plugin documentation.',
     'shot.wiki-page.alt': 'Sample Repo Wiki page: navigation tree on the left, search box, an auth.py:6 citation and a login flow diagram',
     'shot.wiki-page.cap': 'Screenshot of a site produced by the real dsh-wiki builder from a small sample repo (selfcheck: 4/4 path:line citations resolve, zero external links).',
     'shot.vscode-chat.alt': 'DSH for VS Code preview: sessions side bar, chat and a file-edit approval card with Reject and Allow once buttons',
