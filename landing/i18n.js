@@ -1,4 +1,4 @@
-/* Bilingual UI strings for the DSH Extensions landing page.
+/* Bilingual UI strings for the DSH Orbit landing page.
  * Classic script (no ES module): works over http://127.0.0.1 and file://.
  * vi is the default; en is the toggle. Every key exists in both tables. */
 (function () {

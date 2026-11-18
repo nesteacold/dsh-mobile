@@ -1,4 +1,4 @@
-/* DSH Extensions landing page — deep-ocean technical glass.
+/* DSH Orbit landing page — deep-ocean technical glass.
    Follows website/DESIGN.md tokens. Dark-only, zero external resources. */
 
 :root {
@@ -74,8 +74,7 @@ pre { margin: 0; }
 .header {
   position: sticky; top: 0; z-index: 100;
   border-bottom: 1px solid rgb(37 68 93 / 70%);
-  background: rgb(6 23 43 / 88%);
-  -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+  background: #06172b;
 }
 .header-inner { display: flex; align-items: center; gap: 24px; min-height: 72px; }
 .brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); font-weight: 700; letter-spacing: -0.02em; white-space: nowrap; }
@@ -467,3 +466,9 @@ pre { margin: 0; }
   html { scroll-behavior: auto; }
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+/* Header is opaque (no text bleeding through); long strings wrap on narrow screens. */
+html, body { overflow-x: clip; }
+p, li, dd, summary, .product-card, .product-card > *, .tailscale-step > div, .section-head > * { min-width: 0; overflow-wrap: anywhere; }
+pre, code { max-width: 100%; }
+pre { overflow-x: auto; }
