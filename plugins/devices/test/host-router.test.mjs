@@ -6,12 +6,17 @@
 // about routing / renaming / merging and about what actually crosses the wire to
 // a remote Host.
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { test } from 'node:test'
 
 import { RemoteConnection } from '../lib/remote-client.mjs'
 import {
-  DSH_ENGINES_RANGE, HOST_HINT, ID_FIELDS, PINNED_DSH_VERSION, createHostRouter, hostHintOf, hostIdOfId, hostIdsIn, namespaceId,
+  DSH_ENGINES_RANGE, HOST_HINT, HOST_ROUTER_REVISION, ID_FIELDS, PINNED_DSH_VERSION,
+  ROUTING_DIAGNOSTIC_CODES, createHostRouter, hostHintOf, hostIdOfId, hostIdsIn, namespaceId,
   namespaceIds, selfTest, stripHostIds, taggedIdsIn,
 } from '../lib/host-router.mjs'
 import { mountPlugin } from './helpers.mjs'
@@ -96,7 +101,8 @@ const workspaceView = (workspaceId, sessionIds, extra = {}) => ({
   createdAt: '2026-11-09T00:00:00.000Z', updatedAt: '2026-11-09T00:00:00.000Z', ...extra,
 })
 
-function createHarness({ remotes = [], dispatchRpc, connected: connectedIds, baseline = { items: [], archivedSessionIds: [], pinnedSessionIds: [] }, controlBaseline = { projections: {} } } = {}) {
+function createHarness({ remotes = [], dispatchRpc, connected: connectedIds, baseline = { items: [], archivedSessionIds: [], pinnedSessionIds: [] }, controlBaseline = { projections: {} },
+  cache = null, diagnostics = null, version = '0.4.20-test', cachedSessionCount = 0 } = {}) {
   const localCalls = []
   const localStreams = []
   const logs = []
@@ -149,6 +155,10 @@ function createHarness({ remotes = [], dispatchRpc, connected: connectedIds, bas
       pending: () => [],
     },
     mergeBaselineTimeoutMs: 100,
+    cache,
+    diagnostics: diagnostics ?? (() => {}),
+    version,
+    cachedSessionCount: () => cachedSessionCount,
     log: (line) => logs.push(line),
   })
   const status = router.install()
@@ -3550,7 +3560,16 @@ test('remoteSessions:false leaves the carrier alone and reports why', async () =
   const original = harness.gateway.dispatchRpc
   const mounted = await mountPlugin({ remoteSessions: false, services: { typertGateway: harness.gateway } })
   const answer = await mounted.call('GET', '/devices/remotes')
-  assert.deepEqual(answer.json.routing, { remote: false, reason: 'disabled', hosts: [], merged: [] })
+  const routing = answer.json.routing
+  assert.equal(routing.remote, false)
+  assert.equal(routing.reason, 'disabled')
+  assert.equal(routing.hosts.length, 0)
+  assert.deepEqual(routing.merged, [], 'no endpoints are merged when remote routing is disabled')
+  assert.equal(routing.cacheConfigured, false)
+  assert.equal(routing.cachedSessionCount, 0)
+  assert.equal(routing.lastFollowDiagnostic, null)
+  assert.equal(routing.revision, HOST_ROUTER_REVISION)
+  assert.equal(typeof routing.pluginVersion, 'string')
   assert.equal(harness.gateway.dispatchRpc, original)
   mounted.close()
 })
@@ -3743,6 +3762,62 @@ test('the first follow open on a still-listed offline Host replays its cache imm
     control.abort()
     await iterator.return()
   } finally { h.router.uninstall() }
+})
+
+test('an rc.3 follow open emits a key hash and append count to the injected diagnostics', async () => {
+  // The live wire shape is {args:{request:{address:{sessionId},activate,assistantStream}}};
+  // followSessionId must resolve THAT shape (a null-prototype request is still plain).
+  const events = []
+  const appended = []
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const harness = createHarness({
+    remotes: [hostB],
+    cache: { append: (_hostId, _sessionId, frame) => appended.push(frame), read: () => null },
+    diagnostics: (event) => events.push(event),
+    version: '0.4.20-fake',
+    cachedSessionCount: 3,
+  })
+  const control = new AbortController()
+  try {
+    const request = Object.assign(Object.create(null), {
+      address: { sessionId: 'h:hostB:s1' }, activate: true, assistantStream: true,
+    })
+    const source = await harness.gateway.openWireStream('session/follow',
+      { args: { request } }, undefined, {}, control.signal, control, 64)
+    const remoteStream = hostB.streams.find((entry) => entry.endpoint === 'session/follow')
+    assert.ok(remoteStream, 'the follow reached the remote Host')
+    assert.equal(remoteStream.args.request.address.sessionId, 's1', 'the id is host-relative on the wire')
+    remoteStream.queue.push(cachedFollow()[0])
+    const iterator = source[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'remote opening snapshot')).value.type, 'snapshot')
+    assert.equal(appended.length, 1, 'the cached transcript was appended once')
+    control.abort()
+    await iterator.return()
+
+    const opens = events.filter((event) => event.code === ROUTING_DIAGNOSTIC_CODES.FOLLOW_OPEN)
+    assert.equal(opens.length, 1, 'one diagnostic per follow open')
+    assert.equal(opens[0].cacheConfigured, true)
+    assert.equal(opens[0].resolved, true)
+    const expectedHash = createHash('sha256').update('hostB').update('\u0000').update('s1').digest('hex').slice(0, 16)
+    assert.equal(opens[0].keyHash, expectedHash)
+    assert.equal(JSON.stringify(events).includes('h:hostB:s1'), false, 'no raw id reaches diagnostics')
+    const frames = events.filter((event) => event.code === ROUTING_DIAGNOSTIC_CODES.FOLLOW_FRAMES)
+    assert.ok(frames.length > 0, 'an append-count diagnostic was emitted')
+    assert.equal(frames.at(-1).appendCount, 1)
+    assert.ok(events.some((event) => event.code === ROUTING_DIAGNOSTIC_CODES.INSTALL
+      && event.revision === HOST_ROUTER_REVISION && event.pluginVersion === '0.4.20-fake'))
+
+    const status = harness.router.status()
+    assert.equal(status.pluginVersion, '0.4.20-fake')
+    assert.equal(status.revision, HOST_ROUTER_REVISION)
+    assert.equal(status.cacheConfigured, true)
+    assert.equal(status.cachedSessionCount, 3)
+    assert.equal(status.lastFollowDiagnostic.code, ROUTING_DIAGNOSTIC_CODES.FOLLOW_FRAMES)
+    assert.equal(typeof status.lastFollowDiagnostic.at, 'number')
+  } finally {
+    control.abort()
+    harness.router.uninstall()
+  }
 })
 
 test('a Host vanishing between the route and the stream open settles the first open', async () => {

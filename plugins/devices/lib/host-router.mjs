@@ -1,3 +1,5 @@
+import crypto from 'node:crypto'
+
 // Multi-host routing for the CONTROLLER machine (spec 008 P2a).
 //
 // One DSH Desktop UI owns exactly one `typertGateway` instance, and the official
@@ -196,7 +198,18 @@ export const PINNED_DSH_VERSION = '0.2.2-rc.3'
  * be matched to the code that produced it without reading files or hashing
  * `import.meta` (spec 038 R8 diagnosis). Bumped when routing behavior changes.
  */
-export const HOST_ROUTER_REVISION = '038-r3-first-open-timeout'
+export const HOST_ROUTER_REVISION = '039-r4-diagnostics'
+
+/**
+ * Stable codes of the injected routing diagnostics. The sink (owned by index.mjs)
+ * writes them to a bounded plugin log; ids, prompt text and tokens never reach it.
+ */
+export const ROUTING_DIAGNOSTIC_CODES = Object.freeze({
+  INSTALL: 'router.install',
+  FOLLOW_OPEN: 'follow.open',
+  FOLLOW_FRAMES: 'follow.frames',
+  FOLLOW_FALLBACK: 'follow.fallback',
+})
 
 /** Mirrors package.json engines.dsh; DSH evaluates it with semver includePrerelease. */
 export const DSH_ENGINES_RANGE = '>=0.2.2-rc.3 <0.3.0-0'
@@ -1744,6 +1757,11 @@ export class HostRouter {
   #retention
   #outbox
   #log
+  /** Injected by index.mjs: a bounded, plugin-owned file sink (no raw ids ever). */
+  #diagnostics
+  #pluginVersion
+  #cachedSessionCount
+  #lastFollowDiagnostic = null
   #baselineTimeoutMs
   #firstOpenTimeoutMs
   #dshVersion
@@ -1900,6 +1918,9 @@ export class HostRouter {
     this.#retention = deps.retention ?? null
     this.#outbox = deps.outbox ?? null
     this.#log = typeof deps.log === 'function' ? deps.log : () => {}
+    this.#diagnostics = typeof deps.diagnostics === 'function' ? deps.diagnostics : () => {}
+    this.#pluginVersion = typeof deps.version === 'string' && deps.version !== '' ? deps.version : 'unknown'
+    this.#cachedSessionCount = typeof deps.cachedSessionCount === 'function' ? deps.cachedSessionCount : () => 0
     // Hydrate session rows before any connected host can update them: a merged list
     // opened during startup must show the persisted rows from the previous session.
     for (const snapshot of this.#retention?.list() ?? []) {
@@ -1927,6 +1948,23 @@ export class HostRouter {
     this.#dshVersion = typeof deps.dshVersion === 'string' ? deps.dshVersion : undefined
   }
 
+  /**
+   * Emit one bounded diagnostic event. Nothing here can break routing: the sink is
+   * diagnostic-only, and a failing sink still leaves the in-memory status accurate.
+   */
+  #diagnose(event) {
+    const at = Date.now()
+    if (event.code.startsWith('follow.')) this.#lastFollowDiagnostic = { code: event.code, at }
+    try { this.#diagnostics({ ...event, at }) } catch { /* a sink failure is not a routing failure */ }
+  }
+
+  /** Hash the resolved (host-relative) key; an id never reaches a log or status. */
+  #keyHash(hostId, sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return null
+    return crypto.createHash('sha256').update(String(hostId)).update('\u0000').update(sessionId)
+      .digest('hex').slice(0, 16)
+  }
+
   /** Wrap the carrier; on a carrier mismatch nothing is patched and status says why. */
   install() {
     if (this.#installed) return this.status()
@@ -1934,6 +1972,8 @@ export class HostRouter {
     if (reason !== null) {
       this.#reason = reason
       this.#log(`multi-host routing disabled: ${reason} (revision ${HOST_ROUTER_REVISION}, running DSH ${this.#dshVersion ?? 'unknown'}, declared ${DSH_ENGINES_RANGE}, last tested ${PINNED_DSH_VERSION})`)
+      this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.INSTALL, revision: HOST_ROUTER_REVISION,
+        pluginVersion: this.#pluginVersion, cacheConfigured: Boolean(this.#cache), installed: false, reason })
       return this.status()
     }
     const gateway = this.#gateway
@@ -1966,6 +2006,8 @@ export class HostRouter {
     this.#installed = true
     this.#reason = null
     this.#log(`multi-host routing installed (revision ${HOST_ROUTER_REVISION}, opens: ${rc1 ? 'rc1' : 'legacy'} arity)`)
+    this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.INSTALL, revision: HOST_ROUTER_REVISION,
+      pluginVersion: this.#pluginVersion, cacheConfigured: Boolean(this.#cache), installed: true, reason: null })
     return this.status()
   }
 
@@ -2081,9 +2123,19 @@ export class HostRouter {
       retainedWorkspaces: this.#retainedWorkspaces.get(host.hostId) ?? 0,
       queuedPrompts: this.#outbox?.list(host.hostId).queuedCount ?? 0,
     }))
+    let cachedSessionCount = 0
+    try { cachedSessionCount = this.#cachedSessionCount() } catch { /* a count is never a gate */ }
     return {
       remote: this.#installed, reason: this.#installed ? null : this.#reason,
       hosts, disconnected, merged: [...MERGED_ENDPOINTS],
+      // Diagnostic-only: version/revision prove WHICH build is live, counts and the
+      // last follow code make a stuck "Loading history..." explainable without
+      // exposing an id, a body or a token.
+      pluginVersion: this.#pluginVersion,
+      revision: HOST_ROUTER_REVISION,
+      cacheConfigured: Boolean(this.#cache),
+      cachedSessionCount: Number.isSafeInteger(cachedSessionCount) && cachedSessionCount >= 0 ? cachedSessionCount : 0,
+      lastFollowDiagnostic: this.#lastFollowDiagnostic ? { ...this.#lastFollowDiagnostic } : null,
     }
   }
 
@@ -3267,6 +3319,14 @@ export class HostRouter {
     const rawSessionId = followSessionId(args)
     const controlSessionId = rawSessionId === null ? null : namespaceId(hostId, rawSessionId)
     const cache = this.#cache
+    // rc.3 sends `{args:{request:{address:{sessionId},activate,assistantStream}}}`.
+    // `followSessionId` resolves that address; only its HASH is ever diagnosed.
+    const keyHash = this.#keyHash(hostId, rawSessionId)
+    let appendedFrames = 0
+    const followDiagnostic = {
+      cacheConfigured: Boolean(cache), resolved: rawSessionId !== null, keyHash,
+    }
+    this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.FOLLOW_OPEN, ...followDiagnostic })
     const lifetime = new AbortController()
     const queue = new ValueQueue()
     const stop = () => { lifetime.abort(); queue.close() }
@@ -3329,14 +3389,17 @@ export class HostRouter {
      * it can open a follow, otherwise fail visibly. Only after a real opening snapshot
      * is this an open follow, whose link failures resume normally (spec 038 R3).
      * @param {'offline'|'stalled-open'} reason why the first open is being settled
+     * @param {'dead-link'|'stalled-open'|'opening-snapshot'} trigger diagnostic cause
      */
     let firstOpenFallbackDone = false
-    const firstOpenFallback = (reason = 'offline') => {
+    const firstOpenFallback = (reason = 'offline', trigger = reason === 'stalled-open' ? 'stalled-open' : 'dead-link') => {
       if (openingSnapshotDelivered || firstOpenFallbackDone) return false
       firstOpenFallbackDone = true
       clearFirstOpenTimer()
       const frames = this.#cachedFollowFrames(hostId, args)
       if (frames) {
+        this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.FOLLOW_FALLBACK, ...followDiagnostic,
+          trigger, outcome: 'cache' })
         try {
           this.#log('session/follow first open: replaying the cached transcript read-only')
           for (const frame of frames) queue.push(this.#ingress(hostId, frame, 'cached transcript'))
@@ -3353,6 +3416,8 @@ export class HostRouter {
         ? 'the remote Host did not send an opening snapshot before the first-open timeout; the session history could not be loaded'
         : `remote host ${hostId} is offline and no cached transcript is available; the session history could not be loaded`
       const terminal = new HostRouterError('remote/host-offline', message, { hostId, reason })
+      this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.FOLLOW_FALLBACK, ...followDiagnostic,
+        trigger, outcome: 'no-cache' })
       this.#log('session/follow first open: no usable cache, failing visibly')
       settleFirstOnce.reject(terminal)
       queue.fail(terminal)
@@ -3392,13 +3457,13 @@ export class HostRouter {
           // whose host vanished there must still settle: waiting for a host that is no
           // longer in the inventory is exactly the "Loading history..." hang.
           const host = this.#hostById(hostId)
-          if (!host && !snapshotShapedDelivered && firstOpenFallback()) return
+          if (!host && !snapshotShapedDelivered && firstOpenFallback('offline', 'dead-link')) return
           if (!host) { await this.#awaitHost(hostId, lifetime.signal); continue }
           // A listed host can still be mid-drop: `#route` saw an online row, but its
           // link is no longer usable. `openStream` would then either wait for a dial
           // that never finishes or resolve a stream that fails before its snapshot.
           const linkState = typeof host.connection?.state === 'string' ? host.connection.state : null
-          if (linkState !== null && linkState !== 'online' && !snapshotShapedDelivered && firstOpenFallback()) return
+          if (linkState !== null && linkState !== 'online' && !snapshotShapedDelivered && firstOpenFallback('offline', 'dead-link')) return
           const source = await host.connection.openStream(SESSION_FOLLOW_ENDPOINT, args, { signal: lifetime.signal })
           activeSource = source
           // The attempt counter is NOT reset here: a Host that accepts the open and then
@@ -3487,7 +3552,13 @@ export class HostRouter {
             /** Deliver one frame (the single path that advances the durable cursor). */
             const deliver = (frame) => {
               const renamed = this.#ingress(hostId, frame, SESSION_FOLLOW_ENDPOINT)
-              if (sessionId) cache?.append(hostId, sessionId, frame)
+              if (sessionId) {
+                cache?.append(hostId, sessionId, frame)
+                appendedFrames += 1
+                if (appendedFrames === 1) {
+                  this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.FOLLOW_FRAMES, ...followDiagnostic, appendCount: 1 })
+                }
+              }
               const seq = followSeqOf(frame)
               if (seq !== null) lastSeq = seq
               // A claim that removes the pending inbox row leaves the native
@@ -3587,7 +3658,7 @@ export class HostRouter {
           // first open: settle it from the cache (or visibly). A snapshot-shaped frame
           // that failed validation still counts as an opening here so the follow can
           // resume; the first-open timer separately bounds that unusable opening.
-          if (!snapshotShapedDelivered && firstOpenFallback()) return
+          if (!snapshotShapedDelivered && firstOpenFallback('offline', 'opening-snapshot')) return
         } catch (error) {
           if (lifetime.signal.aborted) break
           // A re-opened page left holding an event past a hole, and the Host dropped
@@ -3616,7 +3687,7 @@ export class HostRouter {
           // queue: replay the cache or fail with a visible remote error (spec 038 R3).
           // A broad snapshot was delivered: let the pump resume as an open follow; the
           // bound above still settles it if that snapshot never becomes usable.
-          if (!snapshotShapedDelivered && firstOpenFallback()) return
+          if (!snapshotShapedDelivered && firstOpenFallback('offline', 'dead-link')) return
           if (error?.code === STREAM_DESYNC_CODE) {
             // Counted only while the reader got nothing: a desync AFTER a delivered frame
             // is the first of a new series, not a continuation of a stuck one.
@@ -3653,6 +3724,9 @@ export class HostRouter {
       settleFirstOnce.reject(error)
     }).finally(() => {
       clearFirstOpenTimer()
+      if (appendedFrames !== 1) {
+        this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.FOLLOW_FRAMES, ...followDiagnostic, appendCount: appendedFrames })
+      }
       signal?.removeEventListener?.('abort', onAbort)
       this.#merges.delete(stop)
       this.#untrackFollow(hostId, stop)
@@ -3730,8 +3804,13 @@ export class HostRouter {
   /** The local copy of a session whose host is offline, as a read-only stream. */
   #replayCachedFollow(payload, hostId) {
     if (typeof hostId !== 'string') return null
-    const frames = this.#cachedFollowFrames(hostId, this.#forwardArgs(payload, hostId))
+    const args = this.#forwardArgs(payload, hostId)
+    const frames = this.#cachedFollowFrames(hostId, args)
     if (!frames) return null
+    const rawSessionId = followSessionId(args)
+    this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.FOLLOW_FALLBACK,
+      cacheConfigured: Boolean(this.#cache), resolved: rawSessionId !== null,
+      keyHash: this.#keyHash(hostId, rawSessionId), trigger: 'dead-link', outcome: 'cache' })
     this.#log(`session/follow of ${hostId} is offline: replaying the cached transcript`)
     // Read-only by construction: no request reaches the Host, and the stream ends
     // where the cache ends (the UI shows it behind the offline banner).

@@ -11,13 +11,14 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import {
   CLOSE_REVOKED, PinMismatchError, RemoteConnection, RemoteInputError,
   claimPairing, claimWithOtp, decodePairingString, formatVerificationCode, vetDialHost, normalizeOtp,
   otpDialUrl, resolveDialUrl,
 } from './remote-client.mjs'
-import { assertCleanCard, createHostRouter } from './host-router.mjs'
+import { HOST_ROUTER_REVISION, assertCleanCard, createHostRouter } from './host-router.mjs'
 import { createAgentBrowserPool } from './agent-browser.mjs'
 import { resolveDshRuntimeVersion } from './dsh-runtime-version.mjs'
 import { createPromptOutbox } from './prompt-outbox.mjs'
@@ -46,6 +47,11 @@ const SUBAGENT_MODES = new Set(['continuable', 'one-shot', 'unknown'])
 // purpose: a session opened later than this re-reads the list, so a child created in
 // the meantime is still found.
 const SESSION_LIST_TTL_MS = 5000
+// Live diagnosis of remote routing: one small owner-only file under dataDir, never
+// a DSH file, a prompt body, an id or a token. One rotation keeps the newest
+// ~256 KiB in the live file and the previous window in `.1`.
+const ROUTING_DIAGNOSTIC_FILE = 'routing-diagnostic.log'
+const ROUTING_DIAGNOSTIC_MAX_BYTES = 256 * 1024
 
 // --- request guards: copied from plugins/mobile-gateway/lib/index.mjs (isLoopback, isSameOrigin) ---
 export function isLoopback(req) {
@@ -245,6 +251,63 @@ const publicRemote = (remote, live, approvals) => ({
 /** Per-context internals of an applied plugin (see the note at the end of `apply`). */
 const internals = new WeakMap()
 
+/**
+ * The installed plugin version, read from this package's own manifest — never an
+ * import assertion, and never a version guessed from DSH. A test (or a Host) may
+ * override it with the `version` config key.
+ */
+function installedPluginVersion() {
+  try {
+    const manifest = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json')
+    const version = JSON.parse(fs.readFileSync(manifest, 'utf8')).version
+    return typeof version === 'string' && version !== '' ? version : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+/**
+ * The injected routing-diagnostics sink. host-router emits CODES, counts and a
+ * hashed key only; this function is the single place that touches the plugin's
+ * log file. A failed write never throws into routing and is reported via `log`.
+ */
+function createRoutingDiagnostics(dataDir, log) {
+  const file = path.join(dataDir, ROUTING_DIAGNOSTIC_FILE)
+  const rotated = `${file}.1`
+  return (event) => {
+    try {
+      const line = `[${new Date().toISOString()}] ${JSON.stringify(event)}\n`
+      const bytes = Buffer.byteLength(line)
+      const size = fs.existsSync(file) ? fs.statSync(file).size : 0
+      if (size + bytes > ROUTING_DIAGNOSTIC_MAX_BYTES) {
+        try { fs.copyFileSync(file, rotated) } catch { /* the previous window is best-effort */ }
+        fs.writeFileSync(file, line, { mode: 0o600 })
+        restrictToOwnerSync(file, 'file')
+        if (fs.existsSync(rotated)) restrictToOwnerSync(rotated, 'file')
+      } else {
+        fs.appendFileSync(file, line, { mode: 0o600 })
+        if (size === 0) restrictToOwnerSync(file, 'file')
+      }
+    } catch (error) {
+      log(`routing diagnostic log unavailable: ${error?.code ?? 'error'}`)
+    }
+  }
+}
+
+/** Count cached transcripts by file, without reading an id or a frame body. */
+function countCachedSessions(root) {
+  let count = 0
+  try {
+    for (const host of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!host.isDirectory()) continue
+      for (const entry of fs.readdirSync(path.join(root, host.name), { withFileTypes: true })) {
+        if (entry.isFile() && entry.name.endsWith('.jsonl')) count += 1
+      }
+    }
+  } catch { /* a diagnostic count is never a gate */ }
+  return count
+}
+
 export const plugin = {
   name: 'devices',
   inject: ['webServer'],
@@ -289,6 +352,11 @@ export const plugin = {
       maxBytes: options.sessionCacheMaxBytes,
       rotations: options.sessionCacheRotations,
     })
+    // Live diagnosis of a stuck remote session: the router only emits codes and
+    // counts; this plugin owns the bounded file under dataDir.
+    const routingDiagnostics = createRoutingDiagnostics(dataDir, log)
+    const pluginVersion = typeof options.version === 'string' && options.version !== ''
+      ? options.version : installedPluginVersion()
     // Spec 038: plugin-owned snapshots of the merged workspace/session rows and the
     // durable plain-text prompt outbox. Neither touches a DSH file or state; both
     // live entirely under dataDir and survive a DSH reload.
@@ -727,6 +795,11 @@ export const plugin = {
       // wrap and a reason the Devices page shows.
       dshVersion,
       log,
+      // Diagnostics are INJECTED: this file owns the disk, the router only emits
+      // stable codes, counts and a hashed key. No DSH object or file is touched.
+      version: pluginVersion,
+      diagnostics: routingDiagnostics,
+      cachedSessionCount: () => countCachedSessions(sessionCache.dir),
     })
     hostRouter?.install()
     if (hostRouter) log(`multi-host routing: ${hostRouter.status().remote ? 'active' : `off (${hostRouter.status().reason})`}`)
@@ -1077,7 +1150,11 @@ export const plugin = {
             // `routing` tells the page whether remote sessions are live (and why not).
             sendJson(res, 200, {
               remotes: store.list().map(view),
-              routing: hostRouter ? hostRouter.status() : { remote: false, reason: 'disabled', hosts: [], merged: [] },
+              routing: hostRouter ? hostRouter.status() : {
+                remote: false, reason: 'disabled', hosts: [], merged: [],
+                pluginVersion, revision: HOST_ROUTER_REVISION, cacheConfigured: false,
+                cachedSessionCount: countCachedSessions(sessionCache.dir), lastFollowDiagnostic: null,
+              },
               // Spec 013: whether attachment bytes can reach a remote Host, and why
               // not (A1.1 requires the failure mode to be visible).
               uploads: uploadRoute ? uploadRoute.status() : { route: null, wrapped: false, reason: 'disabled' },
