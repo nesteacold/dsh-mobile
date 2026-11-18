@@ -36,6 +36,18 @@ const OPAQUE = Object.freeze({
 
 const ID_KEY = /^(?:id|[A-Za-z]+Ids?)$/
 
+/**
+ * A live `session/control` projection frame. `changes[].key` names the same
+ * ID_FIELDS rule a baseline's projection value uses, so a field that appears
+ * here must be routable too (see the changes branch of `rewriteIds`/`visitIds`).
+ */
+const projectionChangesFixture = {
+  type: 'projection',
+  sessionId: 's1',
+  seq: 4,
+  changes: [{ key: 'subagentCatalog', val: [{ id: 'c1', mode: 'one-shot' }] }],
+}
+
 function keysFromJson(value, out) {
   if (Array.isArray(value)) value.forEach((v) => keysFromJson(v, out))
   else if (value && typeof value === 'object') {
@@ -53,6 +65,7 @@ function collectKeys() {
     const src = fs.readFileSync(path.join(here, name), 'utf8')
     for (const m of src.matchAll(/[{,]\s*['"]?([A-Za-z]+Ids?|id)['"]?\s*:/g)) keys.add(m[1])
   }
+  keysFromJson(projectionChangesFixture, keys)
   if (fs.existsSync(gatewayFrames)) keysFromJson(JSON.parse(fs.readFileSync(gatewayFrames, 'utf8')), keys)
   return keys
 }
@@ -67,4 +80,10 @@ test('every id-bearing fixture field is covered by ID_FIELDS or declared opaque'
 test('ID_FIELDS and OPAQUE do not overlap', () => {
   const both = Object.keys(OPAQUE).filter((k) => k in ID_FIELDS)
   assert.deepEqual(both, [])
+})
+
+test('every changes[].key in a projection fixture is an ID_FIELDS rule', () => {
+  for (const change of projectionChangesFixture.changes) {
+    assert.ok(change.key in ID_FIELDS, `${change.key} must be routable when carried in changes[].key`)
+  }
 })
