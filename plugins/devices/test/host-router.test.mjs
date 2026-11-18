@@ -229,6 +229,37 @@ test('rename round-trip: nested ids, subagent ids, arrays and $events payloads',
   assert.deepEqual([...hostIdsIn({ args: { sessionId: 'h:hostB:s1', sessionIds: ['h:hostC:s2'] } })], ['hostB', 'hostC'])
 })
 
+test('projection changes[].val is renamed by ID_FIELDS[key], but a stray {key,val} is not', () => {
+  // A live projection frame carries `{key:'subagentCatalog', val:[{id:'c1'}]}`.
+  // The native store folds that pair into the same projection value a baseline
+  // holds under `subagentCatalog`, so the child id must get the SAME namespace.
+  const local = {
+    type: 'projection', sessionId: 'h:hostB:s1', seq: 4,
+    changes: [
+      { key: 'subagentCatalog', val: [{ id: 'h:hostB:c1', mode: 'one-shot' }] },
+      { key: 'title', val: 'plain title' },
+    ],
+    // Not inside a `changes` array: the pair is ordinary data, never a rename.
+    stray: { key: 'foo', val: { id: 'z' } },
+  }
+  const raw = {
+    type: 'projection', sessionId: 's1', seq: 4,
+    changes: [
+      { key: 'subagentCatalog', val: [{ id: 'c1', mode: 'one-shot' }] },
+      { key: 'title', val: 'plain title' },
+    ],
+    stray: { key: 'foo', val: { id: 'z' } },
+  }
+  assert.deepEqual(namespaceIds(raw, 'hostB'), local)
+  assert.deepEqual(stripHostIds(local, 'hostB'), raw)
+  assert.deepEqual([...hostIdsIn(local)], ['hostB'])
+  // The tag detector must see a hidden pre-tagged id, with the same blind spot
+  // closed as in the renamer: this is what #refuseTagged relies on.
+  assert.deepEqual([...taggedIdsIn({ changes: [{ key: 'subagentCatalog', val: [{ id: 'h:otherHost:x' }] }] })], ['h:otherHost:x'])
+  assert.deepEqual([...taggedIdsIn({ stray: { key: 'foo', val: { id: 'h:otherHost:x' } } })], [],
+    'a {key,val} outside changes stays opaque')
+})
+
 // -- install / self-test ---------------------------------------------------
 
 test('the most fundamental failure wins: gateway presence and carrier methods precede the version', () => {
@@ -813,7 +844,7 @@ async function openEventsStream(harness) {
   const iterator = source[Symbol.asyncIterator]()
   const ready = iterator.next()
   await new Promise((resolve) => setImmediate(resolve))
-  harness.localStreams[0].queue.push({ type: 'ready', clientId: 'c1', host: { home: '/home/owner' } })
+  harness.localStreams.at(-1).queue.push({ type: 'ready', clientId: 'c1', host: { home: '/home/owner' } })
   assert.equal((await ready).value.type, 'ready')
   return { control, iterator }
 }
@@ -1987,6 +2018,114 @@ test('session/control emits one opening baseline: a delayed remote baseline beco
   assertNoNamespacedId(hostB)
   control.abort()
   await iterator.return()
+})
+
+test('a projection frame with a pre-tagged subagent id is refused: no frame, remote/id-leak', async () => {
+  // The whole frame goes through #ingress, whose tag detector must look INSIDE
+  // `changes[].val`: a compromised Host must not be able to name another host's
+  // child-session namespace just because the id sits in a live change pair.
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const harness = createHarness({ remotes: [hostB], controlBaseline: null })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const nextControl = createControlProtocolReader()
+  assert.equal((await nextControl(iterator, 'opening baseline')).type, 'baseline')
+
+  hostB.send({ type: 'projection', sessionId: 's1', seq: 8,
+    changes: [{ key: 'subagentCatalog', val: [{ id: 'h:otherHost:x', mode: 'one-shot' }] }] })
+  const quiet = await frameWithin(iterator, 60)
+  assert.equal(quiet, null, 'the hostile catalog value was not published')
+  assert.ok(harness.logs.some((line) => line.includes('remote/id-leak')), JSON.stringify(harness.logs))
+  control.abort()
+  await iterator.return()
+})
+
+test('a late catalog baseline is re-sent with namespaced subagent ids', async () => {
+  // #controlBaselineFrames rebuilds a late cut as `{changes:[{key,val}]}` frames
+  // from the RAW baseline; the rebuilt frames must go through the same rename as
+  // a live projection and as the opening baseline's projection values.
+  const block = { kind: 'sequenced', asOfSeq: 3, values: { subagentCatalog: [{ id: 'c1', mode: 'one-shot' }] } }
+  const hostB = createFakeRemote('hostB', 'Host B')
+  const controlQueues = []
+  const originalOpenStream = hostB.connection.openStream.bind(hostB.connection)
+  hostB.connection.openStream = async (endpoint, args, options) => {
+    if (endpoint !== 'session/control') return originalOpenStream(endpoint, args, options)
+    const queue = createQueue()
+    controlQueues.push(queue)
+    return queue
+  }
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  const source = await harness.gateway.openWireStream('session/control', { args: {} },
+    undefined, {}, control.signal, control, 64)
+  const iterator = source[Symbol.asyncIterator]()
+  const nextControl = createControlProtocolReader()
+  assert.equal((await nextControl(iterator, 'opening baseline')).type, 'baseline')
+
+  controlQueues[0].push({ type: 'baseline', value: { projections: { s1: block } } })
+  assert.deepEqual(await nextControl(iterator, 'late catalog projection'), {
+    type: 'projection', sessionId: 'h:hostB:s1', seq: 3,
+    changes: [{ key: 'subagentCatalog', val: [{ id: 'h:hostB:c1', mode: 'one-shot' }] }],
+  })
+  assertNoNamespacedId(hostB)
+  control.abort()
+  await iterator.return()
+})
+
+test('baseline + live catalog projection give the running dot the same namespaced child id', async () => {
+  // DSH's row renders its running dot by matching catalogEntry.id against
+  // api-session/status ids. Both sides must name `c1` as `h:hostB:c1`.
+  const block = { kind: 'sequenced', asOfSeq: 4, values: {
+    subagentCatalog: [{ id: 'c1', mode: 'continuable', label: 'child' }],
+  } }
+  const hostB = createFakeRemote('hostB', 'Host B', {
+    controlProjections: { s1: block },
+    replies: { 'session/list': { items: [] } },
+  })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  const control = new AbortController()
+  try {
+    const source = await harness.gateway.openWireStream('session/control', { args: {} },
+      undefined, {}, control.signal, control, 64)
+    const iterator = source[Symbol.asyncIterator]()
+    const nextControl = createControlProtocolReader()
+    const opening = await nextControl(iterator, 'opening baseline')
+    assert.equal(opening.type, 'baseline')
+    const mergedBlock = opening.value.projections['h:hostB:s1']
+    assert.ok(mergedBlock, 'the remote catalog block is in the merged baseline')
+    assert.deepEqual(mergedBlock.values.subagentCatalog,
+      [{ id: 'h:hostB:c1', mode: 'continuable', label: 'child' }])
+
+    hostB.send({ type: 'projection', sessionId: 's1', seq: 5,
+      changes: [{ key: 'subagentCatalog', val: [{ id: 'c1', mode: 'one-shot', label: 'child' }] }] })
+    const live = await nextControl(iterator, 'live catalog projection')
+    assert.deepEqual(live, {
+      type: 'projection', sessionId: 'h:hostB:s1', seq: 5,
+      changes: [{ key: 'subagentCatalog', val: [{ id: 'h:hostB:c1', mode: 'one-shot', label: 'child' }] }],
+    })
+    // Fold both through the native store shape the controller reads: the dot's
+    // lookup key is the final catalog id, not the raw Host id.
+    const store = createNativeProjectionStore()
+    store.seed(mergedBlock)
+    for (const change of live.changes) store.apply('subagentCatalog', change.val, live.seq)
+    assert.deepEqual(store.get('subagentCatalog'), [{ id: 'h:hostB:c1', mode: 'one-shot', label: 'child' }])
+
+    const events = await openEventsStream(harness)
+    try {
+      pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 'c1', running: true })
+      assert.deepEqual((await nextFrame(events.iterator, 'child status')).value,
+        { type: 'emit', event: 'api-session/status', args: ['h:hostB:c1', true] })
+    } finally {
+      events.control.abort()
+      await events.iterator.return()
+    }
+    harness.router.uninstall()
+  } finally {
+    control.abort()
+  }
 })
 
 test('session/control emits one opening baseline: a late Local baseline also becomes projections', async () => {
@@ -3552,7 +3691,7 @@ const followArgs = () => ({ args: { request: { address: { kind: 'session', sessi
  * Router with an in-memory transcript cache and a host that stays in the inventory
  * while its link state (or its presence) is controlled by the test.
  */
-function createFirstOpenHarness({ cached = null, state = 'online', present = () => true, openStream } = {}) {
+function createFirstOpenHarness({ cached = null, state = 'online', present = () => true, openStream, firstOpenTimeoutMs } = {}) {
   const gateway = {
     // rc.1 arity, so the A1.1 self-test installs the wrapper.
     async dispatchRpc(endpoint, payload, signal, peer) { // eslint-disable-line no-unused-vars
@@ -3576,6 +3715,7 @@ function createFirstOpenHarness({ cached = null, state = 'online', present = () 
     hosts: () => (present() ? [host] : []),
     knownHosts: () => [{ hostId: 'hostB', hostName: 'Host B' }],
     onHostsChanged: () => () => {},
+    firstOpenTimeoutMs,
     log: (line) => logs.push(line),
   })
   router.install()
@@ -3700,6 +3840,131 @@ test('a pre-opening frame followed by a clean end fails visibly when no cache ca
     await assert.rejects(() => nextFrame(iterator, 'the visible first-open failure'),
       (error) => error.code === 'remote/host-offline')
     assert.equal(opened, 1, 'no reopen waited behind the unfinished opening')
+    control.abort()
+    await iterator.return()
+  } finally { h.router.uninstall() }
+})
+
+test('a stalled first follow open with a cache replays it at the timeout', async () => {
+  // The Host stays listed and online, `openStream` answers, but no opening snapshot
+  // ever arrives. DSH would stay in `openState:'loading'`; the bound must settle it.
+  let opened = 0
+  const h = createFirstOpenHarness({ cached: cachedFollow(), firstOpenTimeoutMs: 40,
+    openStream: async (endpoint, args, options) => {
+      opened += 1
+      return (async function* stalled() {
+        while (!options?.signal?.aborted) await new Promise((resolve) => setTimeout(resolve, 5))
+      })()
+    } })
+  try {
+    const control = new AbortController()
+    const source = await h.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, control.signal, control, 64)
+    const iterator = source[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'cached snapshot after stall')).value.type, 'snapshot')
+    assert.equal((await nextFrame(iterator, 'cached event after stall')).value.event.seq, 7)
+    assert.equal((await nextFrame(iterator, 'cache boundary after stall')).done, true)
+    assert.equal(opened, 1, 'the stalled stream was opened once and then stopped')
+    assert.ok(h.logs.some((line) => line.includes('first open stalled')), 'the stall is observed')
+    assert.ok(h.logs.some((line) => line.includes('replaying the cached transcript')), 'the replay is observed')
+    control.abort()
+    await iterator.return()
+  } finally { h.router.uninstall() }
+})
+
+test('a stalled first follow open with no cache fails visibly at the timeout', async () => {
+  // Both the open-then-stall shape (the stream answers, the snapshot never does) and
+  // the open-never-answers shape must settle. Neither may leave DSH loading.
+  const stalled = createFirstOpenHarness({ firstOpenTimeoutMs: 40,
+    openStream: async (endpoint, args, options) => (async function* stalled() {
+      while (!options?.signal?.aborted) await new Promise((resolve) => setTimeout(resolve, 5))
+    })() })
+  try {
+    const control = new AbortController()
+    const source = await stalled.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, control.signal, control, 64)
+    await assert.rejects(() => nextFrame(source[Symbol.asyncIterator](), 'the stalled open failure'),
+      (error) => error.code === 'remote/host-offline' && error.details?.reason === 'stalled-open')
+    assert.ok(stalled.logs.some((line) => line.includes('first open stalled')), 'the stall is observed')
+    assert.ok(stalled.logs.some((line) => line.includes('failing visibly')), 'the visible failure is observed')
+    control.abort()
+  } finally { stalled.router.uninstall() }
+
+  const hanging = createFirstOpenHarness({ firstOpenTimeoutMs: 40,
+    openStream: () => new Promise(() => {}) })
+  try {
+    await assert.rejects(() => bounded(hanging.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, new AbortController().signal, new AbortController(), 64), 'the hanging open'),
+    (error) => error.code === 'remote/host-offline' && error.details?.reason === 'stalled-open')
+  } finally { hanging.router.uninstall() }
+})
+
+test('an unusable snapshot-shaped frame does not disarm the first-open timeout', async () => {
+  // DSH rejects a `snapshot` without the assistant baseline/records before it reaches
+  // `openState:'open'`, so it is NOT an opening: a later stall must still settle from
+  // cache or visibly, even though a snapshot-SHAPED frame was already delivered.
+  const unusable = (options) => (async function* broken() {
+    yield { type: 'snapshot', cursor: 1, header: { version: 4, id: 's1' } }
+    while (!options?.signal?.aborted) await new Promise((resolve) => setTimeout(resolve, 5))
+  })()
+  const cached = createFirstOpenHarness({ cached: cachedFollow(), firstOpenTimeoutMs: 40,
+    openStream: async (endpoint, args, options) => unusable(options) })
+  try {
+    const control = new AbortController()
+    const source = await cached.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, control.signal, control, 64)
+    const iterator = source[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'snapshot-shaped frame')).value.type, 'snapshot')
+    // The cached replay is the usable opening the bound was waiting for.
+    const replayed = (await nextFrame(iterator, 'cached usable snapshot after unusable frame')).value
+    assert.deepEqual(replayed.assistantStream, { revision: 0 })
+    assert.equal((await nextFrame(iterator, 'cached event')).value.event.seq, 7)
+    assert.equal((await nextFrame(iterator, 'cache boundary')).done, true)
+    assert.ok(cached.logs.some((line) => line.includes('first open stalled')), 'the stall is observed')
+    control.abort()
+    await iterator.return()
+  } finally { cached.router.uninstall() }
+
+  const noCache = createFirstOpenHarness({ firstOpenTimeoutMs: 40,
+    openStream: async (endpoint, args, options) => unusable(options) })
+  try {
+    const control = new AbortController()
+    const source = await noCache.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, control.signal, control, 64)
+    const iterator = source[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'snapshot-shaped frame')).value.type, 'snapshot')
+    await assert.rejects(() => nextFrame(iterator, 'the visible stalled-open failure'),
+      (error) => error.code === 'remote/host-offline' && error.details?.reason === 'stalled-open')
+    control.abort()
+  } finally { noCache.router.uninstall() }
+})
+
+test('a delivered opening snapshot disarms the first-open timeout', async () => {
+  let opened = 0
+  let live
+  const h = createFirstOpenHarness({ cached: cachedFollow(), firstOpenTimeoutMs: 50,
+    openStream: async () => {
+      opened += 1
+      live = createQueue()
+      live.push({ type: 'snapshot', header: { version: 4, id: 's1' }, cursor: 1, records: [],
+        projections: { asOfSeq: 1, values: {} }, assistantStream: { revision: 0 } })
+      return live
+    } })
+  try {
+    const control = new AbortController()
+    const source = await h.gateway.openWireStream('session/follow', followArgs(),
+      undefined, {}, control.signal, control, 64)
+    const iterator = source[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'live opening')).value.type, 'snapshot')
+    // Outlive the (now disarmed) bound, then push live traffic: no cache replay, no
+    // visible failure, and no second open may be triggered by the timer.
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    h.logs.length = 0
+    live.push({ type: 'event', event: { seq: 2, type: 'user/message', data: { sessionId: 's1', text: 'after the bound' } } })
+    assert.equal((await nextFrame(iterator, 'live frame after the bound')).value.event.seq, 2)
+    assert.equal(opened, 1, 'the timer did not reopen the follow')
+    assert.equal(h.logs.some((line) => line.includes('first open stalled')), false)
+    assert.equal(h.logs.some((line) => line.includes('replaying the cached transcript')), false)
     control.abort()
     await iterator.return()
   } finally { h.router.uninstall() }

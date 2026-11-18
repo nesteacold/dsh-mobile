@@ -191,6 +191,13 @@ const QUESTION_CONTINUED_ENDPOINT = 'userQuestions/answer'
  */
 export const PINNED_DSH_VERSION = '0.2.2-rc.3'
 
+/**
+ * Stable revision marker of this router source, logged at install so a live Host can
+ * be matched to the code that produced it without reading files or hashing
+ * `import.meta` (spec 038 R8 diagnosis). Bumped when routing behavior changes.
+ */
+export const HOST_ROUTER_REVISION = '038-r3-first-open-timeout'
+
 /** Mirrors package.json engines.dsh; DSH evaluates it with semver includePrerelease. */
 export const DSH_ENGINES_RANGE = '>=0.2.2-rc.3 <0.3.0-0'
 
@@ -419,6 +426,17 @@ const isPlainObject = (value) => {
 }
 
 /**
+ * One `{type:'projection', changes:[{key, val}]}` element. The pairs carry the
+ * SAME projection values a baseline stores under `key`, so `val` has to be
+ * renamed by ID_FIELDS[`key`] just as a baseline value is. Only a `changes`
+ * array creates this reading — a stray `{key, val}` elsewhere is plain data.
+ */
+const isProjectionChange = (entry) => isPlainObject(entry)
+  && typeof entry.key === 'string'
+  && !UNSAFE_KEYS.has(entry.key)
+  && Object.hasOwn(entry, 'val')
+
+/**
  * DSH's `InboxWireState` is exactly these two hyphenated arrays. An id is the
  * only identity a splice needs to check; message bodies stay opaque here, so no
  * content is copied into a log or a synthetic frame beyond the wire value itself.
@@ -520,6 +538,18 @@ function rewriteIds(value, transform, seen = new Map(), depth = 0, selection) {
   seen.set(value, out)
   for (const [key, item] of Object.entries(value)) {
     if (UNSAFE_KEYS.has(key)) continue
+    if (key === 'changes' && Array.isArray(item)) {
+      // `val` is read as though it sat under `key` (e.g. `subagentCatalog`):
+      // otherwise a live child-session id stays raw while the same id in a
+      // baseline is namespaced, and the native status dot never matches.
+      out[key] = item.map((entry) => {
+        if (!isProjectionChange(entry)) return rewriteIds(entry, transform, seen, depth + 1, selection)
+        const { val: _val, ...rest } = entry
+        const renamed = rewriteIds({ [entry.key]: entry.val }, transform, seen, depth + 1, selection)
+        return { ...rewriteIds(rest, transform, seen, depth + 1, selection), val: renamed[entry.key] }
+      })
+      continue
+    }
     const rule = ID_FIELDS[key]
     if (rule === 'id') {
       out[key] = typeof item === 'string' ? transform(item) : item
@@ -819,6 +849,21 @@ function visitIds(value, visit, seen = new Set(), depth = 0) {
   }
   if (!isPlainObject(value)) return
   for (const [key, item] of Object.entries(value)) {
+    if (key === 'changes' && Array.isArray(item)) {
+      // Mirror `rewriteIds` exactly: a pre-tagged id hidden in `changes[].val`
+      // must be seen by `taggedIdsIn` too, or #refuseTagged would let a
+      // malicious Host mint another namespace's subagent id.
+      for (const entry of item) {
+        if (!isProjectionChange(entry)) {
+          visitIds(entry, visit, seen, depth + 1)
+          continue
+        }
+        const { val: _val, ...rest } = entry
+        visitIds(rest, visit, seen, depth + 1)
+        visitIds({ [entry.key]: entry.val }, visit, seen, depth + 1)
+      }
+      continue
+    }
     const rule = ID_FIELDS[key]
     if (rule === 'id') {
       if (typeof item === 'string') visit(item)
@@ -1685,6 +1730,8 @@ class MergeState {
  * @param {{append: Function, read: Function}} [deps.cache] offline transcript cache
  * @param {(line: string) => void} [deps.log]
  * @param {number} [deps.mergeBaselineTimeoutMs] how long the merged baseline waits for remotes
+ * @param {number} [deps.firstOpenTimeoutMs] how long a FIRST remote `session/follow` may stay
+ *   without a usable opening snapshot before the cache/visible-failure fallback (default 8000)
  * @param {string} [deps.dshVersion] the running DSH version (constitution A1.1 self-test)
  */
 export class HostRouter {
@@ -1698,6 +1745,7 @@ export class HostRouter {
   #outbox
   #log
   #baselineTimeoutMs
+  #firstOpenTimeoutMs
   #dshVersion
   #originals = null
       #root = null
@@ -1867,6 +1915,13 @@ export class HostRouter {
     this.#onlineHosts = new Set(this.#connectedHosts().map((host) => host.hostId))
     if (this.#outbox) this.#hostChangeUnsub = this.#onHostsChanged(() => this.#onLinkStateChanged())
     this.#baselineTimeoutMs = Number.isFinite(deps.mergeBaselineTimeoutMs) ? deps.mergeBaselineTimeoutMs : 3000
+    // A first remote follow stays in `openState:'loading'` until DSH sees a usable
+    // opening snapshot. Bound that wait so a Host that answers the open but stalls
+    // before its snapshot settles from cache or visibly (spec 038 R3). Positive and
+    // finite only: a zero/negative timer would fire before any Host could answer.
+    const firstOpenTimeoutMs = deps.firstOpenTimeoutMs
+    this.#firstOpenTimeoutMs = Number.isFinite(firstOpenTimeoutMs) && firstOpenTimeoutMs > 0
+      ? firstOpenTimeoutMs : 8000
     // A1.1: the wrap is gated on the declared `engines.dsh` range (not the pinned version), so the running version is
     // part of the self-test. A caller that cannot detect it gets no wrap.
     this.#dshVersion = typeof deps.dshVersion === 'string' ? deps.dshVersion : undefined
@@ -1878,7 +1933,7 @@ export class HostRouter {
     const reason = selfTest(this.#gateway, { dshVersion: this.#dshVersion })
     if (reason !== null) {
       this.#reason = reason
-      this.#log(`multi-host routing disabled: ${reason} (running DSH ${this.#dshVersion ?? 'unknown'}, declared ${DSH_ENGINES_RANGE}, last tested ${PINNED_DSH_VERSION})`)
+      this.#log(`multi-host routing disabled: ${reason} (revision ${HOST_ROUTER_REVISION}, running DSH ${this.#dshVersion ?? 'unknown'}, declared ${DSH_ENGINES_RANGE}, last tested ${PINNED_DSH_VERSION})`)
       return this.status()
     }
     const gateway = this.#gateway
@@ -1910,7 +1965,7 @@ export class HostRouter {
     gateway.openWireStream = wrappedOpen
     this.#installed = true
     this.#reason = null
-    this.#log(`multi-host routing installed (opens: ${rc1 ? 'rc1' : 'legacy'} arity)`)
+    this.#log(`multi-host routing installed (revision ${HOST_ROUTER_REVISION}, opens: ${rc1 ? 'rc1' : 'legacy'} arity)`)
     return this.status()
   }
 
@@ -3226,8 +3281,14 @@ export class HostRouter {
     let lastSeq = null
     /** Whether a frame ever reached the reader: a later opening is a RESUME. */
     let opened = false
-    /** R3 boundary: only a delivered opening snapshot ends the LOADING state. Pre-opening
-     * frames are not an opening and must not disable the cache/visible-failure fallback. */
+    /** Whether any snapshot-SHAPED frame reached the reader. Kept separate from the
+     * usable flag so a broad (torn/partial) snapshot still lets a re-opened follow
+     * resume normally after its link drops: the pump only replays the first-open
+     * cache/failure when NO opening of any shape was delivered. */
+    let snapshotShapedDelivered = false
+    /** R3 boundary: only a USABLE opening snapshot ends DSH's LOADING state. A
+     * snapshot-shaped frame without the Host's baseline/records is rejected by DSH
+     * before `openState:'open'`, so it must not disarm the bound or the fallback. */
     let openingSnapshotDelivered = false
     /**
      * The durable sequence the FIRST opening snapshot named: from then on a snapshot
@@ -3253,18 +3314,31 @@ export class HostRouter {
       resolve() { if (firstSettled) return; firstSettled = true; settleFirst.resolve() },
       reject(error) { if (firstSettled) return; firstSettled = true; settleFirst.reject(error) },
     }
+    /** The first-open timer, armed until a USABLE opening snapshot reaches the reader. */
+    let firstOpenTimer = null
+    /** The current attempt's source, so a stalled open can close it explicitly. */
+    let activeSource = null
+    const clearFirstOpenTimer = () => {
+      if (firstOpenTimer === null) return
+      clearTimeout(firstOpenTimer)
+      firstOpenTimer = null
+    }
     /**
      * While no opening snapshot has reached the reader, DSH stays in `loading`: a
      * pre-opening frame does not count. Replay the cached transcript read-only when
      * it can open a follow, otherwise fail visibly. Only after a real opening snapshot
      * is this an open follow, whose link failures resume normally (spec 038 R3).
+     * @param {'offline'|'stalled-open'} reason why the first open is being settled
      */
-    const firstOpenFallback = () => {
-      if (openingSnapshotDelivered) return false
+    let firstOpenFallbackDone = false
+    const firstOpenFallback = (reason = 'offline') => {
+      if (openingSnapshotDelivered || firstOpenFallbackDone) return false
+      firstOpenFallbackDone = true
+      clearFirstOpenTimer()
       const frames = this.#cachedFollowFrames(hostId, args)
       if (frames) {
         try {
-          this.#log(`session/follow of ${hostId} is offline: replaying the cached transcript`)
+          this.#log('session/follow first open: replaying the cached transcript read-only')
           for (const frame of frames) queue.push(this.#ingress(hostId, frame, 'cached transcript'))
           openingSnapshotDelivered = true
           queue.close()
@@ -3275,12 +3349,29 @@ export class HostRouter {
         }
         return true
       }
-      const terminal = new HostRouterError('remote/host-offline',
-        `remote host ${hostId} is offline and no cached transcript is available; the session history could not be loaded`, { hostId })
+      const message = reason === 'stalled-open'
+        ? 'the remote Host did not send an opening snapshot before the first-open timeout; the session history could not be loaded'
+        : `remote host ${hostId} is offline and no cached transcript is available; the session history could not be loaded`
+      const terminal = new HostRouterError('remote/host-offline', message, { hostId, reason })
+      this.#log('session/follow first open: no usable cache, failing visibly')
       settleFirstOnce.reject(terminal)
       queue.fail(terminal)
       return true
     }
+    // A Host can hold the link up, answer `openStream` and still never deliver its
+    // opening snapshot (a stalled pump). DSH stays in `openState:'loading'` forever
+    // unless the first open settles. Bound it here; the timer is dropped as soon as
+    // a USABLE snapshot is delivered, so an already-open follow keeps its normal
+    // long-running semantics and no later attempt is timed out (spec 038 R3).
+    firstOpenTimer = setTimeout(() => {
+      if (openingSnapshotDelivered) return
+      this.#log('session/follow first open stalled: no opening snapshot within the bound')
+      firstOpenFallback('stalled-open')
+      // Stop this attempt and do not wait for a Host that already proved it stalls.
+      try { activeSource?.return?.() } catch { /* the source is already closed */ }
+      stop()
+    }, this.#firstOpenTimeoutMs)
+    firstOpenTimer.unref?.()
     void (async () => {
       let attempt = 0
       /** Consecutive attempts that ended in a DESYNC without delivering a frame. */
@@ -3301,14 +3392,15 @@ export class HostRouter {
           // whose host vanished there must still settle: waiting for a host that is no
           // longer in the inventory is exactly the "Loading history..." hang.
           const host = this.#hostById(hostId)
-          if (!host && firstOpenFallback()) return
+          if (!host && !snapshotShapedDelivered && firstOpenFallback()) return
           if (!host) { await this.#awaitHost(hostId, lifetime.signal); continue }
           // A listed host can still be mid-drop: `#route` saw an online row, but its
           // link is no longer usable. `openStream` would then either wait for a dial
           // that never finishes or resolve a stream that fails before its snapshot.
           const linkState = typeof host.connection?.state === 'string' ? host.connection.state : null
-          if (linkState !== null && linkState !== 'online' && firstOpenFallback()) return
+          if (linkState !== null && linkState !== 'online' && !snapshotShapedDelivered && firstOpenFallback()) return
           const source = await host.connection.openStream(SESSION_FOLLOW_ENDPOINT, args, { signal: lifetime.signal })
+          activeSource = source
           // The attempt counter is NOT reset here: a Host that accepts the open and then
           // immediately DESYNCs would answer "open succeeded" every time and be retried
           // at the minimum 100 ms forever. Only a delivered frame (`progressed` below, // handled after the attempt) counts as the link working.
@@ -3411,7 +3503,15 @@ export class HostRouter {
               // A snapshot-shaped frame is the reader's opening boundary even if a
               // malformed one lacks the assistant baseline; only NON-snapshot frames
               // leave DSH loading and allow the R3 fallback (cache validation is stricter).
-              if (isSnapshotFrame(frame)) openingSnapshotDelivered = true
+              if (isSnapshotFrame(frame)) snapshotShapedDelivered = true
+              // Only a USABLE opening snapshot ends DSH's loading state. A snapshot-
+              // shaped frame that fails the validator (e.g. no assistantStream) leaves
+              // DSH in `openState:'loading'`, so it must neither disarm the bound nor
+              // suppress the cache/visible-failure fallback (spec 038 R3).
+              if (isOpeningSnapshotFrame(frame)) {
+                openingSnapshotDelivered = true
+                clearFirstOpenTimer()
+              }
               progressed = true
               queue.push(renamed)
             }
@@ -3483,10 +3583,11 @@ export class HostRouter {
             queue.fail(terminal)
             return
           }
-          // A stream that ends before its opening snapshot is an empty answer to a
-          // first open: settle it from the cache (or visibly) instead of leaving DSH
-          // waiting on a snapshot that will not arrive.
-          if (firstOpenFallback()) return
+          // A stream that ends before ANY opening snapshot is an empty answer to a
+          // first open: settle it from the cache (or visibly). A snapshot-shaped frame
+          // that failed validation still counts as an opening here so the follow can
+          // resume; the first-open timer separately bounds that unusable opening.
+          if (!snapshotShapedDelivered && firstOpenFallback()) return
         } catch (error) {
           if (lifetime.signal.aborted) break
           // A re-opened page left holding an event past a hole, and the Host dropped
@@ -3510,10 +3611,12 @@ export class HostRouter {
             queue.fail(error)
             return
           }
-          // The link failed before the reader saw a snapshot. This is still the FIRST
+          // The link failed before the reader saw ANY snapshot. This is still the FIRST
           // open, not an open follow, so it must not wait for the Host behind an empty
           // queue: replay the cache or fail with a visible remote error (spec 038 R3).
-          if (firstOpenFallback()) return
+          // A broad snapshot was delivered: let the pump resume as an open follow; the
+          // bound above still settles it if that snapshot never becomes usable.
+          if (!snapshotShapedDelivered && firstOpenFallback()) return
           if (error?.code === STREAM_DESYNC_CODE) {
             // Counted only while the reader got nothing: a desync AFTER a delivered frame
             // is the first of a new series, not a continuation of a stuck one.
@@ -3549,6 +3652,7 @@ export class HostRouter {
       if (!lifetime.signal.aborted) queue.fail(error)
       settleFirstOnce.reject(error)
     }).finally(() => {
+      clearFirstOpenTimer()
       signal?.removeEventListener?.('abort', onAbort)
       this.#merges.delete(stop)
       this.#untrackFollow(hostId, stop)

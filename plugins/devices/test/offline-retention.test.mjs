@@ -42,7 +42,7 @@ function queue() {
   }
 }
 
-function harness({ dir = tempDir(), workspaces = [], sessions = [], offlineHostListed = false } = {}) {
+function harness({ dir = tempDir(), workspaces = [], sessions = [], offlineHostListed = false, firstOpenTimeoutMs } = {}) {
   const gateway = {
     async dispatchRpc(endpoint, payload, signal, peer) { // eslint-disable-line no-unused-vars
       return { ok: true, value: { items: endpoint === 'session/list' ? [] : {} } }
@@ -81,7 +81,7 @@ function harness({ dir = tempDir(), workspaces = [], sessions = [], offlineHostL
   const retention = createRetentionStore({ dir })
   const cache = createSessionCache({ dir: path.join(dir, 'sessions') })
   const router = createHostRouter({
-    gateway, dshVersion: PINNED_DSH_VERSION, retention, cache, mergeBaselineTimeoutMs: 30,
+    gateway, dshVersion: PINNED_DSH_VERSION, retention, cache, mergeBaselineTimeoutMs: 30, firstOpenTimeoutMs,
     // A link can still be in the inventory after it died: the route succeeds, but
     // its connection state is no longer online. The first open must use the cache.
     hosts: () => (connected.has('hostB')
@@ -248,5 +248,26 @@ test('a first follow open on a dead link still listed in the inventory replays i
     assert.equal((await nextFrame(iterator, 'cached snapshot')).value.type, 'snapshot')
     assert.equal((await nextFrame(iterator, 'cached event')).value.event.seq, 2)
     assert.equal((await nextFrame(iterator, 'cache boundary')).done, true)
+  } finally { h.close(); cleanup(h.dir) }
+})
+
+test('a live Host that stalls before its opening snapshot replays the real cache at the timeout', async () => {
+  // The link is up and the stream open is accepted, but the Host never sends its
+  // opening snapshot. With a persisted cache the first open must still settle:
+  // the timeout replays the cached transcript read-only instead of hanging in
+  // `openState:'loading'` (spec 038 R3).
+  const h = harness({ firstOpenTimeoutMs: 50 })
+  try {
+    h.cache.append('hostB', 's1', { type: 'snapshot', header: { version: 4, id: 's1' }, cursor: 1,
+      records: [], projections: { asOfSeq: 1, values: {} }, assistantStream: { revision: 0 } })
+    h.cache.append('hostB', 's1', { type: 'event', event: { type: 'user/message', seq: 2, data: { sessionId: 's1' } } })
+    const stream = await h.gateway.openWireStream('session/follow',
+      { args: { request: { address: { kind: 'session', sessionId: 'h:hostB:s1' } } } },
+      undefined, {}, new AbortController().signal, new AbortController(), 64)
+    const iterator = stream[Symbol.asyncIterator]()
+    assert.equal((await nextFrame(iterator, 'cached snapshot after stall')).value.type, 'snapshot')
+    assert.equal((await nextFrame(iterator, 'cached event after stall')).value.event.seq, 2)
+    assert.equal((await nextFrame(iterator, 'cache boundary after stall')).done, true)
+    assert.equal(h.remoteOpens, 1, 'the stalled stream was opened once, then stopped')
   } finally { h.close(); cleanup(h.dir) }
 })
