@@ -472,3 +472,18 @@ html, body { overflow-x: clip; }
 p, li, dd, summary, .product-card, .product-card > *, .tailscale-step > div, .section-head > * { min-width: 0; overflow-wrap: anywhere; }
 pre, code { max-width: 100%; }
 pre { overflow-x: auto; }
+
+/* Real product screenshots in the experience tabs. */
+.shot-figure { margin: 0 0 20px; }
+.shot-figure img { display: block; width: 100%; height: auto; border: 1px solid var(--line); border-radius: 14px; background: #fff; }
+.shot-figure figcaption { margin-top: 10px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+
+/* Quick scroll buttons (fixed, bottom-right). */
+.page-jump { position: fixed; right: 16px; bottom: 16px; z-index: 90; display: flex; flex-direction: column; gap: 8px; }
+.jump-btn {
+  display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px;
+  border: 1px solid var(--line); border-radius: 50%; background: #0b2941; color: var(--accent);
+  cursor: pointer; box-shadow: 0 6px 18px rgb(0 0 0 / 35%);
+}
+.jump-btn:hover { border-color: var(--accent); color: var(--text); }
+.jump-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

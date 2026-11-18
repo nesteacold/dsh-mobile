@@ -275,6 +275,16 @@
     });
   });
 
+  /* ---------- quick scroll: top / bottom ---------- */
+  function jumpTo(top) {
+    var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    window.scrollTo({ top: top, behavior: reduce ? 'auto' : 'smooth' });
+  }
+  var jumpTop = document.getElementById('jump-top');
+  var jumpBottom = document.getElementById('jump-bottom');
+  if (jumpTop) jumpTop.addEventListener('click', function () { jumpTo(0); });
+  if (jumpBottom) jumpBottom.addEventListener('click', function () { jumpTo(document.documentElement.scrollHeight); });
+
   updateDesktopState();
   updateSetupStep();
 })();

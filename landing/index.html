@@ -239,6 +239,10 @@
               <input class="wiki-search" id="wiki-search" type="search" placeholder="pairing, argsHash, gateway…" data-i18n-placeholder="wiki.search.placeholder" data-i18n-aria="wiki.search">
               <p class="sim-note" data-i18n="wiki.note">MCP mặc định dùng stdio; 5 công cụ tra cứu: wiki_search, wiki_page, wiki_cards, wiki_impact, wiki_status.</p>
             </div>
+            <figure class="shot-figure">
+              <img src="assets/screens/wiki-page.png" width="1360" height="760" loading="lazy" alt="Trang Repo Wiki mẫu" data-i18n-alt="shot.wiki-page.alt">
+              <figcaption data-i18n="shot.wiki-page.cap"></figcaption>
+            </figure>
             <div class="window-mock wiki-mock" aria-label="Mô phỏng trang Repo Wiki" data-i18n-aria="wiki.mock">
               <div class="window-bar"><span class="window-dot"></span><span class="window-dot"></span><span class="window-dot"></span><span class="window-title" data-i18n="wiki.window">.dsh-wiki / knowledge</span></div>
               <div class="wiki-body">
@@ -264,6 +268,10 @@
                 <button type="button" class="btn btn-secondary btn-small" id="vscode-revert" data-i18n="vscode.revert">Hoàn tác lượt</button>
               </div>
             </div>
+            <figure class="shot-figure">
+              <img src="assets/screens/vscode-chat.png" width="1280" height="810" loading="lazy" alt="Bản xem trước DSH for VS Code" data-i18n-alt="shot.vscode-chat.alt">
+              <figcaption data-i18n="shot.vscode-chat.cap"></figcaption>
+            </figure>
             <div class="window-mock ide-mock" aria-label="Mô phỏng giao diện IDE" data-i18n-aria="vscode.mock">
               <div class="window-bar"><span class="window-dot"></span><span class="window-dot"></span><span class="window-dot"></span><span class="window-title" data-i18n="vscode.window">DSH · ACP Session</span></div>
               <div class="ide-body">
@@ -462,6 +470,11 @@ endpoints:
     </div>
     <div class="wrap footer-bottom" data-i18n="footer.bottom">Host executes. Your devices control. · Zero telemetry · Zero public relay.</div>
   </footer>
+
+  <div class="page-jump" role="group" aria-label="Cuộn nhanh" data-i18n-aria="jump.group">
+    <button type="button" class="jump-btn" id="jump-top" aria-label="Lên đầu trang" data-i18n-aria="jump.top"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false"><path d="M6 15l6-6 6 6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    <button type="button" class="jump-btn" id="jump-bottom" aria-label="Xuống cuối trang" data-i18n-aria="jump.bottom"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+  </div>
 
   <dialog class="screenshot-dialog glass" id="lightbox-dialog" data-kind="dark" aria-labelledby="lightbox-title">
     <div class="lightbox-inner">

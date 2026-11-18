@@ -6,6 +6,9 @@
 
   var vi = {
     'skip': 'Chuyển đến nội dung chính',
+    'jump.group': 'Cuộn nhanh',
+    'jump.top': 'Lên đầu trang',
+    'jump.bottom': 'Xuống cuối trang',
     'nav.ecosystem': 'Sản phẩm',
     'nav.experience': 'Xem giao diện',
     'nav.architecture': 'Bảo mật',
@@ -141,6 +144,10 @@
 
     'vscode.title': 'Chat và duyệt Diff ngay trong VS Code',
     'vscode.badge': 'v0.1.0 · Đang phát triển',
+    'shot.wiki-page.alt': 'Trang Repo Wiki mẫu: cây điều hướng bên trái, ô tìm kiếm, trích dẫn auth.py:6 và sơ đồ luồng đăng nhập',
+    'shot.wiki-page.cap': 'Ảnh chụp site do trình dựng dsh-wiki thật tạo từ một repo mẫu nhỏ (tự kiểm tra: 4/4 trích dẫn path:line hợp lệ, không liên kết ngoài).',
+    'shot.vscode-chat.alt': 'Bản xem trước DSH for VS Code: thanh bên phiên, đoạn chat và thẻ duyệt thay đổi file với nút Reject và Allow once',
+    'shot.vscode-chat.cap': 'Bản xem trước giao diện tĩnh (docs/ui-preview.html) với dữ liệu mẫu. Chưa phải bản phát hành trên Marketplace.',
     'vscode.arch': 'Bản mô phỏng giao diện — chưa phát hành trên VS Code Marketplace.',
     'vscode.desc': 'Mở khung chat ACP v1 cạnh file code, xem trước diff thật do agent đề xuất và bấm Revert để trả về snapshot đầu lượt nếu cần.',
     'vscode.approve': 'Duyệt thay đổi',
@@ -266,6 +273,9 @@
 
   var en = {
     'skip': 'Skip to main content',
+    'jump.group': 'Quick scroll',
+    'jump.top': 'Back to top',
+    'jump.bottom': 'Jump to bottom',
     'nav.ecosystem': 'Products',
     'nav.experience': 'Preview UI',
     'nav.architecture': 'Security',
@@ -401,6 +411,10 @@
 
     'vscode.title': 'Chat and review diffs right inside VS Code',
     'vscode.badge': 'v0.1.0 · In Development',
+    'shot.wiki-page.alt': 'Sample Repo Wiki page: navigation tree on the left, search box, an auth.py:6 citation and a login flow diagram',
+    'shot.wiki-page.cap': 'Screenshot of a site produced by the real dsh-wiki builder from a small sample repo (selfcheck: 4/4 path:line citations resolve, zero external links).',
+    'shot.vscode-chat.alt': 'DSH for VS Code preview: sessions side bar, chat and a file-edit approval card with Reject and Allow once buttons',
+    'shot.vscode-chat.cap': 'Static UI preview (docs/ui-preview.html) with sample data. Not a Marketplace release.',
     'vscode.arch': 'Interface mockup — not yet published to the VS Code Marketplace.',
     'vscode.desc': 'Keep an ACP v1 chat pane next to your code, review native VS Code diffs before edits apply, and hit Revert to restore the turn snapshot.',
     'vscode.approve': 'Approve diff',

@@ -113,7 +113,7 @@ body { isolation: isolate; }
 /* ---------- Low/static/reduced-motion fallbacks ---------- */
 /* Keep them cheap and readable: no animated backdrop filters or complex
    replacement displacement maps. */
-.header.glass { -webkit-backdrop-filter: none; backdrop-filter: none; }
+.header.glass { -webkit-backdrop-filter: none; backdrop-filter: none; background: #06172b !important; }
 :root[data-render-quality="low"] .glass,
 :root[data-render-quality="static"] .glass {
   background: rgb(7 28 49 / 90%) !important;
