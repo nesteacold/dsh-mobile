@@ -494,6 +494,38 @@ describe('CompanionClient over the fake gateway', () => {
     }
   });
 
+  it('parses and dispatches question-requested / question-resolved pushes', async () => {
+    const qGateway = await FakeGateway.create({ tokens: ['tok-question'] });
+    try {
+      const client = makeClient();
+      const seen: unknown[] = [];
+      const resolved: unknown[] = [];
+      const gotQuestion = deferred<void>();
+      const gotResolved = deferred<void>();
+      client.on('questionRequested', (frame) => { seen.push(frame); gotQuestion.resolve(); });
+      client.on('questionResolved', (frame) => { resolved.push(frame); gotResolved.resolve(); });
+      await connectReady(client, qGateway, 'tok-question');
+      const question = { id: 'q1', header: 'Pick one', options: [{ label: 'a' }] };
+      qGateway.pushQuestionRequested({ rpcId: '', sessionId: 's1', questions: [question] });
+      qGateway.pushQuestionRequested({ rpcId: 'q-1', sessionId: 's1', questions: 'not-an-array' });
+      qGateway.pushQuestionRequested({ rpcId: 'q-2', sessionId: 's1', questions: [question], callId: 'call-2', replay: true });
+      await gotQuestion.promise;
+      assert.equal(seen.length, 1, 'only the well-formed frame was emitted');
+      const frame = seen[0] as Record<string, unknown>;
+      assert.deepEqual(frame, {
+        kind: 'question-requested', rpcId: 'q-2', sessionId: 's1',
+        questions: [question], callId: 'call-2', replay: true,
+      });
+      qGateway.pushQuestionResolved({ rpcId: 'q-2', sessionId: 's1', outcome: 'answered' });
+      await gotResolved.promise;
+      qGateway.pushQuestionResolved({ rpcId: 'q-2', sessionId: 's1', outcome: 'bogus' });
+      assert.deepEqual(resolved, [{ kind: 'question-resolved', rpcId: 'q-2', sessionId: 's1', outcome: 'answered' }]);
+      client.close();
+    } finally {
+      await qGateway.close();
+    }
+  });
+
   it('pings every interval with a fresh requestId', async () => {
     const pingGateway = await FakeGateway.create({ tokens: ['tok-ping'] });
     try {

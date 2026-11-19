@@ -161,6 +161,10 @@ export type MessageKey =
   | 'pair.modeOtp'
   | 'pair.otpAddress'
   | 'pair.otpAddressPlaceholder'
+  // Spec 054 — native certificate pin from the pairing link.
+  | 'pair.otpPin'
+  | 'pair.otpPinPlaceholder'
+  | 'pair.error.addressPinRequired'
   // Spec 031 §8: the browser shows its current origin as read-only text, and refuses the code flow
   // outright on a host that is not the gateway's origin.
   | 'pair.webAddressLabel'
@@ -372,6 +376,15 @@ export type MessageKey =
   | 'approval.rejected'
   | 'approval.cancelledElsewhere'
   | 'approval.unavailableElsewhere'
+  // human questions (spec 018)
+  | 'question.title'
+  | 'question.header'
+  | 'question.custom'
+  | 'question.submit'
+  | 'question.skip'
+  | 'question.sent'
+  | 'question.notice'
+  | 'question.resolved'
   // banners / notifications
   | 'banner.reconnecting'
   | 'banner.offline'
@@ -604,6 +617,9 @@ const en = {
   'pair.modeOtp': '8-digit code',
   'pair.otpAddress': 'Your computer’s address',
   'pair.otpAddressPlaceholder': '192.168.1.20:3081',
+  'pair.otpPin': 'Computer certificate fingerprint',
+  'pair.otpPinPlaceholder': '64 hexadecimal characters from the pairing link',
+  'pair.error.addressPinRequired': 'This code needs the computer address and its certificate fingerprint from the pairing link. Scan that QR or paste its full link.',
   // Spec 031 §8: what the PWA dials is whatever page it was opened from — the owner must see it, and
   // cannot type over it (a typed address used to be ignored, which read as a bug).
   'pair.webAddressLabel': 'This page connects through its own address',
@@ -796,6 +812,14 @@ const en = {
   'approval.rejected': 'Rejected',
   'approval.cancelledElsewhere': 'Cancelled on another device.',
   'approval.unavailableElsewhere': 'No longer available.',
+  'question.title': 'Question',
+  'question.header': '{header}',
+  'question.custom': 'Custom answer',
+  'question.submit': 'Submit',
+  'question.skip': 'Skip',
+  'question.sent': 'Answer sent',
+  'question.notice': 'The question was not accepted. Try again.',
+  'question.resolved': 'Answered on another device.',
   'banner.reconnecting': 'Reconnecting…',
   'banner.offline': 'Offline — showing the last known state.',
   'banner.gatewayOff': 'Remote control is off on your computer. Auto-reconnect is paused.',
@@ -1006,6 +1030,9 @@ const vi = {
   'pair.modeOtp': 'Mã 8 số',
   'pair.otpAddress': 'Địa chỉ máy tính của bạn',
   'pair.otpAddressPlaceholder': '192.168.1.20:3081',
+  'pair.otpPin': 'Vân tay chứng chỉ của máy tính',
+  'pair.otpPinPlaceholder': '64 ký tự hex từ liên kết ghép đôi',
+  'pair.error.addressPinRequired': 'Mã này cần địa chỉ máy tính và vân tay chứng chỉ từ liên kết ghép đôi. Hãy quét mã QR đó hoặc dán toàn bộ liên kết.',
   'pair.webAddressLabel': 'Trang này kết nối qua chính địa chỉ của nó',
   'pair.webOrigin': 'Trang hiện tại: {origin}',
   'pair.webOriginFixed': 'Gateway được truy cập tại {url} — địa chỉ này cố định theo trang bạn mở, nên không có gì để nhập ở đây.',
@@ -1193,6 +1220,14 @@ const vi = {
   'approval.rejected': 'Đã từ chối',
   'approval.cancelledElsewhere': 'Đã huỷ trên thiết bị khác.',
   'approval.unavailableElsewhere': 'Không còn hiệu lực.',
+  'question.title': 'Câu hỏi',
+  'question.header': '{header}',
+  'question.custom': 'Câu trả lời khác',
+  'question.submit': 'Gửi',
+  'question.skip': 'Bỏ qua',
+  'question.sent': 'Đã gửi câu trả lời',
+  'question.notice': 'Câu trả lời chưa được chấp nhận. Hãy thử lại.',
+  'question.resolved': 'Đã trả lời trên thiết bị khác.',
   'banner.reconnecting': 'Đang kết nối lại…',
   'banner.offline': 'Ngoại tuyến — đang hiển thị trạng thái gần nhất.',
   'banner.gatewayOff': 'Điều khiển từ xa đang tắt trên máy tính. Tự kết nối lại đã tạm dừng.',

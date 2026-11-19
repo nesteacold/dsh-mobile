@@ -1099,6 +1099,25 @@ export interface ApprovalResolvedFrame {
   outcome: FinalApprovalOutcome
 }
 
+/** Spec 018 item 4: a human question card pushed to a paired device (gateway `question-requested`). */
+export interface QuestionRequestedFrame {
+  kind: 'question-requested'
+  rpcId: string
+  sessionId: string
+  questions: Array<Record<string, unknown>>
+  /** Host tool-call id used to key the pending question; absent only for a legacy Host. */
+  callId?: string
+  replay?: boolean
+}
+
+/** Spec 018 item 4: the question was answered or cancelled (gateway `question-resolved`). */
+export interface QuestionResolvedFrame {
+  kind: 'question-resolved'
+  rpcId: string
+  sessionId: string
+  outcome: 'answered' | 'cancelled'
+}
+
 export interface SentFrame {
   kind: 'sent'
   requestId: string

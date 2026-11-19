@@ -71,6 +71,8 @@ import {
   type ApprovalRequestedFrame,
   type ApprovalResolvedFrame,
   type DeviceInfo,
+  type QuestionRequestedFrame,
+  type QuestionResolvedFrame,
   type HelloFrame,
   type Op,
   type PairedFrame,
@@ -130,6 +132,10 @@ export interface ClientEventMap {
   approvalRequested: ApprovalRequestedFrame;
   /** Server push `approval-resolved` (decided here, on the desktop, or gone). */
   approvalResolved: ApprovalResolvedFrame;
+  /** Spec 018 — gateway `question-requested` push (a human question for this device). */
+  questionRequested: QuestionRequestedFrame;
+  /** Spec 018 — gateway `question-resolved` push (answered or cancelled elsewhere). */
+  questionResolved: QuestionResolvedFrame;
   /** Server push `event` (session updates); payload is passed through. */
   event: Record<string, unknown>;
   /**
@@ -1237,6 +1243,16 @@ export class CompanionClient {
         if (push !== null) this.emit('approvalResolved', push, 'frame:approval-resolved');
         return;
       }
+      case 'question-requested': {
+        const push = parseQuestionRequested(f);
+        if (push !== null) this.emit('questionRequested', push, 'frame:question-requested');
+        return;
+      }
+      case 'question-resolved': {
+        const push = parseQuestionResolved(f);
+        if (push !== null) this.emit('questionResolved', push, 'frame:question-resolved');
+        return;
+      }
       case 'event':
         this.emit('event', f, 'frame:event');
         return;
@@ -2144,9 +2160,38 @@ function parseApprovalResolved(f: Record<string, unknown>): ApprovalResolvedFram
   };
 }
 
+/** Spec 018: a question push is accepted only with the ids and question list the UI needs. */
+function parseQuestionRequested(f: Record<string, unknown>): QuestionRequestedFrame | null {
+  for (const key of ['rpcId', 'sessionId'] as const) {
+    const value = f[key];
+    if (typeof value !== 'string' || value.length === 0) return null;
+  }
+  if (!Array.isArray(f.questions)) return null;
+  const frame: QuestionRequestedFrame = {
+    kind: 'question-requested',
+    rpcId: f.rpcId as string,
+    sessionId: f.sessionId as string,
+    // Question text is kept in memory only: never logged, never persisted.
+    questions: f.questions as Array<Record<string, unknown>>,
+    ...(typeof f.callId === 'string' && f.callId !== '' ? { callId: f.callId } : {}),
+    ...(typeof f.replay === 'boolean' ? { replay: f.replay } : {}),
+  };
+  return frame;
+}
+
+function parseQuestionResolved(f: Record<string, unknown>): QuestionResolvedFrame | null {
+  for (const key of ['rpcId', 'sessionId'] as const) {
+    const value = f[key];
+    if (typeof value !== 'string' || value.length === 0) return null;
+  }
+  const outcome = f.outcome;
+  if (outcome !== 'answered' && outcome !== 'cancelled') return null;
+  return { kind: 'question-resolved', rpcId: f.rpcId as string, sessionId: f.sessionId as string, outcome };
+}
+
 function isStringRecord(value: unknown): value is Record<string, string> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     && Object.values(value as Record<string, unknown>).every((v) => typeof v === 'string');
 }
 
-export type { PairedFrame, ApprovalRequestedFrame, ApprovalResolvedFrame };
+export type { PairedFrame, ApprovalRequestedFrame, ApprovalResolvedFrame, QuestionRequestedFrame, QuestionResolvedFrame };
