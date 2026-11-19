@@ -8,6 +8,12 @@
 // Why a file: the failure this exists for (the host's `hello` was reported as delivered to JS, the
 // bearer socket still died on its 10 s handshake deadline) is decided inside JS, and a release
 // build's JS console is attached to nothing. Read the trace with `e2e/device/pull-debug-log.ps1`.
+//
+// The web (PWA) target has no `expo-file-system`, so the same flag there routes the trace to the
+// browser console instead: the operator opens Safari's or Chrome's devtools and reads the lines
+// live. Same flag, same redacted text — only the destination differs.
+
+import { Platform } from 'react-native';
 
 import type { File as ExpoFile } from 'expo-file-system';
 
@@ -90,13 +96,45 @@ export function createDebugLogFileSink(options: { directory?: string } = {}): Lo
   };
 }
 
+/** Which `Platform.OS` the sink choice is made for, and the console it writes to. */
+export interface DebugLogSinkEnv {
+  readonly platform?: string;
+  readonly console?: Pick<Console, 'log' | 'warn' | 'error'>;
+}
+
 /**
- * The sinks the controller's `DebugLog` is constructed with: empty in every normal build, the file
- * sink only when the build set `EXPO_PUBLIC_DSH_DEBUG_LOG=1` (Expo inlines `EXPO_PUBLIC_*` at
- * build time, so this flag is a build decision, not something a released app can turn on).
+ * The sinks the controller's `DebugLog` is constructed with: empty in every normal build, one
+ * console sink on web and the file sink on native, but only when the build set
+ * `EXPO_PUBLIC_DSH_DEBUG_LOG=1` (Expo inlines `EXPO_PUBLIC_*` at build time, so this flag is a build
+ * decision, not something a released app can turn on).
+ *
+ * The console sink is the web counterpart of the file: `expo-file-system` does not exist in a
+ * browser, and the operator's devtools is the only place that reaches them there.
+ *
+ * `env` exists so the web branch is testable: Node tests run with `Platform.OS === 'android'` (the
+ * shared stub), and a test must never turn on the real console. Nothing in the app passes it.
  */
-export function debugLogSinksFromEnv(): LogSink[] {
+export function debugLogSinksFromEnv(env: DebugLogSinkEnv = {}): LogSink[] {
   if (process.env.EXPO_PUBLIC_DSH_DEBUG_LOG !== '1') return [];
+  const platform = env.platform ?? Platform.OS;
+  if (platform === 'web') return [createDebugLogConsoleSink(env.console)];
   const sink = createDebugLogFileSink();
   return sink === null ? [] : [sink];
+}
+
+/** `[dsh] <level> <text>` — level names the method, so a devtools filter matches on severity. */
+export function createDebugLogConsoleSink(
+  target: Pick<Console, 'log' | 'warn' | 'error'> = console,
+): LogSink {
+  return (line: LogLine) => {
+    const text = `[dsh] ${line.level} ${line.text}`;
+    // Chosen per level so error/warn keep their own styling and devtools severity filters work.
+    try {
+      if (line.level === 'error') target.error(text);
+      else if (line.level === 'warn') target.warn(text);
+      else target.log(text);
+    } catch {
+      // A console wrapped by a hostile/absent host must not break the caller, same rule as the file.
+    }
+  };
 }

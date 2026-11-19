@@ -221,6 +221,21 @@ export function createPermissionLower(ctx, facts) {
   const audit = (text) => log(text.replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, '?'))
 
   /**
+   * Spec 052 follow-up: a stable WIRE code only — never a message, payload or session detail.
+   * Codes are allow-listed to a narrow character set so a Host cannot forge an audit line.
+   */
+  const wireCode = (reply) => {
+    // DSH rpcFailure nests the code under `error.code`; older replies put it at the top level.
+    // Neither `message` nor `details` is ever read here.
+    const candidate = typeof reply?.code === 'string' ? reply.code : reply?.error?.code
+    return typeof candidate === 'string' && /^[A-Za-z0-9._/-]{1,64}$/.test(candidate) ? candidate : 'no-code'
+  }
+  const projectionCause = (reply, fallback) => {
+    const code = wireCode(reply)
+    return `projections-refused:${code === 'no-code' ? fallback : code}`
+  }
+
+  /**
    * Resolve a device-named session id to the Host's LIVE Session object, in two steps
    * that must BOTH pass — see the header for why the projection read alone cannot.
    *
@@ -236,28 +251,35 @@ export function createPermissionLower(ctx, facts) {
    *   resolved plus the live Session, or the refusal code
    */
   const resolveSession = async (sessionId, peer) => {
-    if (dispatchRpc === undefined) return { refusal: 'unavailable' }
+    if (dispatchRpc === undefined) return { refusal: 'unavailable', cause: 'no-dispatch' }
     // The router hands over the raw field: trim it once, then validate what goes on the wire.
     const id = typeof sessionId === 'string' ? sessionId.trim() : ''
-    if (id === '' || id.length > MAX_SESSION_ID) return { refusal: 'bad-request' }
-    if (!peer) return { refusal: 'unavailable' }
+    if (id === '' || id.length > MAX_SESSION_ID) return { refusal: 'bad-request', cause: 'bad-session-id' }
+    if (!peer) return { refusal: 'unavailable', cause: 'no-peer' }
     const sessions = usableSessions(ctx)
+    if (sessions === undefined) return { refusal: 'unavailable', cause: 'no-sessions-service' }
     // Liveness before visibility (header): a session this Host does not hold live can never
     // be served, so it is refused without the projection read a stored session would satisfy.
-    const live = sessions?.get(id)
-    if (live === null || typeof live !== 'object') return { refusal: 'unavailable' }
+    const live = sessions.get(id)
+    if (live === null || typeof live !== 'object') return { refusal: 'unavailable', cause: 'session-not-live' }
+    let value
     try {
-      const value = await dispatchRpc(SESSION_PROJECTIONS_ENDPOINT, { sessionId: id }, undefined, peer)
-      if (!value || typeof value !== 'object' || value.ok !== true) {
-        // A policy refusal and a missing service both land here: nothing to compare,
-        // nothing to write.
-        return { refusal: 'unavailable' }
-      }
-      const view = value.value?.values?.permissions
-      if (value.value?.kind !== 'sequenced' || view === null || typeof view !== 'object') {
-        return { refusal: 'unavailable' }
-      }
-    } catch { return { refusal: 'unavailable' } }
+      // DSH rc.5 `remoteRequest()` requires EXACTLY `{args:{request:{sessionId}}}`: the single
+      // parameter is named `request` in the client schema. A flat or one-level payload fails
+      // exact-argument validation (`gateway/arguments-invalid`). Peer/liveness checks unchanged.
+      value = await dispatchRpc(SESSION_PROJECTIONS_ENDPOINT, { args: { request: { sessionId: id } } }, undefined, peer)
+    } catch { return { refusal: 'unavailable', cause: 'projections-refused:no-code' } }
+    if (!value || typeof value !== 'object') return { refusal: 'unavailable', cause: projectionCause(value, 'no-code') }
+    // Spec 052: DSH rc.5 answers `session/projections` with `{asOfSeq, values}` directly;
+    // rc.1 wrapped it in `{ok:true, value:{...}}`. Accept BOTH, still requiring this device's
+    // Peer (above) and a sequenced snapshot with a permissions view (below).
+    if (value.ok === true && Object.hasOwn(value, 'value')) value = value.value
+    else if (value.ok === false) return { refusal: 'unavailable', cause: projectionCause(value, 'ok-false') }
+    if (!value || typeof value !== 'object') return { refusal: 'unavailable', cause: projectionCause(value, 'no-code') }
+    const view = value.values?.permissions
+    if (value.kind !== 'sequenced' || view === null || typeof view !== 'object') {
+      return { refusal: 'unavailable', cause: projectionCause(value, 'not-sequenced') }
+    }
     // The visibility read ends here: `view` was the wire view, never the Session. The
     // Session served below is the live object the store returned above.
     return { id, session: live }
@@ -322,7 +344,7 @@ export function createPermissionLower(ctx, facts) {
       // never echoed back into the reply or the log.
       const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId.trim() : ''
       const nameable = sessionId !== '' && sessionId.length <= MAX_SESSION_ID ? sessionId : undefined
-      audit(`permission-options refused: ${address.refusal} device=${deviceId(callingDeviceId)}${nameable ? ` session=${nameable}` : ''}`)
+      audit(`permission-options refused: ${address.refusal} device=${deviceId(callingDeviceId)}${nameable ? ` session=${nameable}` : ''} cause=${address.cause ?? 'unknown'}`)
       return refusal(address.refusal, 'permission-options', nameable)
     }
     const state = stateOf(service, address.session, address.id)
@@ -359,7 +381,7 @@ export function createPermissionLower(ctx, facts) {
     if (address.refusal !== undefined) {
       const sessionId = typeof msg.sessionId === 'string' ? msg.sessionId.trim() : ''
       const nameable = sessionId !== '' && sessionId.length <= MAX_SESSION_ID ? sessionId : undefined
-      audit(`permission-lower refused: ${address.refusal} device=${deviceId(callingDeviceId)}${nameable ? ` session=${nameable}` : ''}`)
+      audit(`permission-lower refused: ${address.refusal} device=${deviceId(callingDeviceId)}${nameable ? ` session=${nameable}` : ''} cause=${address.cause ?? 'unknown'}`)
       return refusal(address.refusal, 'permission-lower', nameable)
     }
     const state = stateOf(service, address.session, address.id)

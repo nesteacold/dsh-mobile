@@ -110,6 +110,44 @@ describe('CompanionClient over the fake gateway', () => {
     }
   });
 
+  it('client-hello advertises the web-unlock-session capability (spec 036)', async () => {
+    const capGateway = await FakeGateway.create({ tokens: ['tok-cap'] });
+    try {
+      // Capture the RAW frame on the wire: the fake gateway's `clientHellos` view deliberately
+      // projects a fixed set of fields, so it cannot see the capability array.
+      const sent: string[] = [];
+      const client = new CompanionClient({
+        transport: {
+          create: () => {
+            const inner = new NodePinnedTransport({ handshakeTimeoutMs: 4_000 });
+            return {
+              connect: (url: string, options: Parameters<Transport['connect']>[1]) => inner.connect(url, options),
+              send: (data: string) => {
+                sent.push(data);
+                return inner.send(data);
+              },
+              close: (code?: number, reason?: string) => inner.close(code, reason),
+              on: (listener: TransportListener) => inner.on(listener),
+            };
+          },
+        },
+        appVersion: TARGET.appVersion,
+        platform: TARGET.platform,
+        requestTimeoutMs: 2_000,
+        pingIntervalMs: 0,
+        newRequestId: () => `cap-${++counter}`,
+      });
+      await connectReady(client, capGateway, 'tok-cap');
+      const helloFrame = sent.map((text) => JSON.parse(text) as Record<string, unknown>)
+        .find((frame) => frame.type === 'client-hello');
+      assert.ok(helloFrame, 'a client-hello frame was written to the transport');
+      assert.deepEqual(helloFrame.capabilities, ['web-unlock-session.v1']);
+      client.close();
+    } finally {
+      await capGateway.close();
+    }
+  });
+
   it('refuses requests before ready without sending them', async () => {
     const client = makeClient();
     await assert.rejects(client.request('sessions'), (err: unknown) => {
@@ -521,6 +559,31 @@ function scriptedClient(transport: ScriptedTransport, ids: { counter: { value: n
 }
 
 describe('CompanionClient frame-level contract (M9 / N1 / N6)', () => {
+  it('spec 036: a second authoritative hello updates webLock without resending client-hello', () => {
+    const transport = new ScriptedTransport();
+    const ids = { counter: { value: 0 } };
+    const client = scriptedClient(transport, ids);
+    const states: string[] = [];
+    client.on('state', (state) => states.push(state));
+    client.connect({ url: 'wss://127.0.0.1:1/ws', certSha256: PIN, token: 'tok-second-hello', ...TARGET });
+    transport.fireOpen();
+    // 1) first hello: locked, before the gateway has seen our opt-in.
+    transport.deliver({ ...HELLO, webLock: 'locked' });
+    assert.equal(client.state, 'waiting-client-hello');
+    assert.equal(transport.sentFrames().filter((f) => f.type === 'client-hello').length, 1);
+    const helloId = transport.lastRequestId('client-hello');
+
+    // 2) after reading the opt-in the gateway sends a NEW authoritative hello, then the ACK.
+    transport.deliver({ ...HELLO, webLock: 'unlocked' });
+    assert.equal(transport.sentFrames().filter((f) => f.type === 'client-hello').length, 1, 'no handshake loop');
+    assert.deepEqual(states, ['connecting', 'waiting-hello', 'waiting-client-hello'], 'no extra state transition');
+    transport.deliver({ kind: 'client-hello', requestId: helloId, accepted: true });
+
+    assert.equal(client.state, 'ready');
+    assert.equal(client.webLock, 'unlocked', 'the newest hello is authoritative');
+    client.close();
+  });
+
   it('accepts `paired` exactly once on a pairing socket and refuses a second one (M9)', () => {
     const transport = new ScriptedTransport();
     const ids = { counter: { value: 0 } };
@@ -700,6 +763,7 @@ describe('CompanionClient transport-event ordering (lost `open`)', () => {
       companionProtocol: COMPANION_PROTOCOL_VERSION,
       appVersion: '0.1.0',
       platform: 'android',
+      capabilities: ['web-unlock-session.v1'],
     });
     client.close();
   });

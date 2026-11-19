@@ -68,6 +68,9 @@ export function upgradeStatusError(status: number): CoreError {
  */
 export const DEVICE_ID_PATTERN = /^[A-Za-z0-9._-]{8,128}$/;
 
+/** The gateway's advertised alternative carrier for `X-DSH-Device-Name` (`lib/index.mjs`). */
+export const DEVICE_NAME_SUBPROTOCOL_PREFIX = 'dsh-device-name.';
+
 function extraProtocols(options: TransportConnectOptions): string[] {
   const protocols = [...(options.protocols ?? [PROTOCOL_SUBPROTOCOL])];
   const deviceId = options.headers?.['X-DSH-Device-ID'];
@@ -75,8 +78,55 @@ function extraProtocols(options: TransportConnectOptions): string[] {
     const fromHeader = deviceSubprotocol(deviceId);
     if (!protocols.includes(fromHeader)) protocols.push(fromHeader);
   }
+  // The display name is `X-DSH-Device-Name` on native. The gateway accepts the same UTF-8 name
+  // Base64URL-encoded in a `dsh-device-name.<value>` subprotocol when that header is missing or
+  // invalid, which is the only way a browser can report one: without it the Host lists this
+  // install as unnamed. Display only — the gateway never reads it for authentication. An
+  // encoding quirk drops the name and not the connection: a missing name is cosmetic.
+  const deviceName = options.headers?.['X-DSH-Device-Name'];
+  if (typeof deviceName === 'string') {
+    const encoded = encodeDeviceName(deviceName);
+    if (encoded !== null) {
+      const fromHeader = `${DEVICE_NAME_SUBPROTOCOL_PREFIX}${encoded}`;
+      if (!protocols.includes(fromHeader)) protocols.push(fromHeader);
+    }
+  }
   return protocols;
 }
+
+/** Longest display name offered (code points), matching the gateway's own 80-character cap. */
+export const DEVICE_NAME_MAX_CODE_POINTS = 80;
+/** Longest encoded name value offered; beyond this the name protocol is dropped, never the socket. */
+export const DEVICE_NAME_MAX_ENCODED = 512;
+
+/**
+ * The Base64URL value for the name subprotocol, or `null` when no name should be offered: empty
+ * after normalisation, too long once encoded, or the encoder threw. Never throws — a missing name
+ * is cosmetic and must not cost the connection or any other protocol.
+ */
+export function encodeDeviceName(raw: string): string | null {
+  try {
+    // Trim, drop control characters (C0, DEL, C1), then cap by code point (not UTF-16 unit).
+    const cleaned = raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim();
+    if (cleaned === '') return null;
+    const capped = Array.from(cleaned).slice(0, DEVICE_NAME_MAX_CODE_POINTS).join('').trim();
+    if (capped === '') return null;
+    const encoded = base64urlUtf8(capped);
+    if (encoded.length === 0 || encoded.length > DEVICE_NAME_MAX_ENCODED) return null;
+    return encoded;
+  } catch {
+    return null;
+  }
+}
+
+/** UTF-8 -> unpadded Base64URL, the encoding the gateway's name subprotocol expects. */
+function base64urlUtf8(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 
 /**
  * The web build only talks to the owner's tailnet: trust is delegated to the browser CA store (no

@@ -475,6 +475,7 @@ describe('AppController connection lifecycle (M5 / M6)', () => {
         openSessionId: null,
         openApprovals: [],
         history: [],
+        historyLoaded: false,
         historyHasMore: false,
         // Spec 011 follow-up: the older-history affordance now follows the cursor, and its load state
         // is explicit so a failure is shown rather than swallowed. Nothing was fetched here.
@@ -491,6 +492,13 @@ describe('AppController connection lifecycle (M5 / M6)', () => {
         // Spec 021: this pairing is a native one (no `web:unlock`), so nothing can lock it — the
         // field exists and is `null`, which is exactly what "not a web device" means.
         webLock: null,
+        // The same 401 is recorded here so a web lock gate can offer "forget and pair again" instead
+        // of a passkey action that cannot succeed. It is set on every platform (the controller does
+        // not guess from the transport); only the gate reads it, and a native device never renders
+        // that gate. Cleared by `forget()` and by a successful `pair()`.
+        credentialRejected: true,
+        // Spec 045: the legacy-gateway notice is web-only and this is a native 401.
+        legacyWebLockGateway: false,
         // Spec 011: the snapshot gained the authoring fields. In this state the credential was
         // refused at the upgrade, so there is no live device (grantedScopes is UNKNOWN, not a
         // grant) and nothing was fetched. This guard is updated rather than relaxed: the whole

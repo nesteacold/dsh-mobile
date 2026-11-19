@@ -48,6 +48,37 @@ const transport = {
 const api = createDshHostAdapter(transport, createTestPeer())
 const query = msg => handleQuery(api, api, null, msg)
 
+test('spec 052: rc.5 agentTeam {enabled,tasks} without members is normalised, not rejected', async () => {
+  const rc5 = { enabled: true, tasks: team.tasks }
+  projectionResult = { kind: 'sequenced', asOfSeq: 11, values: { agentTeam: rc5, subagentCatalog: catalog } }
+  try {
+    const frame = await query({ type: 'agent-team', sessionId: 'lead', requestId: 'rc5' })
+    assert.equal(frame.kind, 'agent-team')
+    assert.equal(frame.projectionState, 'ready')
+    assert.equal(frame.asOfSeq, 11)
+    assert.deepEqual(frame.agentTeam.members, [], 'no invented members')
+    assert.deepEqual(frame.agentTeam.tasks, team.tasks, 'real tasks preserved')
+    assert.equal(frame.agentTeam.enabled, true, 'enabled flag preserved')
+    // Every malformed variant is refused; a wrong-typed field is NEVER silently replaced by [].
+    for (const malformed of [
+      { members: [], tasks: 'malformed' },
+      { tasks: [], members: 'malformed' },
+      { members: [] },                       // tasks missing
+      { tasks: [] },                         // rc.5 needs boolean enabled
+      { enabled: 'yes', tasks: [] },         // invalid enabled
+      { members: [], tasks: [], enabled: 1 },// present-but-invalid enabled on contract shape
+      { enabled: true },                     // tasks missing on rc.5
+    ]) {
+      projectionResult = { kind: 'sequenced', asOfSeq: 13, values: { agentTeam: malformed } }
+      const bad = await query({ type: 'agent-team', sessionId: 'lead' })
+      assert.equal(bad.code, 'internal', JSON.stringify(malformed))
+      assert.match(bad.message, /invalid team projection/, JSON.stringify(malformed))
+    }
+  } finally {
+    projectionResult = { kind: 'sequenced', asOfSeq: 7, values }
+  }
+})
+
 test('团队与子智能体投影保留原始字段、可用性和迁移语义', async () => {
   for (const [type, key] of [['agent-team', 'agentTeam'], ['subagents', 'subagentCatalog']]) {
     const frame = await query({ type, sessionId: 'lead', requestId: type })

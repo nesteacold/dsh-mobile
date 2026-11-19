@@ -5,13 +5,14 @@
 // React + react-test-renderer come from the gateway's node_modules (no install here).
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import path from 'node:path'
 import tls from 'node:tls'
 import vm from 'node:vm'
 import { createRequire } from 'node:module'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { RemoteConnection, getWebSocket } from '../lib/remote-client.mjs'
 import { check, finish, createFakeComposerDocument, createLivePage, installFileListStub, livePick, picked, pickFiles, refusePickerList } from './helpers.mjs'
@@ -24,6 +25,38 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true
 const source = fs.readFileSync(path.join(here, '../lib/client.js'), 'utf8')
 
 console.log('client')
+
+// Spec 050: a controlled v3 payload for the native target. The released app's parser accepts only
+// this shape: wss URLs, a 64-lower-hex pin, a canonical 43-char base64url code and a v4 gateway id.
+const NATIVE_PIN = 'a'.repeat(64)
+const NATIVE_GATEWAY_ID = '11111111-1111-4111-8111-111111111111'
+function nativeV3String(expiresAt = Date.now() + 290_000) {
+  const payload = {
+    version: 3,
+    publicUrl: 'wss://10.0.0.5:3081/ws/mobile',
+    pairingCode: crypto.randomBytes(32).toString('base64url'),
+    expiresAt,
+    certSha256: NATIVE_PIN,
+    gatewayId: NATIVE_GATEWAY_ID,
+    gatewayName: 'Test host',
+    endpoints: ['wss://10.0.0.5:3081/ws/mobile'],
+  }
+  return { payload, text: Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url') }
+}
+
+/** Run the RELEASED native parser against a controlled string (no payload/code is logged). */
+function nativeParserAccepts(text) {
+  const repo = path.join(here, '..', '..', '..')
+  const loader = pathToFileURL(path.join(repo, 'apps', 'mobile-companion', 'node_modules', 'tsx', 'dist', 'loader.mjs')).href
+  const parser = pathToFileURL(path.join(repo, 'apps', 'mobile-companion', 'src', 'core', 'qr.ts')).href
+  const script = `const m = await import(${JSON.stringify(parser)});
+const r = m.parsePairingQr(${JSON.stringify(text)}, { now: () => Date.now() - 1000 });
+process.stdout.write(r.ok ? 'ok' : r.reason);
+process.exit(r.ok ? 0 : 1);`
+  const result = execFileSync(process.execPath, ['--import', loader, '--input-type=module', '-e', script],
+    { cwd: repo, encoding: 'utf8' })
+  return result === 'ok'
+}
 
 function load({ locale = 'en-US', status, devices = [], remotes = [], pending, fail = {}, sessions, listenFailure, controlPersists, uploads, menu = false, source: sourceText = source } = {}) {
   let api
@@ -98,6 +131,12 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     if (route === '/devices/pairings' && options.method === 'POST') { state.pairing = { id: 'p-1', state: 'connecting', address: body.address, verificationCode: null, error: null }; return reply({ pairing: state.pairing }, true) }
     if (/^\/devices\/pairings\/p-1$/.test(route) && (options.method ?? 'GET') === 'GET') return reply({ pairing: state.pairing })
     if (/^\/devices\/pairings\/p-1$/.test(route) && options.method === 'DELETE') { state.pairing = { ...state.pairing, state: 'cancelled' }; return reply({ pairing: state.pairing }) }
+    if (route === '/mgw/pair' && body.mode === 'string') {
+      const native = nativeV3String()
+      return reply({ pairing: { expiresAt: native.payload.expiresAt, kind: body.kind, scopes: body.scopes },
+        pairingString: native.text, qrPayload: native.text, payload: native.payload,
+        svg: '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8"/></svg>' })
+    }
     if (route === '/mgw/pair') return reply({ pairing: { expiresAt: Date.now() + 90_000, kind: body.kind, scopes: body.scopes }, pairingString: 'PAIRSTRING' + (body.scopes ? '-' + body.scopes.join('+') : ''), payload: {} })
     if (/^\/mgw\/devices\/.+\/revoke$/.test(route)) return reply({ revoked: true })
     // POST /mgw/devices/:id/scopes (spec 025 R5): apply the diff the page sends to the row the
@@ -570,6 +609,11 @@ await check('generate pairing code (Window 1): an 8-digit OTP grouped 4-4, a cou
   const ui = load({ status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: ['wss://10.0.0.5:3081/ws/mobile'] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
+  // Native is now the default; this older Window-1 test is about the PWA/desktop OTP path.
+  await act(async () => {
+    find(page, (node) => node.type === 'input' && node.props.type === 'radio' && node.props.value === 'desktop')[0]
+      .props.onChange({ target: { checked: true, value: 'desktop' } })
+  })
   await click(button(page, 'Generate pairing code'))
   const body = ui.calls.find((call) => call.route === '/mgw/pair').body
   assert.equal(body.mode, 'otp'); assert.equal(body.kind, 'desktop')
@@ -1235,6 +1279,11 @@ await check('OTP offer asks for every desktop scope the kind can hold — never 
   const ui = load({ status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: ['wss://10.0.0.5:3081/ws/mobile'] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
+  // Spec 050: native is the default, so select the desktop target for this desktop-scope test.
+  await act(async () => {
+    find(page, (node) => node.type === 'input' && node.props.type === 'radio' && node.props.value === 'desktop')[0]
+      .props.onChange({ target: { checked: true, value: 'desktop' } })
+  })
   await click(button(page, 'Generate pairing code'))
   const body = ui.calls.find((call) => call.route === '/mgw/pair').body
   assert.equal(body.kind, 'desktop')
@@ -1253,82 +1302,84 @@ await check('OTP offer asks for every desktop scope the kind can hold — never 
 // `desktop`, so a phone or PWA that paired with one received a desktop device — no `web:unlock`
 // — and could never register or assert the passkey that unlocks its own session
 // (`scope refused: type=passkey-assert-options … scope=web:unlock` on the gateway).
-// The measured bug this block exists for (2026-11-16): every code the page made was kind
-// `desktop`, so a phone or PWA that paired with one received a desktop device — no `web:unlock`
-// — and could never register or assert the passkey that unlocks its own session
-// (`scope refused: type=passkey-assert-options … scope=web:unlock` on the gateway).
-await check('OPT pairing kind: the page offers a phone/PWA seat and a computer seat, defaults to the computer (old behaviour), and a phone offer asks for web:unlock', async () => {
+// Spec 050: three explicit targets, native default. The native offer is the existing v3 string
+// path (QR + copyable string + pin), with a mobile-kind scope set that omits web:unlock; PWA keeps
+// its OTP/passkey flow and desktop keeps its old flow. Nothing is logged here: only shapes.
+await check('pairing targets: native string (default), PWA OTP, desktop OTP; stale offers clear on switch', async () => {
   const ui = load({ status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: ['wss://10.0.0.5:3081/ws/mobile'] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
-  const { DICT, scopesForKind, gatewayScopesFor } = ui.api.testing
+  const { DICT, scopesForKind, gatewayScopesFor, nativeScopesFor } = ui.api.testing
   const radios = () => find(page, (node) => node.type === 'input' && node.props.type === 'radio')
-  // Two choices, the phone seat named first, and real vi/en sentences for both.
-  assert.deepEqual(radios().map((node) => node.props.value), ['mobile', 'desktop'])
+  const byTestId = (id) => find(page, (node) => node.props['data-testid'] === id)
+  assert.deepEqual(radios().map((node) => node.props.value), ['native', 'pwa', 'desktop'], 'three explicit targets')
+  assert.equal(radios().filter((node) => node.props.checked).map((node) => node.props.value).join(''), 'native', 'native is default')
   const shown = text(page)
-  for (const key of ['otpKindMobile', 'otpKindDesktop']) assert.ok(shown.includes(DICT.en[key]), `en: ${key}`)
-  for (const key of ['otpKindLabel', 'otpKindMobile', 'otpKindMobileHint', 'otpKindDesktop', 'otpKindDesktopHint']) {
+  for (const key of ['otpKindNative', 'otpKindPwa', 'otpKindDesktop']) assert.ok(shown.includes(DICT.en[key]), `en: ${key}`)
+  for (const key of ['otpKindLabel', 'otpKindNative', 'otpKindNativeHint', 'otpKindPwa', 'otpKindPwaHint', 'otpKindDesktop', 'otpKindDesktopHint']) {
     assert.equal(typeof DICT.vi[key], 'string', `${key} (vi)`)
     assert.notEqual(DICT.vi[key], DICT.en[key], `${key}: a real translation, not a copy`)
   }
-  // The one sentence that explains the difference: the default (computer) hint is stated with
-  // "passkey" in it, and picking a seat swaps in that seat's own sentence.
-  assert.ok(shown.includes(DICT.en.otpKindDesktopHint), 'the computer hint is stated')
-  assert.notEqual(DICT.en.otpKindMobileHint, DICT.en.otpKindDesktopHint, 'two different sentences')
-  // Default: the computer seat, so a code made without touching anything is the old one.
-  assert.equal(radios().filter((node) => node.props.checked).map((node) => node.props.value).join(''), 'desktop')
-  // A radio has no onClick, so drive the choice the way the page does.
-  const pick = async (kind) => {
-    await act(async () => { radios().find((node) => node.props.value === kind).props.onChange({ target: { checked: true, value: kind } }) })
+  assert.ok(shown.includes(DICT.en.otpKindNativeHint), 'the native explanation is stated')
+  const pick = async (target) => {
+    await act(async () => { radios().find((node) => node.props.value === target).props.onChange({ target: { checked: true, value: target } }) })
   }
-  await pick('mobile')
-  assert.equal(radios().find((node) => node.props.value === 'mobile').props.checked, true, 'the phone seat is selected')
   const body = () => ui.calls.filter((call) => call.route === '/mgw/pair').pop().body
+
+  // 1. Native: v3 string/QR, mobile kind, no web:unlock, QR SVG + copyable string + expiry.
   await click(button(page, 'Generate pairing code'))
-  const mobile = body()
-  const observed = JSON.stringify(mobile)
-  assert.equal(mobile.mode, 'otp', observed)
-  assert.equal(mobile.kind, 'mobile', observed)
-  // The never-default scope the whole bug is about: asked for explicitly, listed once.
-  assert.ok(mobile.scopes.includes('web:unlock'), observed)
-  assert.equal(mobile.scopes.join(','), scopesForKind('mobile').join(','), `EQUAL actual=${observed}`)
-  // Nowhere wider than the kind allows: no desktop-only scope in a phone offer.
-  const wider = mobile.scopes.filter((scope) => !scopesForKind('mobile').includes(scope))
-  assert.deepEqual(wider, [], `WIDER actual=${observed}`)
-  // The computer seat is exactly what this page always sent.
-  await click(find(page, (node) => node.type === 'button' && node.props['aria-label'] === 'Close')[0])
+  const native = body()
+  const observed = JSON.stringify(native)
+  assert.equal(native.mode, 'string', `native shape ${observed}`)
+  assert.equal(native.kind, 'mobile', `native shape ${observed}`)
+  assert.deepEqual([...native.scopes], [...nativeScopesFor()], `native scopes ${observed}`)
+  assert.equal(native.scopes.includes('web:unlock'), false, 'native never asks for the web-only unlock')
+  assert.equal(byTestId('native-pairing-qr').length, 1, 'the gateway QR SVG is rendered')
+  assert.equal(byTestId('pairing-string').length, 1, 'the full copyable string is rendered')
+  assert.ok(text(page).includes(DICT.en.expiresIn), 'expiry is shown')
+  assert.equal(byTestId('otp-code').length, 0, 'native is not a bare OTP link')
+  // Decode the controlled payload with the released parser's exact shape rules (no logging).
+  const stringNode = byTestId('pairing-string')[0]
+  const flatten = (value) => Array.isArray(value) ? value.map(flatten).join('')
+    : typeof value === 'string' || typeof value === 'number' ? String(value)
+      : value && value.props ? flatten(value.props.children) : ''
+  const raw = flatten(stringNode.props.children)
+  const decoded = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
+  assert.equal(decoded.version, 3)
+  assert.equal(decoded.certSha256, NATIVE_PIN)
+  assert.match(decoded.certSha256, /^[0-9a-f]{64}$/, '64-lower-hex pin')
+  assert.match(decoded.pairingCode, /^[A-Za-z0-9_-]{43}$/, 'canonical 256-bit base64url code')
+  assert.match(decoded.gatewayId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.ok(decoded.publicUrl.startsWith('wss://') && decoded.endpoints.every((url) => url.startsWith('wss://')))
+  assert.ok(decoded.expiresAt > Date.now() && decoded.expiresAt - Date.now() <= 300_000, 'fresh but inside the parser TTL')
+  assert.equal('web:unlock' in decoded, false, 'the QR payload is a v3 pairing string, never a PWA link')
+  assert.equal(nativeParserAccepts(raw), true, 'the released native parser accepts this QR')
+
+  // 2. Switching target clears the stale native offer; PWA keeps OTP + web:unlock.
+  await pick('pwa')
+  assert.equal(byTestId('pairing-string').length, 0, 'stale native string cleared')
+  assert.equal(byTestId('native-pairing-qr').length, 0, 'stale native QR cleared')
+  await click(button(page, 'Generate pairing code'))
+  const pwa = body()
+  assert.equal(pwa.mode, 'otp')
+  assert.equal(pwa.kind, 'mobile')
+  assert.deepEqual([...pwa.scopes], [...scopesForKind('mobile')])
+  assert.ok(pwa.scopes.includes('web:unlock'), 'PWA still gets its passkey scope')
+  assert.equal(byTestId('otp-code').length, 1, 'PWA keeps the OTP dialog')
+
+  // 3. Desktop keeps the exact old request shape.
   await pick('desktop')
+  assert.equal(byTestId('otp-code').length, 0, 'stale PWA code cleared')
   await click(button(page, 'Generate pairing code'))
   assert.deepEqual(body(), { mode: 'otp', kind: 'desktop', scopes: DESKTOP_ALL })
-  // The helper is a straight repeat of the kind's own list — it never mints a scope of its own
-  // (review M1: the older version appended `web:unlock`, which was fail-open). Measured here, so
-  // a kind table that ever lost the scope fails in this file instead of at a PWA's passkey.
+  assert.equal(body().scopes.includes('web:unlock'), false, 'desktop never gets the web scope')
+
+  // Kind/scope helpers remain fail-closed and unchanged for the old surfaces.
   assert.deepEqual(gatewayScopesFor('desktop'), scopesForKind('desktop'))
   assert.deepEqual(gatewayScopesFor('mobile'), scopesForKind('mobile'))
-  assert.equal(scopesForKind('mobile').includes('web:unlock'), true, 'the phone list itself carries it')
-  assert.equal(scopesForKind('desktop').includes('web:unlock'), false, 'the desktop list never does')
-  for (const kind of ['mobile', 'desktop']) {
-    const allowed = scopesForKind(kind)
-    for (const scope of gatewayScopesFor(kind)) assert.ok(allowed.includes(scope), `${kind} offer: ${scope}`)
-  }
-  // Regression for the fail-open branch (review M1): a kind table WITHOUT `web:unlock` must not
-  // gain it from the offer helper. The helper is the identity on its kind, so this states both
-  // halves: it names no scope of its own, and it answers exactly the kind's list — a build that
-  // still appended `web:unlock` for `mobile` fails the second assertion below, and one whose list
-  // lost the scope would have it re-minted by the first.
-  const offered = gatewayScopesFor('mobile')
-  const allowedMobile = scopesForKind('mobile')
-  assert.equal(allowedMobile.includes('web:unlock'), true, 'the phone list carries it today')
-  assert.deepEqual(offered, allowedMobile, 'the offer is the kind list, never a widened one')
-  assert.equal(offered.filter((scope) => scope === 'web:unlock').length, 1, 'listed once, not appended')
-  // A table without the scope yields a list without it: nothing is added back to fill the gap.
-  assert.equal(allowedMobile.filter((scope) => scope === 'web:unlock').length, 1)
-  assert.deepEqual(allowedMobile.filter((scope) => scope !== 'web:unlock'), offered.filter((scope) => scope !== 'web:unlock'))
-  // Review m2: the dialog is keyed by nothing — `kind` lives at `pairing.kind` (and the offer
-  // answers carry an `otp`), so the old `key: otpOffer.kind` was always undefined anyway. The
-  // offer's own reply proves the dialog rendered from a server answer without a page-side key.
-  assert.equal(ui.calls.some((call) => call.route === '/mgw/pair'), true)
-
+  assert.deepEqual(nativeScopesFor(), scopesForKind('mobile').filter((scope) => scope !== 'web:unlock'))
+  assert.deepEqual([...nativeScopesFor()], [...native.scopes])
+  assert.equal(nativeScopesFor().filter((scope) => !scopesForKind('mobile').includes(scope)).length, 0)
   page.unmount()
 })
 
@@ -1336,6 +1387,10 @@ await check('OTP dialog: X only closes the dialog — the waiting request stays 
   const ui = load({ status: ONLINE })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
+  await act(async () => {
+    find(page, (node) => node.type === 'input' && node.props.type === 'radio' && node.props.value === 'pwa')[0]
+      .props.onChange({ target: { checked: true, value: 'pwa' } })
+  })
   await click(button(page, 'Generate pairing code'))
   await flush()
   assert.ok(find(page, (node) => node.props['data-testid'] === 'otp-code').length, 'the dialog is open')
@@ -2808,6 +2863,11 @@ await check('route vs bind: a later reply that serves nothing clears the stale r
   ui.state.qrReply = { svg: '<svg/>', address: 'box.tailnet.ts.net:30443', pwaOrigin: 'https://box.tailnet.ts.net:30443', link: true }
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
+  // Spec 050: the QR-route test is about the PWA OTP dialog, so pick that target explicitly.
+  await act(async () => {
+    find(page, (node) => node.type === 'input' && node.props.type === 'radio' && node.props.value === 'pwa')[0]
+      .props.onChange({ target: { checked: true, value: 'pwa' } })
+  })
   await openAdvanced(page)
   // First code: the Host reports a served origin, so the route line is drawn.
   await click(button(page, 'Generate pairing code'))
@@ -3120,6 +3180,203 @@ await check('a raw session-status frame becomes a sessionStatus event; unknown k
     if (priorWs) require.cache[wsPath] = priorWs
     else delete require.cache[wsPath]
   }
+})
+
+// ----------------------------------------- spec 042 Part A: runtime perf hardening
+// A self-contained harness for the polling/store/listener contracts. Unlike the page
+// harness above it gives the vm a controllable `document.visibilityState` and a fake
+// `AbortSignal.timeout`, so gating and the request bound are provable without waiting
+// four seconds or starting a real timer.
+function loadPerf({ visibilityState = 'visible', fetchImpl, answer } = {}) {
+  let api
+  const fetchCalls = []
+  const fetch = fetchImpl ?? (async (url, options = {}) => {
+    fetchCalls.push({ url, options })
+    if (answer) return answer(fetchCalls.length)
+    return { ok: true, status: 200, json: async () => ({ remotes: [], routing: { remote: false, reason: 'not-reported', hosts: [] } }) }
+  })
+  const intervals = new Map()
+  let seq = 0
+  const docListeners = new Map()
+  const document = {
+    baseURI: 'http://127.0.0.1:3080/',
+    visibilityState,
+    head: { appendChild() {} },
+    createElement: () => ({ remove() {} }),
+    addEventListener(type, fn) { const list = docListeners.get(type) ?? []; list.push(fn); docListeners.set(type, list) },
+    removeEventListener(type, fn) { const list = docListeners.get(type) ?? []; const at = list.indexOf(fn); if (at >= 0) list.splice(at, 1) },
+  }
+  const window = {
+    __ModuleLoader__: { load: ({ factory }) => { api = { id: '@dsh-ext/devices', ...factory(() => React) } } },
+    setInterval: (fn, ms) => { intervals.set(++seq, { fn, ms }); return seq },
+    clearInterval: (id) => intervals.delete(id),
+    setTimeout: () => 1, clearTimeout() {}, confirm: () => true,
+  }
+  // Only the contract request() needs: static `timeout(ms)` returning an `aborted` flag.
+  class FakeSignal {
+    constructor() { this.aborted = false }
+    static timeout(ms) { const signal = new FakeSignal(); signal.timeoutMs = ms; return signal }
+  }
+  vm.runInNewContext(source, { window, document, fetch, URL, console, AbortSignal: FakeSignal,
+    setTimeout: () => 1, clearTimeout() {}, Date, navigator: { language: 'en-US' } })
+  const disposers = []
+  const ctx = {
+    locale: { getSnapshot: () => ({ active: 'en-US' }), subscribe: () => () => {} },
+    effect(fn) { const out = fn(); if (typeof out === 'function') disposers.push(out) },
+    inject() { return () => {} },
+    slots: { inject() { return () => {} }, register(meta) { return { meta } } },
+  }
+  api.apply(ctx)
+  const remoteCalls = () => fetchCalls.filter((call) => new URL(call.url).pathname === '/devices/remotes')
+  return {
+    api, fetchCalls, remoteCalls, intervals, document, docListeners,
+    tick: () => { for (const { fn } of [...intervals.values()]) fn() },
+    fireVisible(state) {
+      document.visibilityState = state
+      for (const fn of [...(docListeners.get('visibilitychange') ?? [])]) fn()
+    },
+    dispose() { for (const dispose of disposers.splice(0)) { try { dispose() } catch { /* teardown */ } } },
+  }
+}
+
+await check('perf: an unchanged /devices/remotes poll keeps the snapshot reference and notifies nobody', async () => {
+  const ui = loadPerf()
+  const store = ui.api.testing.hostsStore
+  await store.refresh() // settle the startup fetch and its coalesced callers
+  const first = store.getSnapshot()
+  assert.equal(first.loaded, true)
+  let notified = 0
+  const unsubscribe = store.subscribe(() => { notified += 1 })
+  const callsBefore = ui.remoteCalls().length
+  await store.refresh()
+  assert.equal(ui.remoteCalls().length, callsBefore + 1, 'the poll really happened')
+  assert.equal(store.getSnapshot(), first, 'identical JSON keeps Object.is(prev, next) === true')
+  assert.equal(notified, 0, 'useSyncExternalStore consumers were not woken for no change')
+  unsubscribe()
+  ui.dispose()
+})
+
+await check('perf: concurrent refresh() calls coalesce into one GET and share one promise', async () => {
+  const gates = []
+  let fetches = 0
+  const ui = loadPerf({ fetchImpl: async () => {
+    fetches += 1
+    await new Promise((resolve) => { gates.push(resolve) })
+    return { ok: true, status: 200, json: async () => ({ remotes: [], routing: {} }) }
+  } })
+  const store = ui.api.testing.hostsStore
+  // Release the startup fetch first, then start from a known count.
+  gates.shift()()
+  await new Promise((resolve) => setImmediate(resolve))
+  const before = fetches
+  const p1 = store.refresh()
+  const p2 = store.refresh()
+  const p3 = store.refresh()
+  assert.equal(p1, p2, 'the exact same promise is returned to concurrent callers')
+  assert.equal(p2, p3)
+  assert.equal(fetches, before + 1, 'three ticks produced one GET')
+  gates.shift()()
+  await Promise.all([p1, p2, p3])
+  ui.dispose()
+})
+
+await check('perf: request() bounds a callerless fetch; a caller signal is kept and its abort is a failure', async () => {
+  let mode = 'ok'
+  const seen = []
+  const ui = loadPerf({ fetchImpl: async (url, options) => {
+    seen.push(options)
+    return {
+      ok: true, status: 200,
+      json: async () => {
+        if (mode === 'timeout') { const error = new Error('timed out'); error.name = 'TimeoutError'; throw error }
+        if (mode === 'external') { const error = new Error('aborted'); error.name = 'AbortError'; throw error }
+        return { ok: true }
+      },
+    }
+  } })
+  const { request } = ui.api.testing
+  const start = seen.length
+  mode = 'timeout'
+  await assert.rejects(() => request('/devices/remotes'), (error) => error.name === 'TimeoutError',
+    'an aborted body is NOT swallowed into {}')
+  assert.equal(seen[start].signal.timeoutMs, 15000, 'a callerless fetch gets the 15s bound')
+  class OwnSignal { constructor() { this.aborted = true } }
+  const own = new OwnSignal()
+  mode = 'external'
+  await assert.rejects(() => request('/devices/remotes', { signal: own }), (error) => error.name === 'AbortError')
+  assert.equal(seen[start + 1].signal, own, 'a caller-supplied signal is never replaced')
+  ui.dispose()
+})
+
+await check('perf: the 4s poll skips hidden ticks, refreshes on visible, and removes its listener on dispose', async () => {
+  const ui = loadPerf()
+  await ui.api.testing.hostsStore.refresh()
+  const before = ui.remoteCalls().length
+  ui.document.visibilityState = 'hidden'
+  ui.tick()
+  assert.equal(ui.remoteCalls().length, before, 'a hidden renderer issues no GET')
+  ui.fireVisible('visible')
+  assert.equal(ui.remoteCalls().length, before + 1, 'returning to visible refreshes immediately')
+  assert.deepEqual([...ui.intervals.values()].map(({ ms }) => ms), [4000], 'the one timer still ticks at 4s')
+  const listeners = (ui.docListeners.get('visibilitychange') ?? []).length
+  assert.ok(listeners >= 1, 'the visibility listener was installed')
+  ui.dispose()
+  assert.equal(ui.intervals.size, 0, 'teardown clears the one timer')
+  assert.equal((ui.docListeners.get('visibilitychange') ?? []).length, listeners - 1, 'teardown removes exactly its listener')
+})
+
+await check('perf: a status patch with identical values does not allocate a snapshot or notify', async () => {
+  const ui = loadPerf()
+  const remoteUI = ui.api.testing.remoteUI
+  const before = remoteUI.getSnapshot()
+  let notified = 0
+  const unsubscribe = remoteUI.subscribe(() => { notified += 1 })
+  remoteUI.set({ grouped: before.grouped, hosts: before.hosts, reason: before.reason, tabs: before.tabs, tabsReason: before.tabsReason })
+  assert.equal(remoteUI.getSnapshot(), before, 'same values keep the same snapshot object')
+  assert.equal(notified, 0, 'no listener was woken')
+  remoteUI.set({ hosts: before.hosts + 1 })
+  assert.notEqual(remoteUI.getSnapshot(), before, 'a real change still publishes')
+  assert.equal(notified, 1, 'and notifies once')
+  unsubscribe()
+  ui.dispose()
+})
+
+await check('perf: the remote pick listener is removed with the exact event the chunk named', async () => {
+  let api
+  const window = {
+    __ModuleLoader__: { load: ({ factory }) => { api = factory(() => React) } },
+    setInterval: () => 1, clearInterval() {}, setTimeout: () => 1, clearTimeout() {},
+  }
+  const events = []
+  const document = {
+    baseURI: 'http://127.0.0.1:3080/', head: { appendChild() {} }, createElement: () => ({ remove() {} }),
+    addEventListener(type, listener, capture) { events.push({ op: 'add', type, listener, capture }) },
+    removeEventListener(type, listener, capture) { events.push({ op: 'remove', type, listener, capture }) },
+  }
+  vm.runInNewContext(source, { window, document, fetch: async () => ({}), URL, console })
+  let installed = false
+  const chunk = {
+    PICK_EVENT: 'remote-pick',
+    remoteFileIntakeFor() {
+      return {
+        install() { installed = true }, uninstall() {},
+        status: () => ({ state: 'active', reason: null }), takeNotice: () => null,
+      }
+    },
+    adoptPickerFrom() { return null },
+  }
+  const dispose = api.testing.installRemoteFileAttach({ global: window, doc: document, wrapper: () => Promise.resolve(chunk) })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(installed, true)
+  const add = events.find((entry) => entry.op === 'add')
+  assert.equal(add.type, 'remote-pick', 'the chunk\'s own pick event was registered')
+  assert.equal(add.capture, true)
+  dispose()
+  const remove = events.find((entry) => entry.op === 'remove')
+  assert.ok(remove, 'a listener was removed')
+  assert.equal(remove.type, add.type, 'with the exact same event name')
+  assert.equal(remove.listener, add.listener, 'and the exact same listener')
+  assert.equal(remove.capture, true, 'and the same capture flag')
 })
 
 finish('client')

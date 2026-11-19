@@ -50,8 +50,14 @@ function fakeGateway() {
   const opened = []
   const gateway = {
     calls, opened,
+    // The session the Host lists to every device (the gateway's visible set, which the
+    // devices' DSH per-resource bindings are built from). T11h needs a REAL root id.
+    visibleSessionId: 's1',
     // 36d9: a device only receives cards for sessions the Host lists to it.
-    async invoke(request) { return request?.namespace === 'session' && request?.method === 'list' ? { items: [{ sessionId: 's1' }] } : {} },
+    async invoke(request) {
+      return request?.namespace === 'session' && request?.method === 'list'
+        ? { items: [{ sessionId: gateway.visibleSessionId }] } : {}
+    },
     async stream(request) {
       return (async function* () {
         yield { type: 'baseline', value: request.namespace === 'workspace'
@@ -65,7 +71,7 @@ function fakeGateway() {
       if (endpoint === 'session/attachment') {
         return { ok: true, value: { name: 'a.bin', data: new Uint8Array(REMOTE_BINARY_CHUNK_BYTES + 10).fill(7) } }
       }
-      if (endpoint === 'session/list') return { ok: true, value: { items: [{ sessionId: 's1' }] } }
+      if (endpoint === 'session/list') return { ok: true, value: { items: [{ sessionId: gateway.visibleSessionId }] } }
       if (endpoint === 'session/modelCatalog') {
         return { ok: true, value: { default: { provider: 'deepseek', model: 'deepseek-chat' },
           groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'deepseek-chat' }, { id: 'deepseek-reasoner' }] }], failures: [] } }
@@ -350,7 +356,10 @@ const SCOPE_TABLE = {
   // Revision 11: archiving ONE session moved here from prompt:send.
   'sessions:author': ['session/selectModel', 'session/fork', 'session/rename', 'workspace/archiveSession',
     'workspace/pinSession', 'workspace/unpinSession', 'workspace/unarchiveSession',
-    'workspace/insertBefore', 'workspace/insertSessionBefore'],
+    'workspace/insertBefore', 'workspace/insertSessionBefore',
+    // Owner 2026-11-15: the Team switch of one session (DSH 0.2.2-rc.3's only
+    // `agentTeams` wire method) is session authoring.
+    'agentTeams/setEnabled'],
   'credentials:write': ['credentials/set', 'credentials/unset'],
   'plugins:manage': ['pluginManager/listBundles', 'pluginManager/listPlugins', 'pluginManager/setPluginEnabled',
     'pluginManager/updateBundle', 'pluginManager/installBundle', 'pluginManager/someFutureMethod',
@@ -1235,7 +1244,9 @@ test('T9a: session/prompt starting with "/" is refused before the Host (remote/s
     assert.equal(ok.ok, true, JSON.stringify(args))
   }
   // The guard is specific to session/prompt (workspaceId is checked against the Host list).
-  assert.equal((await call(ws, 'session/create', { request: { workspaceId: 'w1', text: '/ok' } })).ok, true)
+  // (A session/create is checked against the Host's workspace list, hence `w2` of the
+  // fake Host's `workspace/follow` baseline.)
+  assert.equal((await call(ws, 'session/create', { request: { workspaceId: 'w2', text: '/ok' } })).ok, true)
   // Defence in depth only: a device that holds commands:execute can run slash commands anyway.
   const { ws: commander } = await desktop(instance, [...ALL_REMOTE, 'commands:execute'], 'deskcmd0-0000-4000-8000-000000000010')
   assert.equal((await call(commander, 'session/prompt', { text: '/compact' })).ok, true)
@@ -2055,7 +2066,10 @@ test('T10l: presets and the mobile boundary — standard/full are exactly as spe
   const plain = await instance.post('pair', { kind: 'desktop', publicUrl: instance.lanUrl })
   for (const scope of DESKTOP_ONLY_SCOPES) assert.equal(plain.data.pairing.scopes.includes(scope), false)
   const full = await instance.post('pair', { kind: 'desktop', scopes: [...SCOPE_PRESETS.full], publicUrl: instance.lanUrl })
-  assert.deepEqual([...full.data.pairing.scopes].sort(), [...SCOPES].sort())
+  // Spec 021 rev 15: `full` still lists `web:unlock`, but a DESKTOP grant can never contain it
+  // (it would lock every frame forever). The desktop gets every other scope of the preset.
+  assert.deepEqual([...full.data.pairing.scopes].sort(), [...EVERY_SCOPE].sort())
+  assert.equal(full.data.pairing.scopes.includes('web:unlock'), false, 'the desktop full grant has no web scope')
   // authorizeEndpoint: a mobile record holding a scope reaches exactly what a desktop
   // record with the same grant reaches (spec 012 rule 3 — kind is not policy).
   const mobileRecord = { kind: 'mobile', scopes: [...SCOPES] }
@@ -2106,6 +2120,242 @@ test('T11a: pin/unpin/unarchive/reorder are sessions:author and pluginInventory 
     assert.equal(refused.error.code, 'auth/forbidden-scope', endpoint)
   }
   assert.equal(instance.gateway.calls.length, before, 'a scope refusal must not reach the Host')
+})
+
+test('T11g: the Team switch agentTeams/setEnabled is sessions:author (owner 2026-11-15), never a hard block', async (t) => {
+  // The toast this fixes: the desktop Team toggle over a REMOTE host answered
+  // `agentTeams/setEnabled is not on the remote-bridge allowlist`. It maps to one
+  // scope now, and that scope (not another one) is what unlocks it.
+  assert.equal(denyReason('agentTeams/setEnabled'), undefined)
+  assert.equal(hostUiOnlyReason('agentTeams/setEnabled'), undefined)
+  assert.equal(scopeForEndpoint('agentTeams/setEnabled'), 'sessions:author')
+  assert.deepEqual(authorizeEndpoint(holding('sessions:author'), 'agentTeams/setEnabled'),
+    { ok: true, scope: 'sessions:author' })
+  // Without the scope it is a scope refusal naming sessions:author — not the
+  // "not on the allowlist" refusal, and not a hard deny.
+  for (const other of [undefined, 'sessions:read', 'prompt:send', 'settings:write', 'workspace:manage']) {
+    const refused = authorizeEndpoint(holding(...(other ? [other] : [])), 'agentTeams/setEnabled')
+    assert.equal(refused.code, 'auth/forbidden-scope', String(other))
+    assert.equal(refused.scope, 'sessions:author', String(other))
+  }
+  // `agentTeams` is NOT a whole-namespace family: a method a later DSH adds stays
+  // unlisted (deny by default) until it is mapped deliberately.
+  assert.equal(scopeForEndpoint('agentTeams/isEnabled'), undefined)
+  assert.equal(authorizeEndpoint(holding('sessions:author'), 'agentTeams/isEnabled').code, 'op/forbidden')
+  // Over the wire: forwarded verbatim for the device that holds the scope — the
+  // renderer's own wire args, `{ agentId, enabled }` (dsh-api-gateway args
+  // `args[parameter.wire]`; the devices router strips its `h:<hostId>:` tag first).
+  // The agentId is a session the Host lists to the device (T11h): scope alone no
+  // longer forwards an id the device may not see.
+  const instance = await factory(t)
+  const { ws } = await desktop(instance, [...ALL_REMOTE, 'sessions:author'],
+    'deskteam0-0000-4000-8000-0000000000a3')
+  const args = { agentId: instance.gateway.visibleSessionId, enabled: true }
+  const reply = await call(ws, 'agentTeams/setEnabled', args)
+  assert.equal(reply.ok, true, JSON.stringify(reply))
+  const forwarded = instance.gateway.calls.find((entry) => entry.endpoint === 'agentTeams/setEnabled')
+  assert.ok(forwarded, 'agentTeams/setEnabled reached the Host')
+  assert.deepEqual(forwarded.payload, { args })
+  // And never for the device without it.
+  const before = instance.gateway.calls.length
+  const { ws: without } = await desktop(instance, ALL_REMOTE, 'deskteam1-0000-4000-8000-0000000000a4')
+  const refused = await call(without, 'agentTeams/setEnabled', args)
+  assert.equal(refused.ok, false)
+  assert.equal(refused.error.code, 'auth/forbidden-scope')
+  assert.equal(refused.error.scope, 'sessions:author')
+  assert.equal(instance.gateway.calls.length, before, 'a scope refusal must not reach the Host')
+})
+
+// Reviewer FAIL (owner 2026-11-15): T11g authorized the Team switch by SCOPE only.
+// `agentTeams/setEnabled` names no `sessionId`, so DSH resolves no Session resource
+// for it: a device holding harness:remote + sessions:author could flip Team mode on a
+// live root session outside its visible set by guessing the id. The bridge now
+// requires the id in the visible set the DEVICE's own DSH policy is built from.
+test('T11h: the Team switch refuses an agentId outside the device\'s visible sessions — before any Host call', async (t) => {
+  const TEAM = 'agentTeams/setEnabled'
+  // The same over-wide frame a later test uses (MAX_ARG_BREADTH is 64 keys).
+  const padding = (n = 70) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`pad${i}`, i]))
+  const scopeDevice = (scopes) => ({ kind: 'desktop', scopes: ['harness:remote', ...scopes] })
+  const listed = (ids = ['s1']) => ({ visibleSessionIds: new Set(ids), freshness: 1 })
+
+  // -- unit: the rule itself (`checkArgumentsWithHost` + a fake visible set) --------
+  const device = scopeDevice(['sessions:author', 'sessions:read'])
+  const check = (args, host, who = device) => checkArgumentsWithHost(who, TEAM, args, host)
+  assert.equal(await check({ agentId: 's1', enabled: true }, { visibleSessions: async () => listed() }), undefined)
+  assert.equal(await check({ agentId: 's1', enabled: false }, { visibleSessions: async () => listed() }), undefined)
+  assert.equal(await check({ request: { agentId: 's1', enabled: true } }, { visibleSessions: async () => listed() }), undefined)
+  // Outside the set: refused, and the refusal names sessions:read.
+  const unlisted = await check({ agentId: 's9', enabled: true }, { visibleSessions: async () => listed() })
+  assert.equal(unlisted?.code, 'remote/argument-denied')
+  assert.equal(unlisted?.scope, 'sessions:read')
+  // The set cannot be read, or no resolver at all: fail closed as "unavailable".
+  for (const host of [
+    { visibleSessions: async () => undefined },
+    { visibleSessions: async () => { throw new Error('boom') } },
+    { visibleSessions: async () => ({ visibleSessionIds: new Set(['s1']) }) }, // no Host-backed proof
+    { visibleSessions: async () => ({ freshness: 1 }) }, // no set
+    {},
+  ]) {
+    const refused = await check({ agentId: 's1', enabled: true }, host)
+    assert.equal(refused?.code, 'remote/unavailable', JSON.stringify(Object.keys(host)))
+  }
+  // Missing / non-string agentId: refused whatever the set says.
+  for (const bad of [undefined, '', '   ', 7, null]) {
+    const refused = await check({ agentId: bad, enabled: true }, { visibleSessions: async () => listed() })
+    assert.equal(refused?.code, 'remote/argument-denied', JSON.stringify(bad))
+  }
+  // A container where the id belongs cannot be checked either: it refuses, never passes.
+  for (const odd of [{ id: 's1' }, ['s1'], [{ id: 's1' }]]) {
+    const refused = await check({ agentId: odd, enabled: true }, { visibleSessions: async () => listed() })
+    assert.equal(refused?.code, 'remote/arguments-too-complex', JSON.stringify(odd))
+  }
+  // Live `sessions:read` is part of the rule: without it scope alone is a scope refusal.
+  const blind = await check({ agentId: 's1', enabled: true }, { visibleSessions: async () => listed() },
+    scopeDevice(['sessions:author']))
+  assert.equal(blind?.code, 'auth/forbidden-scope')
+  assert.equal(blind?.scope, 'sessions:read')
+  // An over-wide ROOT with no id at all refuses as too complex (never as a missing id).
+  assert.equal((await check({ ...padding() }, { visibleSessions: async () => listed() }))?.code,
+    'remote/arguments-too-complex')
+  // A registered slot of the frame is bounded, id or not: padding may not ride along
+  // with a listed id, at the top level or in the `request` wrapper. (`request` is
+  // only bypassed here because this fake Host answers every call; over the wire the
+  // wrapper is refused for this endpoint before any of this runs — see below.)
+  for (const framed of [{ agentId: 's1', enabled: true, ...padding() },
+    { request: { agentId: 's1', enabled: true, ...padding() } }]) {
+    const wide = await check(framed, { visibleSessions: async () => listed() })
+    assert.equal(wide?.code, 'remote/arguments-too-complex', JSON.stringify(Object.keys(framed)))
+  }
+  // The op-level gate (dispatch path): a set with no Host listing behind it refuses
+  // before anything is even walked; a Host-backed one leaves the id to be checked.
+  const noProof = { agentId: 's1', enabled: true, ...padding() }
+  assert.equal(checkArguments(device, TEAM, noProof, { sessionListed: false })?.code, 'remote/unavailable')
+  // (The oversized frame of the previous check is bounded before the set is read, so
+  // the probe below uses a plain one: the set has no listing behind it.)
+  assert.equal((await check({ agentId: 's1', enabled: true },
+    { visibleSessions: async () => ({ visibleSessionIds: new Set(['s1']) }) }))?.code, 'remote/unavailable')
+  // Other endpoints never consult it.
+  assert.equal(checkArguments(device, 'session/list', {}, { sessionListed: false }), undefined)
+  // A bridge built WITHOUT the resolver refuses at authorization: it cannot check the id.
+  assert.equal(authorizeEndpoint(device, TEAM, { allowMissing: [TEAM] }).code, 'op/forbidden')
+  assert.equal(authorizeEndpoint(device, TEAM).ok, true)
+
+  // -- over the wire (real plugin, real device Peers) -------------------------------
+  const instance = await factory(t)
+  const visible = instance.gateway.visibleSessionId
+  const { ws } = await desktop(instance, [...ALL_REMOTE, 'sessions:author', 'sessions:read'],
+    'deskteam2-0000-4000-8000-0000000000a5')
+  const teamCalls = () => instance.gateway.calls.filter((entry) => entry.endpoint === TEAM)
+  const before = teamCalls().length
+  // Within the set: forwarded once, verbatim, for both directions of the switch.
+  for (const enabled of [true, false]) {
+    const args = { agentId: visible, enabled }
+    const reply = await call(ws, TEAM, args)
+    assert.equal(reply.ok, true, JSON.stringify(reply))
+    const sent = teamCalls()
+    assert.equal(sent.length, before + (enabled ? 1 : 2), JSON.stringify(reply))
+    assert.deepEqual(sent.at(-1).payload, { args })
+  }
+  // Outside it (a live root session this device cannot see): refused, never forwarded.
+  let seen = teamCalls().length
+  const outside = await call(ws, TEAM, { agentId: 'root-outside-visible-set', enabled: true })
+  assert.equal(outside.ok, false, JSON.stringify(outside))
+  assert.equal(outside.error.code, 'remote/argument-denied')
+  assert.equal(teamCalls().length, seen, 'a refused switch must not reach the Host')
+  // Malformed ids are refused the same way (a container is unchecked, never forwarded).
+  for (const [bad, code] of [[undefined, 'remote/argument-denied'], ['', 'remote/argument-denied'],
+    [7, 'remote/argument-denied'], [['s1'], 'remote/arguments-too-complex']]) {
+    seen = teamCalls().length
+    const reply = await call(ws, TEAM, { agentId: bad, enabled: true })
+    assert.equal(reply.ok, false, JSON.stringify(bad))
+    assert.equal(reply.error.code, code, JSON.stringify(bad))
+    assert.equal(teamCalls().length, seen, JSON.stringify(bad))
+  }
+  // Rank padding cannot hide the id from the check: wrapped in a nested lookup slot
+  // the tree is too complex to check unattended, and the switch refuses before the Host.
+  seen = teamCalls().length
+  const padded = await call(ws, TEAM, { request: { agentId: visible, enabled: true, ...padding() } })
+  assert.equal(padded.ok, false, JSON.stringify(padded))
+  assert.equal(padded.error.code, 'remote/arguments-too-complex')
+  assert.equal(teamCalls().length, seen, 'an over-wide frame must not reach the Host')
+  // No live sessions:read: the rule cannot be evaluated, so it refuses by scope.
+  seen = teamCalls().length
+  // harness:remote is required to reach the bridge at all; without it the device is
+  // refused at the door and the visibility rule under test never runs.
+  const { ws: blindWs } = await desktop(instance, ['harness:remote', 'sessions:author'], 'deskteam3-0000-4000-8000-0000000000a6')
+  const withoutRead = await call(blindWs, TEAM, { agentId: visible, enabled: true })
+  assert.equal(withoutRead.ok, false, JSON.stringify(withoutRead))
+  assert.equal(withoutRead.error.code, 'auth/forbidden-scope')
+  assert.equal(withoutRead.error.scope, 'sessions:read')
+  assert.equal(teamCalls().length, seen, 'a scope refusal must not reach the Host')
+  // No sessions:author at all: the ordinary scope refusal is unchanged.
+  const { ws: withoutScope } = await desktop(instance, ALL_REMOTE, 'deskteam4-0000-4000-8000-0000000000a7')
+  const noScope = await call(withoutScope, TEAM, { agentId: visible, enabled: true })
+  assert.equal(noScope.ok, false)
+  assert.equal(noScope.error.code, 'auth/forbidden-scope')
+  assert.equal(noScope.error.scope, 'sessions:author')
+  assert.equal(teamCalls().length, seen, 'a scope refusal must not reach the Host')
+})
+
+test('T11i: an unavailable visibility resolver refuses that call only, recovers, and never starts Host work', async () => {
+  // Reviewer 2026-11-16: (a) one transient failure must not latch the Team switch off for
+  // the bridge's life or for other devices; (b) reading the resolver is a side-effect-free
+  // authorization read, so refused or malformed calls cause no Host call of any kind.
+  const TEAM = 'agentTeams/setEnabled'
+  const gateway = fakeGateway()
+  const hostCalls = []
+  gateway.dispatchRpc = async (endpoint, payload) => { hostCalls.push(endpoint); return { ok: true, value: null } }
+  const sent = []
+  const ws = (sink) => ({ readyState: 1, bufferedAmount: 0, send: (text) => sink.push(JSON.parse(text)) })
+  let answer = 'down'
+  const resolverCalls = []
+  const bridge = createRemoteBridge({
+    getGateway: () => gateway,
+    createPeer: () => ({ principal: { kind: 'owner' } }),
+    getDevice: (id) => (id === 'dev-blind'
+      ? { kind: 'desktop', scopes: ['harness:remote', 'sessions:author'] }
+      : { kind: 'desktop', scopes: [...ALL_REMOTE, 'sessions:author'] }),
+    decideApproval: async () => ({ kind: 'error', code: 'bad-request', message: 'n/a' }),
+    visibleSessions: (deviceId) => {
+      resolverCalls.push(deviceId)
+      if (answer === 'down') return undefined
+      if (answer === 'throw') throw new Error('transient')
+      return { visibleSessionIds: new Set(['s1']), freshness: 1, sessionListed: true }
+    },
+    log: () => {},
+  })
+  const a = bridge.attach(ws(sent), 'dev-a')
+  const reply = (id) => sent.find((f) => f.kind === 'remote-result' && f.requestId === id)
+
+  await a.call({ requestId: 'down', endpoint: TEAM, args: { agentId: 's1', enabled: true } })
+  assert.equal(reply('down').ok, false, 'unavailable resolver refuses this call')
+  answer = 'throw'
+  await a.call({ requestId: 'throw', endpoint: TEAM, args: { agentId: 's1', enabled: true } })
+  assert.equal(reply('throw').ok, false, 'a throwing resolver refuses this call')
+  assert.equal(hostCalls.length, 0, 'refused calls start no Host work')
+
+  answer = 'up'
+  await a.call({ requestId: 'up', endpoint: TEAM, args: { agentId: 's1', enabled: false } })
+  assert.equal(reply('up').ok, true, JSON.stringify(reply('up')))
+  assert.deepEqual(hostCalls, [TEAM], 'the recovered resolver lets the visible id through once')
+
+  // Another device on the same bridge is unaffected by the earlier failures.
+  const sentB = []
+  const b = bridge.attach(ws(sentB), 'dev-b')
+  await b.call({ requestId: 'b', endpoint: TEAM, args: { agentId: 's1', enabled: true } })
+  assert.equal(sentB.find((f) => f.requestId === 'b').ok, true)
+
+  // Repeated refused calls (no sessions:read, malformed ids) never reach the Host.
+  const before = hostCalls.length
+  const sentBlind = []
+  const blind = bridge.attach(ws(sentBlind), 'dev-blind')
+  for (let i = 0; i < 5; i += 1) {
+    await blind.call({ requestId: `n${i}`, endpoint: TEAM, args: { agentId: 's1', enabled: true } })
+    await a.call({ requestId: `m${i}`, endpoint: TEAM, args: { agentId: 7, enabled: true } })
+  }
+  assert.equal(sentBlind.every((f) => f.kind !== 'remote-result' || f.ok === false), true)
+  assert.equal(hostCalls.length, before, 'refused or malformed calls cause no Host call')
+  a.close(); b.close(); blind.close()
 })
 
 test('T11b: session/fork, session/rename and workspace/archiveSession are sessions:author; workspace/rename keeps prompt:send', () => {

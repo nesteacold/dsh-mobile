@@ -278,7 +278,9 @@ test('CAPABILITIES / OPTIONAL_CAPABILITIES match the prose of §3.5', () => {
   assert.deepEqual([...OPTIONAL_CAPABILITIES],
     ['push-v1', 'browser-agent:1', 'session-rename', 'session-archive', ...SPEC_019_CAPABILITIES,
       // Spec 026 (revision 15): web push, advertised only while the owner enabled it.
-      protocol.WEB_PUSH_CAPABILITY])
+      protocol.WEB_PUSH_CAPABILITY,
+      // Spec 036 (revision 16): the client-side opt-in for the rolling 24h grant.
+      protocol.WEB_UNLOCK_SESSION_CAPABILITY])
   // Revision 13 reflowed the tail of this list (it now feeds `permission-lower`), so the
   // rename/archive condition dropped its closing period; the two facts asserted above
   // still pin its names and the scope it names, so a scope change cannot pass silently.
@@ -765,6 +767,32 @@ test('SCOPE_PRESETS: standard is the four read/prompt/approve/files scopes plus 
     ['sessions:read', 'prompt:send', 'approval:respond', 'attachments:write', 'browser:control'])
 })
 
+// Spec 021 revision 15 (additive): `web:unlock` is a web/`mobile`-only scope. A `desktop` that
+// holds it is refused `auth/locked` forever — a desktop never sends an `Origin`, so it can never
+// register or assert a passkey — which is exactly the state measured on 2026-11-14 (an OTP offer
+// of kind `desktop` carrying SCOPE_PRESETS.full). The contract now says so, so both offer builders
+// can filter by kind instead of each keeping its own idea of what a kind may hold.
+test('spec 021 rev 15: `web:unlock` is MOBILE_ONLY — never in a desktop grant, still in a mobile one', () => {
+  assert.deepEqual([...protocol.MOBILE_ONLY_SCOPES], SPEC_021_SCOPES)
+  assert.equal(protocol.DESKTOP_ONLY_SCOPES.includes('web:unlock'), false, 'it is the mirror of the desktop-only list')
+  // The table is the whole vocabulary split by kind: no scope is lost, none is in both lists.
+  for (const kind of protocol.DEVICE_KINDS) {
+    const holder = kind === 'desktop' ? protocol.MOBILE_ONLY_SCOPES : protocol.DESKTOP_ONLY_SCOPES
+    const gone = kind === 'desktop' ? protocol.DESKTOP_ONLY_SCOPES : protocol.MOBILE_ONLY_SCOPES
+    assert.deepEqual([...protocol.scopesForKind(kind)], protocol.SCOPES.filter((scope) => !holder.includes(scope)),
+      `${kind} holds every scope except the other kind's list`)
+    for (const scope of holder) assert.equal(protocol.scopesForKind(kind).includes(scope), false, `${kind} may not hold ${scope}`)
+    for (const scope of gone) assert.equal(protocol.scopesForKind(kind).includes(scope), true, `${kind} may hold ${scope}`)
+  }
+  // An absent/unknown kind gets the narrower (`mobile`) list, never the desktop one.
+  assert.deepEqual([...protocol.scopesForKind(undefined)], [...protocol.scopesForKind('mobile')])
+  assert.equal(protocol.scopesForKind('tablet').includes('harness:remote'), false)
+  // `full` still lists it (it is one preset for both kinds); filtering is the caller's job.
+  assert.ok(protocol.SCOPE_PRESETS.full.includes('web:unlock'))
+  const declaration = fs.readFileSync(new URL('../index.d.ts', import.meta.url), 'utf8')
+  for (const name of ['MOBILE_ONLY_SCOPES', 'scopesForKind']) assert.ok(declaration.includes(name), `${name} must be declared`)
+})
+
 test('the d.ts declares the revision 4 surface', () => {
   const declaration = fs.readFileSync(new URL('../index.d.ts', import.meta.url), 'utf8')
   assert.match(declaration, /\| 'harness:remote'/)
@@ -1170,4 +1198,47 @@ test('revision 15: the d.ts declares the web push surface', () => {
   assert.ok(hello, 'HelloFrame not found')
   assert.match(hello, /^\s*webPush\?: WebPushHello$/m)
   assert.ok(declaration.includes(`| 'webPush'`), 'webPush must be declared as an OptionalCapability')
+})
+
+// ---------------------------------------------------------------------------
+// Spec 036 — the opt-in web unlock session (revision 16, additive)
+// ---------------------------------------------------------------------------
+
+test('revision 16: the web unlock session capability and TTL are pinned, additive and opt-in', () => {
+  assert.equal(protocol.WEB_UNLOCK_SESSION_CAPABILITY, 'web-unlock-session.v1')
+  assert.equal(protocol.WEB_UNLOCK_SESSION_TTL_MS, 24 * 60 * 60 * 1000)
+  assert.ok(OPTIONAL_CAPABILITIES.includes(protocol.WEB_UNLOCK_SESSION_CAPABILITY), 'the opt-in is optional')
+  assert.equal(CAPABILITIES.includes(protocol.WEB_UNLOCK_SESSION_CAPABILITY), false, 'never required')
+  // No new frame: the §4 table and the scope vocabulary are untouched.
+  assert.equal(OPS.length, contractOps.length)
+  assert.equal(protocol.SCOPE_BY_TYPE[protocol.WEB_UNLOCK_SESSION_CAPABILITY], undefined)
+  assert.match(contract, /## Revision 16 \(spec 036 web unlock session, additive\)/)
+  assert.ok(contract.includes('`web-unlock-session.v1`'), 'the capability must appear in the contract')
+  assert.ok(contract.includes('24 × 60 × 60 × 1000 ms'), 'the sliding TTL must appear in §14.7')
+  assert.ok(contract.includes('keeps the revision 14 rule (every new socket locked'), 'non-capable clients keep spec 021')
+  const declaration = fs.readFileSync(new URL('../index.d.ts', import.meta.url), 'utf8')
+  for (const name of ['WEB_UNLOCK_SESSION_CAPABILITY', 'WEB_UNLOCK_SESSION_TTL_MS']) {
+    assert.ok(declaration.includes(`export const ${name}`), `${name} must be declared`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Spec 045 — deprecate the browser web-lock frames/capability WITHOUT changing wire values
+// ---------------------------------------------------------------------------
+
+test('spec 045: browser web-lock frames are documented as deprecated; wire names and values are unchanged', () => {
+  assert.equal(protocol.PASSKEY_LOCK_TYPE, 'passkey-lock')
+  assert.equal(protocol.WEB_UNLOCK_SESSION_CAPABILITY, 'web-unlock-session.v1')
+  assert.equal(protocol.WEB_UNLOCK_SESSION_TTL_MS, 24 * 60 * 60 * 1000)
+  assert.deepEqual([...protocol.WEB_LOCK_STATES], ['unregistered', 'locked', 'unlocked'])
+  const source = fs.readFileSync(new URL('../src/index.mjs', import.meta.url), 'utf8')
+  const declaration = fs.readFileSync(new URL('../index.d.ts', import.meta.url), 'utf8')
+  const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8')
+  assert.match(source, /@deprecated[\s\S]{0,240}Spec 045[\s\S]{0,240}BROWSER\/PWA/,
+    'the ceremony block must name the browser deprecation')
+  assert.match(source, /@deprecated[\s\S]{0,240}Spec 045[\s\S]{0,240}passkey-lock|@deprecated[\s\S]{0,240}Spec 045[\s\S]{0,240}browser\/PWA sockets ignore its lock effect/,
+    'passkey-lock must be deprecated')
+  assert.match(declaration, /@deprecated Spec 045[\s\S]{0,160}PASSKEY_LOCK_TYPE|@deprecated Spec 045[\s\S]{0,160}browser\/PWA sockets ignore its lock effect/,
+    'the declaration must carry the deprecation')
+  assert.ok(readme.includes('deprecated for'), 'the README must describe the browser deprecation')
 })

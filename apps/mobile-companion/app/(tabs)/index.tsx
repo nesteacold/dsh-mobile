@@ -15,7 +15,7 @@
 // store exposes it. Nothing is invented to fake the reference's per-workspace sections.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Alert, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -61,6 +61,7 @@ import { GlassSurface } from '../../src/ui/components/ui';
 import { MeshBackdrop } from '../../src/ui/components/ocean-mesh';
 import { elevation, hit, radius, space, useTheme } from '../../src/ui/theme';
 import { useApp } from '../_layout';
+import { browserConfirm, confirmAndForget } from '../../src/ui/confirm-forget';
 import type { CompatDecision } from '../../src/core/compat';
 import { compatBannerView } from '../../src/ui/compat-banner';
 import { t, type MessageKey } from '../../i18n';
@@ -319,7 +320,7 @@ export default function ListScreen() {
       {/* Reconnect / offline / revoked banner — restored after the tab-bar removal dropped it. The
           list is where a user notices a dead link, so the reason must be visible here, not just in
           the conversation screen. */}
-      <Banner banner={banner} warn={bannerWarn} />
+      <Banner kind={snapshot.banner} banner={banner} warn={bannerWarn} controller={controller} tr={tr} />
 
       {/* Spec 029: a capability/version mismatch is surfaced, never silent. */}
       <CompatBanner
@@ -836,8 +837,8 @@ function FilterRow(props: {
 }
 
 /** Why the link is degraded, in one line. Warn-toned for states that need the user's attention. */
-function Banner(props: { banner: string | null; warn: boolean }) {
-  const { banner, warn } = props;
+function Banner(props: { kind: string | null; banner: string | null; warn: boolean; controller: ReturnType<typeof useApp>['controller']; tr: ReturnType<typeof useApp>['tr'] }) {
+  const { kind, banner, warn, controller, tr } = props;
   const { colors, type } = useTheme();
   if (banner === null) return null;
   return (
@@ -847,6 +848,32 @@ function Banner(props: { banner: string | null; warn: boolean }) {
       accessibilityLabel={banner}
     >
       <Text style={[type.caption, { color: warn ? colors.warning : colors.accent }]}>{banner}</Text>
+      {kind === 'connect-failed' ? (
+        <View style={{ flexDirection: 'row', gap: space.md, marginTop: space.sm }}>
+          <Pressable
+            testID="banner-retry"
+            accessibilityRole="button"
+            accessibilityLabel={tr('banner.retry')}
+            onPress={() => { void controller.retryConnection(); }}
+          >
+            <Text style={[type.caption, { color: colors.accent }]}>{tr('banner.retry')}</Text>
+          </Pressable>
+          <Pressable
+            testID="banner-pair-again"
+            accessibilityRole="button"
+            accessibilityLabel={tr('banner.pairAgain')}
+            onPress={() => confirmAndForget({
+              platform: Platform.OS,
+              confirm: browserConfirm(),
+              alert: (title, message, buttons) => Alert.alert(title, message, buttons),
+              forget: () => { void controller.forget(); },
+              copy: { title: tr('sessions.forget'), message: tr('sessions.forgetConfirm'), cancel: tr('common.cancel') },
+            })}
+          >
+            <Text style={[type.caption, { color: colors.textMuted }]}>{tr('banner.pairAgain')}</Text>
+          </Pressable>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -898,6 +925,8 @@ function bannerKey(banner: Exclude<ReturnType<typeof useApp>['snapshot']['banner
       return 'banner.revoked';
     case 'reauth':
       return 'banner.reauth';
+    case 'connect-failed':
+      return 'banner.connectFailed';
     case 'cleanup-failed':
       return 'banner.cleanupFailed';
   }

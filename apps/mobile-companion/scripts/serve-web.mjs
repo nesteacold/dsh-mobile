@@ -28,9 +28,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Same directives the build injects as <meta>, sent as a header so they are all enforced
 // (notably frame-ancestors, which a meta element cannot carry).
-const CSP = [
+// Exported so the dev CSP can be asserted behaviourally by the app test (no source regex).
+export const CSP = [
   "default-src 'self'",
-  "script-src 'self'",
+  // Spec 043: same-origin ZXing WASM compile token; keep in step with the build <meta> and the
+  // gateway ASSET_CSP header. Not general JS eval; no external origin.
+  "script-src 'self' 'wasm-unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
@@ -60,11 +63,13 @@ const TYPES = {
   '.woff': 'font/woff',
   '.woff2': 'font/woff2',
   '.css': 'text/css; charset=utf-8',
+  // Spec 043: streaming WASM compile needs application/wasm; otherwise fallback to ArrayBuffer.
+  '.wasm': 'application/wasm',
 };
 
 // The manifest is advertised as application/manifest+json (docs/web-pwa.md §3); the `types`
 // option below is what lets a browser parse it as a manifest at all.
-const typeFor = (file) => (file.endsWith('manifest.json') ? 'application/manifest+json' : TYPES[path.extname(file)] || 'application/octet-stream');
+export const typeFor = (file) => (file.endsWith('manifest.json') ? 'application/manifest+json' : TYPES[path.extname(file)] || 'application/octet-stream');
 
 const baseHeaders = () => ({
   'Content-Security-Policy': CSP,

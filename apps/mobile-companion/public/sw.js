@@ -13,7 +13,13 @@
 // Keeping the allowlist positive (only these paths are cacheable) is what makes the guarantee
 // auditable: an endpoint added later is NOT cached unless someone edits this list.
 
-const CACHE = 'dsh-shell-v5';
+// v6 (spec 043): adds the exact, version+hash-stamped ZXing WASM asset to the shell allowlist.
+// Bumping the name makes `activate` delete the v5 cache, so an upgraded PWA cannot keep a decoder
+// built for a different binary; the old worker's precache is dropped in the same pass.
+const CACHE = 'dsh-shell-v6';
+
+/** The one self-hosted decoder binary. An EXACT path only: no wildcard suffix, no API prefix. */
+const QR_WASM_PATH = '/zxing_reader-3.1.6-5003fb4b.wasm';
 
 /** Static shell assets: content-hashed by the bundler, so cache-first is safe. */
 const SHELL_ASSET_PATHS = ['/_expo/static/', '/assets/', '/icon.svg', '/icon-maskable.svg', '/manifest.json'];
@@ -28,6 +34,9 @@ const NEVER_CACHE = ['/api/', '/rpc', '/pair', '/devices', '/auth', '/push', '/s
 const HASHED_ASSET = /\.[0-9a-f]{8,}\.(?:js|css|woff2?|png|jpg|svg|webp)$/i;
 
 function isShellAsset(url) {
+  // The decoder binary is an EXACT path: a suffixed path like `<stamp>.wasm.anything` must never
+  // inherit shell caching. Prefixes are only for the directory-style shell entries above.
+  if (url.pathname === QR_WASM_PATH) return true;
   if (!SHELL_ASSET_PATHS.some((prefix) => url.pathname.startsWith(prefix))) return false;
   return !NEVER_CACHE.some((prefix) => url.pathname.startsWith(prefix));
 }

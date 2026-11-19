@@ -8,8 +8,9 @@
 // one place. The step is idempotent: re-running it never duplicates a tag.
 //
 // CSP NOTES (reviewer: read):
-//   * `script-src 'self'` — no inline scripts, no eval, no CDN. The SW is registered from an
-//     external `register-sw.js`.
+//   * `script-src 'self' 'wasm-unsafe-eval'` — no inline scripts, no JS eval, no CDN. The single
+//     addition is the standard CSP3 token for compiling the SAME-ORIGIN ZXing WASM binary that
+//     spec 043 self-hosts; the SW is registered from an external `register-sw.js`.
 //   * `connect-src 'self' wss: https:` — the app talks to the Host over `wss://<host>.ts.net`,
 //     which is a different origin; the transport relies on the browser CA store (no pinning), so
 //     this must be allowed. There is no way to pin a certificate in a browser (spec 020 §owner).
@@ -20,6 +21,7 @@
 //   * Deliberately NO `worker-src`/`service-worker` relaxation beyond 'self'.
 
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -27,6 +29,25 @@ import { pathToFileURL } from 'node:url';
 const ROOT = path.resolve(import.meta.dirname, '..');
 const OUT_DIR = path.join(ROOT, 'dist');
 const INDEX = path.join(OUT_DIR, 'index.html');
+
+/** Spec 043 (reviewer): the self-hosted decoder is content-addressed; a wrong/missing binary FAILS the build. */
+export const QR_WASM_ASSET = 'zxing_reader-3.1.6-5003fb4b.wasm';
+export const QR_WASM_SHA256 = '5003fb4b88c4fbd1fd518a2fd8c8ad365c519e183a08c03a322dddfea3cea84e';
+
+/**
+ * Verify the exact exported decoder. Returns its SHA-256 on success; throws with a clear message
+ * when the stamped file is missing or its bytes do not match the pinned hash. Pure enough for tests
+ * (takes the output directory as an argument).
+ */
+export function verifyQrWasm(outDir = OUT_DIR) {
+  const file = path.join(outDir, QR_WASM_ASSET);
+  if (!existsSync(file)) throw new Error(`build-web: REQUIRED decoder asset missing: /${QR_WASM_ASSET}`);
+  const digest = createHash('sha256').update(readFileSync(file)).digest('hex');
+  if (digest !== QR_WASM_SHA256) {
+    throw new Error(`build-web: /${QR_WASM_ASSET} SHA-256 ${digest} != pinned ${QR_WASM_SHA256}`);
+  }
+  return digest;
+}
 
 /**
  * The files the service worker precaches at install (`/precache.json`, read by `public/sw.js`).
@@ -40,7 +61,10 @@ const INDEX = path.join(OUT_DIR, 'index.html');
  * never listed. Pure: it takes the output directory's file list, so it is unit-testable.
  */
 export function buildPrecacheList(relativeFiles) {
-  const SHELL_FILES = ['manifest.json', 'icon.svg', 'icon-maskable.svg', 'register-sw.js'];
+  // Spec 043: the self-hosted, version+hash-stamped ZXing binary is a same-origin static asset. Its
+  // exact name is the cache key: a dependency upgrade changes the stamp, the precache entry and the
+  // SW allowlist together, so an old PWA can never reuse a stale decoder.
+  const SHELL_FILES = ['manifest.json', 'icon.svg', 'icon-maskable.svg', 'register-sw.js', QR_WASM_ASSET];
   const normalised = relativeFiles.map((file) => file.split(path.sep).join('/'));
   const list = ['/'];
   for (const file of normalised.slice().sort()) {
@@ -60,9 +84,11 @@ function listFiles(dir, base = dir) {
   return found;
 }
 
-const CSP = [
+export const CSP = [
   "default-src 'self'",
-  "script-src 'self'",
+  // Spec 043: compiling the same-origin, stamped `zxing_reader-3.1.6-5003fb4b.wasm` needs this token on iOS PWA. It is
+  // NOT general JS eval, and no external origin is admitted to `connect-src` for the WASM fetch.
+  "script-src 'self' 'wasm-unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
@@ -140,6 +166,9 @@ function main() {
   writeFileSync(INDEX, after, 'utf8');
   const injected = ['Content-Security-Policy', 'rel="manifest"', 'register-sw.js', 'rel="icon"'].filter((needle) => after.includes(needle));
   console.log(`build-web: injected ${injected.length}/4 PWA tags into dist/index.html (${injected.join(', ')})`);
+  // Hard gate (reviewer): a missing or altered decoder must fail the build, not merely warn.
+  const wasmDigest = verifyQrWasm(OUT_DIR);
+  console.log(`build-web: verified /${QR_WASM_ASSET} SHA-256 ${wasmDigest}`);
   for (const asset of ['manifest.json', 'sw.js', 'register-sw.js', 'icon.svg']) {
     if (!existsSync(path.join(OUT_DIR, asset))) console.warn(`build-web: WARNING ${asset} missing from dist/ (public/ not copied?)`);
   }

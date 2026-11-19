@@ -63,7 +63,7 @@ describe('session list — banner on the no-host empty state', () => {
   });
 
   it('renders the banner once, from one component (one hook, not two)', () => {
-    assert.equal(count(/<Banner banner=\{banner\} warn=\{bannerWarn\} \/>/g), 1, 'one banner render');
+    assert.equal(count(/<Banner kind=\{snapshot\.banner\} banner=\{banner\}[^>]*\/>/g), 1, 'one banner render');
     const hooks = [...source.matchAll(/testID=(?:"([^"]+)"|\{`([^`]+)`\})/g)]
       .map((match) => match[1] ?? match[2])
       .filter((id) => id === 'banner');
@@ -141,7 +141,11 @@ describe('revoked banner copy', () => {
 
   it('keeps a distinct message for every banner state', () => {
     for (const locale of LOCALES) {
-      assert.match(t(locale, 'banner.reauth'), /re-?authenticate|xác thực lại/i);
+      // A 401 is terminal: the retry loop is stopped, so the copy must promise pairing, never a
+      // reconnection (the version that said "Reconnecting…" described something that never happens).
+      assert.match(t(locale, 'banner.reauth'), /refused|từ chối/i);
+      assert.match(t(locale, 'banner.reauth'), /pair .*again|ghép đôi lại/i);
+      assert.doesNotMatch(t(locale, 'banner.reauth'), /reconnecting|đang kết nối lại/i);
       assert.ok(t(locale, 'banner.gatewayOff').trim() !== '', `${locale}: banner.gatewayOff`);
     }
   });

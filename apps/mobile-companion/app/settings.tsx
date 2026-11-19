@@ -35,12 +35,7 @@ export default function SettingsScreen() {
    * (the screen itself also refuses), instead of opening a page that could only say "not granted".
    */
   const canReadSchedules = controller.hasReadScope('schedule:read');
-  /**
-   * Spec 021: "Lock now" only exists where a passkey lock exists. The snapshot's `webLock` is
-   * non-null exactly for a device the Host locks (`web:unlock`), so a native install — which is
-   * never locked — draws no row for it, and the button is never dead.
-   */
-  const webLock = snapshot.webLock;
+  // Spec 045: the web-only "Lock now" action is gone. The PWA has no lock gate.
 
   /**
    * Spec 026 (R6/R7): web push toggle. Drawn only on web where the browser supports push and the Host
@@ -161,25 +156,6 @@ export default function SettingsScreen() {
               >
                 <Text style={[settingsType.item, { color: colors.danger }]}>{tr('sessions.forget')}</Text>
               </Pressable>
-              {/* Spec 021: the web (PWA) "Lock" action — sends `passkey-lock` and closes the socket,
-                  so the next frame, reload or tab needs the passkey again. Web only: a native install
-                  never carries `web:unlock` and is never locked, so it draws no row. */}
-              {Platform.OS === 'web' && webLock !== null ? (
-                <>
-                  <Divider inset={0} />
-                  <Pressable
-                    testID="settings-lock-now"
-                    accessibilityRole="button"
-                    accessibilityLabel={tr('settings.lockNow')}
-                    onPress={() => {
-                      void controller.lockWebDevice();
-                    }}
-                    style={({ pressed }) => [styles.row, pressed && styles.pressed]}
-                  >
-                    <Text style={[settingsType.item, { color: colors.text }]}>{tr('settings.lockNow')}</Text>
-                  </Pressable>
-                </>
-              ) : null}
             </Card>
           </View>
         )}

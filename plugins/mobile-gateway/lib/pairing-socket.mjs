@@ -121,7 +121,7 @@ export function createPairingSocketAcceptor({
           return registry.claimPairing(narrowed.code, clientDeviceId, request.name, { certSha256 })
         },
       })
-      log(`pairing pending: ${request.name} (${request.id}) from ${clientIp}, kind=${request.kind}, scopes=${request.requestedScopes.join(', ')}`)
+      log(`pairing pending: ${request.name || `(unnamed ${request.id.slice(0, 8)})`} (${request.id}) from ${clientIp}, kind=${request.kind}, scopes=${request.requestedScopes.join(', ')}`)
       send({ kind: 'pairing-pending', verificationCode: request.verificationCode, requestId: request.id, expiresAt: request.expiresAt })
     }
 

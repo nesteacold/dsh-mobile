@@ -25,6 +25,7 @@ import { test } from 'node:test'
 import WebSocket from 'ws'
 import plugin from '../lib/index.mjs'
 import { createPairingRequests, otpProof, verificationCode } from '../lib/pairing-requests.mjs'
+import { SCOPES as CONTRACT_SCOPES, scopesForKind } from '@dsh-ext/mobile-protocol'
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -629,4 +630,78 @@ test('P15: two concurrent approvals of one request produce exactly one token and
   assert.equal(session.frames.filter((frame) => frame.kind === 'paired').length, 1, 'exactly one token frame')
   assert.equal((await instance.get('devices')).data.devices.length, 1, 'exactly one device')
   assert.equal((await instance.get('pending')).data.pending.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// Spec 021 rev 15 — a `desktop` offer/grant can never carry `web:unlock` (a `mobile` still can)
+// ---------------------------------------------------------------------------
+
+test('P16: an OTP offer of kind desktop with the full preset drops web:unlock and says so; the approved grant has it not; a mobile offer keeps it', async (t) => {
+  const instance = await factory(t)
+  // The Devices page offers every scope it knows; the gateway must cut by KIND before the offer.
+  const created = await instance.post('pair', { mode: 'otp', kind: 'desktop', scopes: [...CONTRACT_SCOPES] })
+  assert.equal(created.status, 201, JSON.stringify(created.data))
+  assert.deepEqual(created.data.scopesNotForKind, ['web:unlock'], 'the drop is reported, not silent')
+  assert.equal(created.data.pairing.scopes.includes('web:unlock'), false, 'no web:unlock in a desktop offer')
+  // Everything else the desktop may hold is still offered: the offer is filtered, not failed.
+  for (const scope of CONTRACT_SCOPES.filter((scope) => scope !== 'web:unlock')) {
+    assert.ok(created.data.pairing.scopes.includes(scope), `${scope} survives on a desktop offer`)
+  }
+
+  // Approve the FULL offered list: the grant, the `paired` frame and the record agree, without it.
+  const session = await openPairing(instance, { name: 'Desk full' })
+  prove(session, created.data.otp, instance)
+  await session.take((frame) => frame.kind === 'pairing-pending')
+  const [request] = await waitPending(instance, 1)
+  assert.equal(request.kind, 'desktop')
+  const approved = await instance.post(`pending/${request.id}/approve`, { scopes: created.data.pairing.scopes })
+  assert.equal(approved.status, 200, JSON.stringify(approved.data))
+  assert.equal(approved.data.device.scopes.includes('web:unlock'), false, 'granted scopes carry no web:unlock')
+  const paired = await session.take((frame) => frame.kind === 'paired')
+  assert.equal(paired.device.scopes.includes('web:unlock'), false, 'the paired frame carries no web:unlock')
+  assert.equal((paired.device.scopes.filter((scope) => scope !== 'web:unlock').length), created.data.pairing.scopes.length)
+  // The record on disk never held it, so the restart below has nothing to repair.
+  const [device] = (await instance.get('devices')).data.devices
+  assert.equal(device.scopes.includes('web:unlock'), false)
+
+  // No weakening: the WEB device (the PWA is a `mobile`) still gets the scope, and still locks.
+  const mobile = await instance.post('pair', { mode: 'otp', kind: 'mobile', scopes: [...CONTRACT_SCOPES] })
+  assert.equal(mobile.status, 201, JSON.stringify(mobile.data))
+  assert.equal(mobile.data.pairing.scopes.includes('web:unlock'), true, 'a mobile offer keeps web:unlock')
+  assert.equal(mobile.data.pairing.scopes.includes('harness:remote'), false, 'the bridge scope stays desktop-only')
+  // What a mobile offer drops is the DESKTOP-only set (minus `harness:remote`, which the older
+  // bridge filter removed first) — never the web scope, and never silently.
+  assert.deepEqual(mobile.data.scopesNotForKind,
+    CONTRACT_SCOPES.filter((scope) => !scopesForKind('mobile').includes(scope) && scope !== 'harness:remote'))
+  assert.equal(mobile.data.scopesNotForKind.includes('web:unlock'), false, 'the web scope is never dropped for a mobile')
+})
+
+// ---------------------------------------------------------------------------
+// Spec 050 — the Devices page's NATIVE target: v3 string offer with a mobile-kind scope set
+// that omits web:unlock; Host approval can only narrow that offer, never re-add the web scope.
+// ---------------------------------------------------------------------------
+
+test('P17: a native-target mobile offer carries the v3 pin payload without web:unlock', async (t) => {
+  const instance = await factory(t)
+  const nativeScopes = scopesForKind('mobile').filter((scope) => scope !== 'web:unlock')
+
+  // The existing string path is unchanged; only the requested scope list differs from a PWA.
+  // This test asserts the OFFER only. Redeeming THIS string offer through the pending path,
+  // decoding it with the released app parser and reading a session with the issued token is
+  // covered end to end by test/spec050-native-string.test.mjs — an OTP offer is a DIFFERENT
+  // offer and must not be redeemed here to 'prove' the string offer.
+  const created = await instance.post('pair', {
+    mode: 'string', kind: 'mobile', scopes: nativeScopes, publicUrl: instance.lanUrl,
+  })
+  assert.equal(created.status, 201, JSON.stringify(created.data))
+  assert.equal(created.data.pairing.kind, 'mobile', 'a genuine mobile-kind string offer')
+  assert.deepEqual(created.data.pairing.scopes, nativeScopes)
+  assert.equal(created.data.pairing.scopes.includes('web:unlock'), false, 'the native string offer has no web unlock')
+  assert.equal(created.data.pairingString, created.data.qrPayload, 'copyable string is the QR payload')
+  const decoded = JSON.parse(Buffer.from(created.data.qrPayload, 'base64url').toString('utf8'))
+  assert.equal(decoded.version, 3, 'the native QR is the existing v3 payload')
+  assert.equal(decoded.certSha256, instance.pin, 'the pin is the Host certificate fingerprint')
+  assert.match(decoded.pairingCode, /^[A-Za-z0-9_-]{43}$/, '256-bit canonical base64url pairing code')
+  assert.match(decoded.gatewayId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.ok(decoded.publicUrl.startsWith('wss://') && decoded.endpoints.every((endpoint) => endpoint.startsWith('wss://')))
 })

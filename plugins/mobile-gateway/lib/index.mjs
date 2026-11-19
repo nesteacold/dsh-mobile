@@ -1093,7 +1093,13 @@ function devicesPluginActive(ctx) {
  *    address, so an alias can never map a loopback bind onto 0.0.0.0, :: or a
  *    public address.
  */
-const NO_TEST_SEAMS = Object.freeze({ networkInterfaces: null, listenAliases: Object.freeze({}) })
+const NO_TEST_SEAMS = Object.freeze({
+  networkInterfaces: null,
+  listenAliases: Object.freeze({}),
+  // Spec 045 legacy wire suites: re-arm the pre-045 web lock on Origin-bearing sockets.
+  // A seam, never a config key: Cordis/profile config cannot reach it.
+  testWebUnlockLegacyBrowserLock: false,
+})
 
 // A frozen plain-data copy. The caller keeps ownership of its objects and may
 // change them freely: nothing it does after this point is read by a bind.
@@ -1137,7 +1143,11 @@ function sealTestSeams(seams) {
       throw new Error(`mobile-gateway: test listen alias ${from} -> ${String(to)} must be a loopback or private address`)
     }
   }
-  return Object.freeze({ networkInterfaces, listenAliases })
+  return Object.freeze({
+    networkInterfaces,
+    listenAliases,
+    testWebUnlockLegacyBrowserLock: seams.testWebUnlockLegacyBrowserLock === true,
+  })
 }
 
 const plugin = {
@@ -1413,6 +1423,8 @@ const plugin = {
     // later reader too.
     delete options.testNetworkInterfaces
     delete options.testListenAliases
+    // Spec 045: the legacy lock seam is a `testSeams` argument, never a profile option.
+    delete options.testWebUnlockLegacyBrowserLock
     const testSeamsInForce = sealTestSeams(testSeams)
     // Contract §2: a programmatic caller reaches apply() without the schema, so
     // the resolved TTL is clamped here too; `/mgw/status` and the registry then
@@ -1551,7 +1563,8 @@ const plugin = {
       onPasskeyChanged: (deviceId) => {
         passkeyService.invalidate(deviceId, 'passkey-changed')
         for (const client of [...clients]) {
-          if (client.deviceId !== deviceId || !holdsWebUnlockScope(registry.get(deviceId)?.scopes)) continue
+          // Spec 045: a browser/PWA never re-arms a web lock, including on passkey replacement.
+          if (client.browserSocket || client.deviceId !== deviceId || !holdsWebUnlockScope(registry.get(deviceId)?.scopes)) continue
           if (client.passkeySlot) passkeyLock.lock(client.passkeySlot)
           client.send(stringifyWireFrame({ kind: 'hello', ...gatewayIdentity, webLock: 'locked' }))
         }
@@ -1578,7 +1591,8 @@ const plugin = {
       const live = registry.get(deviceId)
       if (live) passkeyService.invalidate(deviceId, PASSKEY_LOCK_TYPE)
       for (const client of [...clients]) {
-        if (client.deviceId !== deviceId || !client.passkeySlot) continue
+        // Spec 045: explicit Lock is native-only; browser sockets keep working.
+        if (client.browserSocket || client.deviceId !== deviceId || !client.passkeySlot) continue
         passkeyLock.lock(client.passkeySlot)
         passkeyService.forgetSocket(client)
       }
@@ -3487,7 +3501,8 @@ const plugin = {
                 verificationCode: passkeyDecision.verificationCode,
               })
               for (const client of clients) {
-                if (client.passkeySlot?.stateKey !== passkeyDecision.stateKey) continue
+                // Spec 045: browser sockets never take part in a passkey approval/lock ceremony.
+                if (client.browserSocket || client.passkeySlot?.stateKey !== passkeyDecision.stateKey) continue
                 // A `reject` answers nothing on the register path and the asking socket is LOCKED
                 // again: no grant was left, so its only way forward is a new ceremony.
                 if (passkeyDecision.action === 'reject' && client.passkeySlot) {
@@ -3924,6 +3939,15 @@ const plugin = {
       // carries the `Origin` it upgraded with and the door asks for that origin's rp id. A
       // native companion sends no Origin, so it can never run a ceremony at all.
       ws.origin = typeof transport.origin === 'string' ? transport.origin : undefined
+      // Spec 045: a browser/PWA is identified by the `Origin` it sent on the WS upgrade — the
+      // same transport signal the passkey site policy reads. Native companions send no Origin.
+      // Browser sockets are never armed with a Host-enforced web lock; the device credential,
+      // scopes and revocation checks below are unchanged. `testWebUnlockLegacyBrowserLock` is a
+      // sealed `testSeams` argument (never a config key or bundle option) that keeps the pre-045
+      // wire suites exercising the native lock path; it does not relax any production check.
+      const browserSocket = typeof transport.origin === 'string' && transport.origin !== ''
+        && testSeamsInForce.testWebUnlockLegacyBrowserLock !== true
+      ws.browserSocket = browserSocket
       // Spec 021 (revision 14): a `web:unlock` socket has its OWN lock record. It starts locked on
       // every connection (a tab reload or reconnect always needs a new assertion), and only a
       // `passkey-assert` ON THIS socket unlocks it. Ordinary devices get no slot and no gate.
@@ -3937,7 +3961,7 @@ const plugin = {
       if (device && holdsWebUnlockScope(device.scopes) && !mayHoldUnlock) {
         log(`device ${device.id}: ${device.kind} kind cannot hold ${WEB_UNLOCK_SCOPE}; not arming the web lock`)
       }
-      if (webDevice) {
+      if (webDevice && !browserSocket) {
         ws.passkeySlot = passkeyLock.newSocket()
         passkeyService.bindSocket(ws.passkeySlot, device.id)
       }
@@ -3946,7 +3970,7 @@ const plugin = {
       // opted-in device; the 15-minute idle bound does not apply while that grant is valid.
       // `unregistered` means the device has no passkey yet — register first.
       const webLockState = () => {
-        if (!webDevice) return undefined
+        if (!webDevice || browserSocket) return undefined
         const grant = effectiveGrant(device, ws)
         // Reviewer: an opted-in socket has ONLY the Host grant as its source of truth. A stale
         // slot.unlocked from an earlier assertion on this same socket must never be a fallback.
@@ -4002,7 +4026,8 @@ const plugin = {
         ...(typeof frame.code === 'string' ? { code: frame.code } : {}),
         message: LOCKED_ERROR_MESSAGE,
       })
-      ws.sendGate = (wire) => {
+      // Spec 045: a browser socket has no data gate at all — it is simply served normally.
+      if (!browserSocket) ws.sendGate = (wire) => {
         if (!webDevice) return wire
         // Spec 036: an outbound DATA send on a socket with a valid grant slides its 24h window.
         // Refusals/handshake frames never refresh it.
@@ -6229,7 +6254,9 @@ const plugin = {
               Object.defineProperty(sessionProjectionBaselines, sessionId, { enumerable: true, configurable: true, writable: true,
                 value: { asOfSeq: frame.seq, values: { ...projectionValues(previous?.values), [frame.key]: value } } })
               broadcastProjection(sessionId, frame.key, value, frame.seq)
-              log(`projection forwarded: key=${frame.key} session=${sessionId} seq=${frame.seq}`)
+              if (clients.size > 0 && frame.key !== 'subagentTiming') {
+                log(`projection forwarded: key=${frame.key} session=${sessionId} seq=${frame.seq}`)
+              }
             }
           }
           if (!backgroundStreamAbort.signal.aborted) log('session control stream ended; retrying')

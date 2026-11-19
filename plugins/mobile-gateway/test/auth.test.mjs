@@ -148,8 +148,47 @@ function upgradeOutcome(url, protocols, headers) {
   registry.revoke(firstNamed.device.id)
   registry.revoke(secondNamed.device.id)
   const unnamed = registry.claimPairing(registry.createPairing('Ignored desktop name').code, 'unnamed-device-001')
-  assert.equal(unnamed.device.name, '未命名设备')
+  assert.equal(unnamed.device.name, '', 'a client that reports no name is stored as "" — never a placeholder name')
+  assert.equal(registry.list().find((device) => device.id === unnamed.device.id).displayName, '', 'an unnamed device displays as ""; the page substitutes its own label')
+  assert.equal(JSON.parse(fs.readFileSync(registryFile, 'utf8')).devices.some((row) => row.id === unnamed.device.id && row.name === ''), true, '"" is what the store holds')
   registry.revoke(unnamed.device.id)
+
+  {
+    // Two unnamed devices are NOT numbered (" (1)" / " (2)" would be names nobody chose); a real
+    // duplicate name still is.
+    const dupFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-auth-dup-')), 'devices.json')
+    const dup = createRegistry(dupFile)
+    const u1 = dup.claimPairing(dup.createPairing().code, 'dup-unnamed-001')
+    const u2 = dup.claimPairing(dup.createPairing().code, 'dup-unnamed-002')
+    assert.deepEqual(dup.list().map((device) => device.displayName), ['', ''], 'unnamed devices keep displayName ""')
+    const p1 = dup.claimPairing(dup.createPairing().code, 'dup-phone-0001', 'Phone')
+    const p2 = dup.claimPairing(dup.createPairing().code, 'dup-phone-0002', 'Phone')
+    assert.deepEqual(
+      dup.list().map((device) => device.displayName),
+      ['', '', 'Phone (1)', 'Phone (2)'],
+      'only non-empty duplicate names are numbered',
+    )
+    for (const claimed of [u1, u2, p1, p2]) dup.revoke(claimed.device.id)
+  }
+
+  {
+    // Legacy store: the upstream placeholder was persisted as if the device had chosen it. It is
+    // converted to '' once, at load, and saved — so no later reader has to know about it.
+    const legacyFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-auth-legacy-')), 'devices.json')
+    const seed = createRegistry(legacyFile)
+    const seeded = seed.claimPairing(seed.createPairing().code, 'legacy-device-001', 'Legacy phone')
+    const persisted = JSON.parse(fs.readFileSync(legacyFile, 'utf8'))
+    for (const row of persisted.devices) {
+      if (row.id === seeded.device.id) row.name = '未命名设备'
+    }
+    fs.writeFileSync(legacyFile, JSON.stringify(persisted, null, 2))
+    const reloaded = createRegistry(legacyFile)
+    assert.equal(reloaded.get(seeded.device.id).name, '', 'the placeholder is read as ""')
+    assert.equal(JSON.parse(fs.readFileSync(legacyFile, 'utf8')).devices.find((row) => row.id === seeded.device.id).name, '', 'the conversion is saved once, not only held in memory')
+    assert.equal(reloaded.authenticate(seeded.token).id, seeded.device.id, 'converting the name leaves the credential intact')
+    const named = reloaded.authenticate(seeded.token, 'legacy-device-001', 'Renamed later')
+    assert.equal(named.name, 'Renamed later', 'a later name still lands')
+  }
 
   let managementRoute
   let upgradeRoute

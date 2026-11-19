@@ -415,6 +415,33 @@ function defaultModelUnavailable(requestType) {
     message: 'this Host has no default-model service (agentDefaultModel is not loaded)' }
 }
 
+/**
+ * Spec 052 — accept both the contract's `{members[], tasks[]}` and DSH rc.5's
+ * `{enabled, tasks[]}` (the live agentTeam view has no `members`). A malformed object with
+ * neither array is still refused; we never invent member rows.
+ */
+function isTeamProjection(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  // Any field that is present but malformed is refused outright — never silently replaced.
+  if (Object.hasOwn(value, 'members') && !Array.isArray(value.members)) return false
+  if (Object.hasOwn(value, 'tasks') && !Array.isArray(value.tasks)) return false
+  if (Object.hasOwn(value, 'enabled') && typeof value.enabled !== 'boolean') return false
+  // Contract shape: BOTH arrays required.
+  if (Object.hasOwn(value, 'members') && Object.hasOwn(value, 'tasks')) return true
+  // rc.5 shape: NO `members` key at all, boolean enabled, and a tasks array.
+  return !Object.hasOwn(value, 'members')
+    && typeof value.enabled === 'boolean'
+    && Array.isArray(value.tasks)
+}
+
+function normalizeTeamProjection(value) {
+  return {
+    ...value,
+    members: Array.isArray(value.members) ? value.members : [],
+    tasks: Array.isArray(value.tasks) ? value.tasks : [],
+  }
+}
+
 // Dispatch one mobile query frame; returns the wire frame to send back.
 async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
   if (PLUGIN_REQUEST_TYPES.has(msg.type)) return handlePluginQuery(api, msg, pluginContext)
@@ -433,11 +460,15 @@ async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
       }
       const value = snapshot.values[key] ?? null
       if (value !== null && (key === 'subagentCatalog' ? !Array.isArray(value)
-        : !Array.isArray(value.members) || !Array.isArray(value.tasks))) throw new Error('invalid team projection')
+        : !isTeamProjection(value))) throw new Error('invalid team projection')
+      // Spec 052: DSH rc.5's agentTeam view is `{enabled, tasks}` with NO `members` array.
+      // Normalise at the gateway boundary to the contract's `{members[], tasks[]}` without
+      // inventing members. The subagents view is unchanged.
+      const projected = key === 'agentTeam' && value !== null ? normalizeTeamProjection(value) : value
       return { kind: msg.type, sessionId, ...identity,
         projectionState: snapshot.kind === 'migration-required' ? 'migration-required'
           : value === null ? 'unavailable' : 'ready',
-        ...(snapshot.kind === 'sequenced' ? { asOfSeq: snapshot.asOfSeq } : {}), [key]: value }
+        ...(snapshot.kind === 'sequenced' ? { asOfSeq: snapshot.asOfSeq } : {}), [key]: projected }
     } catch (error) {
       return { kind: 'error', code: error.code || 'internal', message: error.message,
         requestType: msg.type, sessionId, ...identity }

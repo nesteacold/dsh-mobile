@@ -391,13 +391,15 @@ describe('registerPasskey / assertPasskey over a fake WebAuthn', () => {
     assert.deepEqual(Object.keys(assertion).sort(), ['authenticatorData', 'clientDataJSON', 'id', 'rawId', 'signature', 'userHandle']);
   });
 
-  it('a DISMISSED prompt is not an unlock: no frame is sent and the reason is the ordinary lock', async () => {
+  it('a DISMISSED prompt is not an unlock: no frame is sent and it has its own neutral reason', async () => {
     const dismissed = Object.assign(new Error('user dismissed'), { name: 'NotAllowedError' });
     fake = installWebAuthn({ get: dismissed });
     const { client, sent } = fakeClient([ASSERT_OPTIONS]);
     await assert.rejects(assertPasskey(client), (error: unknown) => {
-      assert.equal((error as { code?: string }).code, 'client/passkey-not-allowed');
-      assert.equal(lockReasonFor(error), 'locked');
+      // Spec 037: NotAllowedError is ambiguous (cancel / timeout / lost activation), so it gets its
+      // own copy path instead of blaming the Host with the generic lock.
+      assert.equal((error as { code?: string }).code, 'client/passkey-dismissed');
+      assert.equal(lockReasonFor(error), 'passkey-dismissed');
       return true;
     });
     assert.deepEqual(sent.map((frame) => frame.type), ['passkey-assert-options'], 'a dismissed prompt never asserts');

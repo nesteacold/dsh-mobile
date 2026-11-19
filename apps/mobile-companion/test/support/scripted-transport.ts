@@ -23,6 +23,9 @@ export class ScriptedTransport implements Transport {
   private readonly listeners = new Set<TransportListener>();
   private open = false;
 
+  /** Whether a `close` has been delivered; tests assert the pairing socket survives a background event. */
+  isOpen(): boolean { return this.open }
+
   connect(url: string, options: TransportConnectOptions): void {
     this.connects.push({ url, options });
   }

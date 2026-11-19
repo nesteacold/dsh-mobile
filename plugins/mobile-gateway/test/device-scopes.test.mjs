@@ -15,7 +15,7 @@ import { test } from 'node:test'
 import { createRegistry, digest } from '../lib/devices.js'
 import { scopeDenial } from '../lib/allowlist.mjs'
 import {
-  DESKTOP_DEFAULT_SCOPES, DESKTOP_ONLY_SCOPES, DEVICE_KINDS, NEVER_DEFAULT_SCOPES, REMOTE_CLIENT_TYPES,
+  DESKTOP_DEFAULT_SCOPES, DESKTOP_ONLY_SCOPES, DEVICE_KINDS, MOBILE_ONLY_SCOPES, NEVER_DEFAULT_SCOPES, REMOTE_CLIENT_TYPES,
   SCOPES as CONTRACT_SCOPES, SCOPE_BY_TYPE,
 } from '@dsh-ext/mobile-protocol'
 
@@ -387,23 +387,31 @@ test('spec 008 full control: a desktop can be granted every desktop-only scope; 
   const { file, options } = tempRegistry(t)
   const registry = createRegistry(file, options)
   const all = [...CONTRACT_SCOPES]
+  // Spec 021 rev 15: `web:unlock` is a WEB scope (MOBILE_ONLY_SCOPES), so the desktop lists are
+  // every contract scope EXCEPT it — a desktop that held it would be locked out of every frame for
+  // good, since no desktop can run a passkey ceremony. The mobile list is unchanged, and keeps it.
+  const desktopAll = all.filter((scope) => scope !== 'web:unlock')
+  assert.deepEqual(MOBILE_ONLY_SCOPES, ['web:unlock'])
   const desktop = registry.createPairing('d', { kind: 'desktop', scopes: all })
-  assert.deepEqual(desktop.scopes, all, 'a desktop keeps every scope it was offered')
-  assert.deepEqual(registry.claimPairing(desktop.code, 'desk-full-0001').device.scopes, all)
-  // A mobile offer drops every desktop-only scope.
+  assert.deepEqual(desktop.scopes, desktopAll, 'a desktop keeps every scope it was offered, minus the web one')
+  assert.deepEqual(registry.claimPairing(desktop.code, 'desk-full-0001').device.scopes, desktopAll)
+  // A mobile offer drops every desktop-only scope — and keeps the web/lock scope.
   const mobile = registry.createPairing('m', { kind: 'mobile', scopes: all })
   assert.deepEqual(mobile.scopes, [...SCOPES])
+  assert.equal(mobile.scopes.includes('web:unlock'), true, 'the web scope still belongs to a mobile')
   for (const scope of DESKTOP_ONLY_SCOPES) assert.equal(mobile.scopes.includes(scope), false, scope)
   // No default (desktop, mobile, or "all scopes") ever includes one.
   for (const offer of [registry.createPairing('d2', { kind: 'desktop' }), registry.createPairing('m2')]) {
     for (const scope of DESKTOP_ONLY_SCOPES) assert.equal(offer.scopes.includes(scope), false, scope)
   }
   // A stored mobile record that lists them loses them on load; a stored desktop keeps them.
+  // Spec 021 rev 15: the stored desktop ALSO loses `web:unlock` — the measured 2026-11-14 record.
   fs.writeFileSync(file, JSON.stringify({ version: 3, devices: [
     storedRecord({ id: '99999999-9999-4999-8999-999999999999', tokenHash: digest('m-full'), kind: 'mobile', scopes: [...all] }),
     storedRecord({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', tokenHash: digest('d-full'), clientDeviceId: 'stored-install-0003', kind: 'desktop', scopes: [...all] }),
   ] }))
   const byId = new Map(createRegistry(file, options).list().map((device) => [device.id, device]))
   assert.deepEqual(byId.get('99999999-9999-4999-8999-999999999999').scopes, [...SCOPES])
-  assert.deepEqual(byId.get('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa').scopes, all)
+  assert.deepEqual(byId.get('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa').scopes, desktopAll,
+    'a desktop record listing the web scope is repaired at load, never loaded locked')
 })

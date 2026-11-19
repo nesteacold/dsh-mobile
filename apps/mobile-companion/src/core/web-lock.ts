@@ -51,6 +51,11 @@ export interface LockCopyKeys {
   'already-registered': 'unlock.passkeyApproval';
   'not-supported': 'unlock.passkeyUnsupported';
   'host-version': 'unlock.passkeyHostVersion';
+  'lock-unconfirmed': 'unlock.lockUnconfirmed';
+  // Spec 037: an app-side WebAuthn deadline and an ambiguous `NotAllowedError` are NOT the same
+  // as a Host refusal, so each has its own sentence and its own next action.
+  'passkey-timeout': 'unlock.passkeyTimeout';
+  'passkey-dismissed': 'unlock.passkeyDismissed';
 }
 
 /** One copy key the gate can show (a narrowed `MessageKey` of the i18n table). */
@@ -70,6 +75,9 @@ export const LOCK_COPY: Readonly<LockCopyKeys> = Object.freeze({
   'already-registered': 'unlock.passkeyApproval',
   'not-supported': 'unlock.passkeyUnsupported',
   'host-version': 'unlock.passkeyHostVersion',
+  'lock-unconfirmed': 'unlock.lockUnconfirmed',
+  'passkey-timeout': 'unlock.passkeyTimeout',
+  'passkey-dismissed': 'unlock.passkeyDismissed',
 });
 
 /** What the gate is waiting for: a new passkey, an assertion, or the owner's approval on the Host. */
@@ -109,13 +117,49 @@ export type LockFailureReason =
   | 'not-registered'
   | 'already-registered'
   | 'not-supported'
-  | 'host-version';
+  | 'host-version'
+  | 'lock-unconfirmed'
+  | 'passkey-timeout'
+  | 'passkey-dismissed';
 
 /** The gate's reason vocabulary: every locked state plus every local failure. */
 export type LockReason = WebLockState | LockFailureReason;
 
 /** Code the app answers with when the browser/authenticator declined (never sent to the Host). */
 export const PASSKEY_NOT_ALLOWED = 'client/passkey-not-allowed';
+
+/**
+ * Spec 037: an app-side WebAuthn deadline, and an ambiguous `NotAllowedError`.
+ *
+ * The first is definite — our timer fired and no assertion was produced. The second is NOT: a user
+ * cancel, a browser timeout and a lost user activation all surface as `NotAllowedError`, so its copy
+ * never blames the Host and always names the next action (tap Unlock again).
+ */
+export const PASSKEY_TIMEOUT = 'client/passkey-timeout';
+export const PASSKEY_DISMISSED = 'client/passkey-dismissed';
+
+/**
+ * App-side timing for a web unlock ceremony (spec 037 §3).
+ *
+ * The Host challenge lives `ASSERT_OPTIONS_TTL_MS` (contract §14.1: 60 s) from the moment it was
+ * ISSUED, not from when its answer arrived. A prepared request is usable only while at least
+ * `WEBAUTHN_APP_TIMEOUT_MS + ASSERT_SEND_MARGIN_MS` of that life remains, so a sheet opened now can
+ * finish before the Host expires the challenge. Nothing here extends the Host's TTL.
+ */
+export const WEBAUTHN_APP_TIMEOUT_MS = 25_000;
+export const ASSERT_OPTIONS_TTL_MS = 60_000;
+export const ASSERT_SEND_MARGIN_MS = 5_000;
+export const MIN_ASSERT_REMAINING_MS = WEBAUTHN_APP_TIMEOUT_MS + ASSERT_SEND_MARGIN_MS;
+
+/**
+ * Pure freshness test for a prepared `passkey-assert-options` answer.
+ *
+ * `sentAt` is when the OPTIONS REQUEST WAS SENT (not when it answered); `now` is the caller's clock.
+ * A challenge with less than `MIN_ASSERT_REMAINING_MS` left must be discarded and re-fetched.
+ */
+export function preparedOptionsFresh(sentAt: number, now: number, ttlMs = ASSERT_OPTIONS_TTL_MS): boolean {
+  return Number.isFinite(sentAt) && Number.isFinite(now) && (sentAt + ttlMs - now) >= MIN_ASSERT_REMAINING_MS;
+}
 
 /**
  * The PWA's own "lock now" frame (contract §14.2: `{type:"passkey-lock"}` -> `{kind:"passkey-lock",
@@ -158,7 +202,11 @@ export function lockReasonFor(error: unknown): LockReason {
       return 'verification-failed';
     case PASSKEY_RATE_LIMITED:
       return 'rate-limited';
-    case 'client/passkey-not-allowed':
+    case PASSKEY_TIMEOUT:
+      return 'passkey-timeout';
+    case PASSKEY_DISMISSED:
+      return 'passkey-dismissed';
+    case PASSKEY_NOT_ALLOWED:
     case 'client/timeout':
     case 'client/disconnected':
       return 'locked';

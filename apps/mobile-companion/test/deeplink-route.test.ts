@@ -110,8 +110,8 @@ describe('unlock gate still applies to the deep-link route (A020)', () => {
   const layout = readFileSync(LAYOUT, 'utf8');
 
   it('renders the navigator — and therefore every route — only after unlock', () => {
-    // The first frame is the gate: `gate` starts at 'checking' and 'checking' counts as locked.
-    assert.match(layout, /const \[gate, setGate\] = useState<GateStatus>\('checking'\);/);
+    // Native first frame is the gate; spec 045 makes web start unlocked (no gate at all).
+    assert.match(layout, /useState<GateStatus>\(\(\) => \(isWeb \? 'unlocked' : 'checking'\)\)/);
     assert.match(layout, /const locked = gate === 'checking' \|\|/);
     assert.match(layout, /\{locked \? \(/, 'the locked branch is rendered before any navigator');
     // Exactly one navigator, and it is the unlocked branch of that ternary: a cold start through
@@ -119,8 +119,8 @@ describe('unlock gate still applies to the deep-link route (A020)', () => {
     assert.equal([...layout.matchAll(/<Stack\s/g)].length, 1, 'exactly one navigator');
     assert.match(
       layout,
-      /\) : \(\s*<AppProvider[\s\S]{0,200}?<Stack\s/,
-      'the navigator is rendered in the unlocked branch only',
+      /\) : \(\s*<AppProvider[\s\S]{0,3000}?<Stack\s/,
+      'the navigator is rendered in the unlocked branch only (after the optional legacy notice)',
     );
   });
 

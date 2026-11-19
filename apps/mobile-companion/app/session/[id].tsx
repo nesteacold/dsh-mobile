@@ -20,8 +20,11 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentRef } from 'react';
 import {
+  AccessibilityInfo,
   ActivityIndicator,
   Alert,
+  Animated,
+  Easing,
   KeyboardAvoidingView,
   Linking,
   Modal,
@@ -37,7 +40,14 @@ import {
 } from 'react-native';
 import { useLocalSearchParams, useNavigation, useRouter } from 'expo-router';
 import * as DocumentPicker from 'expo-document-picker';
-import { File } from 'expo-file-system';
+// Spec 044 — platform-resolved byte reader. On web this resolves to `picked-file.web.ts` (the real
+// DOM File, no expo-file-system); native keeps the existing File/info/arrayBuffer path.
+import {
+  isPickerObjectUrl,
+  readPickedFile,
+  revokePickerObjectUrl,
+  WEB_PICKED_FILE_READ_TIMEOUT_MS,
+} from '../../src/platform/picked-file';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Circle } from 'react-native-svg';
 import {
@@ -61,7 +71,7 @@ import { sessionDisplayTitle } from '../../src/ui/session-title';
 import { promptSendLabel, promptSendState } from '../../src/ui/prompt-state';
 import { redactArgsPreview } from '../../src/core';
 import type { ClientState, HistoryMessage } from '../../src/core';
-import { elevation, monoFont, useTheme } from '../../src/ui/theme';
+import { composerPalette, elevation, monoFont, sessionChromePalette, useTheme } from '../../src/ui/theme';
 import { MicHintButton, MicHintLine } from '../../src/ui/conversation/MicHintButton';
 import { AgentTeamPanel } from '../../src/ui/conversation/AgentTeamPanel';
 import { SessionStatsPanel } from '../../src/ui/components/stats-panel';
@@ -102,6 +112,236 @@ const COMPOSER_MAX_LINES = 5;
 /** Height of the floating header, so the transcript can start below it and scroll behind it. */
 const HEADER_BASE_HEIGHT = 52;
 
+/** How close to the top a reader must be before older history is fetched on scroll. */
+const OLDER_HISTORY_TOP_PX = 100;
+
+/** Safety net for platforms that never emit onContentSizeChange; generation-guarded, no stale height. */
+const INITIAL_SCROLL_FALLBACK_MS = 800;
+
+/**
+ * Pure viewport maths for a prepend: keep the SAME row under the finger. `oldHeight` is the content
+ * height measured before the older page arrived, `newHeight` the one reported by the layout after.
+ * Clamped at 0 — a prepend can never ask for a negative offset.
+ */
+export function prependViewportOffset(oldOffset: number, oldHeight: number, newHeight: number): number {
+  return Math.max(0, oldOffset + newHeight - oldHeight);
+}
+
+/**
+ * Spec 044 — register the once-only release of a picker-created object URL on the transfer that
+ * owns it. Pure so the cleanup can be exercised behaviourally in Node tests; the screen calls it
+ * IMMEDIATELY after receiving an asset and BEFORE the stale guard, otherwise a picker that resolves
+ * after a session switch would leak its blob URL.
+ */
+export function registerPickedObjectUrl(
+  owner: { releaseObjectUrl: () => void },
+  uri: unknown,
+  isObjectUrl: (uri: unknown) => boolean,
+  revoke: (uri: string) => void,
+): void {
+  if (!isObjectUrl(uri)) return;
+  const objectUrl = uri as string;
+  let revoked = false;
+  owner.releaseObjectUrl = () => {
+    if (revoked) return;
+    revoked = true;
+    revoke(objectUrl);
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Spec 048 — pure UI helpers (no renderer, no wire): web batch admission, receipt snapshots and
+// the non-blocking progress phase. Kept HERE (screen scope) so the other agents' core work stays
+// untouched and the Node tests exercise the same functions the screen calls.
+// ---------------------------------------------------------------------------
+
+/** PWA image picks are capped: six files, 64 MiB TOTAL, admitted before any byte is read. */
+export const MAX_BATCH_IMAGES = 6;
+
+export interface AttachmentReceipt {
+  sessionId: string;
+  name: string;
+  receiptId: string;
+}
+
+function batchError(code: string): Error {
+  const error = new Error('attachment-batch');
+  (error as { code?: string }).code = code;
+  return error;
+}
+
+/** Fail closed on the WHOLE batch before the first read; missing/NaN/negative sizes are refused. */
+export function admitImageBatch(assets: readonly { size?: number; fileSize?: number }[]): void {
+  if (assets.length > MAX_BATCH_IMAGES) throw batchError('too-many-files');
+  let total = 0;
+  for (const asset of assets) {
+    if (asset.size === undefined || !Number.isFinite(asset.size) || asset.size < 0) {
+      throw batchError('file-too-large');
+    }
+    // Spec 044 parity: the DOM File's own size is authoritative on web and is admitted for EVERY
+    // asset BEFORE the first read — not left until that file's turn in the sequential loop.
+    if (asset.fileSize !== undefined && (!Number.isFinite(asset.fileSize) || asset.fileSize < 0)) {
+      throw batchError('file-too-large');
+    }
+    const effective = asset.fileSize ?? asset.size;
+    if (!Number.isFinite(effective) || effective < 0) throw batchError('file-too-large');
+    total += effective;
+  }
+  admitClientUploadSize(total);
+}
+
+/** Only receipts of THIS session may be shown or sent with this session's prompt. */
+export function receiptsForSession(receipts: readonly AttachmentReceipt[], sessionId: string): AttachmentReceipt[] {
+  return receipts.filter((receipt) => receipt.sessionId === sessionId);
+}
+
+/** Add a Host receipt once, without disturbing receipts of other sessions. */
+export function addReceipt(receipts: readonly AttachmentReceipt[], receipt: AttachmentReceipt): AttachmentReceipt[] {
+  if (receipts.some((item) => item.sessionId === receipt.sessionId && item.receiptId === receipt.receiptId)) {
+    return receipts as AttachmentReceipt[];
+  }
+  return [...receipts, receipt];
+}
+
+/**
+ * On a successful ack clear EXACTLY the snapshotted receiptIds of that session. A refusal/timeout
+ * never calls this, so the receipts stay for retry; a receipt added during the send is untouched.
+ */
+export function clearSnapshottedReceipts(
+  current: readonly AttachmentReceipt[],
+  sessionId: string,
+  receiptIds: readonly string[],
+): AttachmentReceipt[] {
+  const sent = new Set(receiptIds);
+  return current.filter((receipt) => !(receipt.sessionId === sessionId && sent.has(receipt.receiptId)));
+}
+
+/** Web header must be an opaque, same-scheme fill; native keeps the floating translucent look. */
+export function resolveHeaderBackground(colors: { bg: string; glassSolid: string }, web: boolean): string {
+  return web ? colors.glassSolid : translucent(colors.bg);
+}
+
+export type ProgressPhase = 'sending' | 'processing' | null;
+
+/** Derived ONLY from existing state: no new wire, no private reasoning text in the indicator. */
+export function progressPhase(input: {
+  sending: boolean; outgoing: readonly { status: string }[]; running: boolean;
+}): ProgressPhase {
+  // Only the outbox's non-terminal statuses mean "still sending". A REJECTED ('failed') item is
+  // terminal and must not keep the indicator up forever after a refusal.
+  const active = input.outgoing.some((item) => item.status === 'queued' || item.status === 'sent');
+  if (input.sending || active) return 'sending';
+  if (input.running) return 'processing';
+  return null;
+}
+
+/**
+ * Spec 050 — "since this PWA observed the running state". Never a claim about the Host's own start
+ * time; no persistent timer across reloads. Whole seconds, at most hours in normal use.
+ */
+export function formatProcessingElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  if (minutes < 60) return `${minutes}m ${seconds}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+/** Exactly one "jump to newest" per opened session id, fired by the FIRST page — never by a prepend. */
+export function shouldScrollToNewestOnOpen(state: {
+  doneFor: string | null;
+  sessionId: string;
+  historyLoaded: boolean;
+  historyLoading: boolean;
+}): boolean {
+  return state.sessionId !== ''
+    && state.doneFor !== state.sessionId
+    && state.historyLoaded
+    && !state.historyLoading;
+}
+
+/**
+ * Opening-jump coordinator — a PURE state machine the screen only drives and obeys.
+ *
+ * A native ScrollView has no layout on the first render, so the effect must NOT call `scrollToEnd`
+ * or mark the jump done: a spinner / previous page's height is not proof that the transcript landed.
+ * The effect only SCHEDULES a pending jump (with a generation token); ONLY a later transcript layout
+ * (or the generation-guarded fallback) completes it. `prependRestore` is a separate branch and never
+ * completes an opening jump. Kept pure so the whole sequence is testable without a renderer.
+ */
+export interface InitialScrollState {
+  /** Bumped on every new schedule / session change; stale fallbacks carry an older generation. */
+  generation: number;
+  /** Session whose opening jump already landed (at most one per opened id). */
+  doneFor: string | null;
+  /** The single jump waiting for a real transcript layout. */
+  pending: { sessionId: string; generation: number } | null;
+}
+
+export type InitialScrollEvent =
+  | { kind: 'session'; sessionId: string }
+  | { kind: 'history'; sessionId: string; loaded: boolean; loading: boolean }
+  | { kind: 'layout'; sessionId: string; generation: number; height: number }
+  | { kind: 'fallback'; sessionId: string; generation: number };
+
+export type InitialScrollCommand =
+  | { kind: 'none' }
+  | { kind: 'schedule-fallback'; sessionId: string; generation: number }
+  | { kind: 'scroll-to-end'; sessionId: string };
+
+export function createInitialScrollState(): InitialScrollState {
+  return { generation: 0, doneFor: null, pending: null };
+}
+
+export function initialScrollStep(
+  state: InitialScrollState,
+  event: InitialScrollEvent,
+): { state: InitialScrollState; command: InitialScrollCommand } {
+  const noChange = { state, command: { kind: 'none' } as const };
+  switch (event.kind) {
+    case 'session':
+      // A new session invalidates any pending jump and any fallback armed for the old one.
+      return { state: { ...state, generation: state.generation + 1, pending: null }, command: { kind: 'none' } };
+    case 'history':
+      // Only a COMPLETE opening page schedules. Loading/spinner frames never schedule or complete.
+      if (event.sessionId === '' || !event.loaded || event.loading
+        || state.pending !== null || state.doneFor === event.sessionId) return noChange;
+      {
+        const generation = state.generation + 1;
+        return {
+          state: { ...state, generation, pending: { sessionId: event.sessionId, generation } },
+          command: { kind: 'schedule-fallback', sessionId: event.sessionId, generation },
+        };
+      }
+    case 'layout':
+    case 'fallback': {
+      const pending = state.pending;
+      if (pending === null || pending.sessionId !== event.sessionId || pending.generation !== event.generation
+        || (event.kind === 'layout' && event.height <= 0)) return noChange;
+      return {
+        state: { generation: state.generation, doneFor: pending.sessionId, pending: null },
+        command: { kind: 'scroll-to-end', sessionId: pending.sessionId },
+      };
+    }
+  }
+}
+
+/** “No message yet” is only honest after a complete opening page with no older pages behind it. */
+export function shouldShowNoMessage(state: {
+  connectionReady: boolean;
+  historyLoaded: boolean;
+  historyLoading: boolean;
+  historyHasMore: boolean;
+  historyHasEarlier: boolean;
+}): boolean {
+  return state.connectionReady
+    && state.historyLoaded
+    && !state.historyLoading
+    && !state.historyHasMore
+    && !state.historyHasEarlier;
+}
+
 /**
  * Reference 04's header is translucent paper, not opaque: let the transcript blur through it. The
  * theme token may be a hex colour or already carry alpha, so anything else is passed through.
@@ -122,6 +362,12 @@ export default function SessionScreen() {
   const insets = useSafeAreaInsets();
   const theme = useTheme();
   const { colors, type, space, radius, hit } = theme;
+  // Spec 049: on web the header/composer use a FIXED dark pair; native keeps the scheme palette.
+  const isWeb = Platform.OS === 'web';
+  const chrome = sessionChromePalette(isWeb, colors);
+  const composer = isWeb
+    ? { surface: chrome.surface, border: chrome.border, text: chrome.text, textMuted: chrome.textMuted }
+    : composerPalette(theme.scheme);
   const headerHeight = insets.top + HEADER_BASE_HEIGHT;
   /**
    * The header's MEASURED height. `HEADER_BASE_HEIGHT` is only an estimate: the subline carries the
@@ -145,6 +391,17 @@ export default function SessionScreen() {
   /** Wave 1: the message this reply quotes; `null` when composing a plain prompt. */
   const [replyTo, setReplyTo] = useState<HistoryMessage | null>(null);
   const scrollRef = useRef<ComponentRef<typeof ScrollView>>(null);
+  /** Pure opening-jump state machine; the screen only dispatches events and obeys its command. */
+  const initialScroll = useRef<InitialScrollState>(createInitialScrollState());
+  /** Safety net when a platform never fires onContentSizeChange; guarded by generation, no stale height. */
+  const initialScrollFallback = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const initialScrollFallbackGen = useRef<number | null>(null);
+  /** Last measured scroll position, captured BEFORE an older page prepends rows above it. */
+  const scrollMetrics = useRef({ offsetY: 0, contentHeight: 0 });
+  /** Set when an older page is requested; consumed by `onContentSizeChange` after the layout grows. */
+  const prependRestore = useRef<{ offsetY: number; oldHeight: number } | null>(null);
+  /** Stops repeated near-top scroll events from queueing the same older page before `historyLoading` flips. */
+  const olderAutoRequest = useRef(false);
   /** Đợt 3: the composer's field, so the mic control can focus it for the keyboard's own dictation. */
   const composerRef = useRef<ComponentRef<typeof TextInput>>(null);
   const [micHint, setMicHint] = useState(false);
@@ -153,17 +410,23 @@ export default function SessionScreen() {
   // grant (not a hello capability), so an older pairing keeps a visible button that explains itself.
   const [attachSheetOpen, setAttachSheetOpen] = useState(false);
   const [attachMessage, setAttachMessage] = useState<string | null>(null);
-  const [attachTransfer, setAttachTransfer] = useState<{ name: string; sent: number; total: number } | null>(null);
-  // Per-transfer identity: a generation bumped on session change/unmount and a UNIQUE token per
-  // upload, plus that transfer's own cancellation flag. Every post-await update checks all three.
+  const [attachTransfer, setAttachTransfer] = useState<{
+    name: string; sent: number; total: number; index: number; count: number;
+  } | null>(null);
+  // Per-BATCH identity: a generation bumped on session change/unmount and a UNIQUE token per batch.
+  // Every post-await update checks all three; one batch may contain up to six sequential uploads.
   const uploadGen = useRef(0);
   const activeUpload = useRef<{
     generation: number; token: object; cancelled: boolean; uploadId: string | null;
+    /** ALL picker object URLs (including unread assets) and read aborts, released exactly once. */
+    releaseObjectUrl: () => void;
+    abortRead: () => void;
   } | null>(null);
   // Synchronous single-flight: React state lags a tap burst, so the guard must be a ref set BEFORE
   // the picker opens. It also guards Send in the handler (not only the button's disabled prop).
   const attachInFlight = useRef(false);
-  const [attachReceipt, setAttachReceipt] = useState<{ sessionId: string; name: string; receiptId: string } | null>(null);
+  // Spec 048: a batch produces several Host receipts. Only THIS session's receipts are sendable.
+  const [attachReceipts, setAttachReceipts] = useState<AttachmentReceipt[]>([]);
   const canAttach = controller.hasScope(ATTACHMENTS_WRITE_SCOPE);
 
   /** Invalidate the live transfer and cancel a reserved gateway slot, if one was named yet. */
@@ -174,6 +437,10 @@ export default function SessionScreen() {
     attachInFlight.current = false;
     if (active === null) return;
     active.cancelled = true;
+    // Spec 044: a session switch/unmount during a read must stop it and release the PICKER's own
+    // object URL once; the transfer's `finally` closure is idempotent for the same reason.
+    active.abortRead();
+    active.releaseObjectUrl();
     if (active.uploadId !== null) void controller.cancelRemoteUpload(active.uploadId).catch(() => {});
   }, [controller]);
 
@@ -191,8 +458,38 @@ export default function SessionScreen() {
     void controller.listModels(sessionId);
   }, [controller, sessionId, snapshot.connection, snapshot.models.length, subagentSession]);
 
+  /** Advance the pure machine and carry out only the command it returns (never from stale height). */
+  const dispatchInitialScroll = (event: InitialScrollEvent): InitialScrollCommand => {
+    const step = initialScrollStep(initialScroll.current, event);
+    initialScroll.current = step.state;
+    if (step.command.kind === 'schedule-fallback') {
+      const { sessionId: target, generation } = step.command;
+      if (initialScrollFallback.current !== null) clearTimeout(initialScrollFallback.current);
+      initialScrollFallbackGen.current = generation;
+      initialScrollFallback.current = setTimeout(() => {
+        initialScrollFallback.current = null;
+        // Stale timers are rejected by the generation guard inside the pure machine.
+        dispatchInitialScroll({ kind: 'fallback', sessionId: target, generation });
+      }, INITIAL_SCROLL_FALLBACK_MS);
+    } else if (step.command.kind === 'scroll-to-end') {
+      if (initialScrollFallback.current !== null) clearTimeout(initialScrollFallback.current);
+      initialScrollFallback.current = null;
+      initialScrollFallbackGen.current = null;
+      scrollRef.current?.scrollToEnd({ animated: false });
+      setAwayFromBottom(false);
+    }
+    return step.command;
+  };
+
   useEffect(() => {
     if (sessionId !== '') controller.openSession(sessionId);
+    olderAutoRequest.current = false;
+    prependRestore.current = null;
+    // Invalidate any pending jump / fallback from the previous session (pure 'session' event).
+    if (initialScrollFallback.current !== null) clearTimeout(initialScrollFallback.current);
+    initialScrollFallback.current = null;
+    initialScrollFallbackGen.current = null;
+    dispatchInitialScroll({ kind: 'session', sessionId });
     return () => controller.closeSession();
   }, [controller, sessionId]);
 
@@ -200,13 +497,25 @@ export default function SessionScreen() {
   // into another session's composer — the gateway would reject a receipt from a different session.
   useEffect(() => {
     invalidateUpload();
-    setAttachReceipt(null);
+    // Spec 048: a session switch drops EVERY receipt, including partial batch successes.
+    setAttachReceipts([]);
     setAttachTransfer(null);
     setAttachMessage(null);
     setAttachSheetOpen(false);
   }, [invalidateUpload, sessionId]);
 
   useEffect(() => () => invalidateUpload(), [invalidateUpload]);
+
+  // Lazy history: a COMPLETE opening page only SCHEDULES the jump. No scrollToEnd here, and no done
+  // mark: a spinner/previous-page height is not proof the transcript has laid out.
+  useEffect(() => {
+    dispatchInitialScroll({
+      kind: 'history',
+      sessionId,
+      loaded: snapshot.historyLoaded,
+      loading: snapshot.historyLoading,
+    });
+  }, [sessionId, snapshot.historyLoaded, snapshot.historyLoading]);
 
   // One header, drawn below: the native one is hidden for this route only.
   useEffect(() => {
@@ -238,13 +547,68 @@ export default function SessionScreen() {
   // Consecutive tool/system rows collapse into one expandable line (parity A/D): once agent prose is
   // classified correctly, the transcript is prose with runs of tool activity between turns.
   const transcript = useMemo(() => groupTranscript(snapshot.history), [snapshot.history]);
+  // Spec 048 §4: derived from state the app ALREADY has. No new frame, no reasoning text inline;
+  // ack/failure/turn end/history reload all clear it through these same existing fields.
+  const phase = progressPhase({
+    sending,
+    outgoing: snapshot.outgoing,
+    running: session?.state === 'running',
+  });
+  // Spec 050: elapsed time starts when THIS screen first observes processing for THIS session.
+  // Every reset (null, sending, session switch, ack/failure/turn end, reload) drops the start.
+  const processingStart = useRef<{ sessionId: string; since: number } | null>(null);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  useEffect(() => {
+    if (phase !== 'processing') {
+      processingStart.current = null;
+      setElapsedMs(0);
+      return;
+    }
+    if (processingStart.current?.sessionId !== sessionId) {
+      processingStart.current = { sessionId, since: Date.now() };
+    }
+    const since = processingStart.current.since;
+    const tick = () => setElapsedMs(Date.now() - since);
+    tick();
+    const timer = setInterval(tick, 1_000);
+    return () => clearInterval(timer);
+  }, [phase, sessionId]);
+
+  // Subtle liveness pulse only while processing; a static label remains when motion is reduced.
+  const [reduceMotion, setReduceMotion] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    void AccessibilityInfo.isReduceMotionEnabled?.().then((value) => {
+      if (alive) setReduceMotion(value === true);
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, []);
+  const pulse = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    if (phase !== 'processing' || reduceMotion) {
+      pulse.setValue(1);
+      return;
+    }
+    const loop = Animated.loop(Animated.sequence([
+      Animated.timing(pulse, { toValue: 0.55, duration: 500, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+      Animated.timing(pulse, { toValue: 1, duration: 500, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+    ]));
+    loop.start();
+    return () => loop.stop();
+  }, [phase, reduceMotion, pulse]);
+
+  const phaseLabel = phase === 'sending' ? tr('session.sending')
+    : phase === 'processing' ? tr('session.processingElapsed', { elapsed: formatProcessingElapsed(elapsedMs) }) : null;
 
   const send = useCallback(async () => {
     const value = text.trim();
     // Spec 041: the handler itself refuses a transfer in flight (the ref is synchronous), and a
     // receipt is only consumed when the Host confirms this exact prompt.
     if (value === '' || sending || attachInFlight.current) return;
-    const receipt = attachReceipt !== null && attachReceipt.sessionId === sessionId ? attachReceipt : null;
+    // Spec 048: snapshot the EXACT receipt set of this session. A receipt added while the send is
+    // in flight is not part of this prompt and must survive; a refusal/timeout keeps them all.
+    const receipts = receiptsForSession(attachReceipts, sessionId);
+    const receiptIds = receipts.map((receipt) => receipt.receiptId);
     setSending(true);
     // Wave 1 (ComposerReplyPreview.kt): a reply carries the quoted excerpt to the Host as a markdown
     // blockquote, so the model sees what is being answered. The quote is cleared with the draft.
@@ -253,17 +617,15 @@ export default function SessionScreen() {
     setReplyTo(null);
     try {
       const sent = await controller.sendPrompt(payload, {
-        ...(receipt === null ? {} : { files: [{ receiptId: receipt.receiptId }] }),
+        ...(receiptIds.length === 0 ? {} : { files: receiptIds.map((receiptId) => ({ receiptId })) }),
       });
-      if (sent && receipt !== null) {
-        const expected = { sessionId, receiptId: receipt.receiptId };
-        // Functional update: a newer session or a replaced receipt must never be cleared here.
-        setAttachReceipt((current) => shouldClearReceipt(current, expected) ? null : current);
+      if (sent && receiptIds.length > 0) {
+        setAttachReceipts((current) => clearSnapshottedReceipts(current, sessionId, receiptIds));
       }
     } finally {
       setSending(false);
     }
-  }, [attachReceipt, controller, replyTo, sending, sessionId, text]);
+  }, [attachReceipts, controller, replyTo, sending, sessionId, text]);
 
   /**
    * Spec 041 FR-2: pick one item, read its bytes through expo-file-system, then hand those exact
@@ -284,11 +646,16 @@ export default function SessionScreen() {
     }
     // One identity for THIS transfer. Session change/unmount bumps the generation, sets `cancelled`
     // and clears the active slot; every post-await update below is gated by the pure identity rule.
+    // Every picker asset owns an independent once-only release, including assets never read.
+    const releases: Array<() => void> = [];
+    const readAborts: Array<() => void> = [];
     const active = {
       generation: uploadGen.current,
       token: {} as object,
       cancelled: false,
       uploadId: null as string | null,
+      releaseObjectUrl: () => { for (const release of releases) release(); },
+      abortRead: () => { for (const abort of readAborts) abort(); },
     };
     activeUpload.current = active;
     const current = (): boolean => isCurrentUpload(
@@ -301,61 +668,109 @@ export default function SessionScreen() {
       setAttachSheetOpen(true);
     };
     try {
+      // Spec 048: multi-pick is PWA + images ONLY. Native and the generic File picker stay single.
+      const multi = kind === 'image' && Platform.OS === 'web';
       const picked = await DocumentPicker.getDocumentAsync({
         type: kind === 'image' ? 'image/*' : '*/*',
-        multiple: false,
+        multiple: multi,
+        base64: false,
         copyToCacheDirectory: true,
       });
-      if (!current()) return;
       if (picked.canceled || picked.assets.length === 0) {
+        // No asset means no picker object URL to own. A stale cancel publishes nothing.
+        if (!current()) return;
         fail(tr('session.attachNoFile'));
         return;
       }
-      const asset = picked.assets[0] as (typeof picked.assets)[number];
-      if (kind === 'image' && asset.mimeType !== undefined && !asset.mimeType.startsWith('image/')) {
-        fail(tr('session.attachFailed'));
-        return;
+      const assets = picked.assets as Array<(typeof picked.assets)[number]>;
+      // Expo's WEB picker creates an object URL for EVERY asset. Register all releases BEFORE the
+      // stale guard so a late picker result after a session switch still revokes all of them,
+      // including the ones this batch will never read.
+      if (Platform.OS === 'web') {
+        for (const asset of assets) {
+          const owner = { releaseObjectUrl: () => {} };
+          registerPickedObjectUrl(owner, asset.uri, isPickerObjectUrl, revokePickerObjectUrl);
+          releases.push(owner.releaseObjectUrl);
+        }
       }
-      // Admission BEFORE arrayBuffer(): the picker's reported size (when present) and the file's
-      // own metadata both gate the whole-file read. Missing/nonfinite/negative/oversize fail closed.
-      if (asset.size !== undefined) admitClientUploadSize(asset.size);
-      const file = new File(asset.uri);
-      const info = file.info();
-      if (!info.exists) {
-        fail(tr('session.attachNoFile'));
-        return;
-      }
-      admitClientUploadSize(info.size);
-      const bytes = new Uint8Array(await file.arrayBuffer());
       if (!current()) return;
-      // Defense in depth: never trust metadata over the bytes actually read.
-      if (bytes.length === 0) {
-        fail(tr('session.attachNoFile'));
-        return;
+      // WHOLE-batch admission before ANY read: at most 6 images, finite nonnegative sizes, total
+      // <= the client ceiling. The server's per-upload maxBytes still applies after open.
+      if (multi) admitImageBatch(assets.map((asset) => ({
+        size: asset.size,
+        fileSize: (asset as { file?: { size?: number } }).file?.size,
+      })));
+      for (const asset of assets) {
+        if (kind === 'image' && asset.mimeType !== undefined && !asset.mimeType.startsWith('image/')) {
+          fail(tr('session.attachFailed'));
+          return;
+        }
       }
-      admitClientUploadSize(bytes.length);
-      setAttachTransfer({ name: asset.name, sent: 0, total: bytes.length });
-      setAttachMessage(null);
-      const receipt = await controller.uploadAttachment({
-        sessionId,
-        kind,
-        bytes,
-        name: asset.name,
-        ...(kind === 'image' && asset.mimeType !== undefined ? { mediaType: asset.mimeType } : {}),
-      }, {
-        progress: (sent, total) => {
-          if (current()) setAttachTransfer({ name: asset.name, sent, total });
-        },
-        cancelled: () => active.cancelled,
-        onUploadId: (uploadId) => { if (current()) active.uploadId = uploadId; },
-      });
-      if (!current()) return;
-      setAttachReceipt({ sessionId, name: asset.name, receiptId: receipt.receiptId });
+      for (let index = 0; index < assets.length; index += 1) {
+        // One batch, sequential reads: only the CURRENT image's bytes are held in memory.
+        if (!current() || active.cancelled) return;
+        const asset = assets[index] as (typeof assets)[number];
+        if (!multi && asset.size !== undefined) admitClientUploadSize(asset.size);
+        const readOptions = Platform.OS === 'web'
+          ? (() => {
+              const readController = new AbortController();
+              readAborts.push(() => readController.abort());
+              return { signal: readController.signal, timeoutMs: WEB_PICKED_FILE_READ_TIMEOUT_MS };
+            })()
+          : undefined;
+        const read = await readPickedFile(asset, readOptions);
+        if (!current() || active.cancelled) return;
+        // Metadata is untrusted on both sides; never infer MIME from a data URL or an extension.
+        if (kind === 'image' && read.mediaType !== undefined && !read.mediaType.startsWith('image/')) {
+          fail(tr('session.attachFailed'));
+          return;
+        }
+        if (read.bytes.length === 0) {
+          fail(tr('session.attachNoFile'));
+          return;
+        }
+        admitClientUploadSize(read.bytes.length);
+        setAttachTransfer({
+          name: read.name, sent: 0, total: read.bytes.length, index: index + 1, count: assets.length,
+        });
+        setAttachMessage(null);
+        const receipt = await controller.uploadAttachment({
+          sessionId,
+          kind,
+          bytes: read.bytes,
+          name: read.name,
+          ...(kind === 'image' && read.mediaType !== undefined ? { mediaType: read.mediaType } : {}),
+        }, {
+          progress: (sent, total) => {
+            if (current()) setAttachTransfer({
+              name: read.name, sent, total, index: index + 1, count: assets.length,
+            });
+          },
+          cancelled: () => active.cancelled,
+          onUploadId: (uploadId) => { if (current()) active.uploadId = uploadId; },
+        });
+        if (!current()) return;
+        // Publish each successful receipt immediately: a later failure/cancel keeps what already
+        // succeeded, so the user can send those files or retry the rest. A session switch drops all.
+        setAttachReceipts((list) => addReceipt(list, {
+          sessionId, name: read.name, receiptId: receipt.receiptId,
+        }));
+      }
     } catch (error) {
       if (!current()) return;
+      // ONLY stable codes reach copy. Never stringify the error, its message, a path/URI/data URL,
+      // bytes or a Host message (spec 044 reviewer).
       const code = (error as { code?: string } | null)?.code;
-      fail(code === 'file-too-large' ? tr('session.attachTooLarge') : tr('session.attachFailed'));
+      if (code === 'too-many-files') fail(tr('session.attachTooMany'));
+      else if (code === 'file-too-large') fail(tr('session.attachTooLarge'));
+      else if (code === 'no-file') fail(tr('session.attachNoFile'));
+      else if (code === 'read-failed' || code === 'read-timeout') fail(tr('session.attachReadFailed'));
+      else fail(tr('session.attachFailed'));
     } finally {
+      // The PICKER's object URL is released once for EVERY path, including a stale completion that
+      // may not publish UI or release a newer transfer's slot. No asset means this is a no-op.
+      active.abortRead();
+      active.releaseObjectUrl();
       // Cleanup is an OWNERSHIP act, not a publishing act: a user-cancelled upload still owns its
       // slot and MUST release it (otherwise Send stays locked and progress is stuck). A stale
       // transfer (old generation/token) still may not release a newer transfer's slot.
@@ -642,9 +1057,10 @@ export default function SessionScreen() {
             paddingHorizontal: space.md,
             paddingBottom: space.sm,
             borderBottomColor: colors.border,
-            // Reference 04: the header floats OVER the transcript, so the content scrolls behind a
-            // translucent bar instead of stopping under an opaque one.
-            backgroundColor: translucent(colors.bg),
+            // Spec 048: the header still FLOATS (shadow/border/layout unchanged), but on web the
+            // fill is the opaque same-scheme token so scrolled transcript text cannot bleed through
+            // the title. Native keeps the original translucent paper look.
+            backgroundColor: isWeb ? chrome.surface : resolveHeaderBackground(colors, false),
             position: 'absolute',
             top: 0,
             left: 0,
@@ -677,12 +1093,12 @@ export default function SessionScreen() {
           }}
           testID="session-back"
         >
-          <ChevronLeft size={24} color={colors.text} accessibilityLabel={tr('common.back')} />
+          <ChevronLeft size={24} color={chrome.text} accessibilityLabel={tr('common.back')} />
         </TouchableOpacity>
 
         <View style={[styles.headerTitles, { marginHorizontal: space.sm }]}>
           <Text
-            style={[type.subheading, { color: colors.text }]}
+            style={[type.subheading, { color: chrome.text }]}
             numberOfLines={1}
             accessibilityRole="header"
             testID="session-title"
@@ -692,15 +1108,15 @@ export default function SessionScreen() {
           <View style={[styles.subline, { gap: space.xs }]}>
             <Monitor
               size={20}
-              color={colors.textMuted}
+              color={chrome.textMuted}
               accessibilityLabel={snapshot.activeHost?.name ?? tr('common.host')}
             />
-            <Text style={[type.captionSmall, { color: colors.textMuted, flexShrink: 1 }]} numberOfLines={1}>
+            <Text style={[type.captionSmall, { color: chrome.textMuted, flexShrink: 1 }]} numberOfLines={1}>
               {snapshot.activeHost?.name ?? tr('common.host')}
             </Text>
             {session === undefined ? null : (
               <>
-                <Text style={[type.captionSmall, { color: colors.textFaint }]}>·</Text>
+                <Text style={[type.captionSmall, { color: chrome.textFaint }]}>·</Text>
                 <SessionStatusPill state={session.state} label={statusWord(tr, session.state)} plain />
               </>
             )}
@@ -709,9 +1125,9 @@ export default function SessionScreen() {
                 hides the label instead of showing an empty one. */}
             {agentPresetLabel === null ? null : (
               <>
-                <Text style={[type.captionSmall, { color: colors.textFaint }]}>·</Text>
+                <Text style={[type.captionSmall, { color: chrome.textFaint }]}>·</Text>
                 <Text
-                  style={[type.captionSmall, { color: colors.textMuted, flexShrink: 1 }]}
+                  style={[type.captionSmall, { color: chrome.textMuted, flexShrink: 1 }]}
                   numberOfLines={1}
                   testID="session-agent-preset"
                 >
@@ -723,7 +1139,7 @@ export default function SessionScreen() {
                 disabled — without the `permission-lower` capability or without a projection. */}
             {permissionChip === null ? null : (
               <>
-                <Text style={[type.captionSmall, { color: colors.textFaint }]}>·</Text>
+                <Text style={[type.captionSmall, { color: chrome.textFaint }]}>·</Text>
                 <PermissionChip preset={permissionChip.preset} hint={permissionChip.label} onPress={() => setPermissionSheetOpen(true)} />
               </>
             )}
@@ -846,8 +1262,31 @@ export default function SessionScreen() {
         ]}
         keyboardShouldPersistTaps="handled"
         scrollEventThrottle={64}
+        onContentSizeChange={(_width, height) => {
+          scrollMetrics.current.contentHeight = height;
+          // PREPEND BRANCH wins: an older page grew content above the reader. Restore the same visual
+          // anchor and NEVER complete an opening jump here (no scrollToEnd, no done mark).
+          const prepend = prependRestore.current;
+          if (prepend !== null) {
+            prependRestore.current = null;
+            scrollRef.current?.scrollTo({
+              y: prependViewportOffset(prepend.offsetY, prepend.oldHeight, height),
+              animated: false,
+            });
+            return;
+          }
+          // TRANSCRIPT LAYOUT BRANCH: only a pending jump scheduled by the history effect may land,
+          // and only with the current generation and a real (>0) height. A spinner/old height before
+          // scheduling cannot land the jump (there is no pending event to complete it).
+          const pending = initialScroll.current.pending;
+          if (pending === null) return;
+          dispatchInitialScroll({
+            kind: 'layout', sessionId: pending.sessionId, generation: pending.generation, height,
+          });
+        }}
         onScroll={(event) => {
           const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+          scrollMetrics.current = { offsetY: contentOffset.y, contentHeight: contentSize.height };
           setAwayFromBottom(
             isAwayFromBottom({
               offsetY: contentOffset.y,
@@ -855,6 +1294,16 @@ export default function SessionScreen() {
               viewportHeight: layoutMeasurement.height,
             }),
           );
+          // Lazy load: reaching the top asks for the PREVIOUS page, if one exists. One request per
+          // gesture; the controller's lock and this ref both stop a scroll burst from queueing more.
+          if (contentOffset.y <= OLDER_HISTORY_TOP_PX
+            && snapshot.historyHasEarlier
+            && !snapshot.historyLoading
+            && !olderAutoRequest.current) {
+            olderAutoRequest.current = true;
+            prependRestore.current = { offsetY: contentOffset.y, oldHeight: contentSize.height };
+            void controller.loadOlderHistory().finally(() => { olderAutoRequest.current = false; });
+          }
         }}
       >
         {/* The banner scrolls WITH the content now that the header floats over it (reference 04):
@@ -896,7 +1345,13 @@ export default function SessionScreen() {
             accessibilityLabel={tr('session.historyOlder')}
             accessibilityState={{ busy: snapshot.historyLoading, disabled: snapshot.historyLoading }}
             disabled={snapshot.historyLoading}
-            onPress={() => void controller.loadOlderHistory()}
+            onPress={() => {
+              prependRestore.current = {
+                offsetY: scrollMetrics.current.offsetY,
+                oldHeight: scrollMetrics.current.contentHeight,
+              };
+              void controller.loadOlderHistory();
+            }}
           >
             {snapshot.historyLoading ? (
               <ActivityIndicator color={colors.accent} />
@@ -934,9 +1389,18 @@ export default function SessionScreen() {
 
         {snapshot.history.length === 0 ? (
           <View style={[styles.centerArea, { padding: space.xxxl }]}>
-            {snapshot.connection === 'ready' ? (
+            {shouldShowNoMessage({
+              connectionReady: snapshot.connection === 'ready',
+              historyLoaded: snapshot.historyLoaded,
+              historyLoading: snapshot.historyLoading,
+              historyHasMore: snapshot.historyHasMore,
+              historyHasEarlier: snapshot.historyHasEarlier,
+            }) ? (
               <Text style={[type.bodySmall, { color: colors.textMuted }]}>{tr('session.empty')}</Text>
             ) : (
+              // A first page may be EMPTY while older pages still exist (`view:'conversation'` crops
+              // chatter). Showing “No message yet” there was the PWA defect: the transcript was not
+              // empty, it just had not been paged yet.
               <ActivityIndicator color={colors.textMuted} />
             )}
           </View>
@@ -1039,11 +1503,37 @@ export default function SessionScreen() {
             <MicHintLine text={tr('session.micHint')} />
           </View>
         ) : null}
+        {phaseLabel === null ? null : (
+          <Animated.View
+            accessible
+            accessibilityRole="text"
+            accessibilityLabel={phaseLabel}
+            pointerEvents="none"
+            testID="session-progress-indicator"
+            style={{
+              alignSelf: 'flex-start',
+              // Spec 050: fixed web chrome pair stays readable over the dark header/composer.
+              backgroundColor: isWeb ? chrome.surface : colors.surface,
+              borderColor: isWeb ? chrome.border : colors.border,
+              borderWidth: StyleSheet.hairlineWidth,
+              borderRadius: radius.pill,
+              marginHorizontal: space.xs,
+              marginBottom: space.xxs,
+              paddingHorizontal: space.sm,
+              paddingVertical: space.xxs,
+              opacity: phase === 'processing' && !reduceMotion ? pulse : 1,
+            }}
+          >
+            <Text style={[type.captionSmall, { color: isWeb ? chrome.textMuted : colors.textMuted }]}>{phaseLabel}</Text>
+          </Animated.View>
+        )}
         <GlassSurface
           style={[
             styles.composer,
             {
               borderRadius: radius.xxl,
+              backgroundColor: composer.surface,
+              borderColor: composer.border,
               paddingHorizontal: space.md,
               paddingVertical: space.sm,
               gap: space.sm,
@@ -1069,7 +1559,7 @@ export default function SessionScreen() {
               testID="session-reply-quote"
             >
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.xs }}>
-                <Text style={[type.captionSmall, { color: colors.accent, flex: 1 }]} numberOfLines={1}>
+                <Text style={[type.captionSmall, { color: isWeb ? chrome.text : colors.accent, flex: 1 }]} numberOfLines={1}>
                   {tr('session.reply')}
                 </Text>
                 <TouchableOpacity
@@ -1080,10 +1570,10 @@ export default function SessionScreen() {
                   testID="session-reply-cancel"
                   style={{ minWidth: hit, minHeight: hit, alignItems: 'center', justifyContent: 'center' }}
                 >
-                  <X size={20} color={colors.textMuted} accessibilityLabel={tr('common.cancel')} />
+                  <X size={20} color={chrome.textMuted} accessibilityLabel={tr('common.cancel')} />
                 </TouchableOpacity>
               </View>
-              <Text style={[type.captionSmall, { color: colors.textMuted }]} numberOfLines={2}>
+              <Text style={[type.captionSmall, { color: chrome.textMuted }]} numberOfLines={2}>
                 {quotePreview(replyTo.text)}
               </Text>
             </View>
@@ -1094,7 +1584,7 @@ export default function SessionScreen() {
               type.body,
               styles.input,
               {
-                color: colors.text,
+                color: composer.text,
                 maxHeight: COMPOSER_MAX_LINES * (type.body.lineHeight ?? 22) + space.md,
                 paddingVertical: space.xs,
               },
@@ -1103,7 +1593,7 @@ export default function SessionScreen() {
             value={text}
             onChangeText={setText}
             placeholder={tr('session.composerPlaceholder')}
-            placeholderTextColor={colors.textMuted}
+            placeholderTextColor={composer.textMuted}
             accessibilityLabel={tr('session.composerPlaceholder')}
             multiline
             editable
@@ -1115,7 +1605,7 @@ export default function SessionScreen() {
             {subagentSession ? (
               // A subagent session's model cannot be changed from here (the `models` request fails
               // with `session/agent-busy`), so there is no pill and no round trip — one honest line.
-              <Text style={[type.captionSmall, { color: colors.textMuted, flexShrink: 1 }]} numberOfLines={1}>
+              <Text style={[type.captionSmall, { color: chrome.textMuted, flexShrink: 1 }]} numberOfLines={1}>
                 {tr('authoring.modelSubagent')}
               </Text>
             ) : (
@@ -1124,6 +1614,7 @@ export default function SessionScreen() {
                 hasCatalog={snapshot.models.length > 0}
                 onOpenModel={() => setModelPickerOpen(true)}
                 hint={tr('authoring.model')}
+                palette={isWeb ? chrome : undefined}
               />
             )}
             <View style={{ flex: 1 }} />
@@ -1234,8 +1725,8 @@ export default function SessionScreen() {
               </TouchableOpacity>
             </View>
           )}
-          {/* The Host's receipt, not the bytes: the next prompt can name these attachments. */}
-          {attachReceipt === null ? null : (
+          {/* Host receipts, not bytes: every receipt of THIS session names one pending attachment. */}
+          {receiptsForSession(attachReceipts, sessionId).length === 0 ? null : (
             <View
               style={{
                 backgroundColor: colors.surface,
@@ -1247,12 +1738,16 @@ export default function SessionScreen() {
               }}
               testID="session-attach-receipt"
             >
-              <Text style={[type.captionSmall, { color: colors.text }]} numberOfLines={1}>
-                {tr('session.attachReceipt', { name: attachReceipt.name })}
-              </Text>
-              <Text style={[type.captionSmall, { color: colors.textFaint }]} numberOfLines={1}>
-                {attachReceipt.receiptId}
-              </Text>
+              {receiptsForSession(attachReceipts, sessionId).map((receipt) => (
+                <View key={receipt.receiptId}>
+                  <Text style={[type.captionSmall, { color: colors.text }]} numberOfLines={1}>
+                    {tr('session.attachReceipt', { name: receipt.name })}
+                  </Text>
+                  <Text style={[type.captionSmall, { color: colors.textFaint }]} numberOfLines={1}>
+                    {receipt.receiptId}
+                  </Text>
+                </View>
+              ))}
             </View>
           )}
         </GlassSurface>
@@ -1786,7 +2281,7 @@ function sendUnavailableCopy(tr: Interpolate, connection: ClientState): string {
 
 function bannerCopy(
   tr: Interpolate,
-  banner: 'reconnecting' | 'offline' | 'gateway-off' | 'revoked' | 'reauth' | 'cleanup-failed',
+  banner: 'reconnecting' | 'offline' | 'gateway-off' | 'revoked' | 'reauth' | 'cleanup-failed' | 'connect-failed',
 ): string {
   switch (banner) {
     case 'reconnecting':
@@ -1799,6 +2294,8 @@ function bannerCopy(
       return tr('banner.revoked');
     case 'reauth':
       return tr('banner.reauth');
+    case 'connect-failed':
+      return tr('banner.connectFailed');
     case 'cleanup-failed':
       return tr('banner.cleanupFailed');
   }

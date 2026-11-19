@@ -40,7 +40,9 @@ describe('web bootstrap: a failed cold start is retryable', () => {
     assert.match(bootstrap, /onPress=\{onRetryStartup\}/, 'it calls the startup retry prop');
     // The root layout hands the bootstrap the same `ensure()` call the mount effect makes: not a
     // second attempt, not a bare `controller.start()` — one shared startup path.
-    assert.match(LAYOUT, /onRetryStartup=\{\(\) => void runStartup\(\)\}/);
+    // Spec 045: no WebBootstrap is mounted; the retry now lives in the web notice above the navigator.
+    assert.match(LAYOUT, /testID="web-startup-retry"/);
+    assert.match(LAYOUT, /onPress=\{\(\) => void runStartup\(\)\}/);
     assert.match(LAYOUT, /const started = await startup\.ensure\(\);/);
   });
 
@@ -65,7 +67,8 @@ describe('web bootstrap: a failed cold start is retryable', () => {
   it('leaves the native gate alone', () => {
     // The retry state is fed only to the web bootstrap; the native branch keeps the A020 gate and
     // its own retry (`attemptUnlock`), unchanged.
-    assert.equal(LAYOUT.match(/startupStatus=\{startupStatus\}/g)?.length, 1, 'one consumer, the web bootstrap');
+    assert.equal(LAYOUT.match(/startupStatus=\{startupStatus\}/g)?.length ?? 0, 0, 'spec 045: WebBootstrap is never mounted');
+    assert.match(LAYOUT, /testID="web-startup-notice"/, 'the web notice replaces it');
     assert.match(LAYOUT, /gateMessage !== null \? <Text style=\{\[styles\.message/);
   });
 });

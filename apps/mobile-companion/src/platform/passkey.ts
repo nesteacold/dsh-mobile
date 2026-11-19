@@ -16,7 +16,24 @@ export async function registerPasskey(_client: CompanionClient): Promise<{ ok: t
   throw new Error('passkey unlock is a web (PWA) feature');
 }
 
-export async function assertPasskey(_client: CompanionClient): Promise<{ ok: true }> {
+/**
+ * Spec 037 platform alias: the prepared-request hooks exist on native too so shared controller code
+ * type-checks, but they are deliberate no-ops — a native device is never locked and never prefetches.
+ */
+export type PreparedAssertionOptions = never;
+export interface PasskeyAssertHooks {
+  onPrompt?: () => void;
+}
+
+export function prefetchAssertionOptions(_client: CompanionClient): void {
+  // nothing to prefetch: native has no Host passkey lock
+}
+
+export function invalidateWebPasskey(): void {
+  // nothing to invalidate: native has no prepared request
+}
+
+export async function assertPasskey(_client: CompanionClient, _hooks?: PasskeyAssertHooks): Promise<{ ok: true }> {
   throw new Error('passkey unlock is a web (PWA) feature');
 }
 

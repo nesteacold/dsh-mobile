@@ -9,7 +9,7 @@
  * Source:     packages/mobile-protocol/src/index.mjs
  * Regenerate: node scripts/sync-mobile-protocol.mjs   (npm run sync:protocol)
  * Verify:     node scripts/sync-mobile-protocol.mjs --check   (npm run check:protocol)
- * Source sha256: 95d2c087faf22e43b0481ada36ec192a906691b27a02939722b4a913434f7a57
+ * Source sha256: 0d6545b729a41ff6f2032c5b2b387240df78cd09b8bbb31eaf43780ffbcd874f
  *
  * Everything below this header is the source file unchanged (byte for byte, LF):
  * the contract logic is never forked, only copied.
@@ -259,6 +259,34 @@ export const DESKTOP_ONLY_SCOPES = Object.freeze([
 ])
 
 /**
+ * Scopes only a WEB/MOBILE device may hold (spec 020, spec 021 §7), the mirror of
+ * {@link DESKTOP_ONLY_SCOPES}.
+ *
+ * `web:unlock` gates the WebAuthn passkey frames and ARMS the server-side lock: a
+ * device holding it is refused `auth/locked` for every other frame until a
+ * `passkey-assert` on that socket, and a `desktop` never runs a ceremony (the desktop
+ * client sends no `Origin`, so it can never create one). A desktop granted it is
+ * therefore locked forever — measured 2026-11-14, an OTP offer of kind `desktop`
+ * carrying `SCOPE_PRESETS.full` produced exactly that. So an offer/grant of that kind
+ * must not carry it, and a record of that kind that already does is read as not
+ * holding it: the web lock is armed by the scope a device may hold, not by the string
+ * a store happens to contain.
+ */
+export const MOBILE_ONLY_SCOPES = Object.freeze(['web:unlock'])
+
+/**
+ * The scopes a record of one kind may hold (spec 021 rev 15, additive): every
+ * contract scope except {@link MOBILE_ONLY_SCOPES} on a `desktop`, and every scope
+ * except {@link DESKTOP_ONLY_SCOPES} on a `mobile`. An unknown/missing kind gets the
+ * `mobile` list, which is the narrower one. Both packages that build an offer
+ * (`plugins/mobile-gateway`, `plugins/devices`) filter by this one function.
+ */
+export function scopesForKind(kind) {
+  const excluded = kind === 'desktop' ? MOBILE_ONLY_SCOPES : DESKTOP_ONLY_SCOPES
+  return Object.freeze(SCOPES.filter((scope) => !excluded.includes(scope)))
+}
+
+/**
  * Scopes a desktop offer gets unless the owner picks some (spec 005, FR3): see
  * sessions, prompt, answer approvals — plus, since spec 013, attach files and
  * images to a session (`attachments:write`) and, since spec 014 C6, drive the
@@ -294,6 +322,8 @@ export const DESKTOP_DEFAULT_SCOPES = Object.freeze([
  *
  * This narrows *defaults* only. An explicit scope list — an owner's tick, an OTP
  * offer that names it, `SCOPE_PRESETS.full` — is taken literally and still grants it.
+ * The one exception is the device KIND (spec 021 rev 15): {@link MOBILE_ONLY_SCOPES}
+ * (`web:unlock`) is filtered out of any `desktop` grant by {@link scopesForKind}.
  */
 export const NEVER_DEFAULT_SCOPES = Object.freeze(['sessions:author', 'attachments:write', 'browser:control', 'stats:read', 'schedule:read', 'web:unlock', 'permission:lower'])
 
@@ -301,7 +331,9 @@ export const NEVER_DEFAULT_SCOPES = Object.freeze(['sessions:author', 'attachmen
  * Pairing presets for the Devices UI (spec 008). `standard` is the default at
  * Approve; `full` ticks every contract scope ("full control"), including the
  * spec 011 author scope and the spec 013 attachment scope. A preset is only a
- * list the owner may edit: the grant is still the explicit scope list.
+ * list the owner may edit: the grant is still the explicit scope list — filtered by
+ * the device's kind ({@link scopesForKind}) where the kind cannot hold a scope,
+ * which is why `web:unlock` (spec 021 rev 15) reaches a `mobile`/web offer only.
  */
 export const SCOPE_PRESETS = Object.freeze({
   standard: Object.freeze(['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote']),
@@ -773,6 +805,10 @@ export const QUESTION_CUSTOM_MAX_LENGTH = 2000
  * answered {@link WEB_LOCK_ERROR} for every frame outside {@link WEB_UNLOCK_EXEMPT_TYPES}
  * (hello and ping are channel-neutral and always run), until a successful
  * `passkey-assert` on that socket. `hello` tells it why in `webLock`.
+ *
+ * @deprecated Spec 045 removes this gate for BROWSER/PWA sockets (those that present an Origin
+ * on the WS upgrade). The wire names and values stay for native lock paths and older bundles;
+ * a browser socket is never armed with a lock and its hello carries no `webLock`.
  */
 export const PASSKEY_REGISTER_OPTIONS_TYPE = 'passkey-register-options'
 export const PASSKEY_REGISTER_TYPE = 'passkey-register'
@@ -783,6 +819,9 @@ export const PASSKEY_ASSERT_TYPE = 'passkey-assert'
  * The PWA's own re-lock frame (contract §14.2): `{type:PASSKEY_LOCK_TYPE}` ->
  * `{kind:PASSKEY_LOCK_TYPE, locked:true}`. Scoped by `web:unlock` and accepted in any lock state;
  * deliberately NOT in {@link PASSKEY_CLIENT_TYPES} (the four ceremony frames).
+ *
+ * @deprecated Spec 045: browser/PWA sockets ignore this frame's lock effect (the frame name and
+ * value stay unchanged on the wire). Native sockets keep the spec 021 behaviour.
  */
 export const PASSKEY_LOCK_TYPE = 'passkey-lock'
 
@@ -832,6 +871,23 @@ export const PASSKEY_RATE_LIMITS = Object.freeze({ perDevice: 5, perDeviceWindow
  * on its next frame. A new connection always starts locked, so a tab reload re-asserts.
  */
 export const WEB_UNLOCK_IDLE_MS = 15 * 60_000
+
+/**
+ * Spec 036 (revision 16): the opt-in capability for the Host-authoritative 24-hour web unlock
+ * session. A client that does NOT list it in `client-hello.capabilities` keeps spec 021 behaviour:
+ * every new socket starts locked. No frame shape changes.
+ *
+ * @deprecated Spec 045: browser/PWA clients no longer need a web unlock session. The capability
+ * name and value stay on the wire so an older bundle can still connect; the gateway never applies
+ * the grant to a browser socket. Native lock paths are unchanged.
+ */
+export const WEB_UNLOCK_SESSION_CAPABILITY = 'web-unlock-session.v1'
+
+/**
+ * Sliding lifetime of a granted web unlock session (spec 036): authorized activity refreshes it
+ * from the moment of that activity; there is no absolute cap.
+ */
+export const WEB_UNLOCK_SESSION_TTL_MS = 24 * 60 * 60 * 1000
 
 /**
  * Error codes of the passkey frames (contract §6). `passkey/already-registered` means the
@@ -1172,6 +1228,9 @@ export const OPTIONAL_CAPABILITIES = Object.freeze([
   // send Web Push messages. Advertised only while the owner has web push enabled — the
   // switch is off by default, and off means zero outbound requests.
   'webPush',
+  // Spec 036 (revision 16): the Host supports a 24-hour rolling unlock grant. A CLIENT opts in
+  // by listing the same name in `client-hello.capabilities`; without it, spec 021 applies.
+  WEB_UNLOCK_SESSION_CAPABILITY,
 ])
 
 /**
@@ -1369,7 +1428,8 @@ export const PING_INTERVAL_MS = 25_000
 /** @typedef {{ type: 'ping', requestId: string }} PingFrame */
 /** @typedef {{ type: 'sessions', requestId: string }} SessionsRequestFrame */
 /** @typedef {{ type: 'search', requestId: string, query: string }} SearchRequestFrame */
-/** @typedef {{ type: 'history', requestId: string, sessionId: string, beforeSeq?: number, maxMessages?: number, maxBytes?: number }} HistoryRequestFrame */
+/** @typedef {{ type: 'history', requestId: string, sessionId: string, beforeSeq?: number, historyFormatVersion?: number, maxMessages?: number, maxBytes?: number, view?: 'conversation' }} HistoryRequestFrame */
+/** @typedef {{ kind: 'history', requestId?: string, sessionId?: string, events?: unknown[], historyFormatVersion?: number, cursor?: number, bytes?: number, view?: 'conversation', hasMore?: boolean, nextBeforeSeq?: number }} HistoryFrame */
 /** @typedef {{ type: 'subscribe', requestId: string, sessionId: string }} SubscribeFrame */
 /** @typedef {{ type: 'unsubscribe', requestId: string }} UnsubscribeFrame */
 /** @typedef {{ type: 'message', requestId: string, sessionId: string, text: string, clientMsgId: string, mode?: 'queue'|'steer' }} MessageFrame */

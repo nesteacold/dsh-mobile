@@ -21,6 +21,7 @@ describe('service worker precache list', () => {
     'register-sw.js',
     'icon.svg',
     'icon-maskable.svg',
+    'zxing_reader-3.1.6-5003fb4b.wasm',
     'metadata.json',
     'precache.json',
     '_expo/static/js/web/index-10b55514dd1568e71143c26799e37027.js',
@@ -36,6 +37,7 @@ describe('service worker precache list', () => {
     for (const file of ['/manifest.json', '/icon.svg', '/icon-maskable.svg', '/register-sw.js']) {
       assert.ok(list.includes(file), file);
     }
+    assert.ok(list.includes('/zxing_reader-3.1.6-5003fb4b.wasm'), 'spec 043: the stamped decoder is precached');
   });
 
   it('never lists the worker, the list itself or build metadata', () => {
@@ -59,7 +61,7 @@ describe('service worker precache list', () => {
 
   it('the worker reads that list at install and bumps the cache name when the strategy changes', () => {
     assert.match(SW, /fetch\('\/precache\.json'/, 'install must read the build-generated list');
-    assert.match(SW, /const CACHE = 'dsh-shell-v5'/, 'strategy changed => cache name bumped (see the note in sw.js)');
+    assert.match(SW, /const CACHE = 'dsh-shell-v6'/, 'spec 043 added the stamped WASM shell asset => cache name bumped so old PWAs drop the stale decoder');
     // Never-cache stays in force at install, not only in the fetch handler.
     assert.match(SW, /NEVER_CACHE\.some\(\(prefix\) => path\.startsWith\(prefix\)\)\) continue/);
   });

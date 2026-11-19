@@ -139,7 +139,7 @@ describe('a cursor request always carries sessionId', () => {
 
   it('the helper takes sessionId and includes it in the params', () => {
     assert.match(cursorHelper, /private historyCursorParams\(sessionId: string, beforeSeq: number\)/);
-    assert.match(cursorHelper, /sessionId, beforeSeq/, 'sessionId is sent');
+    assert.match(cursorHelper, /sessionId,\s*beforeSeq/, 'sessionId is sent');
     assert.match(cursorHelper, /historyFormatVersion: formatVersion/, 'and the format version with it');
   });
 
@@ -192,16 +192,16 @@ describe('(1) the cursor carries historyFormatVersion', () => {  it('remembers t
   });
 });
 
-describe('(2) pages load until the transcript contains the prompt', () => {
-  it('hasUserTurn() reports whether a real prompt is present', () => {
+describe('(2) the newest page renders on its own; older pages are opt-in', () => {
+  it('the opening page already carries the assistant answer, even without a prompt', () => {
     const store = new HistoryStore();
     store.setPage(coerceHistoryEvents(OPENING_PAGE), { hasMore: true, nextBeforeSeq: 14, formatVersion: 4 });
-    assert.equal(store.hasUserTurn(), false, 'the opening page alone has no prompt');
-    store.prependPage(coerceHistoryEvents(OLDER_PAGE), { hasMore: false });
-    assert.equal(store.hasUserTurn(), true, 'after the older page the prompt is there');
+    assert.equal(store.hasUserTurn(), false, 'the newest page alone may have no prompt');
+    assert.deepEqual(store.items.map((row) => row.role), ['assistant'], 'but the answer is renderable');
+    assert.equal(store.page.hasMore, true, 'older history stays available, not auto-fetched');
   });
 
-  it('the two full pages together reconstruct question + answer', () => {
+  it('an explicit older page reconstructs question + answer without duplicates', () => {
     const store = new HistoryStore();
     store.setPage(coerceHistoryEvents(OPENING_PAGE), { hasMore: true, nextBeforeSeq: 14, formatVersion: 4 });
     store.prependPage(coerceHistoryEvents(OLDER_PAGE), { hasMore: false });
@@ -212,17 +212,7 @@ describe('(2) pages load until the transcript contains the prompt', () => {
     assert.equal(user[0]?.text, PROMPT);
     assert.equal(assistant.length, 1);
     assert.equal(assistant[0]?.text, ANSWER);
-    // Ordered by seq: the question (9) before the answer (18).
     assert.deepEqual(rows.map((row) => row.seq), [9, 18]);
-  });
-
-  it('the auto-pager stops, and is bounded', () => {
-    assert.match(APP_STATE, /private async loadHistoryWithPrompts\(sessionId: string, maxPages = 5\)/,
-      'bounded to ~5 pages');
-    assert.match(APP_STATE, /if \(!page\.hasMore \|\| this\.history\.hasUserTurn\(\)\) break;/,
-      'it stops once a prompt is present');
-    assert.match(APP_STATE, /pages < maxPages/, 'and the bound is enforced');
-    assert.match(APP_STATE, /if \(beforeSeq === null\) break;/, 'no cursor means no further paging');
   });
 });
 

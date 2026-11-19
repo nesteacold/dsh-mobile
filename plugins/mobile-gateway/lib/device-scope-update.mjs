@@ -10,20 +10,31 @@
 // scope NAMES only, all of which the owner already sees on the Devices page.
 
 import {
-  SCOPES as CONTRACT_SCOPES, DESKTOP_ONLY_SCOPES, WEB_UNLOCK_SCOPE,
+  SCOPES as CONTRACT_SCOPES, scopesForKind as CONTRACT_SCOPES_FOR_KIND, WEB_UNLOCK_SCOPE,
 } from './vendor/mobile-protocol.mjs'
 
 /**
- * The scopes a record of this kind may hold. The same rule `lib/devices.js` loads a record with:
- * a desktop-only scope survives only on a `desktop`. Exported so the Devices page and the tests
- * read one list instead of restating it.
+ * The scopes a record of this kind may hold. Spec 021 rev 15: the rule moved into the contract as
+ * `scopesForKind` (a `desktop` loses `MOBILE_ONLY_SCOPES` — `web:unlock` — and a `mobile` loses
+ * `DESKTOP_ONLY_SCOPES`), so the gateway, the Devices page and the pairing offers all read ONE
+ * table. Re-exported here because this module is where the route and the tests look it up.
  */
-export function scopesForKind(kind) {
-  return CONTRACT_SCOPES.filter((scope) => !DESKTOP_ONLY_SCOPES.includes(scope) || kind === 'desktop')
-}
+export const scopesForKind = CONTRACT_SCOPES_FOR_KIND
 
 /** `web:unlock` is deliberately unreachable here: the passkey flow owns granting and revoking it. */
 export const UNSETTABLE_SCOPES = Object.freeze([WEB_UNLOCK_SCOPE])
+
+/**
+ * Spec 021 rev 15: the one exception, and only in the REMOVING direction. A desktop record that
+ * still holds `web:unlock` (an offer written before this revision — measured 2026-11-14) could
+ * otherwise never be repaired from the owner's UI, because the scope is unsettable here for
+ * everybody. Removing it takes nothing away from a desktop (it can never run a ceremony), so the
+ * owner may do it; ADDING it stays refused for every kind, and a web/`mobile` record keeps the
+ * passkey flow's sole ownership.
+ */
+function droppableForKind(kind) {
+  return kind === 'desktop' ? [WEB_UNLOCK_SCOPE] : []
+}
 
 function badRequest(message, code = 'bad-request') {
   const error = new Error(message)
@@ -57,9 +68,16 @@ export function planScopeUpdate({ body, device }) {
   for (const scope of [...adding, ...removing]) {
     if (!CONTRACT_SCOPES.includes(scope)) throw badRequest(`unknown scope: ${scope}`, 'unknown-scope')
   }
-  // R2: `web:unlock` never moves here, in either direction.
-  for (const scope of [...adding, ...removing]) {
+  // R2: `web:unlock` never moves here, in either direction — except the spec 021 rev 15 repair
+  // above: a `desktop` may drop it (it could never use it), never gain it.
+  const droppable = droppableForKind(device && device.kind)
+  for (const scope of adding) {
     if (UNSETTABLE_SCOPES.includes(scope)) {
+      throw badRequest(`${scope} cannot be changed here; the passkey flow owns it`, 'scope-not-updatable')
+    }
+  }
+  for (const scope of removing) {
+    if (UNSETTABLE_SCOPES.includes(scope) && !droppable.includes(scope)) {
       throw badRequest(`${scope} cannot be changed here; the passkey flow owns it`, 'scope-not-updatable')
     }
   }

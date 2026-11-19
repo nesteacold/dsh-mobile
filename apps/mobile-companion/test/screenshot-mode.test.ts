@@ -509,7 +509,7 @@ describe('runtime wiring (app/_layout.tsx)', () => {
   });
 
   it('does not start the gate before the decision resolved', () => {
-    assert.match(layout, /gate === 'checking' && \(!isWeb \? demoGate !== null : true\)/);
+    assert.match(layout, /if \(!isWeb && gate === 'checking' && demoGate !== null\)/);
   });
 });
 

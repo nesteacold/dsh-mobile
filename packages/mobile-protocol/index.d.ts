@@ -154,6 +154,17 @@ export const DESKTOP_DEFAULT_SCOPES: readonly Scope[]
 export const NEVER_DEFAULT_SCOPES: readonly Scope[]
 /** Scopes only a `desktop` device may hold, and only when chosen explicitly. */
 export const DESKTOP_ONLY_SCOPES: readonly Scope[]
+/**
+ * Scopes only a web/`mobile` device may hold (spec 021 revision 15): `web:unlock`,
+ * which arms the passkey lock a `desktop` can never satisfy.
+ */
+export const MOBILE_ONLY_SCOPES: readonly Scope[]
+/**
+ * The scopes a record of one kind may hold: every contract scope minus the other
+ * kind's only-list (`MOBILE_ONLY_SCOPES` for a `desktop`, `DESKTOP_ONLY_SCOPES`
+ * otherwise). The one table both packages filter an offer/grant by.
+ */
+export function scopesForKind(kind: DeviceKind | undefined): readonly Scope[]
 export type ScopePresetName = 'standard' | 'full'
 /** Devices UI presets: `standard` = default at Approve, `full` = every contract scope. */
 export const SCOPE_PRESETS: Readonly<Record<ScopePresetName, readonly Scope[]>>
@@ -205,7 +216,10 @@ export const PASSKEY_REGISTER_OPTIONS_TYPE: 'passkey-register-options'
 export const PASSKEY_REGISTER_TYPE: 'passkey-register'
 export const PASSKEY_ASSERT_OPTIONS_TYPE: 'passkey-assert-options'
 export const PASSKEY_ASSERT_TYPE: 'passkey-assert'
-/** The PWA's own re-lock frame (contract §14.2); not one of the four ceremony frames. */
+/**
+ * The PWA's own re-lock frame (contract §14.2); not one of the four ceremony frames.
+ * @deprecated Spec 045: browser/PWA sockets ignore its lock effect; the wire name stays.
+ */
 export const PASSKEY_LOCK_TYPE: 'passkey-lock'
 export const PASSKEY_CLIENT_TYPES: readonly PasskeyType[]
 
@@ -231,6 +245,16 @@ export const PASSKEY_RATE_LIMITS: Readonly<{
 }>
 /** Inactivity bound of an unlock (15 min): a new connection always starts locked. */
 export const WEB_UNLOCK_IDLE_MS: number
+/**
+ * Spec 036: opt-in capability for a Host-authoritative rolling 24-hour web unlock session.
+ * @deprecated Spec 045: browser/PWA clients no longer need it; the wire value stays for old bundles.
+ */
+export const WEB_UNLOCK_SESSION_CAPABILITY: 'web-unlock-session.v1'
+/**
+ * Spec 036: sliding lifetime of the web unlock grant (24 hours, no absolute cap).
+ * @deprecated Spec 045: not applied to browser/PWA sockets; native paths keep the value.
+ */
+export const WEB_UNLOCK_SESSION_TTL_MS: number
 /** The passkey frames' error codes (contract §6). `already-registered` needs Host approval. */
 export type PasskeyErrorCode =
   | 'passkey/not-registered'
@@ -641,6 +665,8 @@ export type OptionalCapability = 'push-v1' | 'browser-agent:1' | 'session-rename
   | 'permission-lower'
   /** Spec 026 (revision 15): advertised only while the owner has web push enabled. */
   | 'webPush'
+  /** Spec 036 (revision 16): opt-in for the Host-authoritative 24h unlock session. */
+  | 'web-unlock-session.v1'
 
 export const CAPABILITIES: readonly Capability[]
 export const OPTIONAL_CAPABILITIES: readonly OptionalCapability[]
@@ -826,8 +852,12 @@ export interface HistoryRequestFrame {
   requestId: string
   sessionId: string
   beforeSeq?: number
+  /** Required by the gateway when `beforeSeq` is present (PROTOCOL.md:748). */
+  historyFormatVersion?: number
   maxMessages?: number
   maxBytes?: number
+  /** Conversation crop: drop protocol chatter and stream payloads (PROTOCOL.md:747). */
+  view?: 'conversation'
 }
 
 export interface SubscribeFrame {
@@ -1132,7 +1162,16 @@ export interface HistoryFrame {
   sessionId?: string
   items?: HistoryMessage[]
   messages?: HistoryMessage[]
+  /** Raw DSH SessionEvents, as forwarded by the gateway's conversation crop. */
+  events?: unknown[]
+  /** Host's format generation; required alongside a `beforeSeq` cursor. */
+  historyFormatVersion?: number
+  /** Host's absolute cursor, distinct from the paging `nextBeforeSeq`. */
+  cursor?: number
+  bytes?: number
+  view?: 'conversation'
   hasMore?: boolean
+  nextBeforeSeq?: number
   [key: string]: unknown
 }
 

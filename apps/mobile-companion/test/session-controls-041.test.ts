@@ -36,6 +36,8 @@ import { isCurrentUpload, ownsUpload, shouldClearReceipt } from '../src/ui/conve
 import { resetAppState } from './support/stubs/react-native.stub';
 
 const SCREEN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'app', 'session', '[id].tsx');
+// Spec 044 moved the native read into the platform seam; the screen now drives the seam.
+const NATIVE_SEAM = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'platform', 'picked-file.ts');
 const SESSION = 'sess-041';
 
 interface Sent {
@@ -95,8 +97,9 @@ describe('spec 041 hook wiring (source, no renderer)', () => {
       'session.permissionPicker', 'session.permissionDisabled',
       'session.contextUsage', 'session.contextUnavailable',
       'session.attach', 'session.attachTitle', 'session.attachImage', 'session.attachFile',
-      'session.attachUnavailable', 'session.attachTooLarge', 'session.attachProgress',
-      'session.attachCancel', 'session.attachFailed', 'session.attachReceipt',
+      'session.attachUnavailable', 'session.attachTooLarge', 'session.attachTooMany', 'session.attachProgress',
+      'session.sending', 'session.processing',
+      'session.attachCancel', 'session.attachFailed', 'session.attachReadFailed', 'session.attachReceipt',
       'session.attachNoFile', 'session.attachBusy',
     ];
     const copy = (locale: 'en' | 'vi', key: MessageKey): string => {
@@ -359,17 +362,20 @@ describe('spec 041 reviewer fixes — receipt, no-scope, single-flight, ring', (
     const claim = source.indexOf('attachInFlight.current = true;');
     const picker = source.indexOf('DocumentPicker.getDocumentAsync(');
     assert.ok(claim > 0 && picker > claim, 'the guard precedes the picker');
-    const fileRead = source.indexOf('await file.arrayBuffer()');
-    assert.ok(fileRead > claim, 'the guard precedes the whole-file read');
-    assert.ok(source.includes('if (asset.size !== undefined) admitClientUploadSize(asset.size);'), 'picker size is admitted before the read');
-    assert.ok(source.includes('const info = file.info();'), 'file metadata is read before arrayBuffer');
-    const infoAt = source.indexOf('const info = file.info();');
-    const readAt = source.indexOf('await file.arrayBuffer()');
-    assert.ok(infoAt > 0 && readAt > infoAt, 'metadata check precedes the whole-file read');
-    assert.ok(source.includes('admitClientUploadSize(info.size);'), 'missing/nonfinite/negative/oversize metadata fails closed');
+    const seamCall = source.indexOf('await readPickedFile(asset, readOptions);');
+    assert.ok(seamCall > claim, 'the guard precedes the whole-file read');
+    assert.ok(source.includes('if (!multi && asset.size !== undefined) admitClientUploadSize(asset.size);'), 'single-file picker size is admitted before the read');
+    assert.ok(source.indexOf('if (!multi && asset.size !== undefined) admitClientUploadSize(asset.size);') < seamCall, 'admission precedes the seam');
+    assert.ok(source.includes('admitImageBatch(assets.map('), 'a web image batch is admitted as a whole before any read');
+    const native = readFileSync(NATIVE_SEAM, 'utf8');
+    assert.ok(native.includes('const info = file.info();'), 'native metadata is read before arrayBuffer');
+    const infoAt = native.indexOf('const info = file.info();');
+    const readAt = native.indexOf('await file.arrayBuffer()');
+    assert.ok(infoAt > 0 && readAt > infoAt, 'native metadata check precedes the whole-file read');
+    assert.ok(native.includes('admitClientUploadSize(info.size);'), 'missing/nonfinite/negative/oversize metadata fails closed');
     assert.ok(source.includes('if (value === \'\' || sending || attachInFlight.current) return;'), 'Send handler is guarded too');
     assert.ok(source.includes('controller.sendPrompt(payload, {'), 'the send carries the receipt options');
-    assert.ok(source.includes('shouldClearReceipt(current, expected) ? null : current'), 'receipt is cleared by an identity-checked functional update');
+    assert.ok(source.includes('clearSnapshottedReceipts(current, sessionId, receiptIds)'), 'only the snapshotted receipts are cleared after ack');
     assert.ok(source.includes('}, [invalidateUpload, sessionId]);'), 'attachment state is reset on session change');
 
     // Per-transfer lifecycle isolation: generation + unique token + own cancellation flag.

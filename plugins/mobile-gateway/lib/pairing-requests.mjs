@@ -178,7 +178,9 @@ export function createPairingRequests(options = {}) {
       if (pending.size >= MAX_PENDING) return undefined
       const request = {
         id: crypto.randomUUID(),
-        name: typeof name === 'string' && name.trim() ? name.trim().slice(0, 80) : '未命名设备',
+        // No client name is stored as '' — never a placeholder: a made-up name would be
+        // approved as if the device had chosen it. Display sites substitute their own label.
+        name: typeof name === 'string' && name.trim() ? name.trim().slice(0, 80) : '',
         clientIp: String(clientIp ?? ''),
         kind: offer.kind,
         requestedScopes: [...offer.scopes],

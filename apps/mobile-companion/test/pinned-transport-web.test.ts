@@ -13,8 +13,10 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import type { Transport } from '../src/core/transport';
 import {
+  DEVICE_NAME_MAX_ENCODED,
   PinnedTransport,
   createPinnedTransport,
+  encodeDeviceName,
   isTailnetUrl,
 } from '../src/platform/pinned-transport.web';
 
@@ -133,6 +135,93 @@ describe('web transport: tailnet-only, protocol-checked, one failure report', ()
     const socket = FakeWebSocket.last;
     assert.ok(socket !== null);
     assert.deepEqual(socket.protocols, ['dsh-mobile-v1', 'dsh-pair.code123', 'dsh-device.install-1234-abcdef']);
+  });
+
+  it('sends the device name as the dsh-device-name subprotocol (browsers cannot send headers)', () => {
+    const transport = createPinnedTransport();
+    record(transport);
+    transport.connect(HOST, {
+      certSha256: 'a'.repeat(64),
+      protocols: ['dsh-mobile-v1', 'dsh-pair.code123'],
+      headers: { 'X-DSH-Device-ID': 'install-1234-abcdef', 'X-DSH-Device-Name': 'DSH Orbit (Web)' },
+    });
+
+    const socket = FakeWebSocket.last;
+    assert.ok(socket !== null);
+    // UTF-8 -> unpadded Base64URL, the exact encoding `lib/index.mjs` decodes.
+    assert.deepEqual(socket.protocols, [
+      'dsh-mobile-v1',
+      'dsh-pair.code123',
+      'dsh-device.install-1234-abcdef',
+      'dsh-device-name.RFNIIE9yYml0IChXZWIp',
+    ]);
+  });
+
+  it('offers no name subprotocol when the client reports no name', () => {
+    const transport = createPinnedTransport();
+    record(transport);
+    transport.connect(HOST, {
+      certSha256: 'a'.repeat(64),
+      headers: { 'X-DSH-Device-ID': 'install-1234-abcdef', 'X-DSH-Device-Name': '   ' },
+    });
+
+    const socket = FakeWebSocket.last;
+    assert.ok(socket !== null);
+    assert.deepEqual(socket.protocols, ['dsh-mobile-v1', 'dsh-device.install-1234-abcdef']);
+  });
+
+  const connectWithName = (name: string): string[] => {
+    const transport = createPinnedTransport();
+    const events = record(transport);
+    transport.connect(HOST, {
+      certSha256: 'a'.repeat(64),
+      protocols: ['dsh-mobile-v1', 'dsh-pair.code123'],
+      headers: { 'X-DSH-Device-ID': 'install-1234-abcdef', 'X-DSH-Device-Name': name },
+    });
+    assert.equal(events.length, 0, 'connecting with any name never reports a failure');
+    const socket = FakeWebSocket.last;
+    assert.ok(socket !== null, 'a socket is still created');
+    return socket.protocols as string[];
+  };
+  const BASE_PROTOCOLS = ['dsh-mobile-v1', 'dsh-pair.code123', 'dsh-device.install-1234-abcdef'];
+  const decodeName = (protocol: string): string =>
+    Buffer.from(protocol.slice('dsh-device-name.'.length), 'base64url').toString('utf8');
+
+  it('encodes a Unicode name as UTF-8 Base64URL, trimmed and without control characters', () => {
+    const protocols = connectWithName('  Điện thoại 📱\u0000\n  ');
+    assert.deepEqual(protocols.slice(0, 3), BASE_PROTOCOLS);
+    assert.equal(protocols.length, 4);
+    assert.equal(decodeName(protocols[3] as string), 'Điện thoại 📱');
+  });
+
+  it('caps a long name at 80 code points (not UTF-16 units) and keeps the connection', () => {
+    const protocols = connectWithName('😀'.repeat(200));
+    assert.deepEqual(protocols.slice(0, 3), BASE_PROTOCOLS);
+    assert.equal(protocols.length, 4);
+    assert.equal(Array.from(decodeName(protocols[3] as string)).length, 80);
+  });
+
+  it('drops only the name protocol when the encoded name exceeds 512 characters', () => {
+    // 80 code points of 4 UTF-8 bytes = 320 bytes = 427 base64url chars (fits); a 4-byte-per-point
+    // name never exceeds 512 once capped, so prove the guard through the exported encoder's bound.
+    assert.equal(encodeDeviceName('😀'.repeat(80))?.length, 427);
+    assert.ok(DEVICE_NAME_MAX_ENCODED >= 427 && DEVICE_NAME_MAX_ENCODED === 512);
+    // A name that is only control characters / whitespace yields no name protocol at all.
+    assert.deepEqual(connectWithName('\u0000\u0007  \t'), BASE_PROTOCOLS);
+  });
+
+  it('survives an encode failure: no name protocol, all other protocols kept, no throw', () => {
+    const realEncode = TextEncoder.prototype.encode;
+    TextEncoder.prototype.encode = function () {
+      throw new Error('simulated encode failure');
+    };
+    try {
+      assert.equal(encodeDeviceName('Phone'), null);
+      assert.deepEqual(connectWithName('Phone'), BASE_PROTOCOLS);
+    } finally {
+      TextEncoder.prototype.encode = realEncode;
+    }
+    assert.equal(typeof encodeDeviceName('Phone'), 'string', 'encoder restored');
   });
 
   it('closes 1002 and reports a protocol mismatch when the host does not accept dsh-mobile-v1', () => {

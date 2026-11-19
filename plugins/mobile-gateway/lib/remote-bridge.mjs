@@ -18,6 +18,14 @@
 //     former. Nothing is blocked by design: the Host owner grants each family
 //     per device. The argument constraints below apply only to a device that
 //     LACKS the scope that would make the argument legitimate.
+//   - The same scope only gates an ID the device may see. While the Host lists
+//     instances (the empty workspace list refuses below), a call that names no
+//     `sessionId` carries no Session resource, so DSH's own `allows()` cannot
+//     refuse a session outside a device's visible set. So `agentTeams/setEnabled`,
+//     which names `agentId` (a root Session id) and nothing else, additionally
+//     needs the target in the visible set the device's DSH policy is built from,
+//     live `sessions:read`, and proof that a listing for that snapshot has landed.
+//     Without the resolver it is dropped from the allowlist (fail closed).
 //   - `$events/result` is NEVER forwarded raw. It would let a client resolve any
 //     pending Host event (an approval) without seeing its content. It is mapped
 //     onto the hash-bound approval decision of the gateway (`decideApproval`):
@@ -122,6 +130,20 @@ const SESSIONS_AUTHOR = [
   'workspace/pinSession', 'workspace/unpinSession',
   'workspace/unarchiveSession',
   'workspace/insertBefore', 'workspace/insertSessionBefore',
+  // Owner 2026-11-15: the Team switch of the session menu (DSH 0.2.2-rc.3).
+  // `agentTeams` exposes exactly ONE wire method (`setEnabled(agent, enabled)`,
+  // dsh-agent-team/src/index.ts:111; the generated `agentTeams/setEnabled` descriptor
+  // is the only key, lib/typert.remote-client.js:20 — isEnabled/createTask/get…
+  // are host-internal calls, not endpoints). `remote.agentTeams.setEnabled` is the
+  // renderer call (dsh-client-ui-agent-team/src/client/mount.ts:43). The wire args
+  // are `{ agentId, enabled }` (`agent:id` renames the root session id; the devices
+  // router strips its `h:<hostId>:` tag on the way out, host-router.mjs:445). It
+  // appends `team/mode` to the ROOT session of that tree and flushes it: a per-session
+  // authoring decision, not a Host-settings write, so it shares `session/rename`'s
+  // grant. Its read side is the `agentTeam` projection (session/events, sessions:read).
+  // Scope alone is not enough for it: the agentId must also be a session the device
+  // may see (see `unlistedSessionRefusal`, and the header note on owner-Peer resources).
+  'agentTeams/setEnabled',
 ]
 const APPROVAL_RESPOND = [
   'userQuestions/answer', 'userQuestions/attachWait',
@@ -272,10 +294,13 @@ export function scopeForEndpoint(endpoint) {
 }
 
 /**
- * Authorisation of one endpoint for a device.
+ * Authorisation of one endpoint for a device. `allowMissing` names endpoints THIS
+ * bridge must not forward although the table maps them (`noVisibilityResolver`
+ * below: a bridge built without its session-visibility resolver cannot check the id
+ * they address); omitted, the complete table applies.
  * @returns {{ ok: true, scope: string } | { ok: false, code: string, message: string, scope?: string }}
  */
-export function authorizeEndpoint(device, endpoint) {
+export function authorizeEndpoint(device, endpoint, { allowMissing } = {}) {
   if (typeof endpoint !== 'string' || !ENDPOINT_SHAPE.test(endpoint)) {
     return { ok: false, code: 'bad-request', message: 'endpoint must be namespace/method' }
   }
@@ -288,6 +313,10 @@ export function authorizeEndpoint(device, endpoint) {
   }
   const scope = scopeForEndpoint(endpoint)
   if (!scope) return { ok: false, code: 'op/forbidden', message: `${endpoint} is not on the remote-bridge allowlist` }
+  if (Array.isArray(allowMissing) && allowMissing.includes(endpoint)) {
+    return { ok: false, code: 'op/forbidden',
+      message: `${endpoint} needs the session-visibility check this bridge was built without; it is unavailable` }
+  }
   const scopes = Array.isArray(device?.scopes) ? device.scopes : []
   // Kind is not policy (spec 012 rule 3): what a device may reach is the scope list
   // written on its record, whatever it calls itself. The list is read on every call,
@@ -316,6 +345,37 @@ const hasScope = (device, scope) => Array.isArray(device?.scopes) && device.scop
 export const MAX_GOAL_ROUNDS = 50
 
 const refusal = (message, code = 'remote/argument-denied') => ({ code, message })
+
+/** The scope a session's visibility rests on; a refusal about it names this scope. */
+const VISIBLE_SESSION_SCOPE = 'sessions:read'
+
+/**
+ * The session-visible-set check behind an endpoint that addresses a session by an
+ * id DSH resolves as no resource itself (`agentTeams/setEnabled`'s `agentId`): scope
+ * alone would gate it, DSH's own `allows()` would not.
+ *
+ * `snapshot` is the resolver's answer: `{ visibleSessionIds, freshness }`, where a
+ * finite `freshness` proves a Host `session/list` for this snapshot has landed — the
+ * same snapshot the device's per-resource DSH bindings are built from. Fail closed:
+ * no live `sessions:read`, an unreadable snapshot, a snapshot without proof, or an
+ * id outside it all refuse.
+ * @returns {{ code: string, message: string, scope?: string } | undefined}
+ */
+export function unlistedSessionRefusal(device, endpoint, what, id, snapshot) {
+  if (!hasScope(device, VISIBLE_SESSION_SCOPE)) {
+    return { code: 'auth/forbidden-scope', scope: VISIBLE_SESSION_SCOPE,
+      message: `${endpoint}: ${what} must be a session this device may see (needs ${VISIBLE_SESSION_SCOPE})` }
+  }
+  const visible = snapshot?.visibleSessionIds
+  if (!visible || typeof visible.has !== 'function' || !Number.isFinite(snapshot?.freshness)) {
+    return refusal(`${endpoint}: the Host session list is unavailable`, 'remote/unavailable')
+  }
+  if (!visible.has(id)) {
+    return { code: 'remote/argument-denied', scope: VISIBLE_SESSION_SCOPE,
+      message: `${endpoint}: ${what} is not one of the sessions this device may see` }
+  }
+  return undefined
+}
 
 /**
  * A workspace-relative path: no NUL, no ':' (drive letter or URL scheme), no
@@ -398,6 +458,38 @@ const directValue = (args, key) => {
   return undefined
 }
 
+/** The Team switch's args are a plain `{ agentId, enabled }` (dsh-agent-team typert.host.js). */
+const TEAM_SET_ENABLED = 'agentTeams/setEnabled'
+
+/** The Team switch's read of those args: the id, bounded, then the visible-set rule. */
+function teamSetEnabledRefusal(device, args, snapshot) {
+  // `agentId` is the tree's ROOT session id (dsh-agent-team typert.host.js: the wire
+  // parameter of the `agent: Agent` argument; the devices router strips its
+  // `h:<hostId>:` tag first). Documented slot first, then the bounded walk: a MISSING
+  // id is reported as missing; an over-wide or too-deep tree refuses, never passes.
+  // Every slot that carries the key is read, not just the first one that answers: the
+  // top level always wins over a nested slot, so a wrapped frame cannot hand the check
+  // one id while the walk passes another, and no slot is left unchecked.
+  const found = argumentSlots(args)
+    .filter((slot) => Object.hasOwn(slot, 'agentId'))
+    .map((slot) => slot.agentId)
+  // A container where the id belongs cannot be checked: it refuses, never passes.
+  if (found.some((value) => typeof value === 'object' && value !== null)) return tooComplex()
+  const agentId = found[0]
+  try {
+    // Every registered slot is bounded BEFORE the id is trusted, not just the
+    // containers a walk enters: padding must never ride along with a listed id.
+    for (const slot of argumentSlots(args)) boundedEntries(slot)
+  } catch (error) {
+    if (error instanceof ArgumentsTooComplex) return tooComplex()
+    throw error
+  }
+  if (typeof agentId !== 'string' || agentId.trim() === '') {
+    return refusal(`${TEAM_SET_ENABLED}: agentId must be the id of a session this device may see`)
+  }
+  return unlistedSessionRefusal(device, TEAM_SET_ENABLED, 'agentId', agentId.trim(), snapshot)
+}
+
 const PATH_KEYS = new Set(['path', 'baseFile', 'query', 'file', 'filePath', 'relativePath', 'paths'])
 const FILE_ENDPOINTS = new Set([
   'workspaceFiles/list', 'workspaceFiles/stat', 'workspaceFiles/read', 'workspaceFiles/readBytes',
@@ -405,12 +497,30 @@ const FILE_ENDPOINTS = new Set([
 ])
 
 /**
+ * The Team switch's `eligible` argument: true when this gateway holds a Host-backed
+ * snapshot of the visible sessions (its resolver's `sessionListed`: a Host
+ * `session/list` for the current set has landed). Without it the Team switch refuses
+ * (`remote/unavailable`): an id checked against a cold, half-built list would be a
+ * guess, and a device's per-resource DSH bindings are built from the listed set.
+ */
+function teamVisibilityEligible(visibility) {
+  return visibility?.sessionListed === true
+}
+
+/**
  * Argument constraints that need no Host knowledge (pure, synchronous).
+ * `visibility` is the one fact that is not Host knowledge either: for the Team switch,
+ * whether the visible-session snapshot above is Host-backed (see
+ * `teamVisibilityEligible`).
  * @returns {{ code: string, message: string } | undefined}  a refusal, or undefined when fine
  */
-export function checkArguments(device, endpoint, args) {
+export function checkArguments(device, endpoint, args, visibility) {
   const workspaceManage = hasScope(device, 'workspace:manage')
   const settingsWrite = hasScope(device, 'settings:write')
+
+  if (endpoint === TEAM_SET_ENABLED && !teamVisibilityEligible(visibility)) {
+    return refusal(`${TEAM_SET_ENABLED}: the visible session set is not Host-backed yet`, 'remote/unavailable')
+  }
 
   if (FILE_ENDPOINTS.has(endpoint) && !workspaceManage) {
     const pathRefusal = (key, value, nonString) => {
@@ -476,10 +586,21 @@ export function checkArguments(device, endpoint, args) {
 /**
  * Argument constraints that need the Host's own lists (the workspace list).
  * `host.workspaceIds()` reads through the same Host gateway the call would use;
- * a failure to read refuses (fail closed).
+ * a failure to read refuses (fail closed). `host.visibleSessions()` is the same kind
+ * of read for the Team switch: the visible set the device's DSH policy is built from.
  * @returns {Promise<{ code: string, message: string } | undefined>}
  */
 export async function checkArgumentsWithHost(device, endpoint, args, host) {
+  if (endpoint === TEAM_SET_ENABLED) {
+    // The one endpoint whose id DSH resolves as no resource: checked against the
+    // visible set the device's DSH policy is built from. Fail closed with no resolver
+    // (a bridge built without one cannot check the id) and when it cannot answer.
+    let snapshot
+    if (typeof host?.visibleSessions === 'function') {
+      try { snapshot = await host.visibleSessions() } catch { snapshot = undefined }
+    }
+    return teamSetEnabledRefusal(device, args, snapshot)
+  }
   if (endpoint === 'session/create' && !hasScope(device, 'workspace:manage')) {
     let workspaceId
     // The tree is forwarded whole, so a bound exceeded here refuses (never skips).
@@ -750,6 +871,15 @@ function promptSessionId(args) {
  * @param {(deviceId: string, sessionId: string) => void} [deps.onPrompt]
  *        called after a `session/prompt` the Host accepted (spec 016: this device now
  *        drives that session); never called for a frame that named no session
+ * @param {(deviceId: string, endpoint: string) => Promise<object|undefined>|object} [deps.visibleSessions]
+ *        what the gateway ENFORCES as the device's visible sessions: a Set of ids plus
+ *        `freshness` (a finite stamp once a Host `session/list` for that set landed),
+ *        or undefined when it cannot say. MISSING is fail closed: the bridge then
+ *        drops every endpoint that addresses an id DSH resolves as no resource
+ *        (`agentTeams/setEnabled`) — it cannot make that decision, so it forwards
+ *        none of them. Consulted per call by the dispatch path, FAIL CLOSED: a
+ *        resolver that returns nothing for the device (or throws) leaves the endpoint
+ *        refused for the life of the bridge. Never a Host call.
  * @param {number} [deps.maxPayloadBytes]
  * @param {number} [deps.defaultCredit]
  * @param {object} [deps.limits]  OPTIONAL per-DEVICE limits (all connections together);
@@ -773,6 +903,25 @@ export function createRemoteBridge(deps) {
   // A one-shot reply must fit one WS frame; leave headroom for the envelope.
   const singleFrameBudget = Math.max(1024, maxPayloadBytes - 4096)
   const MAX_CREDIT = 4096
+
+  // The endpoints this bridge must not forward because it cannot run their
+  // session-visibility check: built without the resolver, or the resolver could not
+  // even be asked. Dropped from the table (the refusal is `op/forbidden`, like a
+  // missing carrier), never forwarded unchecked. The resolver itself is consulted
+  // per call by `checkArgumentsWithHost`, so a failure to READ the set refuses there.
+  const visibilityGated = TEAM_SET_ENABLED
+  // Fixed at construction: a bridge built without the resolver can never check the id.
+  // A resolver that is present but cannot answer refuses THAT call only and is asked
+  // again next time (reviewer 2026-11-16: no bridge-wide latch on a transient failure).
+  const visibilityUnavailable = typeof deps.visibleSessions !== 'function'
+  const noVisibilityResolver = () => (visibilityUnavailable ? [visibilityGated] : undefined)
+  /** The gateway's own visible-session snapshot for one device, or undefined. */
+  const visibleSessionsFor = (deviceId) => {
+    if (visibilityUnavailable) return undefined
+    try { return deps.visibleSessions(deviceId, visibilityGated) } catch { return undefined }
+  }
+  /** `authorizeEndpoint` as this bridge enforces it (no resolver → that endpoint is refused). */
+  const authorize = (device, endpoint) => authorizeEndpoint(device, endpoint, { allowMissing: noVisibilityResolver() })
 
   // Shared per DEVICE, not per connection: opening more sockets must not
   // multiply the budget. Entries are dropped when the last connection closes.
@@ -870,6 +1019,15 @@ export function createRemoteBridge(deps) {
           try { await iterator?.return?.() } catch { /* the Host closes its own side */ }
         }
       },
+      /**
+       * The visible set the device's DSH policy is built from — the gateway's own
+       * snapshot, never a UI list, so what this bridge checks and what DSH enforces
+       * are the same ids. A resolver that cannot answer (or threw) refuses this call
+       * (fail closed) and is asked again on the next one.
+       */
+      async visibleSessions() {
+        return visibleSessionsFor(deviceId)
+      },
     }
 
     /**
@@ -954,7 +1112,7 @@ export function createRemoteBridge(deps) {
         const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined
         const reply = (body) => send({ kind: 'remote-result', ...(requestId ? { requestId } : {}), ...body })
         const device = deps.getDevice(deviceId)
-        const verdict = authorizeEndpoint(device, msg.endpoint)
+        const verdict = authorize(device, msg.endpoint)
         // Audit: endpoint + device + decision, never the arguments. The endpoint
         // text is logged only after its shape validated; anything else is a
         // fixed marker so attacker-controlled text never reaches the log.
@@ -970,7 +1128,14 @@ export function createRemoteBridge(deps) {
         if (!isRecord(args)) { reply({ ok: false, error: { code: 'bad-request', message: 'args must be an object' } }); return }
         const promptRefusal = slashCommandRefusal(device, msg.endpoint, args)
         if (promptRefusal) { reply({ ok: false, error: promptRefusal }); return }
-        const argumentRefusal = checkArguments(device, msg.endpoint, args)
+        // The one visibility input a pure check needs: whether the Team switch's
+        // visible set is Host-backed. Other endpoints never consult the resolver here.
+        let visibility
+        if (msg.endpoint === TEAM_SET_ENABLED) {
+          const snapshot = visibleSessionsFor(deviceId)
+          visibility = { sessionListed: snapshot !== undefined && Number.isFinite(snapshot.freshness) }
+        }
+        const argumentRefusal = checkArguments(device, msg.endpoint, args, visibility)
         if (argumentRefusal) { reply({ ok: false, error: argumentRefusal }); return }
         // Per-device budget BEFORE any Peer exists or the Host is touched.
         if (overCap) { reply({ ok: false, error: refuseBusy('connections') }); return }
@@ -1099,7 +1264,7 @@ export function createRemoteBridge(deps) {
           else send({ kind: 'remote-result', ...requestId, ok: false, error })
         }
         const device = deps.getDevice(deviceId)
-        const verdict = authorizeEndpoint(device, msg.endpoint)
+        const verdict = authorize(device, msg.endpoint)
         const shapeOk = typeof msg.endpoint === 'string' && ENDPOINT_SHAPE.test(msg.endpoint)
         log(`remote-bridge stream-open: endpoint=${shapeOk ? msg.endpoint : 'invalid-endpoint'} device=${deviceId} allowed=${verdict.ok}`)
         if (!streamId) { refuse({ code: 'bad-request', message: 'streamId must be 1..64 of [A-Za-z0-9._-]' }); return }

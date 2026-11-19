@@ -5,7 +5,7 @@
 // nothing here hard-codes a colour: all values come from `useTheme()` (src/ui/theme.ts).
 
 import type { ReactNode } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { BlurView } from 'expo-blur';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -99,23 +99,26 @@ export function Card(props: { children: ReactNode; onPress?: () => void; testID?
   );
 }
 
-/** Translucent glass fill used by cards, composers and pills (their "liquid glass"). */
+/**
+ * Translucent glass fill on native; a PLAIN opaque View on web (spec 049b).
+ *
+ * `BlurView.web.js` renders `<View style={[style, blurStyle]}>`: its tint-derived background is
+ * applied AFTER ours, so any explicit surface we pass is overwritten by rgba(...) and near-white
+ * text lands on a light capsule on iOS Safari. On web we therefore do not render BlurView at all.
+ */
 export function GlassSurface(props: { children: ReactNode; style?: object }) {
   const { colors, radius, scheme } = useTheme();
+  const shared = { borderRadius: radius.pill, borderWidth: StyleSheet.hairlineWidth, ...elevation(colors, 'bar') };
+  if (Platform.OS === 'web') {
+    const webStyle = { ...shared, backgroundColor: colors.glassSolid, borderColor: colors.borderStrong };
+    return <View style={[webStyle, props.style]}>{props.children}</View>;
+  }
+  const nativeStyle = { ...shared, backgroundColor: colors.glass, borderColor: colors.glassHighlight };
   return (
     <BlurView
       intensity={10}
       tint={scheme === 'dark' ? 'dark' : 'light'}
-      style={[
-        {
-          backgroundColor: colors.glass,
-          borderRadius: radius.pill,
-          borderWidth: StyleSheet.hairlineWidth,
-          borderColor: colors.glassHighlight,
-          ...elevation(colors, 'bar'),
-        },
-        props.style,
-      ]}
+      style={[nativeStyle, props.style]}
     >
       {props.children}
     </BlurView>

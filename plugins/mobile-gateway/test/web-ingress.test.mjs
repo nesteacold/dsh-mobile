@@ -165,7 +165,9 @@ async function startGateway(name, overrides = {}) {
     on() { return () => {} },
     effect(factory) { dispose = factory() },
   }
-  await plugin.apply(ctx, config)
+  // Spec 045: this suite's passkey checks exercise the legacy native lock wiring via a
+  // sealed test seam, never a profile config key.
+  await plugin.apply(ctx, config, { testWebUnlockLegacyBrowserLock: true })
   const base = `http://127.0.0.1:${port}`
   const instance = {
     port,

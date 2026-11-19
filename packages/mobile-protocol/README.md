@@ -19,8 +19,16 @@ additive; **revision 11** adds the `session-rename` and `session-archive` ops on
 attestation with the spec 021 web PASSKEY unlock — the `passkey-*` frames on the same `web:unlock`
 scope, `hello.webLock`, the `passkey/…` error codes; `account-attestation` is withdrawn), and
 **revision 15** adds the spec 026 web push surface (capability `webPush`, the `push-subscribe` /
-`push-unsubscribe` frames and their answers, the endpoint allowlist, the id-only payload shape), and a
-breaking change requires a new major version of this package.
+`push-unsubscribe` frames and their answers, the endpoint allowlist, the id-only payload shape);
+**revision 16** adds the spec 036 opt-in capability `web-unlock-session.v1` and the sliding
+24-hour `WEB_UNLOCK_SESSION_TTL_MS` grant (no new frame shape), and a breaking change requires
+a new major version of this package.
+
+**Spec 045 (browser unlock removal, deprecation only — no wire change):** the `web-unlock-session.v1`
+capability / `WEB_UNLOCK_SESSION_TTL_MS` grant and the `passkey-lock` frame are now **deprecated for
+browser/PWA clients** (sockets presenting a browser `Origin` on the WS upgrade). Their names and
+values remain on the wire for native lock paths and older bundles; a browser socket is never locked,
+never receives `hello.webLock`, and explicit lock/approval broadcasts skip it.
 
 - Runtime: `src/index.mjs` — pure ESM, no dependencies, frozen constant tables.
 - Types: `index.d.ts` — TypeScript declarations for the same surface (`main` + `types` in
@@ -52,6 +60,7 @@ breaking change requires a new major version of this package.
 | `permission:lower` (scope), `PERMISSION_LOWER_CLIENT_TYPES`, `PERMISSION_LOWER_TYPES`, `PERMISSION_LOWER_SCOPE`, `PERMISSION_LOWER_REASONS`, `PERMISSION_LOWER_MESSAGES` | spec 019 (revision 13, additive) |
 | `auth/locked` (error, `null` status), `CLOSE_CODES.locked` (4412), the five `passkey/…` codes | §6, §3 (revision 14) |
 | `QUESTION_RESPONSE_TYPES`, `QUESTION_RESPONSE_SCOPE`, `QUESTION_CUSTOM_MAX_LENGTH` (2000) | spec 018 item 4; `approval:respond`, no new scope |
+| `web-unlock-session.v1` (opt-in capability), `WEB_UNLOCK_SESSION_CAPABILITY`, `WEB_UNLOCK_SESSION_TTL_MS` | spec 036 (revision 16, additive; Host-authoritative rolling 24h grant, no new frame) |
 | `webPush` (capability), `WEB_PUSH_CAPABILITY`, `WEB_PUSH_CLIENT_TYPES`, `WEB_PUSH_SUBSCRIBE_TYPE`, `WEB_PUSH_UNSUBSCRIBE_TYPE`, `WEB_PUSH_RESPONSE_KINDS`, `WEB_PUSH_EVENT_KINDS`, `WEB_PUSH_PAYLOAD_VERSION`, `WEB_PUSH_PAYLOAD_FIELDS`, `WEB_PUSH_TTL_SECONDS`, `WEB_PUSH_HIGH_URGENCY_KINDS`, `WEB_PUSH_RATE_LIMIT_PER_HOUR`, `WEB_PUSH_TIMEOUT_MS`, `WEB_PUSH_ENDPOINT_HOSTS`, `isWebPushEndpointAllowed()`, `validatePushSubscribe()`, `validatePushUnsubscribe()` | spec 026 (revision 15, additive; `push-subscribe`/`push-unsubscribe`, not §4 ops and not scoped) |
 
 The spec 008 scopes (`harness:remote` and the six above) are **desktop-only and explicit-only**: none

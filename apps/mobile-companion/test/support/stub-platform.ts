@@ -33,6 +33,13 @@ const STUBS: Record<string, string> = {
   'lucide-react-native': 'lucide-react-native.stub.ts',
   'react-native-svg': 'react-native-svg.stub.ts',
   'expo-blur': 'expo-blur.stub.ts',
+  // Spec 041 added these to the session screen; the Node tests import that screen for pure helpers.
+  'expo-document-picker': 'expo-document-picker.stub.ts',
+  'expo-file-system': 'expo-file-system.stub.ts',
+  // Spec 053: the pair panel imports the real Photos-library picker; Node source tests never open it.
+  'expo-image-picker': 'expo-image-picker.stub.ts',
+  // Spec 043: web-only ZXing polyfill; the Node tests only observe the installed overrides.
+  'barcode-detector': 'barcode-detector.stub.ts',
 };
 
 registerHooks({

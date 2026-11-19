@@ -18,6 +18,9 @@ const path = require('node:path')
 // Generated copy of the contract (see scripts/sync-mobile-protocol.mjs): the
 // bare package specifier would not resolve in an installed tarball.
 const contract = require('./vendor/mobile-protocol.mjs')
+// Spec 021 rev 15: a scope the device's kind cannot hold is dropped, and the OWNER hears it in the
+// Host log — a silent drop is how `web:unlock` sat on the measured 2026-11-14 desktop offer.
+const { log } = require('./logging.mjs')
 
 // The registry holds hashed device credentials: restrict it to the owner on
 // every platform (mode on POSIX, explicit ACL on Windows). `./secure-file.mjs`
@@ -41,12 +44,11 @@ const MAX_PAIRING_TTL_MS = DEFAULT_PAIRING_TTL_MS
 // vocabulary lives in the shared contract package.
 const { SCOPES: CONTRACT_SCOPES, DESKTOP_DEFAULT_SCOPES, NEVER_DEFAULT_SCOPES } = contract
 // Spec 008: `harness:remote` (tunnel DSH wire calls) is granted only to a
-// `desktop` device that was offered it explicitly. It is not part of the
-// "every scope" grant of a mobile device or of a pre-005 record migration.
-// The full-control scopes (commands:execute, workspace:manage, ...) follow the same
-// rule, so the list is the contract's DESKTOP_ONLY_SCOPES, not a local copy.
-const EXPLICIT_ONLY_SCOPES = contract.DESKTOP_ONLY_SCOPES
-const ALL_SCOPES = Object.freeze(CONTRACT_SCOPES.filter((scope) => !EXPLICIT_ONLY_SCOPES.includes(scope)))
+// `desktop` device that was offered it explicitly. The full-control scopes
+// (commands:execute, workspace:manage, ...) follow the same rule, and spec 021 rev 15
+// adds the mirror one (`web:unlock`, desktop-holdable never). Both are the contract's
+// own kind tables, applied here through `scopesForKind`: this package keeps no copy.
+const scopesForKind = contract.scopesForKind
 
 function normalizeKind(value) {
   return contract.DEVICE_KINDS.includes(value) ? value : 'mobile'
@@ -62,8 +64,12 @@ function normalizeScopes(values, kind) {
   if (!Array.isArray(values)) return []
   // Spec 008: an explicit-only scope survives only on a desktop; a mobile record
   // that somehow lists it (hand-edited store, odd offer) just loses it.
-  return CONTRACT_SCOPES.filter((scope) => values.includes(scope)
-    && (!EXPLICIT_ONLY_SCOPES.includes(scope) || kind === 'desktop'))
+  // Spec 021 rev 15: `web:unlock` is the mirror case — a desktop record that lists it
+  // (an offer written before that revision, the measured 2026-11-14 state) loses it
+  // here instead of being locked forever. Both rules come from the contract's own
+  // kind tables (`scopesForKind`), so a record is loaded with what its kind may hold.
+  const holdable = scopesForKind(kind)
+  return CONTRACT_SCOPES.filter((scope) => values.includes(scope) && holdable.includes(scope))
 }
 
 /** The grant an offer makes when it names no scopes at all. */
@@ -73,7 +79,20 @@ function defaultScopes(kind) {
   // otherwise hand it out unasked. Contract `NEVER_DEFAULT_SCOPES` is the one list both
   // default sites read; an explicit list (an owner's tick) is unaffected.
   if (kind === 'desktop') return [...DESKTOP_DEFAULT_SCOPES]
-  return ALL_SCOPES.filter((scope) => !NEVER_DEFAULT_SCOPES.includes(scope))
+  // Spec 021 rev 15: the mobile default is also cut by `scopesForKind` — `MOBILE_ONLY`
+  // hints that a desktop loses a scope, not that a mobile gains one.
+  return scopesForKind('mobile').filter((scope) => !NEVER_DEFAULT_SCOPES.includes(scope))
+}
+
+/**
+ * Scopes a grant names that the device's kind cannot hold, in contract order. Spec 021 rev 15:
+ * the pairing offer (`POST /mgw/pair`) REPORTS this instead of failing the whole offer — the
+ * owner keeps the rest of the grant and the Host log says what was dropped and why.
+ */
+function scopesNotForKind(values, kind) {
+  if (!Array.isArray(values)) return []
+  const holdable = scopesForKind(kind)
+  return CONTRACT_SCOPES.filter((scope) => values.includes(scope) && !holdable.includes(scope))
 }
 
 function digest(secret) {
@@ -117,6 +136,16 @@ function normalizeClientDeviceId(value) {
   if (typeof value !== 'string') return undefined
   const normalized = value.trim()
   return /^[A-Za-z0-9._:-]{8,128}$/.test(normalized) ? normalized : undefined
+}
+
+// A record written before "no name" meant '' carries the upstream placeholder as if the
+// device had chosen it. It becomes '' at load (and the store is saved, once), so every
+// display site substitutes its own label instead of showing a name nobody picked.
+const LEGACY_UNNAMED = '未命名设备'
+
+function normalizeStoredName(name) {
+  const trimmed = name.trim()
+  return trimmed === LEGACY_UNNAMED ? '' : name
 }
 
 function createRegistry(file, options = {}) {
@@ -177,10 +206,21 @@ function createRegistry(file, options = {}) {
           if (row.scopes !== undefined && !Array.isArray(row.scopes)) return []
           kind = normalizeKind(row.kind)
           scopes = normalizeScopes(row.scopes, kind)
+          // Spec 021 rev 15: a record carrying a scope its kind cannot hold (the measured
+          // `desktop` + `web:unlock`) is repaired at load, loudly: the grant would otherwise
+          // lock that desktop out of every frame forever, since no desktop can register a
+          // passkey. The credential and every other scope are untouched.
+          const dropped = scopesNotForKind(row.scopes, kind)
+          if (dropped.length > 0) {
+            log(`device ${row.id} (${kind}): ignoring scope(s) its kind cannot hold: ${dropped.join(', ')}`)
+            migrated = true
+          }
         }
+        const storedName = normalizeStoredName(row.name)
+        if (storedName !== row.name) migrated = true
         return [{
           id: row.id,
-          name: row.name.slice(0, 80),
+          name: storedName.slice(0, 80),
           clientDeviceId: normalizeClientDeviceId(row.clientDeviceId),
           kind,
           scopes,
@@ -215,13 +255,21 @@ function createRegistry(file, options = {}) {
       const active = devices.filter((device) => !device.revokedAt)
       const counts = new Map()
       const indices = new Map()
-      for (const device of active) counts.set(device.name, (counts.get(device.name) || 0) + 1)
+      // An unnamed device ('') is never numbered: the page substitutes its own label, and " (1)"
+      // would be a name nobody chose. Only real (non-empty) names are disambiguated.
+      for (const device of active) {
+        if (device.name !== '') counts.set(device.name, (counts.get(device.name) || 0) + 1)
+      }
       return active.map((device) => {
-        const index = (indices.get(device.name) || 0) + 1
-        indices.set(device.name, index)
+        let displayName = device.name
+        if (device.name !== '' && counts.get(device.name) > 1) {
+          const index = (indices.get(device.name) || 0) + 1
+          indices.set(device.name, index)
+          displayName = `${device.name} (${index})`
+        }
         return {
           ...publicDevice(device, online.get(device.id) || 0),
-          displayName: counts.get(device.name) > 1 ? `${device.name} (${index})` : device.name,
+          displayName,
         }
       })
     },
@@ -236,7 +284,7 @@ function createRegistry(file, options = {}) {
       const kind = normalizeKind(offer.kind)
       const pairing = {
         id: crypto.randomUUID(),
-        name: typeof name === 'string' && name.trim() !== '' ? name.trim().slice(0, 80) : '未命名设备',
+        name: typeof name === 'string' && name.trim() !== '' ? name.trim().slice(0, 80) : '',
         // Spec 005 FR3: what the redeeming device becomes and may do. An absent
         // list takes the kind's default; an explicit list (even an empty one) is
         // the owner's grant and is kept as given.
@@ -252,6 +300,9 @@ function createRegistry(file, options = {}) {
         claimedAt: null,
       }
       pairings.set(digest(code), pairing)
+      // Spec 021 rev 15: the offer is kept, the unfitting scope is not — say which, to the owner.
+      const dropped = scopesNotForKind(offer.scopes, kind)
+      if (dropped.length > 0) log(`pairing offer: dropped scope(s) a ${kind} cannot hold: ${dropped.join(', ')}`)
       return { ...pairing, code }
     },
 
@@ -302,7 +353,7 @@ function createRegistry(file, options = {}) {
         // A valid one-time pairing code authorizes credential rotation. Keep
         // the stable server-side device record while replacing its token, so
         // re-pairing one iOS installation never creates duplicate rows.
-        device.name = typeof clientDeviceName === 'string' && clientDeviceName.trim() ? clientDeviceName.trim().slice(0, 80) : '未命名设备'
+        device.name = typeof clientDeviceName === 'string' && clientDeviceName.trim() ? clientDeviceName.trim().slice(0, 80) : ''
         device.tokenHash = digest(token)
         device.clientDeviceId = normalizedClientDeviceId
         // The code in hand is the newest grant the owner made: re-pairing is
@@ -315,7 +366,7 @@ function createRegistry(file, options = {}) {
       } else {
         device = {
           id: pairing.id,
-          name: typeof clientDeviceName === 'string' && clientDeviceName.trim() ? clientDeviceName.trim().slice(0, 80) : '未命名设备',
+          name: typeof clientDeviceName === 'string' && clientDeviceName.trim() ? clientDeviceName.trim().slice(0, 80) : '',
           clientDeviceId: normalizedClientDeviceId,
           kind: pairing.kind,
           scopes: [...pairing.scopes],

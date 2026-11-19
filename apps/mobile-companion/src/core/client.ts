@@ -63,6 +63,7 @@ import {
   PING_INTERVAL_MS,
   PROTOCOL_SUBPROTOCOL,
   WEB_LOCK_STATES,
+  WEB_UNLOCK_SESSION_CAPABILITY,
   WEB_PUSH_CLIENT_TYPES,
   authSubprotocols,
   createClientNonce,
@@ -1553,7 +1554,55 @@ export class CompanionClient {
     );
   }
 
+  /** Pure parse of one authoritative `hello`; shared by the first hello and spec 036's second one. */
+  private readHelloFrame(f: Record<string, unknown>): {
+    hello: HelloFrame;
+    webLock: WebLockState | null;
+    webPush: { enabled: boolean; vapidPublicKey: string } | null;
+    device: DeviceInfo;
+  } {
+    const device = parseDevice(f.device) ?? { id: '', name: '' };
+    const hello: HelloFrame = {
+      kind: 'hello',
+      protocol: typeof f.protocol === 'number' ? f.protocol : -1,
+      companionProtocol: typeof f.companionProtocol === 'number' ? f.companionProtocol : -1,
+      minClientVersion: typeof f.minClientVersion === 'number' ? f.minClientVersion : -1,
+      capabilities: Array.isArray(f.capabilities) ? f.capabilities.filter((c): c is string => typeof c === 'string') : [],
+      authenticated: f.authenticated === true,
+      device,
+      gatewayId: typeof f.gatewayId === 'string' ? f.gatewayId : '',
+      ...(typeof f.dshVersion === 'string' ? { dshVersion: f.dshVersion } : {}),
+      ...(typeof f.certSha256 === 'string' ? { certSha256: f.certSha256 } : {}),
+    };
+    // Spec 021 (contract §14.2): `webLock` is present only for a `web:unlock` device; absent means
+    // "not locked" (native, or a Host without revision 14). A STRING the app cannot read is NOT
+    // treated as absent: an unknown lock state must fail shut, so it reads as `locked`.
+    const webLock = f.webLock === undefined || f.webLock === null
+      ? null
+      : (WEB_LOCK_STATES as readonly unknown[]).includes(f.webLock)
+        ? (f.webLock as WebLockState)
+        : 'locked';
+    const wp = f.webPush as { enabled?: unknown; vapidPublicKey?: unknown } | null | undefined;
+    const webPush = wp && typeof wp === 'object' && typeof wp.enabled === 'boolean'
+      && typeof wp.vapidPublicKey === 'string' && /^[A-Za-z0-9_-]+$/.test(wp.vapidPublicKey)
+      ? { enabled: wp.enabled, vapidPublicKey: wp.vapidPublicKey }
+      : null;
+    return { hello, webLock, webPush, device };
+  }
+
   private handleHello(f: Record<string, unknown>): void {
+    if (this._state === 'waiting-client-hello') {
+      // Spec 036: the gateway may send a SECOND authoritative `hello` after it read our opt-in
+      // (first hello `locked` -> client-hello -> `unlocked` hello -> client-hello ACK). Update the
+      // snapshot in place; never resend `client-hello` or move the state machine (no handshake loop).
+      // The ACK still owns `ready`, so app-state reads the newest `webLock` when it applies the lock.
+      const update = this.readHelloFrame(f);
+      this._hello = update.hello;
+      this._webLock = update.webLock;
+      this._webPush = update.webPush;
+      this._device = parseDevice(f.device) ?? this._device;
+      return;
+    }
     if (this._state !== 'waiting-hello') return;
     if (this.pairing && !this.pairedReceived) {
       // Contract §3.3/§5a: a pairing connection must deliver `paired` first. Proceeding would
@@ -1567,34 +1616,11 @@ export class CompanionClient {
       this.finishConnection(1002, 'hello-before-paired', true);
       return;
     }
-    const hello: HelloFrame = {
-      kind: 'hello',
-      protocol: typeof f.protocol === 'number' ? f.protocol : -1,
-      companionProtocol: typeof f.companionProtocol === 'number' ? f.companionProtocol : -1,
-      minClientVersion: typeof f.minClientVersion === 'number' ? f.minClientVersion : -1,
-      capabilities: Array.isArray(f.capabilities) ? f.capabilities.filter((c): c is string => typeof c === 'string') : [],
-      authenticated: f.authenticated === true,
-      device: parseDevice(f.device) ?? { id: '', name: '' },
-      gatewayId: typeof f.gatewayId === 'string' ? f.gatewayId : '',
-      ...(typeof f.dshVersion === 'string' ? { dshVersion: f.dshVersion } : {}),
-      ...(typeof f.certSha256 === 'string' ? { certSha256: f.certSha256 } : {}),
-    };
+    const update = this.readHelloFrame(f);
+    const hello = update.hello;
     this._hello = hello;
-    // Spec 021 (contract §14.2): `webLock` is present only for a `web:unlock` device; absent means
-    // "not locked" (native, or a Host without revision 14). A STRING the app cannot read is NOT
-    // treated as absent: an unknown lock state must fail shut, so it reads as `locked`.
-    this._webLock = f.webLock === undefined || f.webLock === null
-      ? null
-      : (WEB_LOCK_STATES as readonly unknown[]).includes(f.webLock)
-        ? (f.webLock as WebLockState)
-        : 'locked';
-    {
-      const wp = f.webPush as { enabled?: unknown; vapidPublicKey?: unknown } | null | undefined;
-      this._webPush = wp && typeof wp === 'object' && typeof wp.enabled === 'boolean'
-        && typeof wp.vapidPublicKey === 'string' && /^[A-Za-z0-9_-]+$/.test(wp.vapidPublicKey)
-        ? { enabled: wp.enabled, vapidPublicKey: wp.vapidPublicKey }
-        : null;
-    }
+    this._webLock = update.webLock;
+    this._webPush = update.webPush;
     this._device = parseDevice(f.device) ?? this._device;
     const incompatible =
       hello.companionProtocol !== COMPANION_PROTOCOL_VERSION ||
@@ -1632,6 +1658,9 @@ export class CompanionClient {
         companionProtocol: COMPANION_PROTOCOL_VERSION,
         appVersion: this.appVersion,
         platform: this.platform,
+        // Spec 036 (revision 16): opt in to the Host-authoritative 24h unlock session. The gateway
+        // applies the grant only to sockets that advertised this; older Hosts ignore the extra field.
+        capabilities: [WEB_UNLOCK_SESSION_CAPABILITY],
       });
       if (this.transport.send(text)) {
         this.lastClientHelloId = id;

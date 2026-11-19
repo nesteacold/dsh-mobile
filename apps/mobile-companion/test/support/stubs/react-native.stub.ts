@@ -54,3 +54,23 @@ export const KeyboardAvoidingView = 'KeyboardAvoidingView';
 export const Alert = { alert: () => undefined };
 export const useColorScheme = () => 'light';
 export const NativeModules = {};
+
+// Spec 050: the session screen imports these at module load; tests never render the animation.
+class StubAnimatedValue {
+  setValue(_value: number): void {}
+}
+export const Animated = {
+  Value: StubAnimatedValue,
+  View: 'Animated.View',
+  loop: (_animation: unknown) => ({ start: () => undefined, stop: () => undefined }),
+  sequence: (_steps: unknown[]) => ({}),
+  timing: (_value: unknown, _config: unknown) => ({}),
+};
+export const Easing = {
+  ease: (value: number) => value,
+  inOut: (fn: (value: number) => number) => fn,
+};
+export const AccessibilityInfo = {
+  isReduceMotionEnabled: async () => false,
+  addEventListener: () => ({ remove: () => undefined }),
+};

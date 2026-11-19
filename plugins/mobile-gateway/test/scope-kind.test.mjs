@@ -14,6 +14,7 @@
 // client that does not report the same fingerprint (T017). The fake Host records
 // every call, so "refused before the Host" is a real assertion.
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
 import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
@@ -263,7 +264,10 @@ test('T1: every mapped type is served with its scope and refused without it', as
   // One scope at a time, so a type is refused exactly when its own scope is absent.
   for (const [index, scope] of SCOPES.entries()) {
     const deviceId = `scoped-0000-4000-8000-00000000000${index}`
-    const layout = await pairDevice(instance, `scope ${scope}`, deviceId, { kind: 'desktop', scopes: [scope] })
+    // Spec 021 rev 15: `web:unlock` is a WEB scope — only a `mobile` may hold it — and no
+    // SCOPE_BY_TYPE entry maps to it, so this iteration only proves every type is refused.
+    const kind = scope === 'web:unlock' ? 'mobile' : 'desktop'
+    const layout = await pairDevice(instance, `scope ${scope}`, deviceId, { kind, scopes: [scope] })
     assert.deepEqual(layout.hello.device.scopes, [scope])
     const { ws } = await connectToken(instance, layout.token, deviceId)
     for (const [type, required] of Object.entries(SCOPE_BY_TYPE)) {
@@ -297,9 +301,19 @@ test('T1: every mapped type is served with its scope and refused without it', as
         continue
       }
       assert.equal(reply.kind, 'error', `${type} must be refused to a device holding only ${scope}`)
-      assert.equal(reply.code, 'auth/forbidden-scope', `${type} needs ${required}: ${JSON.stringify(reply)}`)
+      if (scope === 'web:unlock') {
+        // That device is a `mobile` holding `web:unlock`, so it is LOCKED on this connection
+        // (spec 021). Which gate answers first depends on the family — `auth/locked` for the
+        // families dispatched before the scope gate, `auth/forbidden-scope` for the generic
+        // ones (its message is rewritten to the fixed locked sentence by the send gate) — but
+        // every path is a refusal, and none reaches the Host.
+        assert.ok(['auth/locked', 'auth/forbidden-scope'].includes(reply.code), `${type}: ${JSON.stringify(reply)}`)
+        assert.equal(reply.message, 'this device is locked; unlock with a passkey first', type)
+      } else {
+        assert.equal(reply.code, 'auth/forbidden-scope', `${type} needs ${required}: ${JSON.stringify(reply)}`)
+        assert.equal(reply.scope, required)
+      }
       assert.equal(reply.requestType, type)
-      assert.equal(reply.scope, required)
       assert.equal(instance.hostCalls.length, before, `${type} was refused but still reached the Host`)
     }
     ws.close()
@@ -571,4 +585,85 @@ test('T9: activation after a re-pair or a revoke sends nothing and closes 4401',
   holds[1].resolve()
   assert.equal(await doomedClosing, CLOSE_CODES.revoked)
   assert.deepEqual(framesOn(doomed), [], 'a channel revoked under it receives nothing, not even the hello')
+})
+
+// ---------------------------------------------------------------------------
+// Spec 021 rev 15 — `web:unlock` is a WEB scope: a desktop holding it is not locked, a web
+// device is (no weakening), and a locked web device's refusal reaches a stream by its id.
+// ---------------------------------------------------------------------------
+
+test('T10: a desktop record holding web:unlock is NOT locked — the remote bridge answers — and a web device still is', async (t) => {
+  // The exact store the 2026-11-14 measurement left behind: a desktop paired with `web:unlock`.
+  // Written directly, because this build's own offer path can no longer produce it.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-021-rev15-'))
+  const deviceFile = path.join(directory, 'devices.json')
+  const token = crypto.randomBytes(32).toString('base64url')
+  fs.writeFileSync(deviceFile, JSON.stringify({ version: 3, devices: [{
+    id: UUID, name: 'Legacy desk', clientDeviceId: 'legacy-desk-0001', kind: 'desktop',
+    scopes: ['sessions:read', 'harness:remote', 'web:unlock'],
+    tokenHash: crypto.createHash('sha256').update(token, 'utf8').digest('hex'),
+    createdAt: 1_700_000_000_000, lastSeenAt: null, revokedAt: null,
+  }] }))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const instance = await factory(t, { requireHostApproval: false, deviceFile })
+
+  const { ws, hello } = await connectToken(instance, token, UUID)
+  // The lock is not armed: no slot, no `webLock` in hello, and no rank repair needed for this socket.
+  assert.equal(hello.webLock, undefined, 'a desktop never reports a web lock state')
+  // The bridge — the frame family the measurement saw refused `op locked` — actually runs.
+  ws.send(JSON.stringify({ type: 'remote-stream-open', requestId: 'k-open', streamId: 'k-s1',
+    endpoint: 'session/follow', args: { request: { address: { sessionId: 's1' } } } }))
+  const frame = await takeFrame(ws, (reply) => reply.kind === 'remote-frame' || reply.kind === 'remote-stream-closed'
+    || (reply.kind === 'error' && (reply.requestId === 'k-open' || reply.streamId === 'k-s1')))
+  assert.notEqual(frame.kind, 'error', `a desktop holding web:unlock must not be locked: ${JSON.stringify(frame)}`)
+  assert.equal(frame.streamId, 'k-s1')
+  assert.ok(instance.hostCalls.some((call) => call.includes('#stream')), 'the open reached the Host bridge')
+
+  // And the record is repaired at load: a scope its KIND cannot hold is dropped, not carried.
+  assert.deepEqual((await instance.devices()).devices[0].scopes, ['sessions:read', 'harness:remote'])
+  ws.close()
+
+  // NO WEAKENING: the same scope on a WEB device (the PWA is a `mobile`) still locks every frame.
+  const webId = 'web00000-0000-4000-8000-000000000001'
+  const web = await pairDevice(instance, 'web pwa', webId, { kind: 'mobile', scopes: ['sessions:read', 'prompt:send', 'web:unlock'] })
+  assert.deepEqual(web.device.scopes, ['sessions:read', 'prompt:send', 'web:unlock'], 'a mobile keeps web:unlock')
+  assert.equal(web.hello.webLock, 'unregistered')
+  const { ws: webSocket, hello: webHello } = await connectToken(instance, web.token, webId)
+  assert.equal(webHello.webLock, 'unregistered', 'the web lock is armed for a web device')
+  const before = instance.hostCalls.length
+  const locked = await request(webSocket, { type: 'sessions' })
+  assert.equal(locked.kind, 'error', JSON.stringify(locked))
+  assert.equal(locked.code, 'auth/locked', 'a web device without a passkey is still refused')
+  assert.equal(instance.hostCalls.length, before, 'and reaches nothing on the Host')
+  webSocket.close()
+})
+
+test('T11: a locked remote-stream-open is answered auth/locked WITH its streamId and requestId — never silence', async (t) => {
+  const instance = await factory(t)
+  // A web device (a `mobile`) — the only kind that may hold `web:unlock`. It does NOT hold
+  // `harness:remote` (no mobile may), which is the point: the LOCK gate runs before the bridge's
+  // own scope check, so the refusal a locked socket sees is `auth/locked`, addressed to its stream.
+  const web = await pairDevice(instance, 'web desk', 'webdesk0-0000-4000-8000-000000000001',
+    { kind: 'mobile', scopes: ['sessions:read', 'web:unlock'] })
+  assert.deepEqual(web.device.scopes, ['sessions:read', 'web:unlock'])
+  const { ws } = await connectToken(instance, web.token, 'webdesk0-0000-4000-8000-000000000001')
+  const before = instance.hostCalls.length
+  // Both forms the spec 008 frame allows: with a requestId and without one (the client only has
+  // its own `streamId` then). Each must come back addressed to that stream.
+  for (const [requestId, streamId] of [['lock-open-1', 'lock-s1'], [undefined, 'lock-s2']]) {
+    ws.send(JSON.stringify({ type: 'remote-stream-open', ...(requestId ? { requestId } : {}), streamId,
+      endpoint: 'session/follow', args: {} }))
+    const reply = await takeFrame(ws, (frame) => frame.kind === 'error' && frame.streamId === streamId)
+    assert.equal(reply.code, 'auth/locked', JSON.stringify(reply))
+    assert.equal(reply.requestType, 'remote-stream-open')
+    assert.equal(reply.streamId, streamId, 'the refusal names the stream the client waits on')
+    assert.equal(reply.requestId, requestId, requestId ? 'the requestId is echoed too' : 'no requestId, none invented')
+    assert.equal(reply.reason, 'unregistered', 'and says why it cannot be solved by an assertion')
+    assert.equal(reply.message, 'this device is locked; unlock with a passkey first')
+  }
+  // The same for a one-shot call, which the client matches by its requestId.
+  const call = await request(ws, { type: 'remote-call', endpoint: 'session/list', args: {} })
+  assert.equal(call.code, 'auth/locked')
+  assert.equal(instance.hostCalls.length, before, 'a locked socket reaches nothing on the Host')
+  ws.close()
 })

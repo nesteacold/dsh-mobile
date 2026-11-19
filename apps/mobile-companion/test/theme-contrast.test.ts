@@ -12,9 +12,14 @@
 // Thresholds (WCAG 2.x AA): body/small text 4.5:1; large/bold text and UI component boundaries 3:1.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
-import { darkColors, lightColors, type Palette } from '../src/ui/theme';
+import { composerPalette, darkColors, lightColors, sessionChromePalette, WEB_SESSION_CHROME, type Palette } from '../src/ui/theme';
+
+const APP = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** sRGB channel (0-255) → linear light. */
 function linear(channel: number): number {
@@ -135,3 +140,80 @@ describe('the palette keeps its identity', () => {
     }
   });
 });
+
+describe('spec 049: fixed web session chrome', () => {
+  it('web uses the fixed dark pair; native keeps the theme palette', () => {
+    const web = sessionChromePalette(true, lightColors);
+    assert.deepEqual(web, WEB_SESSION_CHROME, 'web never depends on the reported scheme');
+    assert.deepEqual(sessionChromePalette(true, darkColors), WEB_SESSION_CHROME);
+    const native = sessionChromePalette(false, darkColors);
+    assert.equal(native.surface, darkColors.surface);
+    assert.equal(native.text, darkColors.text);
+    assert.equal(native.textMuted, darkColors.textMuted);
+    assert.equal(native.border, darkColors.border);
+  });
+
+  it('fixed text, muted, faint and border all clear their thresholds on the fixed surface', () => {
+    assert.ok(contrast(WEB_SESSION_CHROME.text, WEB_SESSION_CHROME.surface) >= 4.5);
+    assert.ok(contrast(WEB_SESSION_CHROME.textMuted, WEB_SESSION_CHROME.surface) >= 4.5);
+    assert.ok(contrast(WEB_SESSION_CHROME.textFaint, WEB_SESSION_CHROME.surface) >= 4.5);
+    assert.ok(contrast(WEB_SESSION_CHROME.border, WEB_SESSION_CHROME.surface) >= 3);
+  });
+
+  it('web composition: opaque header + composer and fixed light text; native paths untouched', () => {
+    const session = readFileSync(path.join(APP, 'app', 'session', '[id].tsx'), 'utf8');
+    const authoring = readFileSync(path.join(APP, 'src', 'ui', 'components', 'authoring.tsx'), 'utf8');
+    assert.match(session, /const chrome = sessionChromePalette\(isWeb, colors\)/);
+    assert.match(session, /backgroundColor: isWeb \? chrome\.surface : resolveHeaderBackground\(colors, false\)/);
+    assert.match(session, /style=\{\[type\.subheading, \{ color: chrome\.text \}\]\}/);
+    assert.match(session, /backgroundColor: composer\.surface,/);
+    assert.match(session, /color: composer\.text,/);
+    assert.match(session, /placeholderTextColor=\{composer\.textMuted\}/);
+    assert.match(session, /palette=\{isWeb \? chrome : undefined\}/);
+    assert.match(authoring, /palette\?: SessionChromePalette/);
+    assert.match(authoring, /props\.palette \?\? \{/);
+    assert.match(session, /resolveHeaderBackground\(colors, false\)/, 'native translucent header unchanged');
+  });
+});
+
+describe('spec 047: composer contrast pair (both schemes)', () => {
+  for (const scheme of ['light', 'dark'] as const) {
+    it(`${scheme}: input, placeholder and border on the resolved composer surface`, () => {
+      const pair = composerPalette(scheme);
+      assert.equal(pair.scheme, scheme);
+      assert.equal(pair.surface, paletteFor(scheme).glassSolid, 'opaque surface from the same scheme');
+      assert.ok(contrast(pair.text, pair.surface) >= 4.5, `${scheme}: typed text ≥ 4.5:1`);
+      assert.ok(contrast(pair.textMuted, pair.surface) >= 4.5, `${scheme}: placeholder ≥ 4.5:1`);
+      assert.ok(contrast(pair.border, pair.surface) >= 3, `${scheme}: pill border ≥ 3:1`);
+    });
+  }
+
+  it('unknown scheme resolves to the light pair, like the theme fallback', () => {
+    assert.deepEqual(composerPalette(undefined), composerPalette('light'));
+    assert.deepEqual(composerPalette(null), composerPalette('light'));
+  });
+
+  it('web composition uses the resolved pair; native keeps glass/blur unchanged', () => {
+    const session = readFileSync(path.join(APP, 'app', 'session', '[id].tsx'), 'utf8');
+    const glass = readFileSync(path.join(APP, 'src', 'ui', 'components', 'ui.tsx'), 'utf8');
+    assert.match(session, /composerPalette\(theme\.scheme\)/);
+    assert.match(session, /color: composer\.text,/);
+    assert.match(session, /placeholderTextColor=\{composer\.textMuted\}/);
+    assert.match(session, /backgroundColor: composer\.surface,/);
+    // Spec 049b: BlurView.web applies its tint background AFTER ours, so web uses a plain View.
+    const start = glass.indexOf('export function GlassSurface(');
+    assert.ok(start > 0);
+    const body = glass.slice(start, glass.indexOf('\n}', start));
+    const webBranch = body.slice(body.indexOf("if (Platform.OS === 'web')"), body.indexOf('const nativeStyle'));
+    assert.match(webBranch, /<View style=\{\[webStyle, props\.style\]\}>/, 'web renders a plain View');
+    assert.doesNotMatch(webBranch, /BlurView|blurStyle|tint=/, 'no blur tint can override the surface');
+    assert.match(webBranch, /backgroundColor: colors\.glassSolid/);
+    assert.match(webBranch, /borderColor: colors\.borderStrong/);
+    assert.match(body, /backgroundColor: colors\.glass, borderColor: colors\.glassHighlight/, 'native glass unchanged');
+    assert.match(body, /tint=\{scheme === 'dark' \? 'dark' : 'light'\}/, 'native blur tint unchanged');
+  });
+});
+
+function paletteFor(scheme: 'light' | 'dark'): Palette {
+  return scheme === 'dark' ? darkColors : lightColors;
+}

@@ -332,8 +332,9 @@ describe('composer leading row — every pill text comes from data', () => {
   });
 
   it('keeps the composer placeholder at the muted-foreground contrast', () => {
-    // Was `textFaint` (the washed-out "Send an instruction…" in the same screenshot).
-    assert.match(SESSION, /placeholderTextColor=\{colors\.textMuted\}/);
+    // Was `textFaint`, then `colors.textMuted`; spec 047 resolves it from the same scheme as the
+    // composer surface so the iOS Safari blur can never paint near-white text on a light capsule.
+    assert.match(SESSION, /placeholderTextColor=\{composer\.textMuted\}/);
     assert.equal(/placeholderTextColor=\{colors\.textFaint\}/.test(SESSION), false);
   });
 });

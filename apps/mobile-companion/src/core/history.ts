@@ -11,6 +11,16 @@ export interface HistoryMessage {
   seq: number | null;
   /** Stable id (host message id, or the clientMsgId for our own optimistic rows). */
   id: string;
+  /**
+   * Stable send id kept after a live echo replaces the optimistic row, so a late `sent` ack can still
+   * find and update that bubble instead of appending a second one (spec 048 item 3).
+   */
+  clientMsgId?: string;
+  /**
+   * True until the Host's user/message echo arrives. Kept separate from `pending` (send state) so an
+   * ack can clear "sending" without losing the correlation needed by a later text-only echo.
+   */
+  awaitingEcho?: boolean;
   role: MessageRole;
   text: string;
   /** Our own prompt not yet confirmed by the host. */
@@ -230,6 +240,19 @@ const HOST_INJECTED_MARKERS: readonly string[] = [
   'instructions from:',
 ];
 
+/**
+ * Spec 051 — a background-subagent completion notice is harness bookkeeping, not an owner prompt.
+ * Strict: BOTH the phrase and one of the two measured harness footers must be present. A real prompt
+ * that merely mentions "background subagent" is deliberately NOT classified. This is a role mapping,
+ * not a drop marker: the notice stays visible through the muted system/ToolRow path for audit.
+ */
+export function isSubagentCompletionNotice(text: string): boolean {
+  if (text === '') return false;
+  const flat = text.toLowerCase();
+  return flat.includes('background subagent')
+    && (flat.includes('finished and will do no further work') || flat.includes('closing message is omitted'));
+}
+
 /** True when a `user/message` body is Host bookkeeping rather than something the user wrote. */
 export function isHostInjectedUserText(text: string): boolean {
   if (text === '') return false;
@@ -248,12 +271,16 @@ export function coerceHistoryEvent(raw: unknown, fallbackIndex = 0): HistoryMess
     const row = coerceHistoryMessage(event, fallbackIndex);
     if (row === null) return null;
     if (row.role === 'user' && isHostInjectedUserText(row.text)) return null;
+    // Spec 051: map the harness notice to a system row, preserving its text for audit.
+    if (row.role === 'user' && isSubagentCompletionNotice(row.text)) {
+      return { ...event, ...row, role: 'system' } as HistoryMessage;
+    }
     return { ...event, ...row } as HistoryMessage;
   }
 
   const type = typeof event.type === 'string' ? event.type : null;
   if (type === null || SKIPPED.has(type)) return null;
-  const role = EVENT_ROLE[type];
+  let role = EVENT_ROLE[type];
   if (role === undefined) return null;
 
   const data = typeof event.data === 'object' && event.data !== null
@@ -277,6 +304,8 @@ export function coerceHistoryEvent(raw: unknown, fallbackIndex = 0): HistoryMess
     // fences. They are not the user speaking, so they never become a bubble (MEASURED on
     // session-391f5de4: seq 10-12 of 20 are exactly these three, around ONE real prompt at seq 9).
     if (isHostInjectedUserText(text)) return null;
+    // Spec 051: harness completion notices are system notes, never owner bubbles. Not a drop.
+    if (isSubagentCompletionNotice(text)) role = 'system';
   } else if (type === 'assistant/message') {
     text = typeof event.text === 'string'
       ? event.text
@@ -325,6 +354,23 @@ export function coerceHistoryEvents(raw: unknown): HistoryMessage[] {
     if (row !== null) out.push(row);
   });
   return out;
+}
+
+/** The Host may echo our stable send id on a live event; read it without trusting arbitrary objects. */
+function echoedClientMsgId(raw: unknown): string | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const outer = raw as Record<string, unknown>;
+  const data = typeof outer.data === 'object' && outer.data !== null
+    ? outer.data as Record<string, unknown>
+    : {};
+  const message = typeof data.message === 'object' && data.message !== null
+    ? data.message as Record<string, unknown>
+    : {};
+  for (const holder of [outer, data, message]) {
+    const value = holder.clientMsgId;
+    if (typeof value === 'string' && value !== '') return value;
+  }
+  return null;
 }
 
 /** Sort key: `seq` when present, else arrival order. */function compare(a: HistoryMessage, b: HistoryMessage, indexA: number, indexB: number): number {
@@ -412,6 +458,56 @@ export class HistoryStore {
   }
 
   /**
+   * Fold a live user/message into the matching optimistic prompt instead of appending a second
+   * bubble (spec 048 item 3). An echoed `clientMsgId` is the authoritative correlation and takes
+   * priority; trimmed text is only the fallback when the Host echoed no id. The correlation id is
+   * carried onto the authoritative row so a late `sent` ack can still find it after the id changed.
+   * Non-user events, stream chunks and confirmed history are untouched; the caller skips `append()`
+   * when this returns true.
+   */
+  mergePendingUserEvent(raw: unknown, incoming: HistoryMessage): boolean {
+    if (incoming.role !== 'user' || incoming.pending === true) return false;
+    const echoed = echoedClientMsgId(raw);
+    const text = incoming.text.trim();
+    // Recognise an authoritative replay FIRST. Otherwise a replay of prompt A's seq could consume a
+    // newer prompt B that merely has the same text (spec 048 reviewer round 3).
+    const duplicateIndex = this.messages.findIndex((message) =>
+      message.id === incoming.id || (incoming.seq !== null && message.seq === incoming.seq));
+    const duplicate = duplicateIndex < 0 ? undefined : this.messages[duplicateIndex] as HistoryMessage;
+    const correlationId = echoed ?? duplicate?.clientMsgId ?? null;
+
+    const isCorrelated = (message: HistoryMessage): boolean => {
+      if (correlationId !== null) {
+        return message.clientMsgId === correlationId || (message.pending === true && message.id === correlationId);
+      }
+      // Text-only fallback: only a row still awaiting its echo may be claimed.
+      return message.awaitingEcho === true && message.failed === undefined && message.text.trim() === text;
+    };
+
+    if (duplicate !== undefined) {
+      const placeholderIndex = this.messages.findIndex((message) => message !== duplicate && isCorrelated(message));
+      if (placeholderIndex < 0) return false; // unrelated prompt: never consume it
+      this.messages.splice(placeholderIndex, 1);
+      duplicate.pending = false;
+      duplicate.awaitingEcho = false;
+      if (correlationId !== null) duplicate.clientMsgId = correlationId;
+      return true;
+    }
+
+    const index = this.messages.findIndex(isCorrelated);
+    if (index < 0) return false;
+    const placeholder = this.messages[index] as HistoryMessage;
+    const correlation = echoed ?? placeholder.clientMsgId ?? placeholder.id;
+    this.messages[index] = {
+      ...incoming,
+      pending: false,
+      awaitingEcho: false,
+      clientMsgId: correlation,
+    };
+    return true;
+  }
+
+  /**
    * Our own prompt before the host echoed it. Rendered immediately; replaced when the host
    * reports the same `clientMsgId`.
    */
@@ -437,6 +533,8 @@ export class HistoryStore {
     const prompt = this.messages.find((message) => message.id === clientMsgId);
     if (prompt === undefined) return;
     prompt.pending = false;
+    // A refused send is terminal: it must not stay eligible for a later text-only echo.
+    prompt.awaitingEcho = false;
     prompt.failed = code;
   }
 
@@ -446,27 +544,54 @@ export class HistoryStore {
     const message: HistoryMessage = {
       seq: null,
       id: clientMsgId,
+      clientMsgId,
       role: 'user',
       text,
       pending: true,
+      awaitingEcho: true,
       at: this.now(),
     };
     this.messages.push(message);
     return message;
   }
 
-  /** The host echoed a message that carries our `clientMsgId`: replace the optimistic row. */
+  /**
+   * Resolve a `sent` ack for one of our prompts. The correlation survives BOTH orders: a live echo
+   * may have replaced the optimistic id already (find by `clientMsgId`), or the ack may arrive first
+   * (find by the optimistic id). Updating in place never re-appends a bubble whose id changed.
+   */
   confirmPending(clientMsgId: string, raw: unknown): HistoryMessage | null {
-    const pending = this.messages.find((m) => m.id === clientMsgId);
-    if (pending === undefined) return this.append(raw);
-    const confirmed = coerceHistoryMessage(raw, this.messages.length);
-    if (confirmed === null) {
-      pending.pending = false;
-      return pending;
+    const rawWithId = typeof raw === 'object' && raw !== null
+      ? { ...(raw as Record<string, unknown>), clientMsgId }
+      : raw;
+    const confirmed = coerceHistoryMessage(rawWithId, this.messages.length);
+    const index = this.messages.findIndex((message) =>
+      message.id === clientMsgId || message.clientMsgId === clientMsgId);
+    if (index < 0) {
+      // A late ack after a history reload: keep the send id so a later echo can still correlate.
+      if (confirmed === null) return null;
+      const added: HistoryMessage = { ...confirmed, clientMsgId, pending: false, awaitingEcho: true };
+      this.messages.push(added);
+      return added;
     }
-    const index = this.messages.indexOf(pending);
-    this.messages[index] = { ...confirmed, id: confirmed.id, pending: false };
-    return this.messages[index] as HistoryMessage;
+    const existing = this.messages[index] as HistoryMessage;
+    if (confirmed === null || existing.seq !== null || (existing.pending === false && existing.id !== clientMsgId)) {
+      // Already authoritative (echo-first): keep host id/seq, only clear the send state.
+      existing.pending = false;
+      existing.awaitingEcho = false;
+      existing.clientMsgId = existing.clientMsgId ?? clientMsgId;
+      return existing;
+    }
+    // Ack-first: sending is done, but the text-only echo is still outstanding.
+    const updated: HistoryMessage = {
+      ...confirmed,
+      id: confirmed.id,
+      pending: false,
+      awaitingEcho: true,
+      clientMsgId,
+    };
+    this.messages[index] = updated;
+    return updated;
   }
 
   /** The replacement for a first page that lost our own row (e.g. the prompt was rejected). */

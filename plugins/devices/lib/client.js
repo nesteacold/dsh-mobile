@@ -140,11 +140,19 @@ window.__ModuleLoader__.load({
         // Which kind of device a pairing code is for. A code's kind is fixed when it is made,
         // and it decides both the scopes the offer can carry and whether a passkey lock applies,
         // so it is a choice next to the button, not a guess.
-        otpKindLabel: 'This code is for',
-        otpKindMobile: 'Phone / PWA (passkey)',
-        otpKindMobileHint: 'The phone or web client registers a passkey right after you approve, which is what unlocks its session. Includes "Unlock the web client".',
+        otpKindLabel: 'This pairing is for',
+        // Spec 050: three explicit targets. Native is the default: the released iOS/Android app
+        // reads the v3 QR/long string and cannot perform the PWA passkey ceremony.
+        otpKindNative: 'Native iPhone / Android',
+        otpKindNativeHint: 'The native mobile app scans this QR or copies the long string. It pins the Host certificate and never uses the web passkey; the web unlock scope is not granted.',
+        otpKindMobile: 'Web / PWA (passkey)',
+        otpKindMobileHint: 'The web client registers a passkey right after you approve, which is what unlocks its session. Includes "Unlock the web client".',
+        otpKindPwa: 'Web / PWA (passkey)',
+        otpKindPwaHint: 'The web client registers a passkey right after you approve, which is what unlocks its session. Includes "Unlock the web client".',
         otpKindDesktop: 'Computer (Desktop Remote)',
         otpKindDesktopHint: 'The Remote tab on another computer; it never registers a passkey.',
+        nativeQrAlt: 'Native pairing QR code',
+        nativeQrMissing: 'The Host did not return a QR image for this pairing. Copy the string below instead.',
         'scope.harness:remote': 'Use this host remotely (sessions, prompts, approvals)',
         'scope.commands:execute': 'Run slash commands',
         'scope.workspace:manage': 'Manage workspaces and any path',
@@ -494,11 +502,17 @@ window.__ModuleLoader__.load({
         working: 'Đang xử lý…',
         sent: 'Đã gửi',
         enableFirst: 'Hãy bật "Cho phép kết nối" trước.',
-        otpKindLabel: 'Mã này dành cho',
-        otpKindMobile: 'Điện thoại / PWA (passkey)',
-        otpKindMobileHint: 'Điện thoại hoặc web đăng ký passkey ngay sau khi bạn duyệt — đó là bước mở khóa phiên. Có kèm quyền "Mở khóa web".',
+        otpKindLabel: 'Lần ghép đôi này dành cho',
+        otpKindNative: 'iPhone / Android chính chủ',
+        otpKindNativeHint: 'Ứng dụng di động chính chủ quét mã QR hoặc sao chép chuỗi dài. Ứng dụng ghim chứng chỉ Host và không dùng passkey web; quyền mở khóa web không được cấp.',
+        otpKindMobile: 'Web / PWA (passkey)',
+        otpKindMobileHint: 'Web đăng ký passkey ngay sau khi bạn duyệt — đó là bước mở khóa phiên. Có kèm quyền "Mở khóa web".',
+        otpKindPwa: 'PWA trên web (passkey)',
+        otpKindPwaHint: 'Web đăng ký passkey ngay sau khi bạn duyệt — đó là bước mở khóa phiên. Có kèm quyền "Mở khóa web".',
         otpKindDesktop: 'Máy tính (Desktop Remote)',
         otpKindDesktopHint: 'Tab Remote trên máy khác; không đăng ký passkey.',
+        nativeQrAlt: 'Mã QR ghép đôi chính chủ',
+        nativeQrMissing: 'Host không trả ảnh QR cho lần ghép đôi này. Hãy sao chép chuỗi bên dưới.',
         'scope.harness:remote': 'Dùng host này từ xa (phiên, prompt, phê duyệt)',
         'scope.commands:execute': 'Chạy lệnh slash',
         'scope.workspace:manage': 'Quản lý workspace và mọi đường dẫn',
@@ -771,12 +785,27 @@ window.__ModuleLoader__.load({
     // rules.
     async function request(path, options, { image = false } = {}) {
       const target = new URL(path.replace(/^\//, ''), document.baseURI).href
-      const response = await fetch(target, { credentials: 'same-origin', ...options })
+      const fetchOptions = { credentials: 'same-origin', ...options }
+      // A caller's own signal is the whole cancellation contract: never replace it.
+      // Otherwise a wedged route must not leave a fetch pending forever, so the same
+      // signal bounds the body read too, not just the headers.
+      if (!fetchOptions.signal && typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+        fetchOptions.signal = AbortSignal.timeout(15000)
+      }
+      const response = await fetch(target, fetchOptions)
+      // A broken body is an empty object, but an abort/timeout is a FAILURE: turning it
+      // into `{}` would answer a half-finished poll as if the Host had answered nothing.
+      const readJson = async () => {
+        try { return await response.json() } catch (cause) {
+          if (fetchOptions.signal?.aborted === true || cause?.name === 'AbortError' || cause?.name === 'TimeoutError') throw cause
+          return {}
+        }
+      }
       if (image) {
         if (!response.ok) {
           // The route's own reason travels in the JSON body (e.g. "no Chrome or Edge
           // is installed"); a failed frame must say that, not a generic sentence.
-          const body = await response.json().catch(() => ({}))
+          const body = await readJson()
           const failure = new Error(body.message || body.error || `HTTP ${response.status}`)
           failure.code = body.error
           failure.status = response.status
@@ -784,7 +813,7 @@ window.__ModuleLoader__.load({
         }
         return { status: response.status, blob: await response.blob() }
       }
-      const body = await response.json().catch(() => ({}))
+      const body = await readJson()
       if (!response.ok) {
         // Keep the route's machine-readable reason beside its sentence: a page that
         // is not in English uses the code to name a KNOWN reason in the Host
@@ -1143,7 +1172,7 @@ window.__ModuleLoader__.load({
       return h('span', { className: 'dshdev-badge' }, `${tr('expiresIn')} ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`)
     }
 
-    function PairingBox({ pairing, onClose }) {
+    function PairingBox({ pairing, onClose, native = false }) {
       useLang()
       return h('div', { className: 'dshdev-card' },
         h('div', { className: 'dshdev-row' },
@@ -1151,6 +1180,14 @@ window.__ModuleLoader__.load({
           h(Countdown, { expiresAt: pairing.pairing.expiresAt }),
           h(CopyButton, { text: pairing.pairingString }),
           onClose ? h('button', { type: 'button', className: 'dshdev-btn', onClick: onClose }, tr('cancel')) : null),
+        // Spec 050: the native target renders the gateway's QR SVG (the same v3 payload as the
+        // copyable string). The desktop re-pair box has no svg and is unchanged.
+        native && pairing.svg
+          ? h('div', { 'data-testid': 'native-pairing-qr', style: { display: 'flex', justifyContent: 'center', margin: '8px 0' } },
+            h('img', { alt: tr('nativeQrAlt'), width: 200, height: 200, src: 'data:image/svg+xml;utf8,' + encodeURIComponent(pairing.svg) }))
+          : native
+            ? h('div', { className: 'dshdev-muted', 'data-testid': 'native-pairing-qr-missing' }, tr('nativeQrMissing'))
+            : null,
         h('code', { className: 'dshdev-code', 'data-testid': 'pairing-string' }, pairing.pairingString),
         h('div', { className: 'dshdev-muted', style: { marginTop: 6 } }, tr('pairingHelp')))
     }
@@ -1263,11 +1300,16 @@ window.__ModuleLoader__.load({
     // list ever lost the scope, the offer must lose it too rather than mint it here, because who
     // may hold `web:unlock` is the kind tables' (and the contract's) call, not this page's.
     const gatewayScopesFor = (kind) => scopesForKind(kind)
-    // The two seats a pairing code can be made for, in the order the page offers them: the
-    // phone/PWA seat (passkey after approval, so its offer carries `web:unlock`) and the old
-    // default, a Remote tab on another computer (never a passkey, never `web:unlock`).
+    // Spec 050: the NATIVE app holds the same mobile-kind scopes minus the web-only passkey
+    // unlock. It is still a `mobile` device (the gateway's kind rules stay authoritative); only
+    // this HOST-SIDE offer omits web:unlock because the native adapter cannot run a passkey
+    // ceremony. No contract/scope table is changed and the PWA offer keeps the scope.
+    const nativeScopesFor = () => gatewayScopesFor('mobile').filter((scope) => scope !== 'web:unlock')
+    // The three explicit targets, native first (the owner's actual phone choice). `pwa` and
+    // `desktop` keep the two flows this page already had; `native` uses the v3 string/QR path.
     const OTP_KINDS = [
-      { kind: 'mobile', labelKey: 'otpKindMobile', hintKey: 'otpKindMobileHint' },
+      { kind: 'native', labelKey: 'otpKindNative', hintKey: 'otpKindNativeHint' },
+      { kind: 'pwa', labelKey: 'otpKindPwa', hintKey: 'otpKindPwaHint' },
       { kind: 'desktop', labelKey: 'otpKindDesktop', hintKey: 'otpKindDesktopHint' },
     ]
 
@@ -1747,9 +1789,9 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false)
       const [pairing, setPairing] = React.useState(null)
       const [otpOffer, setOtpOffer] = React.useState(null)
-      // `desktop` keeps the behaviour this page always had (a Remote tab on another computer);
-      // `mobile` is the phone/PWA seat, which also asks for `web:unlock` — see `gatewayScopesFor`.
-      const [otpKind, setOtpKind] = React.useState('desktop')
+      // Spec 050: three explicit targets; NATIVE is the default because the owner picked a phone.
+      // `pwa` keeps the OTP/passkey flow (and web:unlock); `desktop` keeps the old Remote flow.
+      const [otpTarget, setOtpTarget] = React.useState('native')
       // The Host's own served origin, learned from the QR route the moment a pairing
       // code is generated (see `OtpDialog.onQr`). `null` = the Host never said it serves
       // anything, which is why no route line is drawn: that is the honest answer, and
@@ -1802,18 +1844,25 @@ window.__ModuleLoader__.load({
         } catch (cause) { setError(cause.message) } finally { setBusy(false) }
       }
 
-      // Window 1: an 8-digit single-use code (spec 008 P1b).
-      const generateOtp = async () => {
+      // Spec 050: make an OFFER for the chosen target, never a generic "phone" OTP that the
+      // native app rejects. Nothing is granted until the Host approves; a target switch clears
+      // any stale offer so an old QR/code can never be paired by mistake.
+      const generateOffer = async () => {
         if (busy) return
         setBusy(true); setError('')
+        setPairing(null); setOtpOffer(null)
         try {
-          setPairing(null)
-          // The offer asks for every scope its KIND can hold (spec 021 rev 15: a desktop never
-          // gets `web:unlock`) so the Host user can choose at Approve (which defaults to
-          // Standard); nothing is granted until then. The kind is the one picked next to the
-          // button: a code made as `desktop` left every phone/PWA pair locked out of its own
-          // passkey (`scope refused: type=passkey-assert-options … scope=web:unlock`).
-          setOtpOffer(await post('/mgw/pair', { mode: 'otp', kind: otpKind, scopes: gatewayScopesFor(otpKind) }))
+          if (otpTarget === 'native') {
+            // The released native app needs the existing v3 QR/long string with the certificate
+            // pin. `mode: 'string'` is the gateway's existing path; only the scopes differ from
+            // the PWA offer: no `web:unlock` (that passkey ceremony is web-only).
+            setPairing(await post('/mgw/pair', { mode: 'string', kind: 'mobile', scopes: nativeScopesFor() }))
+            return
+          }
+          const kind = otpTarget === 'pwa' ? 'mobile' : 'desktop'
+          // The OTP offer asks for every scope its KIND can hold so the Host user can choose at
+          // Approve (which defaults to Standard). PWA keeps `web:unlock`; desktop never gets it.
+          setOtpOffer(await post('/mgw/pair', { mode: 'otp', kind, scopes: gatewayScopesFor(kind) }))
         } catch (cause) { setError(cause.message) } finally { setBusy(false) }
       }
 
@@ -1874,9 +1923,9 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dshdev-card' },
           h('div', { className: 'dshdev-row' },
             h('h3', { className: 'dshdev-grow' }, tr('pairingCode')),
-            h('button', { type: 'button', className: 'dshdev-btn primary', disabled: busy || !on, onClick: generateOtp }, tr('generate'))),
-          // The code's KIND, chosen before the code exists: a code is bound to one kind for its
-          // whole life, so picking it afterwards would mean making a second code.
+            h('button', { type: 'button', className: 'dshdev-btn primary', disabled: busy || !on, onClick: generateOffer }, tr('generate'))),
+          // Spec 050: the target is chosen BEFORE the offer exists. Switching it clears any stale
+          // QR/code so a native pairing can never be completed from a PWA/desktop offer (or back).
           h('div', { className: 'dshdev-row', style: { marginTop: 10, flexWrap: 'wrap' } },
             h('span', { className: 'dshdev-muted' }, tr('otpKindLabel')),
             OTP_KINDS.map((entry) => h('label', {
@@ -1884,11 +1933,12 @@ window.__ModuleLoader__.load({
               'data-testid': `otp-kind-${entry.kind}`,
             },
               h('input', {
-                type: 'radio', name: 'otp-kind', value: entry.kind, checked: otpKind === entry.kind,
-                disabled: busy || !on, onChange: () => setOtpKind(entry.kind),
+                type: 'radio', name: 'otp-kind', value: entry.kind, checked: otpTarget === entry.kind,
+                disabled: busy || !on,
+                onChange: () => { setOtpTarget(entry.kind); setOtpOffer(null); setPairing(null); setError('') },
               }),
               h('span', null, tr(entry.labelKey))))),
-          h('div', { className: 'dshdev-muted' }, tr(`otpKind${otpKind === 'mobile' ? 'Mobile' : 'Desktop'}Hint`)),
+          h('div', { className: 'dshdev-muted' }, tr((OTP_KINDS.find((entry) => entry.kind === otpTarget) || OTP_KINDS[0]).hintKey)),
           !on ? h('div', { className: 'dshdev-muted' }, tr('enableFirst')) : null),
         otpOffer ? h(OtpDialog, { offer: otpOffer, addresses, lanHost: status && status.lan ? status.lan.host : '',
           // Spec 029: the QR route's answer is the Host's own served origin, kept in the
@@ -1903,7 +1953,7 @@ window.__ModuleLoader__.load({
           },
           onClose: () => setOtpOffer(null) }) : null,
         h(PendingRequests, { active: on }),
-        pairing && !editing ? h(PairingBox, { pairing, onClose: () => setPairing(null) }) : null,
+        pairing && !editing ? h(PairingBox, { pairing, native: otpTarget === 'native', onClose: () => setPairing(null) }) : null,
         h('div', { className: 'dshdev-card' },
           h('h3', null, tr('address')),
           addresses.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('noAddress'))
@@ -2579,7 +2629,11 @@ window.__ModuleLoader__.load({
     function createHostsStore() {
       let snapshot = EMPTY_HOSTS
       const listeners = new Set()
+      let inFlight = null
       const publish = (next) => {
+        // An unchanged 4s poll must keep the snapshot REFERENCE: useSyncExternalStore
+        // re-renders its consumers on identity alone, whatever the rows contain.
+        if (snapshot.loaded !== false && JSON.stringify(next) === JSON.stringify(snapshot)) return
         snapshot = next
         for (const listener of [...listeners]) {
           // One surface failing must not take the others down with it.
@@ -2589,59 +2643,69 @@ window.__ModuleLoader__.load({
       return {
         getSnapshot: () => snapshot,
         subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
-        async refresh() {
-          try {
-            const data = await request('/devices/remotes')
-            const routing = data.routing || { remote: false, reason: 'not-reported', hosts: [] }
-            publish({
-              remotes: (data.remotes || []).map((remote) => ({
-                id: remote.id, name: remote.name, address: remote.address, status: remote.status,
-                createdAt: remote.createdAt ?? null,
-                kind: (remote.device && remote.device.kind) || null,
-                scopes: remote.device && Array.isArray(remote.device.scopes) ? remote.device.scopes : [],
-                // The link supervisor's pending retry, so every surface that reads
-                // this store can tell "offline, retrying" from "offline".
-                retry: remote.retry ?? null,
-                // Why an automatic reconnect stopped for good (a changed
-                // certificate); `retry` is null in that case, never both.
-                linkError: remote.linkError ?? null,
-                // Spec 016 Phase 3: the body shows this host's own consent, so the
-                // tab never claims the agent is driving when it was never allowed.
-                browserConsent: remote.browserConsent === true,
-              })),
-              // index.mjs answers with exactly the CONNECTED hosts, so a host here is
-              // online by construction; a tagged session whose host is absent is the
-              // offline case the banner is for.
-              hosts: (Array.isArray(routing.hosts) ? routing.hosts : []).map((host) => ({
-                hostId: String(host.hostId), hostName: String(host.hostName ?? host.hostId), online: host.online !== false,
-                // The host-router's last refusal for this host (`status().hosts[].error`);
-                // it only reports one when there is something to say, so a healthy host
-                // stays `null`.
-                error: host.error ?? null,
-              })),
-              // A PAIRED host whose link is down. Its sessions stay in the merged list
-              // (the router retains them), so the row must read "Disconnected" rather
-              // than look like a host that was never there or one with nothing in it.
-              // A revoked grant is filtered out of this set BEFORE it is mapped: its
-              // rows were dropped with the grant, so it is not "disconnected".
-              disconnected: (Array.isArray(routing.disconnected) ? routing.disconnected : [])
-                .filter((host) => {
-                  const held = (data.remotes || []).find((entry) => entry.id === String(host?.hostId))
-                  return !(held && held.status === 'revoked')
-                })
-                .map((host) => ({
-                  hostId: String(host.hostId),
-                  hostName: String(host.hostName ?? host.hostId),
-                  online: false,
-                  retainedSessions: Number(host.retainedSessions) || 0,
+        refresh() {
+          // One answer per burst: every surface shares this store, so concurrent ticks
+          // must coalesce instead of stacking GETs (and late answers overwriting fresh).
+          if (inFlight !== null) return inFlight
+          const running = (async () => {
+            try {
+              const data = await request('/devices/remotes')
+              const routing = data.routing || { remote: false, reason: 'not-reported', hosts: [] }
+              publish({
+                remotes: (data.remotes || []).map((remote) => ({
+                  id: remote.id, name: remote.name, address: remote.address, status: remote.status,
+                  createdAt: remote.createdAt ?? null,
+                  kind: (remote.device && remote.device.kind) || null,
+                  scopes: remote.device && Array.isArray(remote.device.scopes) ? remote.device.scopes : [],
+                  // The link supervisor's pending retry, so every surface that reads
+                  // this store can tell "offline, retrying" from "offline".
+                  retry: remote.retry ?? null,
+                  // Why an automatic reconnect stopped for good (a changed
+                  // certificate); `retry` is null in that case, never both.
+                  linkError: remote.linkError ?? null,
+                  // Spec 016 Phase 3: the body shows this host's own consent, so the
+                  // tab never claims the agent is driving when it was never allowed.
+                  browserConsent: remote.browserConsent === true,
                 })),
-              routing,
-              error: '',
-              loaded: true,
-            })
-          } catch (cause) {
-            publish({ ...snapshot, error: cause.message, loaded: true })
-          }
+                // index.mjs answers with exactly the CONNECTED hosts, so a host here is
+                // online by construction; a tagged session whose host is absent is the
+                // offline case the banner is for.
+                hosts: (Array.isArray(routing.hosts) ? routing.hosts : []).map((host) => ({
+                  hostId: String(host.hostId), hostName: String(host.hostName ?? host.hostId), online: host.online !== false,
+                  // The host-router's last refusal for this host (`status().hosts[].error`);
+                  // it only reports one when there is something to say, so a healthy host
+                  // stays `null`.
+                  error: host.error ?? null,
+                })),
+                // A PAIRED host whose link is down. Its sessions stay in the merged list
+                // (the router retains them), so the row must read "Disconnected" rather
+                // than look like a host that was never there or one with nothing in it.
+                // A revoked grant is filtered out of this set BEFORE it is mapped: its
+                // rows were dropped with the grant, so it is not "disconnected".
+                disconnected: (Array.isArray(routing.disconnected) ? routing.disconnected : [])
+                  .filter((host) => {
+                    const held = (data.remotes || []).find((entry) => entry.id === String(host?.hostId))
+                    return !(held && held.status === 'revoked')
+                  })
+                  .map((host) => ({
+                    hostId: String(host.hostId),
+                    hostName: String(host.hostName ?? host.hostId),
+                    online: false,
+                    retainedSessions: Number(host.retainedSessions) || 0,
+                  })),
+                routing,
+                error: '',
+                loaded: true,
+              })
+            } catch (cause) {
+              publish({ ...snapshot, error: cause.message, loaded: true })
+            }
+          })()
+          inFlight = running
+          // Both settle paths release the guard; only the run we started may do so.
+          const clear = () => { if (inFlight === running) inFlight = null }
+          running.then(clear, clear)
+          return running
         },
       }
     }
@@ -2657,6 +2721,13 @@ window.__ModuleLoader__.load({
         getSnapshot: () => snapshot,
         subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
         set(patch) {
+          // Same values in every key: no new snapshot, no notify. The Devices page
+          // reads this through useSyncExternalStore, which re-renders on identity alone.
+          let changed = false
+          for (const key of Object.keys(patch)) {
+            if (!Object.is(snapshot[key], patch[key])) { changed = true; break }
+          }
+          if (!changed) return
           snapshot = { ...snapshot, ...patch }
           for (const listener of [...listeners]) {
             try { listener() } catch { /* a status surface must not throw */ }
@@ -3304,6 +3375,44 @@ window.__ModuleLoader__.load({
       let waitTimer = null
       let headerWarned = false
       let disposed = false
+      let sidebarRoot = null
+      // The sidebar's own subtree: 60fps chat streaming in the center column must not
+      // schedule a placement pass. A lightweight document whose nodes have no `contains`
+      // keeps the existing path: filtering is only safe once the tree is really walkable.
+      const lowestCommonAncestor = (a, b) => {
+        if (!a || !b) return null
+        const seen = new Set()
+        for (let cursor = a; cursor; cursor = cursor.parentNode) {
+          if (cursor === b) return cursor
+          seen.add(cursor)
+        }
+        for (let cursor = b; cursor; cursor = cursor.parentNode) {
+          if (seen.has(cursor)) return cursor
+        }
+        return null
+      }
+      const trackSidebarRoot = () => {
+        const header = placed ? doc.querySelector(HOST_TABS_HEADER) : null
+        const listArea = placed ? doc.querySelector(HOST_TABS_LIST) : null
+        const ancestor = lowestCommonAncestor(header, listArea ?? header?.parentNode)
+        sidebarRoot = ancestor && ancestor !== doc.body && ancestor !== doc.documentElement ? ancestor : null
+      }
+      // Zero allocation per MutationRecord: browser NodeLists have no array methods, and
+      // turning them into arrays on every DOM mutation was the hot path in the renderer.
+      const isOnlyOurInsert = (entry) => {
+        const added = entry?.addedNodes
+        if (!added || added.length === 0) return false
+        for (let i = 0; i < added.length; i += 1) if (added[i] !== node) return false
+        const removed = entry?.removedNodes
+        if (removed) for (let i = 0; i < removed.length; i += 1) if (removed[i] === node) return false
+        return true
+      }
+      const isForeignToSidebar = (entry) => {
+        if (!(placed && sidebarRoot && sidebarRoot.isConnected !== false && node.parentNode !== null && typeof sidebarRoot.contains === 'function')) return false
+        const target = entry?.target
+        if (!target || typeof target.contains !== 'function') return false
+        return !sidebarRoot.contains(target) && !target.contains(sidebarRoot)
+      }
       // One warn at most, after a wait with no header. Re-armed when a mutation proves
       // the sidebar is drawing, so a header that is merely late is never called missing.
       const armHeaderWait = () => {
@@ -3327,6 +3436,9 @@ window.__ModuleLoader__.load({
           if (inserted) placed = true
           else placed = doc.querySelector(HOST_TABS_HEADER)?.previousElementSibling === node
         } catch { /* a document mid-teardown: the next pass retries */ }
+        // Refresh the subtree the observer may skip. A sidebar re-render replaces its
+        // nodes, so this is deliberately recomputed on every pass while placed.
+        trackSidebarRoot()
         // A row scan is a separate job and must never stop the placement it rides on.
         if (onPass !== null) { try { onPass() } catch { /* a bad row is not a lost strip */ } }
         if (placed && !placedAnnounced) {
@@ -3355,18 +3467,17 @@ window.__ModuleLoader__.load({
         // run for it would find the node already in place and insert nothing. The batch
         // after it is the sidebar's own re-render, and that one does reach the DOM.
         observer = new Observer((entries) => {
-          // Ignore ONLY the batch that carries our own insertion. A record with no
-          // addedNodes means the renderer REMOVED something; `.every()` is true on an
-          // empty list, so that branch used to be mistaken for "our own node" and the
-          // strip was never re-inserted after React dropped it.
-          const foreign = (entries ?? []).filter((entry) => {
-            // A browser hands MutationRecord a NodeList, which has no array methods.
-            const added = Array.from(entry.addedNodes ?? [])
-            const removed = Array.from(entry.removedNodes ?? [])
-            return !(added.length > 0 && added.every((item) => item === node) && !removed.includes(node))
-          })
-          if (foreign.length === 0) return
-          schedule()
+          if (!entries) return
+          let foreign = false
+          for (let i = 0; i < entries.length; i += 1) {
+            const entry = entries[i]
+            // Ignore our own insertion echo and any mutation in a disjoint subtree
+            // (the center column streams tokens at 60fps; it never moves the sidebar).
+            if (isOnlyOurInsert(entry) || isForeignToSidebar(entry)) continue
+            foreign = true
+            break
+          }
+          if (foreign) schedule()
         })
         // `document.body` exists from the first script on, but a shell that runs apply()
         // before the body (or a test document without one) is observed at the document
@@ -3798,6 +3909,7 @@ window.__ModuleLoader__.load({
       let disposed = false
       let attach = null
       let listener = null
+      let pickEvent = null
       const publish = () => {
         if (disposed || attach === null) return
         const status = attach.status()
@@ -3839,7 +3951,10 @@ window.__ModuleLoader__.load({
             if (chunk.adoptPickerFrom(attach, event) === null) return
             publish()
           }
-          doc.addEventListener(chunk.PICK_EVENT ?? 'change', listener, true)
+          // Keep the exact signal we registered: a chunk may name its own pick event,
+          // and removing a hardcoded 'change' would leave that listener on the page.
+          pickEvent = chunk.PICK_EVENT ?? 'change'
+          doc.addEventListener(pickEvent, listener, true)
         }
       }, () => {
         // A shell that cannot hand the chunk over: every pick stays DSH's, and the page shows it.
@@ -3847,8 +3962,8 @@ window.__ModuleLoader__.load({
       })
       return () => {
         disposed = true
-        if (doc !== null && typeof doc.removeEventListener === 'function' && listener !== null) {
-          doc.removeEventListener('change', listener, true)
+        if (doc !== null && typeof doc.removeEventListener === 'function' && listener !== null && pickEvent !== null) {
+          doc.removeEventListener(pickEvent, listener, true)
         }
         listener = null
         if (attach !== null) attach.uninstall()
@@ -4162,7 +4277,9 @@ window.__ModuleLoader__.load({
         reportSeats()
       }
       dispose.push(hostsStore.subscribe(sync))
-      const refresh = () => { hostsStore.refresh().then(sync, () => {}) }
+      // The subscription above already runs sync() on every published change; a second
+      // call here doubled the native catalog checks and seat reports on every poll.
+      const refresh = () => { hostsStore.refresh().then(() => {}, () => {}) }
       refresh()
       dispose.push(...startPoll(refresh))
       dispose.push(() => {
@@ -4188,8 +4305,25 @@ window.__ModuleLoader__.load({
     // One timer for every surface: /devices/remotes returns the whole host picture,
     // and a second timer would only let the surfaces disagree for a few seconds.
     function startPoll(refresh) {
-      const interval = window.setInterval(refresh, 4000)
-      return [() => window.clearInterval(interval)]
+      // The one 4s timer stays: a hidden renderer gets no GETs, and coming back to
+      // visible refreshes immediately instead of waiting up to four seconds.
+      const tick = () => {
+        if (typeof document !== 'undefined' && document?.visibilityState === 'hidden') return
+        refresh()
+      }
+      const interval = window.setInterval(tick, 4000)
+      let onVisible = null
+      if (typeof document !== 'undefined' && typeof document?.addEventListener === 'function') {
+        onVisible = () => { if (document?.visibilityState === 'visible') refresh() }
+        document.addEventListener('visibilitychange', onVisible)
+      }
+      return [() => {
+        window.clearInterval(interval)
+        if (onVisible !== null && typeof document?.removeEventListener === 'function') {
+          document.removeEventListener('visibilitychange', onVisible)
+          onVisible = null
+        }
+      }]
     }
 
 
@@ -4410,7 +4544,7 @@ window.__ModuleLoader__.load({
       FlowStrip, flowState, connectedCount, localName,
       // spec 008 P2b
       HostChip, SessionBanners, OfflineBanner, ModelStatusBanner, RemoteTerminalEntry,
-      SessionHostBadge, PermissionsEditor, scopesForKind, gatewayScopesFor,
+      SessionHostBadge, PermissionsEditor, scopesForKind, gatewayScopesFor, nativeScopesFor,
       RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText, hostLinkOf,
       // The sidebar's two tabs: the exact rule text each tab installs and the tab store,
       // so a test proves both filters, the insertion point, and the small data surface

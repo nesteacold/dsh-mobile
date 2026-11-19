@@ -386,8 +386,11 @@ function load({ locale = 'en-US', declared = ['shell.overlay'], keyRegistry = 'o
     const batch = [{ type: 'childList', target: doc.sidebar, addedNodes: asNodeList(added), removedNodes: asNodeList(removed) }]
     for (const observer of observers) if (observer.observing) observer.callback(batch)
   }
+  // A batch with a caller-chosen target: the perf test needs a mutation from OUTSIDE
+  // the sidebar to prove the observer's subtree filter, not just the sidebar's own.
+  const pulseBatch = (batch) => { for (const observer of observers) if (observer.observing) observer.callback(batch) }
   return {
-    api, calls, entries, registered, doc, rows: doc.rows, flushTimers, pulse, pulseOwn, pulseRemovedOnly, pulseNodeList, warnings,
+    api, calls, entries, registered, doc, rows: doc.rows, flushTimers, pulse, pulseOwn, pulseRemovedOnly, pulseNodeList, pulseBatch, warnings,
     shortcuts: registeredShortcuts,
     stripNode,
     localeSubscribers: () => localeListeners.size,
@@ -1229,6 +1232,47 @@ await check('A1.3: a localStorage getter that throws SecurityError falls back to
   ui.pulse(); ui.flushTimers()
   assert.equal(reopened.attrs['aria-expanded'], 'false', 'the in-memory owner choice still wins')
   ui.dispose()
+})
+
+await check('perf: mutations outside the sidebar subtree are filtered; a fake DOM without contains keeps the old path', async () => {
+  const doc = makeDocument()
+  // A real Node walks its ancestors in `contains`; the lightweight fake deliberately
+  // omits it, so add it only to this document's pre-existing nodes.
+  for (const node of doc.all()) {
+    node.contains = function (other) {
+      for (let cursor = other; cursor; cursor = cursor.parentNode) if (cursor === this) return true
+      return false
+    }
+  }
+  const ui = load({ dom: doc })
+  assert.equal(ui.sidebarOrder(), 'newSession > strip > header > listArea', 'placed in the sidebar')
+  ui.flushTimers()
+  const idle = ui.pendingTimers()
+
+  // 60fps chat streaming in the center column: a mutation whose target is disjoint
+  // from the sidebar must never schedule a placement pass.
+  const stream = doc.mk('div')
+  doc.body.appendChild(stream)
+  stream.contains = doc.sidebar.contains
+  ui.pulseBatch([{ type: 'childList', target: stream, addedNodes: [doc.mk('span')], removedNodes: [] }])
+  assert.equal(ui.pendingTimers(), idle, 'a foreign subtree raised no debounce timer')
+
+  // A sidebar re-render still drives exactly one pass, so a dropped strip comes back.
+  ui.pulseBatch([{ type: 'childList', target: doc.listArea, addedNodes: [doc.mk('div')], removedNodes: [] }])
+  assert.equal(ui.pendingTimers(), idle + 1, 'an in-sidebar mutation still schedules')
+  ui.flushTimers()
+
+  // A lightweight shell with no `contains` on any node keeps the existing path:
+  // filtering is skipped entirely rather than silently freezing the strip.
+  const plain = load()
+  plain.flushTimers()
+  const plainIdle = plain.pendingTimers()
+  const plainStream = plain.doc.mk('div')
+  plain.doc.body.appendChild(plainStream)
+  assert.equal(typeof plainStream.contains, 'undefined')
+  plain.pulseBatch([{ type: 'childList', target: plainStream, addedNodes: [plain.doc.mk('span')], removedNodes: [] }])
+  assert.equal(plain.pendingTimers(), plainIdle + 1, 'a disjoint target still schedules without contains')
+  ui.dispose(); plain.dispose()
 })
 
 finish('client-host-tabs')

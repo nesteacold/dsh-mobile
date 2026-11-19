@@ -39,6 +39,8 @@ import {
   PASSKEY_VERIFICATION_FAILED,
   PASSKEY_RATE_LIMITS,
   WEB_UNLOCK_IDLE_MS,
+  WEB_UNLOCK_SCOPE,
+  WEB_UNLOCK_SESSION_TTL_MS,
 } from './vendor/mobile-protocol.mjs'
 import { assertOwnerOnly, ensureOwnerOnlyDirectory, restrictToOwnerSync, writeSecretFile } from './secure-file.mjs'
 import { encodeBase64url, originHostname, PasskeyVerificationError, verifyAssertion, verifyRegistration } from './webauthn.mjs'
@@ -122,6 +124,13 @@ export function loadPasskeyStore(file) {
         publicKey,
         signCount: Number.isSafeInteger(signCount) && signCount >= 0 ? signCount : 0,
         createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
+        // Spec 036: the Host-authoritative grant survives a Host restart. A malformed row
+        // carries no grant (fail closed); expiry is decided by the effectiveGrant predicate.
+        ...(row.unlockGrant && typeof row.unlockGrant === 'object'
+          && typeof row.unlockGrant.origin === 'string' && row.unlockGrant.origin !== ''
+          && Number.isFinite(row.unlockGrant.grantedAt) && Number.isFinite(row.unlockGrant.expiresAt)
+          ? { unlockGrant: { origin: row.unlockGrant.origin, grantedAt: row.unlockGrant.grantedAt,
+            expiresAt: row.unlockGrant.expiresAt } } : {}),
       })
     }
     return { records }
@@ -146,6 +155,9 @@ export function loadPasskeyStore(file) {
  *   policy when `originPolicy` is absent
  * @param {(socket: object, origin: string) => boolean} [options.originPolicy] the gateway's
  *   ingress-aware decision: whether this SOCKET's origin may be a passkey site (read per call)
+ * @param {(device: object) => boolean} [options.mayHoldUnlock] spec 021 rev 15 kind check
+ * @param {(device: object, socket: object) => boolean} [options.authorizationLive] live
+ *   credential/generation/gateway check for the spec 036 grant predicate
  * @param {(line: string) => void} [options.log]
  * @param {() => number} [options.now]
  */
@@ -177,6 +189,61 @@ export function createPasskeyService(options) {
   const deviceFailures = new Map()
   let globalFailures = []
 
+  // Spec 036: in-memory authorization epochs (never persisted — a restart starts new sockets),
+  // capability opt-ins and debounced grant-refresh timers.
+  const epochs = new Map()
+  const epochFor = (deviceId) => epochs.get(deviceId) ?? 0
+  const bumpEpoch = (deviceId) => epochs.set(deviceId, epochFor(deviceId) + 1)
+  // Spec 036 review: the opt-in is PER SOCKET, never a device-wide/per-grant flag.
+  const refreshState = new Map()
+  const GRANT_REFRESH_DEBOUNCE_MS = Number.isSafeInteger(options.grantRefreshDebounceMs)
+    && options.grantRefreshDebounceMs > 0 ? options.grantRefreshDebounceMs : 60_000
+
+  const cancelRefresh = (deviceId) => {
+    const state = refreshState.get(deviceId)
+    if (state?.timer) clearTimeout(state.timer)
+    refreshState.delete(deviceId)
+  }
+
+  /**
+   * Persist ONLY the CURRENT record, never a captured grant. Re-checks both the epoch and the
+   * exact record object identity, so a replacement/invalidation that landed after the refresh
+   * was scheduled can never be overwritten by a stale timer.
+   */
+  const flushRefresh = (deviceId, expectedEpoch, expectedRecord) => {
+    refreshState.delete(deviceId)
+    if (expectedEpoch !== epochFor(deviceId)) return
+    const record = recordFor(deviceId)
+    if (record === undefined || record !== expectedRecord || record.unlockGrant === undefined) return
+    try {
+      save()
+    } catch (error) {
+      log?.(`passkey grant refresh not persisted (${error?.code ?? 'write-failed'})`)
+    }
+  }
+
+  const debounceGrantSave = (deviceId, at, record) => {
+    let state = refreshState.get(deviceId)
+    if (state === undefined) {
+      state = { timer: null, lastPersistAt: at, epoch: epochFor(deviceId), record }
+      refreshState.set(deviceId, state)
+    }
+    if (state.timer !== null) return
+    const wait = Math.max(0, GRANT_REFRESH_DEBOUNCE_MS - (at - state.lastPersistAt))
+    state.timer = setTimeout(() => {
+      state.timer = null
+      const current = refreshState.get(deviceId)
+      if (current === state) { state.lastPersistAt = now(); flushRefresh(deviceId, state.epoch, state.record) }
+    }, wait)
+    if (typeof state.timer.unref === 'function') state.timer.unref()
+  }
+
+  const originAdmitted = (socket, origin) => {
+    if (typeof origin !== 'string' || origin === '') return false
+    if (typeof options.originPolicy === 'function') return options.originPolicy(socket, origin) === true
+    return Array.isArray(options.allowedOrigins) && options.allowedOrigins.includes(origin)
+  }
+
   const prune = () => {
     const at = now()
     for (const [socketId, entry] of challenges) if (entry.expiresAt <= at) challenges.delete(socketId)
@@ -194,6 +261,32 @@ export function createPasskeyService(options) {
   }
 
   const recordFor = (deviceId) => records.get(deviceHash(deviceId))
+
+  /**
+   * Spec 036: invalidate every authorization artifact of one device. Cancels a pending refresh,
+   * clears the persisted grant IMMEDIATELY, bumps the epoch so an in-flight assertion/challenge
+   * cannot recreate it, and drops pending challenges and replacement grants.
+   */
+  const invalidateState = (deviceId, code) => {
+    cancelRefresh(deviceId)
+    bumpEpoch(deviceId)
+    const record = recordFor(deviceId)
+    const had = record?.unlockGrant !== undefined
+    if (had) delete record.unlockGrant
+    for (const [key, challenge] of challenges) {
+      if (challenge.deviceId === deviceId) challenges.delete(key)
+    }
+    for (const [id, approval] of approvals) {
+      if (approval.deviceId !== deviceId) continue
+      approvals.delete(id)
+      onApprovalSettled?.()
+    }
+    for (const [key, grant] of grants) if (grant.deviceId === deviceId) grants.delete(key)
+    if (had) {
+      save()
+      log?.(`passkey grant invalidated: device=${deviceId} code=${code}`)
+    }
+  }
 
   /** Whether this device is locked out right now (its own window or the global one). */
   const isRateLimited = (deviceId) => {
@@ -249,10 +342,13 @@ export function createPasskeyService(options) {
     return key
   }
 
-  const issueChallenge = (socket) => {
+  const issueChallenge = (socket, device) => {
     prune()
     const key = keyOf(socket)
-    const entry = { challenge: randomBase64url(32), expiresAt: now() + PASSKEY_CHALLENGE_TTL_MS }
+    // Spec 036: bind the challenge to the DEVICE epoch too, so a Lock/revoke/scope change
+    // that lands mid-ceremony makes the finished assertion useless.
+    const entry = { challenge: randomBase64url(32), expiresAt: now() + PASSKEY_CHALLENGE_TTL_MS,
+      deviceId: device?.id, epoch: epochFor(device?.id) }
     challenges.set(key, entry)
     if (challenges.size > CHALLENGE_LIMIT) {
       // Drop the oldest-issued entry, never the one just issued.
@@ -266,12 +362,15 @@ export function createPasskeyService(options) {
   }
 
   /** The socket's live challenge, consumed by the call that verifies against it. */
-  const takeChallenge = (socket) => {
+  const takeChallenge = (socket, device) => {
     prune()
     const key = keyOf(socket)
     const entry = challenges.get(key)
     if (entry === undefined) refuse(PASSKEY_CODES.challengeExpired)
     challenges.delete(key)
+    if (entry.deviceId !== undefined && (entry.deviceId !== device?.id || entry.epoch !== epochFor(entry.deviceId))) {
+      refuse(PASSKEY_CODES.challengeExpired)
+    }
     return entry.challenge
   }
 
@@ -293,7 +392,7 @@ export function createPasskeyService(options) {
     if (isRateLimited(device.id)) refuse(PASSKEY_CODES.rateLimited)
     const stored = recordFor(device.id)
     // A fresh challenge every time an option is issued: an old answer can no longer verify.
-    const challenge = issueChallenge(socket)
+    const challenge = issueChallenge(socket, device)
     return {
       kind: PASSKEY_REGISTER_OPTIONS_TYPE,
       challenge,
@@ -317,7 +416,7 @@ export function createPasskeyService(options) {
     if (isRateLimited(device.id)) refuse(PASSKEY_CODES.rateLimited)
     const stored = recordFor(device.id)
     if (stored === undefined) refuse(PASSKEY_CODES.notRegistered)
-    const challenge = issueChallenge(socket)
+    const challenge = issueChallenge(socket, device)
     return {
       kind: PASSKEY_ASSERT_OPTIONS_TYPE,
       challenge,
@@ -355,9 +454,105 @@ export function createPasskeyService(options) {
 
   const hasRecord = (deviceId) => recordFor(deviceId) !== undefined
 
+  const mayHold = (device) => typeof options.mayHoldUnlock === 'function'
+    ? options.mayHoldUnlock(device) === true : true
+
+  const authorizationLive = (device, socket) => typeof options.authorizationLive === 'function'
+    ? options.authorizationLive(device, socket) === true : true
+
+  /**
+   * The ONE predicate of spec 036 (§14.7). Read on socket creation/hello, before every inbound
+   * dispatch and before every outbound data send. Fails closed and never throws.
+   */
+  const effectiveGrant = (device, socket, at = now()) => {
+    const deviceId = device?.id
+    if (typeof deviceId !== 'string' || !mayHold(device)) return false
+    if (!Array.isArray(device.scopes) || !device.scopes.includes(WEB_UNLOCK_SCOPE)) return false
+    // Reviewer: the opt-in belongs to THIS socket. A persisted grant alone never unlocks a
+    // socket that did not advertise `web-unlock-session.v1` in its accepted client-hello.
+    if (socket?.webUnlockSessionOptIn !== true) return false
+    const slot = socket?.passkeySlot
+    if (slot === null || typeof slot !== 'object') return false
+    if (!authorizationLive(device, socket)) return false
+    if (isRateLimited(deviceId)) return false
+    const grant = recordFor(deviceId)?.unlockGrant
+    if (grant === undefined || grant.origin !== socket.origin || !originAdmitted(socket, grant.origin)) return false
+    if (!Number.isFinite(at) || at >= grant.expiresAt) {
+      if (grant !== undefined && Number.isFinite(at)) invalidateState(deviceId, 'grant-expired')
+      return false
+    }
+    // An in-memory epoch invalidates a grant created before a Lock/revoke/re-pair in this
+    // process; a grant loaded from disk after a restart has epoch 0, like a fresh socket.
+    return (slot.epoch ?? 0) === epochFor(deviceId)
+  }
+
+  const grantSession = (device, socket, site) => {
+    const record = recordFor(device.id)
+    if (record === undefined || !mayHold(device) || !authorizationLive(device, socket)) return false
+    if (socket.webUnlockSessionOptIn !== true || !originAdmitted(socket, site.origin)) return false
+    const at = now()
+    record.unlockGrant = { origin: site.origin, grantedAt: at, expiresAt: at + WEB_UNLOCK_SESSION_TTL_MS }
+    if (socket.passkeySlot && typeof socket.passkeySlot === 'object') socket.passkeySlot.epoch = epochFor(device.id)
+    cancelRefresh(device.id)
+    refreshState.set(device.id, { timer: null, lastPersistAt: at, epoch: epochFor(device.id), record })
+    save()
+    log?.(`passkey unlock grant set: device=${device.id}`)
+    return true
+  }
+
+  /** Slide the grant on AUTHORIZED activity only; persist at most once per 60 s. */
+  const noteActivity = (device, socket, at = now()) => {
+    if (!effectiveGrant(device, socket, at)) return false
+    const record = recordFor(device.id)
+    const grant = record?.unlockGrant
+    if (grant === undefined) return false
+    const target = at + WEB_UNLOCK_SESSION_TTL_MS
+    if (target > grant.expiresAt) {
+      grant.expiresAt = target
+      debounceGrantSave(device.id, at, record)
+    }
+    return true
+  }
+
   return {
     /** Whether this device has a stored passkey (the lock layer reads it on every frame). */
     hasPasskey: hasRecord,
+
+    /** Spec 036: the single grant predicate, shared by the hello, dispatch and send gates. */
+    effectiveGrant,
+
+    /** Bind a new socket to the device's current authorization epoch. */
+    bindSocket(slot, deviceId) {
+      if (slot && typeof slot === 'object') slot.epoch = epochFor(deviceId)
+    },
+
+    /** THIS socket advertised `web-unlock-session.v1` in its accepted client-hello. */
+    markSocketOptIn(socket) {
+      if (socket && typeof socket === 'object') {
+        socket.webUnlockSessionOptIn = true
+        if (socket.passkeySlot && typeof socket.passkeySlot === 'object') socket.passkeySlot.webUnlockSessionOptIn = true
+      }
+    },
+
+    /** Slide a valid grant after authorized inbound/outbound activity. */
+    noteActivity,
+
+    /** Invalidate one device's grant/challenges/approvals immediately (code only in logs). */
+    invalidate(deviceId, code = 'authorization-changed') { invalidateState(deviceId, code) },
+
+    /** Gateway disable / global authorization change: invalidate EVERY device, permanently. */
+    invalidateAll(code = 'gateway-disabled') {
+      for (const device of listDevices()) invalidateState(device.id, code)
+    },
+
+    /** Invalidate grants whose exact origin is no longer an accepted policy. */
+    invalidateOrigin(origin, code = 'origin-policy-changed') {
+      if (typeof origin !== 'string' || origin === '') return
+      for (const device of listDevices()) {
+        const record = recordFor(device.id)
+        if (record?.unlockGrant?.origin === origin) invalidateState(device.id, code)
+      }
+    },
 
     /**
      * Whether THIS device is locked out by the failure budget right now (§14.5): its own
@@ -412,7 +607,7 @@ export function createPasskeyService(options) {
         refuse(PASSKEY_CODES.alreadyRegistered)
       }
       const shape = requireAttestationShape(attestation)
-      const challenge = takeChallenge(socket)
+      const challenge = takeChallenge(socket, device)
       let result
       try {
         result = verify(() => verifyRegistration({ attestation: shape, challenge, origin: site.origin, rpId: site.rpId }))
@@ -420,6 +615,9 @@ export function createPasskeyService(options) {
         if (error instanceof PasskeyRefusal) noteFailure(device.id)
         throw error
       }
+      // Spec 036: replacing a passkey invalidates any grant and any in-flight ceremony on
+      // other sockets of this device before the new record is written.
+      if (stored !== undefined) invalidateState(device.id, 'passkey-replaced')
       records.set(deviceHash(device.id), {
         credentialId: result.credentialId,
         publicKey: result.publicKey,
@@ -449,7 +647,7 @@ export function createPasskeyService(options) {
       const stored = recordFor(device.id)
       if (stored === undefined) refuse(PASSKEY_CODES.notRegistered)
       const shape = requireAssertionShape(assertion)
-      const challenge = takeChallenge(socket)
+      const challenge = takeChallenge(socket, device)
       let result
       try {
         result = verify(() => verifyAssertion({ assertion: shape, stored, challenge, origin: site.origin, rpId: site.rpId }))
@@ -461,6 +659,9 @@ export function createPasskeyService(options) {
         stored.signCount = result.signCount
         save()
       }
+      // Spec 036: only an opted-in web device gets a Host-issued grant, and only after
+      // verification of a challenge issued under the CURRENT authorization epoch.
+      grantSession(device, socket, site)
       log?.(`passkey asserted: device=${device.id}`)
       return { unlocked: true }
     },
@@ -476,6 +677,7 @@ export function createPasskeyService(options) {
     /** Revocation (or a re-pair that drops the grant): the device's record goes. */
     revoke(deviceId) {
       const had = recordFor(deviceId) !== undefined
+      invalidateState(deviceId, 'device-revoked')
       records.delete(deviceHash(deviceId))
       deviceFailures.delete(deviceId)
       for (const [id, approval] of approvals) {
@@ -525,7 +727,7 @@ export function createPasskeyService(options) {
       if (approval === undefined) return undefined
       approvals.delete(id)
       if (action === 'approve') {
-        grants.set(approval.stateKey, { deviceId: approval.deviceId, expiresAt: approval.expiresAt })
+        grants.set(approval.stateKey, { deviceId: approval.deviceId, expiresAt: approval.expiresAt, epoch: epochFor(approval.deviceId) })
       }
       onApprovalSettled?.()
       log?.(`passkey approval ${action}: device=${approval.deviceId} approval=${approval.id}`)
@@ -572,10 +774,12 @@ export function createPasskeyLock(options) {
 
     /**
      * The lock a socket shows right now: `unregistered` (no passkey — register), `locked`
-     * (never asserted here, or idle too long) or `unlocked`.
+     * (never asserted here, or idle too long) or `unlocked`. Spec 036: for an opted-in socket a
+     * valid Host grant also means `unlocked`; the 15-minute idle bound does not apply to it.
      */
-    state(slot, deviceId) {
+    state(slot, deviceId, grantValid = false) {
       if (!options.hasPasskey(deviceId)) return 'unregistered'
+      if (grantValid === true) return 'unlocked'
       if (slot.unlocked !== true) return 'locked'
       if (!withinIdle(slot, now())) {
         slot.unlocked = false

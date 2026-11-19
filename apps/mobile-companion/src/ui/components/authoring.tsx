@@ -19,7 +19,7 @@ import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-nati
 import type { MessageKey } from '../../../i18n';
 import { isAuthoringRefusal } from '../../app-state';
 import type { ClientState } from '../../core';
-import { elevation, radius, space, useTheme } from '../theme';
+import { elevation, radius, space, useTheme, type SessionChromePalette } from '../theme';
 
 /** One workspace, as the Host's `workspace/list` returns it (names/paths as-is, contract revision 7). */
 export interface WorkspaceItem {
@@ -273,8 +273,11 @@ export function ComposerModelRow(props: {
   onOpenModel: () => void;
   /** Localised noun for the accessibility label only — never rendered as the value. */
   hint: string;
+  /** Spec 049: web passes the fixed dark chrome pair so the pill never reads a wrong scheme. */
+  palette?: SessionChromePalette;
 }) {
   const { colors, type, radius } = useTheme();
+  const pillColors = props.palette ?? { text: colors.text, textMuted: colors.textMuted, border: colors.border };
   if (!shouldShowModelPill({ currentModel: props.currentModel, hasCatalog: props.hasCatalog })) return null;
   const label = composerModelLabel(props.currentModel);
   if (label === null) return null;
@@ -290,11 +293,11 @@ export function ComposerModelRow(props: {
         onPress={props.hasCatalog ? props.onOpenModel : undefined}
         style={({ pressed }) => [
           props.hasCatalog ? styles.pill : styles.pillStatic,
-          props.hasCatalog ? { borderRadius: radius.sm, borderColor: colors.border } : null,
+          props.hasCatalog ? { borderRadius: radius.sm, borderColor: pillColors.border } : null,
           pressed && props.hasCatalog && styles.pressed,
         ]}
       >
-        <Text style={[type.caption, { color: props.hasCatalog ? colors.text : colors.textMuted }]} numberOfLines={1}>
+        <Text style={[type.caption, { color: props.hasCatalog ? pillColors.text : pillColors.textMuted }]} numberOfLines={1}>
           {label}
           {props.hasCatalog ? '  ▾' : ''}
         </Text>

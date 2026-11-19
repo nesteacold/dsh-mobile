@@ -62,6 +62,11 @@ export interface Palette {
   readonly screenBackground: string;
   /** Card / row surface on top of `bg`. */
   readonly surface: string;
+  /**
+   * Spec 047 — opaque, same-scheme fill for translucent glass surfaces on web. iOS Safari's blur
+   * can render a different scheme from the text palette; this token is the authority there.
+   */
+  readonly glassSolid: string;
   /** Menus, sheets, dialogs: one step above `surface`. */
   readonly surfaceRaised: string;
   /** Hairline dividers and outlines. Decorative: not required to meet the 3:1 control boundary. */
@@ -119,6 +124,7 @@ export const lightColors: Palette = {
   bg: brand.paper, // Paper #F9FAFC
   screenBackground: 'transparent',
   surface: '#FFFFFF', // surface = Color.White
+  glassSolid: '#FFFFFF',
   surfaceRaised: '#FFFFFF',
   border: '#E3E7EE',
   /**
@@ -161,6 +167,7 @@ export const darkColors: Palette = {
   bg: '#090D13', // background
   screenBackground: 'transparent',
   surface: '#111720', // surface
+  glassSolid: '#111720',
   surfaceRaised: '#18202B', // one step up for menus/sheets
   border: '#232C38',
   borderStrong: '#5E6B82', // 3.4:1 on surface (interactive boundary)
@@ -191,6 +198,66 @@ export const colors: Palette = darkColors;
 
 export function paletteFor(scheme: ColorScheme): Palette {
   return scheme === 'dark' ? darkColors : lightColors;
+}
+
+/**
+ * Resolve a possibly-unavailable system colour scheme to a concrete choice.
+ *
+ * `useColorScheme()` answers `null` on Expo web/PWA (no media-query answer yet, or a browser with no
+ * preference). Treating that as `dark` painted a dark gate on the page's light CSS background: the
+ * Ink title vanished into white and the "forget" control became a high-emphasis dark block.
+ * UNKNOWN therefore means LIGHT; an explicit `'dark'` from the system is still honoured.
+ */
+export function resolveColorScheme(scheme: ColorScheme | null | undefined): ColorScheme {
+  return scheme === 'dark' ? 'dark' : 'light';
+}
+
+/**
+ * Spec 047 — the composer's contrast pair. Every field comes from ONE resolved scheme, so the
+ * surface can never disagree with the text/placeholder colours on a browser where blur fails.
+ */
+/**
+ * Spec 049 — fixed web chrome pair. iOS Safari PWA can report/render a scheme different from the
+ * glass surface, so the session header/composer use THESE literals on web, never useColorScheme.
+ */
+export const WEB_SESSION_CHROME = {
+  surface: '#0B1220',
+  text: '#F1F4FA',
+  textMuted: '#C7CEDA',
+  textFaint: '#9AA7B8',
+  border: '#5E6B82',
+} as const;
+
+export interface SessionChromePalette {
+  readonly surface: string;
+  readonly text: string;
+  readonly textMuted: string;
+  readonly textFaint: string;
+  readonly border: string;
+}
+
+/** Fixed pair on web; the existing theme palette on native (unchanged). */
+export function sessionChromePalette(web: boolean, palette: Palette): SessionChromePalette {
+  return web
+    ? WEB_SESSION_CHROME
+    : {
+        surface: palette.surface,
+        text: palette.text,
+        textMuted: palette.textMuted,
+        textFaint: palette.textFaint,
+        border: palette.border,
+      };
+}
+
+export function composerPalette(scheme: ColorScheme | null | undefined) {
+  const palette = paletteFor(resolveColorScheme(scheme));
+  return {
+    scheme: resolveColorScheme(scheme),
+    surface: palette.glassSolid,
+    border: palette.borderStrong,
+    text: palette.text,
+    textMuted: palette.textMuted,
+  } as const;
 }
 
 // ---------------------------------------------------------------------------
@@ -326,16 +393,18 @@ export interface Theme {
 /** Font-scale steps offered by the settings screen (mirrors upstream's bounded choices). */
 export const FONT_SCALES = [0.9, 1, 1.15, 1.3] as const;
 
+// A consumer rendered without a provider has no scheme information either, so it gets the same
+// light fallback as `ThemeProvider` / `resolveColorScheme` instead of a dark palette on a light page.
 const DEFAULT_THEME: Theme = {
-  scheme: 'dark',
-  colors: darkColors,
-  type: typeScale(darkColors, 1),
+  scheme: 'light',
+  colors: lightColors,
+  type: typeScale(lightColors, 1),
   space,
   radius,
   hit,
   fontScale: 1,
   setFontScale: () => {},
-  settingsType: settingsTypography(darkColors, 1),
+  settingsType: settingsTypography(lightColors, 1),
 };
 
 const ThemeContext = createContext<Theme>(DEFAULT_THEME);
@@ -346,7 +415,7 @@ const ThemeContext = createContext<Theme>(DEFAULT_THEME);
  */
 export function ThemeProvider(props: { children: ReactNode; initialFontScale?: number }) {
   const system = useColorScheme();
-  const scheme: ColorScheme = system === 'light' ? 'light' : 'dark';
+  const scheme = resolveColorScheme(system);
   const [fontScale, setFontScale] = useState<number>(props.initialFontScale ?? 1);
   // The saved scale is read asynchronously at startup, so the provider has to ADOPT it when it
   // arrives; `initialFontScale` alone would only cover the very first render.
@@ -370,7 +439,7 @@ export function ThemeProvider(props: { children: ReactNode; initialFontScale?: n
   return createElement(ThemeContext.Provider, { value }, props.children);
 }
 
-/** Current theme. Usable without a provider (falls back to the dark scheme, scale 1). */
+/** Current theme. Usable without a provider (falls back to the light scheme, scale 1). */
 export function useTheme(): Theme {
   return useContext(ThemeContext);
 }

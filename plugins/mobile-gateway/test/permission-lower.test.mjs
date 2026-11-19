@@ -167,10 +167,13 @@ function fakeHost(hostCalls, { visible = ['s1'], sessionObjects = new Map(), pro
       hostCalls.push({ kind: 'dispatchRpc', endpoint, principal: peer?.principal, args: payload })
       if (options.dispatchThrows) throw new Error(HOST_ONLY_TEXT)
       if (endpoint !== 'session/projections') return { ok: false, error: { code: 'op/forbidden' } }
-      if (projectionsThrows.has(payload?.sessionId)) {
+      // Spec 052e: remoteRequest requires EXACTLY {args:{sessionId}}.
+      const asked = payload?.args?.request?.sessionId
+      assert.deepEqual(payload, { args: { request: { sessionId: asked ?? payload?.args?.sessionId ?? payload?.sessionId } } })
+      if (projectionsThrows.has(asked)) {
         return { ok: false, error: { code: 'remote-access/denied', message: HOST_ONLY_TEXT } }
       }
-      if (!sessionObjects.has(payload?.sessionId)) {
+      if (!sessionObjects.has(asked)) {
         return { ok: false, error: { code: 'session/not-found', message: HOST_ONLY_TEXT } }
       }
       // The wire form of the `permissions` projection: a value object naming no Session.
@@ -383,7 +386,7 @@ test('P-2a permission-options reports the current preset and only STRICTLY stric
   const resolutions = deviceCallsSince(instance, since).filter((call) => call.kind === 'dispatchRpc')
   assert.equal(resolutions.length, 1, 'exactly one visibility check per read')
   assert.equal(resolutions[0].endpoint, 'session/projections')
-  assert.deepEqual(resolutions[0].args, { sessionId: 's1' })
+  assert.deepEqual(resolutions[0].args, { args: { request: { sessionId: 's1' } } }, 'rc.5 remoteRequest envelope')
   assert.equal(resolutions[0].principal?.kind, 'dsh-ext-mobile-device')
   // C1 + C2: the Session came from the separate LIVE store, by id, and the service was
   // asked with THAT object — on the class instance itself, so its PROTOTYPE methods ran.
@@ -866,7 +869,7 @@ test('P-8 both refusals are audited; the line carries the validated id only, nev
   }, {
     log: (line) => lines.push(line),
     // Device-visible ids are answered; anything else is denied the way DSH denies it.
-    dispatchRpc: async (_endpoint, payload) => (payload.sessionId === 's1'
+    dispatchRpc: async (_endpoint, payload) => (payload?.args?.request?.sessionId === 's1'
       ? { ok: true, value: { kind: 'sequenced', asOfSeq: 1, values: { permissions: { currentValue: 'workspace-write' } } } }
       : { ok: false, error: { code: 'remote-access/denied' } }),
   })
@@ -880,7 +883,7 @@ test('P-8 both refusals are audited; the line carries the validated id only, nev
     assert.equal(frame.code, 'bad-request', JSON.stringify(frame))
     assert.equal(Object.hasOwn(frame, 'sessionId'), false, 'a malformed id is not echoed back')
     assert.equal(lines.length, 1, `exactly one audit line for ${JSON.stringify(sessionId)?.slice(0, 12)}: ${JSON.stringify(lines)}`)
-    assert.match(lines[0], /^permission-options refused: bad-request device=dev-1$/, lines[0])
+    assert.match(lines[0], /^permission-options refused: bad-request device=dev-1 cause=bad-session-id$/, lines[0])
     assert.equal(lines[0].includes('\n'), false, 'a wire value can never split an audit line')
   }
   // A newline INSIDE an otherwise valid id is a real (under-limit) id: it is refused by
@@ -898,8 +901,8 @@ test('P-8 both refusals are audited; the line carries the validated id only, nev
   const stale = await unit.lower({ type: 'permission-lower', sessionId: ' s2 ', preset: 'read-only' }, peer, 'dev-1')
   assert.equal(stale.code, 'unavailable', JSON.stringify(stale))
   assert.equal(lines.length, 1)
-  assert.equal(lines[0], 'permission-lower refused: unavailable device=dev-1 session=s2',
-    'the line names the TRIMMED, validated id — never the raw " s2 "')
+  assert.match(lines[0], /^permission-lower refused: unavailable device=dev-1 session=s2 cause=session-not-live$/,
+    'the line names the TRIMMED, validated id and the narrow branch — never the raw " s2 "')
 
   // The not-live refusal (visibility passes, the store has no object) is audited too.
   lines.length = 0
@@ -915,6 +918,52 @@ test('P-8 both refusals are audited; the line carries the validated id only, nev
     const frame = await op(msg, peer, 'dev-1')
     assert.equal(frame.code, 'unavailable', JSON.stringify(frame))
     assert.equal(lines.length, 1)
-    assert.match(lines[0], new RegExp(`^${msg.type} refused: unavailable device=dev-1 session=s1$`), lines[0])
+    assert.match(lines[0], new RegExp(`^${msg.type} refused: unavailable device=dev-1 session=s1 cause=session-not-live$`), lines[0])
+  }
+})
+
+test('spec 052: rc.5 session/projections direct shape is accepted without weakening peer or liveness', async () => {
+  const lines = []
+  const liveSession = { id: 's1' }
+  const unit = createPermissionLower({
+    get: (name) => (name === 'permissionPresets' ? new PresetService({ initial: [] }) : name === 'sessions' ? new LiveSessions(new Map([['s1', liveSession]]), { get: 0 }) : undefined),
+  }, {
+    log: (line) => lines.push(line),
+    // DSH rc.5 answers projections(observation) with {asOfSeq, values}, not {ok:true,value:{...}}.
+    dispatchRpc: async (endpoint, payload, signal, peer) => {
+      assert.equal(endpoint, 'session/projections')
+      assert.deepEqual(payload, { args: { request: { sessionId: 's1' } } })
+      assert.ok(peer, 'the device Peer is still sent on every visibility read')
+      return { kind: 'sequenced', asOfSeq: 7, values: { permissions: { currentValue: 'workspace-write' } } }
+    },
+  })
+  const frame = await unit.options({ type: 'permission-options', sessionId: 's1' }, { id: 'peer' }, 'dev-1')
+  assert.equal(frame.kind, 'permission-options', JSON.stringify(frame))
+  assert.equal(frame.currentValue, 'workspace-write')
+  assert.match(lines[0] ?? '', /^permission-options read: device=dev-1 session=s1 current=workspace-write/)
+
+  const noPeer = await unit.options({ type: 'permission-options', sessionId: 's1' }, undefined, 'dev-1')
+  assert.equal(noPeer.code, 'unavailable')
+  assert.match(lines.at(-1), /cause=no-peer$/)
+})
+
+test('spec 052 follow-up: projection refusals log only a stable wire code', async () => {
+  const SECRET = 'token-should-never-be-logged-xyz'
+  for (const [reply, expected] of [
+    [{ ok: false, error: { code: 'session/forbidden', message: SECRET, details: { token: SECRET } } }, /cause=projections-refused:session\/forbidden$/],
+    [{ ok: false, code: 'op/forbidden', message: SECRET }, /cause=projections-refused:op\/forbidden$/],
+    [{ ok: false, message: SECRET }, /cause=projections-refused:ok-false$/],
+    [{ kind: 'sequenced', values: {}, message: SECRET }, /cause=projections-refused:not-sequenced$/],
+    [null, /cause=projections-refused:no-code$/],
+  ]) {
+    const lines = []
+    const unit = createPermissionLower({
+      get: (name) => (name === 'permissionPresets' ? new PresetService({ initial: [] }) : name === 'sessions' ? new LiveSessions(new Map([['s1', { id: 's1' }]]), { get: 0 }) : undefined),
+    }, { log: (line) => lines.push(line), dispatchRpc: async () => reply })
+    const frame = await unit.options({ type: 'permission-options', sessionId: 's1' }, { id: 'peer' }, 'dev-1')
+    assert.equal(frame.code, 'unavailable', JSON.stringify(frame))
+    assert.equal(frame.message, 'this computer cannot change the permission preset for a device', 'wire message unchanged')
+    assert.match(lines.at(-1) ?? '', expected, JSON.stringify(reply))
+    assert.equal(lines.at(-1).includes(SECRET), false, 'Host message never reaches the audit log')
   }
 })

@@ -29,7 +29,9 @@ export const ASSET_ROOT_DEFAULT = path.resolve(
 /** Same directives the build injects as <meta>, sent as a header so they are all enforced. */
 export const ASSET_CSP = [
   "default-src 'self'",
-  "script-src 'self'",
+  // Spec 043: compiling the same-origin stamped ZXing WASM needs this CSP3 token; the browser
+  // enforces THIS HEADER over the app's <meta> copy. It is not general JS eval, and no CDN is added.
+  "script-src 'self' 'wasm-unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
@@ -58,6 +60,9 @@ const TYPES = {
   '.woff': 'font/woff',
   '.woff2': 'font/woff2',
   '.css': 'text/css; charset=utf-8',
+  // Spec 043: the stamped same-origin ZXing WASM must be served as application/wasm; otherwise
+  // the browser refuses streaming compilation and falls back to a slower ArrayBuffer path.
+  '.wasm': 'application/wasm',
 }
 
 /** The manifest is advertised as application/manifest+json (docs/web-pwa.md §3): without it a
@@ -159,8 +164,11 @@ export function spaFallback(pathname) {
 // is not a hard timeout.
 // ---------------------------------------------------------------------------------------------
 
-/** Every segment of a served file: a plain name, never a dotfile, never a `:` (NTFS stream) or `~`. */
-const SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/
+/** Every segment of a served file: a plain name, never a dotfile, never a `:` (NTFS stream) or `~`.
+ *  `[`/`]` are admitted because Expo emits dynamic-route chunks as `[id]-<hash>.js`; they are plain
+ *  filename characters (not separators, not dots), so allowing them widens nothing else: `..`,
+ *  `%`, `\`, `:` and control bytes stay refused. */
+const SEGMENT = /^[A-Za-z0-9_[\]-][A-Za-z0-9._[\]-]*$/
 /** Win32 device names are reserved with or without an extension (`CON`, `nul.txt`, `COM1.js`). */
 const DEVICE_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i
 /** Limits so a mis-pointed root (a home directory, a drive) cannot exhaust memory or the event loop. */
@@ -384,9 +392,15 @@ export function indexPresent(source) {
   }
 }
 
-// The RAW request target must be this and nothing else: no `%` (so no encoded separator, dot, NUL or
-// second decoding pass), no `\`, no `:` (NTFS streams, drive letters), no space, no control byte.
-const RAW_PATH = /^\/[A-Za-z0-9._\-/]*$/
+// The RAW request target must be this and nothing else: no `\`, no `:` (NTFS streams, drive
+// letters), no space, no control byte — and NO percent escape except the two bracket escapes
+// `%5B`/`%5D` (case-insensitive hex). Expo emits dynamic-route chunks as `[id]-<hash>.js`; browsers
+// and bundlers send those brackets either raw or percent-encoded. Decoding is limited to those two
+// triplets, so it can never introduce a separator (`%2f`), a dot (`%2e`), a NUL, an ADS marker or a
+// second decoding pass; every other `%` sequence still fails this allowlist outright.
+const RAW_PATH = /^\/(?:[A-Za-z0-9._\-/[\]]|%5[bBdD])*$/
+/** Canonical snapshot key for an admitted raw target: only `%5B`/`%5D` are ever unfolded. */
+const canonicalAssetPath = (raw) => raw.replace(/%5[Bb]/g, '[').replace(/%5[Dd]/g, ']')
 const SERVED_PREFIXES = ['/mgw', '/api', '/dsh']
 const isWsPath = (raw) => {
   const lower = raw.toLowerCase()
@@ -432,15 +446,21 @@ export function serveWebAsset(req, res, source) {
       return
     }
     if (!RAW_PATH.test(raw) || raw.includes('//')) { plain(res, 404); return }
-    for (const segment of raw.split('/')) {
-      if (segment === '.' || segment === '..') { plain(res, 404); return }
+    // Only the two bracket escapes are unfolded, after the RAW fences above have passed. The
+    // canonical form is re-checked so a decoded target can never become a dot/separator segment or
+    // a management prefix (defence in depth; neither escape can create one today).
+    const canonical = canonicalAssetPath(raw)
+    for (const pathname of [raw, canonical]) {
+      for (const segment of pathname.split('/')) {
+        if (segment === '.' || segment === '..') { plain(res, 404); return }
+      }
     }
     // No management or DSH route is reachable here, whatever file the snapshot might hold.
-    if (SERVED_PREFIXES.some((prefix) => hasPrefix(raw, prefix))) { plain(res, 404); return }
+    if (SERVED_PREFIXES.some((prefix) => hasPrefix(raw, prefix) || hasPrefix(canonical, prefix))) { plain(res, 404); return }
     const snapshot = source && typeof source === 'object' && source.snapshot instanceof Map ? source.snapshot : null
     if (snapshot === null || snapshot.size === 0) { plain(res, 404); return }
-    let entry = snapshot.get(raw)
-    if (!entry && spaFallback(raw)) entry = snapshot.get('/index.html')
+    let entry = snapshot.get(canonical)
+    if (!entry && spaFallback(canonical)) entry = snapshot.get('/index.html')
     if (!entry) { plain(res, 404); return }
     // A HEAD response carries the same headers a GET would, including Content-Length, and no body.
     res.writeHead(200, {

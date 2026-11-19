@@ -24,6 +24,15 @@ describe('i18n tables', () => {
     }
   });
 
+  it('spec 036: the unconfirmed-lock copy exists in both locales and names the 24h grant', () => {
+    const en = t('en', 'unlock.lockUnconfirmed');
+    const vi = t('vi', 'unlock.lockUnconfirmed');
+    assert.match(en, /not confirmed the lock/i);
+    assert.match(en, /24-hour unlock grant may still be valid/i);
+    assert.match(vi, /chưa xác nhận đã khoá/i);
+    assert.match(vi, /24 giờ có thể vẫn còn hiệu lực/i);
+  });
+
   it('no message is empty', () => {
     for (const locale of LOCALES) {
       for (const [key, value] of Object.entries(MESSAGES[locale])) {
@@ -61,10 +70,57 @@ describe('pairing failure mapping', () => {
     ];
     for (const reason of reasons) {
       const kind = pairErrorFromQr(reason);
-      assert.ok(['expired', 'generic'].includes(kind), reason);
+      assert.ok(['expired', 'generic', 'appUpdate', 'pairingVersion', 'badPayload'].includes(kind), reason);
       assert.ok(t('en', `pair.error.${kind}` as never).length > 0);
     }
     assert.equal(pairErrorFromQr('qr/expired'), 'expired');
+  });
+
+  it('gives a pasted non-payload its own copy, and keeps the two update cases apart', () => {
+    // The owner report: pasting something that is not a pairing string showed the generic "pairing
+    // failed", which reads as "your computer refused you" — the wrong remedy for a typo or the wrong
+    // field. A QR that parses as nothing is now `badPayload`; an observed expiry stays `expired`.
+    for (const reason of ['qr/invalid-json', 'qr/bad-endpoint', 'qr/bad-gateway-id', 'qr/bad-host-name',
+      'qr/bad-cert-sha256', 'qr/bad-pairing-code', 'qr/bad-expires-at'] as QrRejectReason[]) {
+      assert.equal(pairErrorFromQr(reason), 'badPayload', reason);
+    }
+    assert.equal(pairErrorFromQr('qr/expired'), 'expired');
+    // A version mismatch says nothing about which side is behind — `qr/unsupported-version` covers an
+    // older Host, an older app, and a missing or malformed `version` alike — so it takes the
+    // direction-neutral copy, never the "the app must be updated" assertion.
+    assert.equal(pairErrorFromQr('qr/unsupported-version'), 'pairingVersion');
+    assert.notEqual(pairErrorFromQr('qr/unsupported-version'), 'appUpdate');
+    // The contract's own refusal still means the app is behind.
+    assert.equal(pairErrorFromCode('client/update-app-required'), 'appUpdate');
+    assert.notEqual(pairErrorFromQr('qr/invalid-json'), 'generic', 'no QR parse failure falls back to generic');
+    for (const locale of LOCALES) {
+      const text = t(locale, 'pair.error.badPayload');
+      assert.ok(text.trim().length > 0, `${locale}: pair.error.badPayload`);
+      assert.notEqual(text, t(locale, 'pair.error.generic'), `${locale}: it is not the generic failure`);
+    }
+    assert.notEqual(t('en', 'pair.error.badPayload'), t('vi', 'pair.error.badPayload'), 'really localized');
+    // The paste-detected notice exists in both locales and points at the confirm step.
+    for (const locale of LOCALES) assert.ok(t(locale, 'pair.otpDetected').trim().length > 0, `${locale}: pair.otpDetected`);
+  });
+
+  it('gives an unreadable pairing-code version its own direction-neutral copy', () => {
+    // `qr/unsupported-version` is what `parsePairingQr` returns for any `version` but the one this
+    // app reads, including older, missing, or a non-number: the copy must name BOTH sides, because
+    // "your computer needs a newer app" is false when the phone is the side that is behind.
+    for (const locale of LOCALES) {
+      const text = t(locale, 'pair.error.pairingVersion');
+      assert.ok(text.trim().length > 0, `${locale}: pair.error.pairingVersion`);
+      assert.notEqual(text, t(locale, 'pair.error.appUpdate'), `${locale}: it is not the app-update copy`);
+      assert.notEqual(text, t(locale, 'pair.error.generic'), `${locale}: it is not the generic failure`);
+    }
+    assert.notEqual(
+      t('en', 'pair.error.pairingVersion'),
+      t('vi', 'pair.error.pairingVersion'),
+      'really localized',
+    );
+    // The neutral copy still offers the only remedy the user has: get a fresh code afterwards.
+    assert.match(t('en', 'pair.error.pairingVersion'), /up to date/i);
+    assert.match(t('vi', 'pair.error.pairingVersion'), /cập nhật/i);
   });
 
   it('maps contract + client codes to the US1 error states', () => {

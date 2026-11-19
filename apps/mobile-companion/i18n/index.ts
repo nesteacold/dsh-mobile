@@ -29,6 +29,19 @@ export type MessageKey =
   | 'unlock.passkeyApproval'
   | 'unlock.passkeyUnsupported'
   | 'unlock.passkeyHostVersion'
+  // Spec 036: Lock was sent but the Host never confirmed it; the 24h grant may still be live.
+  | 'unlock.lockUnconfirmed'
+  // Spec 037: immediate busy feedback and distinct, actionable unlock failures.
+  | 'unlock.preparing'
+  | 'unlock.unlocking'
+  | 'unlock.passkeyTimeout'
+  | 'unlock.passkeyDismissed'
+  // A Host that refused this device's credential (401): no passkey can answer it, only a re-pair.
+  | 'unlock.credentialRejected'
+  | 'unlock.forgetRepair'
+  | 'unlock.forgetRepairConfirm'
+  // No ready socket for the passkey: the host is unreachable or may have dropped this device.
+  | 'unlock.unreachable'
   // Spec 021 — the web bootstrap's cold start (a failure blocks pairing until it is retried).
   | 'startup.failed'
   | 'startup.retry'
@@ -124,8 +137,18 @@ export type MessageKey =
   // pairing
   | 'pair.title'
   | 'pair.scan'
+  // Spec 043: camera granted but no QR decoded within the bounded window -> distinct hint.
+  | 'pair.scanTimeout'
+  | 'pair.scanRetry'
   | 'pair.cameraPermission'
   | 'pair.cameraPermissionButton'
+  // Spec 053: QR from the native photo library (local decode, never uploaded).
+  | 'pair.imagePicker'
+  | 'pair.imageBusy'
+  | 'pair.imageNoQr'
+  | 'pair.imageMultiple'
+  | 'pair.imagePermission'
+  | 'pair.imageError'
   | 'pair.manual'
   | 'pair.manualPlaceholder'
   | 'pair.webAddress'
@@ -164,12 +187,20 @@ export type MessageKey =
   | 'pair.error.otpLinkNative'
   // The PWA opened from that link: the form is filled in, the user still confirms.
   | 'pair.linkPrefilled'
+  // An 8-digit code pasted into "QR or code": the screen switches to the code tab and says so —
+  // the user still confirms, because one of the Host's proof attempts must not be spent silently.
+  | 'pair.otpDetected'
+  // Something pasted into "QR or code" that is neither a pairing string nor an 8-digit code.
+  | 'pair.error.badPayload'
   // The Host's own identity could not be trusted: it stated none, or it claimed another known one.
   | 'pair.error.noHostId'
   | 'pair.error.hostConflict'
   // The stored host list had not loaded yet, so the identity check could not run at all.
   | 'pair.error.notReady'
   | 'pair.error.unavailable'
+  // A pairing code whose `version` is not the one this app reads (older, newer, missing, or not a
+  // number at all): the direction is unknown, so the copy asks that BOTH sides be up to date.
+  | 'pair.error.pairingVersion'
   | 'pair.error.appUpdate'
   | 'pair.error.hostUpdate'
   | 'pair.error.generic'
@@ -303,12 +334,19 @@ export type MessageKey =
   | 'session.attachFile'
   | 'session.attachUnavailable'
   | 'session.attachTooLarge'
+  | 'session.attachTooMany'
   | 'session.attachProgress'
   | 'session.attachCancel'
   | 'session.attachFailed'
+  | 'session.attachReadFailed'
   | 'session.attachReceipt'
   | 'session.attachNoFile'
   | 'session.attachBusy'
+  // Spec 048 — non-blocking progress indicator (fixed copy, no private reasoning text).
+  | 'session.sending'
+  | 'session.processing'
+  // Spec 050 — observed elapsed time since the PWA saw the running state.
+  | 'session.processingElapsed'
   // Spec 018 — the session's agent preset, view only (the phone never sets it).
   | 'session.agentPreset'
   // Spec 018 item 5 — read-only goal line and task checklist (the Host's `goal` / `todos`).
@@ -340,6 +378,10 @@ export type MessageKey =
   | 'banner.gatewayOff'
   | 'banner.revoked'
   | 'banner.reauth'
+  // Spec 046 — three opaque browser failures: connection unavailable, not a credential verdict.
+  | 'banner.connectFailed'
+  | 'banner.retry'
+  | 'banner.pairAgain'
   | 'banner.cleanupFailed'
   | 'banner.pinnedTransportMissing'
   // spec 029 capability / version mismatch
@@ -356,6 +398,9 @@ export type MessageKey =
   | 'update.details'
   | 'update.retry'
   | 'update.pairAnother'
+  // Spec 045 — a new PWA meeting an old gateway: update notice, never a lock screen.
+  | 'update.legacyWebLockTitle'
+  | 'update.legacyWebLockBody'
   | 'notice.notification.title'
   | 'notice.notification.body'
   // common
@@ -428,6 +473,19 @@ const en = {
   'unlock.passkeyApproval': 'A passkey already exists. Ask the owner to approve replacing it on the computer, then create it again.',
   'unlock.passkeyUnsupported': 'This browser cannot use a passkey. Open the page in a recent browser over https.',
   'unlock.passkeyHostVersion': 'Your computer does not support passkey unlock yet. Update it, then try again.',
+  'unlock.lockUnconfirmed':
+    'The computer has not confirmed the lock. The 24-hour unlock grant may still be valid, so a reload or reconnect can unlock this device again.',
+  'unlock.preparing': 'Preparing the passkey request…',
+  'unlock.unlocking': 'Unlocking…',
+  'unlock.passkeyTimeout': 'The passkey check took too long. Tap Unlock to try again.',
+  'unlock.passkeyDismissed': 'The passkey prompt was dismissed or timed out. Tap Unlock to try again.',
+  'unlock.credentialRejected':
+    'The computer refused this device (it may have been revoked). Forget this computer, then pair it again.',
+  'unlock.forgetRepair': 'Forget this computer and pair again',
+  'unlock.forgetRepairConfirm':
+    'This removes this device\'s pairing information from this browser only. The passkey on your device is not deleted, and the computer keeps or revokes this device according to its own settings. Continue?',
+  'unlock.unreachable':
+    'Could not reach the computer. If this device was revoked, forget this computer and pair again.',
   'startup.failed': 'This app could not finish starting, so pairing is unavailable until it does.',
   'startup.retry': 'Retry',
   'startup.starting': 'Starting…',
@@ -523,8 +581,16 @@ const en = {
   'sessions.refresh': 'Refresh',
   'pair.title': 'Pair your computer',
   'pair.scan': 'Point the camera at the QR code on your computer',
+  'pair.scanTimeout': 'Could not read the QR; paste the code',
+  'pair.scanRetry': 'Retry scan',
   'pair.cameraPermission': 'Camera access is needed to scan the pairing QR code.',
   'pair.cameraPermissionButton': 'Allow camera',
+  'pair.imagePicker': 'Choose QR image',
+  'pair.imageBusy': 'Reading the QR image…',
+  'pair.imageNoQr': 'No QR code was found in that image.',
+  'pair.imageMultiple': 'That image contains more than one QR code; choose one with a single code.',
+  'pair.imagePermission': 'Photo access is needed to choose a QR image.',
+  'pair.imageError': 'Could not read the QR image; try another image or paste the code.',
   'pair.manual': 'Or paste the code shown on your computer',
   'pair.manualPlaceholder': 'Paste the pairing code',
   'pair.webAddress': 'This browser reaches your computer at {url}',
@@ -559,11 +625,14 @@ const en = {
   'pair.error.pinMismatch': 'That computer is not the one the code belongs to. Nothing was sent. If its certificate changed, pair again with a fresh code.',
   'pair.error.otpLinkNative': 'This QR is the pairing-code link for the web app. The phone app cannot pair with an 8-digit code: it carries no certificate for the phone to verify the computer against. Pair with the computer\'s pairing QR (QR or code) instead.',
   'pair.linkPrefilled': 'Address and code filled in from the QR. Check them, then tap Pair, and approve the request on your computer.',
+  'pair.otpDetected': 'That was the 8-digit code — check it and tap Pair.',
+  'pair.error.badPayload': 'That is not a pairing code. Scan the QR on your computer, paste its long pairing string, or use the 8-digit code tab.',
   'pair.error.otpNative': 'On a phone, use the QR code or the long pairing string instead of the 8-digit code: a code carries no certificate for the phone to verify the computer against. Tap “QR or code” above.',
   'pair.error.noHostId': 'This computer did not identify itself, so this phone cannot remember it. Show a new code on your computer and try again.',
   'pair.error.hostConflict': 'This phone already has a different computer saved under that identity, so the pairing was refused. Forget that computer first if it really was replaced.',
   'pair.error.notReady': 'Pairing is not ready yet. Wait a moment, then tap pair again.',
   'pair.error.unavailable': 'Could not reach that computer. Check you are on the same network and the gateway is running.',
+  'pair.error.pairingVersion': 'This pairing code uses a format this app cannot read. Make sure DSH Orbit and DSH on your computer are up to date, then show a new code.',
   'pair.error.appUpdate': 'Your computer needs a newer DSH Orbit. Update the app.',
   'pair.error.hostUpdate': 'Your computer runs an older protocol. Update DSH on the desktop.',
   'pair.error.generic': 'Pairing failed. Show a new code and try again.',
@@ -695,12 +764,17 @@ const en = {
   'session.attachFile': 'File',
   'session.attachUnavailable': 'File attachments are not enabled for this device',
   'session.attachTooLarge': 'This file is too large for this computer.',
+  'session.attachTooMany': 'Choose at most 6 images at a time.',
   'session.attachProgress': 'Uploading {name}… {percent}%',
   'session.attachCancel': 'Cancel upload',
   'session.attachFailed': 'The upload failed. Try again.',
+  'session.attachReadFailed': 'The file could not be read. Try picking it again.',
   'session.attachReceipt': 'Attached: {name}',
   'session.attachNoFile': 'No file was selected.',
   'session.attachBusy': 'Wait for the current upload to finish before sending.',
+  'session.sending': 'Sending…',
+  'session.processing': 'Processing…',
+  'session.processingElapsed': 'Processing… {elapsed}',
   'session.goal': 'Goal',
   'session.goalPhase': '{phase}',
   'session.tasksTitle': 'Tasks',
@@ -726,7 +800,10 @@ const en = {
   'banner.offline': 'Offline — showing the last known state.',
   'banner.gatewayOff': 'Remote control is off on your computer. Auto-reconnect is paused.',
   'banner.revoked': 'This device was removed from the computer. Pair again to continue.',
-  'banner.reauth': 'The computer asks to re-authenticate. Reconnecting…',
+  'banner.reauth': 'The computer refused this device. It will not reconnect on its own — pair this device again.',
+  'banner.connectFailed': 'The saved connection could not be reached. Check the computer and try again.',
+  'banner.retry': 'Retry',
+  'banner.pairAgain': 'Pair again',
   'compat.incompatible':
     "This app and the computer's gateway are incompatible (app v{app}, gateway v{gateway}). Update the older one.",
   'compat.newer': "The computer's gateway is newer than this app; some features may not appear here. ({caps})",
@@ -744,6 +821,8 @@ const en = {
   'update.details': 'Protocol version {version}',
   'update.retry': 'Retry',
   'update.pairAnother': 'Pair a different computer',
+  'update.legacyWebLockTitle': 'Update DSH on your computer',
+  'update.legacyWebLockBody': 'This browser build no longer uses the passkey lock, but the computer still enforces it. Update DSH on the computer, then tap Retry.',
   'notice.notification.title': 'DSH needs your decision',
   'notice.notification.body': (params) => `A ${String(params.tool ?? 'tool')} call is waiting.`,
   'common.ok': 'OK',
@@ -801,6 +880,19 @@ const vi = {
   'unlock.passkeyApproval': 'Đã có passkey. Hãy nhờ chủ máy duyệt thay thế trên máy tính rồi tạo lại.',
   'unlock.passkeyUnsupported': 'Trình duyệt này không dùng được passkey. Mở trang bằng trình duyệt mới qua https.',
   'unlock.passkeyHostVersion': 'Máy tính chưa hỗ trợ mở khoá bằng passkey. Hãy cập nhật rồi thử lại.',
+  'unlock.lockUnconfirmed':
+    'Máy tính chưa xác nhận đã khoá. Giờ mở khoá 24 giờ có thể vẫn còn hiệu lực, nên tải lại hoặc kết nối lại có thể mở khoá thiết bị này.',
+  'unlock.preparing': 'Đang chuẩn bị yêu cầu passkey…',
+  'unlock.unlocking': 'Đang mở khoá…',
+  'unlock.passkeyTimeout': 'Xác minh passkey mất quá lâu. Nhấn Mở khoá để thử lại.',
+  'unlock.passkeyDismissed': 'Hộp passkey đã bị huỷ hoặc hết hạn. Nhấn Mở khoá để thử lại.',
+  'unlock.credentialRejected':
+    'Máy tính đã từ chối thiết bị này (có thể đã bị thu hồi). Hãy quên máy này và ghép đôi lại.',
+  'unlock.forgetRepair': 'Quên máy này và ghép đôi lại',
+  'unlock.forgetRepairConfirm':
+    'Thao tác này chỉ xoá thông tin ghép đôi của thiết bị này trên trình duyệt hiện tại. Passkey trên thiết bị không bị xoá; máy tính vẫn giữ hoặc thu hồi thiết bị này theo quyền của máy tính. Tiếp tục?',
+  'unlock.unreachable':
+    'Không kết nối được tới máy tính. Nếu thiết bị đã bị thu hồi, hãy quên máy này và ghép đôi lại.',
   'startup.failed': 'Ứng dụng chưa khởi động xong nên chưa thể ghép đôi.',
   'startup.retry': 'Thử lại',
   'startup.starting': 'Đang khởi động…',
@@ -893,8 +985,16 @@ const vi = {
   'sessions.refresh': 'Làm mới',
   'pair.title': 'Ghép đôi máy tính',
   'pair.scan': 'Hướng camera vào mã QR trên máy tính',
+  'pair.scanTimeout': 'Không đọc được mã QR; dùng ô nhập tay',
+  'pair.scanRetry': 'Quét lại',
   'pair.cameraPermission': 'Cần quyền camera để quét mã QR ghép đôi.',
   'pair.cameraPermissionButton': 'Cho phép camera',
+  'pair.imagePicker': 'Chọn ảnh QR',
+  'pair.imageBusy': 'Đang đọc mã QR trong ảnh…',
+  'pair.imageNoQr': 'Không tìm thấy mã QR trong ảnh đó.',
+  'pair.imageMultiple': 'Ảnh đó có nhiều hơn một mã QR; hãy chọn ảnh chỉ có một mã.',
+  'pair.imagePermission': 'Cần quyền truy cập ảnh để chọn mã QR.',
+  'pair.imageError': 'Không đọc được mã QR trong ảnh; thử ảnh khác hoặc dán mã.',
   'pair.manual': 'Hoặc dán mã hiển thị trên máy tính',
   'pair.manualPlaceholder': 'Dán mã ghép đôi',
   'pair.webAddress': 'Trình duyệt này kết nối tới máy tính qua {url}',
@@ -925,11 +1025,14 @@ const vi = {
   'pair.error.pinMismatch': 'Máy tính này không khớp với mã. Không có dữ liệu nào được gửi. Nếu chứng chỉ vừa đổi, hãy ghép đôi lại bằng mã mới.',
   'pair.error.otpLinkNative': 'Mã QR này là liên kết mã ghép đôi cho ứng dụng web. Ứng dụng điện thoại không ghép đôi bằng mã 8 số: mã này không mang chứng chỉ để điện thoại xác minh máy tính. Hãy dùng mã QR ghép đôi của máy tính (QR hoặc mã chuỗi).',
   'pair.linkPrefilled': 'Đã điền sẵn địa chỉ và mã từ QR. Kiểm tra lại rồi nhấn Ghép đôi, và phê duyệt yêu cầu trên máy tính.',
+  'pair.otpDetected': 'Đó là mã 8 số — kiểm tra rồi bấm Ghép đôi.',
+  'pair.error.badPayload': 'Đây không phải mã ghép đôi. Hãy quét QR trên máy tính, dán chuỗi ghép đôi dài, hoặc dùng tab Mã 8 số.',
   'pair.error.otpNative': 'Trên điện thoại, hãy dùng mã QR hoặc chuỗi ghép đôi dài thay cho mã 8 số: mã này không mang chứng chỉ để điện thoại xác minh máy tính. Nhấn “Mã QR hoặc mã chuỗi” ở trên.',
   'pair.error.noHostId': 'Máy tính này không cho biết danh tính nên điện thoại không thể ghi nhớ. Hãy hiển thị mã mới trên máy tính và thử lại.',
   'pair.error.hostConflict': 'Điện thoại đã lưu một máy tính khác dưới cùng danh tính đó, nên lần ghép đôi này bị từ chối. Nếu máy tính thật sự đã được thay, hãy xoá máy tính cũ trước.',
   'pair.error.notReady': 'Ứng dụng vẫn đang khởi động. Hãy đợi một chút rồi nhấn ghép đôi lại.',
   'pair.error.unavailable': 'Không kết nối được máy tính. Kiểm tra cùng mạng và gateway đang chạy.',
+  'pair.error.pairingVersion': 'Mã ghép đôi này dùng định dạng ứng dụng không đọc được. Hãy đảm bảo DSH Orbit và DSH trên máy tính đều đã cập nhật, rồi hiển thị mã mới.',
   'pair.error.appUpdate': 'Máy tính cần bản DSH Orbit mới hơn. Hãy cập nhật ứng dụng.',
   'pair.error.hostUpdate': 'Máy tính dùng giao thức cũ hơn. Hãy cập nhật DSH trên máy tính.',
   'pair.error.generic': 'Ghép đôi thất bại. Hãy hiển thị mã mới và thử lại.',
@@ -1058,12 +1161,17 @@ const vi = {
   'session.attachFile': 'Tệp',
   'session.attachUnavailable': 'Thiết bị này không được phép đính kèm tệp',
   'session.attachTooLarge': 'Tệp này quá lớn đối với máy tính này.',
+  'session.attachTooMany': 'Chọn tối đa 6 hình ảnh một lần.',
   'session.attachProgress': 'Đang tải {name}… {percent}%',
   'session.attachCancel': 'Huỷ tải lên',
   'session.attachFailed': 'Tải lên thất bại. Hãy thử lại.',
+  'session.attachReadFailed': 'Không đọc được tệp. Hãy chọn lại tệp.',
   'session.attachReceipt': 'Đã đính kèm: {name}',
   'session.attachNoFile': 'Chưa chọn tệp nào.',
   'session.attachBusy': 'Đợi tải lên hiện tại xong rồi mới gửi.',
+  'session.sending': 'Đang gửi…',
+  'session.processing': 'Đang xử lý…',
+  'session.processingElapsed': 'Đang xử lý… {elapsed}',
   'session.goal': 'Mục tiêu',
   'session.goalPhase': '{phase}',
   'session.tasksTitle': 'Việc cần làm',
@@ -1089,7 +1197,10 @@ const vi = {
   'banner.offline': 'Ngoại tuyến — đang hiển thị trạng thái gần nhất.',
   'banner.gatewayOff': 'Điều khiển từ xa đang tắt trên máy tính. Tự kết nối lại đã tạm dừng.',
   'banner.revoked': 'Thiết bị này đã bị xoá khỏi máy tính. Hãy ghép đôi lại để tiếp tục.',
-  'banner.reauth': 'Máy tính yêu cầu xác thực lại. Đang kết nối lại…',
+  'banner.reauth': 'Máy tính đã từ chối thiết bị này. Ứng dụng không tự kết nối lại — hãy ghép đôi lại thiết bị.',
+  'banner.connectFailed': 'Không kết nối được với máy tính đã lưu. Hãy kiểm tra máy tính rồi thử lại.',
+  'banner.retry': 'Thử lại',
+  'banner.pairAgain': 'Ghép đôi lại',
   'compat.incompatible':
     'Ứng dụng này và cổng kết nối trên máy tính không tương thích (ứng dụng v{app}, cổng v{gateway}). Hãy cập nhật bên cũ hơn.',
   'compat.newer': 'Cổng kết nối trên máy tính mới hơn ứng dụng; một số tính năng có thể không hiển thị ở đây. ({caps})',
@@ -1107,6 +1218,8 @@ const vi = {
   'update.details': 'Phiên bản giao thức {version}',
   'update.retry': 'Thử lại',
   'update.pairAnother': 'Ghép đôi máy tính khác',
+  'update.legacyWebLockTitle': 'Cập nhật DSH trên máy tính',
+  'update.legacyWebLockBody': 'Trình duyệt này không dùng khoá passkey nữa, nhưng máy tính vẫn đang áp khoá cũ. Hãy cập nhật DSH trên máy tính rồi nhấn Thử lại.',
   'notice.notification.title': 'DSH cần bạn quyết định',
   'notice.notification.body': (params) => `Lời gọi ${String(params.tool ?? 'công cụ')} đang chờ.`,
   'common.ok': 'OK',
@@ -1187,23 +1300,32 @@ export type PairErrorKind =
   // The stored host list was not loaded yet, so the identity check could not run.
   | 'notReady'
   | 'unavailable'
+  // `qr/unsupported-version` only: `version` was any value this app does not read, so which side is
+  // behind is unknown and neither "update the app" nor "update the desktop" is true.
+  | 'pairingVersion'
   | 'appUpdate'
   | 'hostUpdate'
+  // The pasted text is not a pairing string at all (a typo, a bare address, something else copied
+  // from the computer): its own copy, because "show a new code" is not what that user needs.
+  | 'badPayload'
   | 'generic';
 
 export function pairErrorFromQr(reason: QrRejectReason): PairErrorKind {
   switch (reason) {
     case 'qr/expired':
       return 'expired';
-    case 'qr/invalid-json':
+    // Any value but the version this app reads — older, newer, missing, or not a number — so the
+    // copy names both sides; `appUpdate` stays on the contract's own `client/update-app-required`.
     case 'qr/unsupported-version':
+      return 'pairingVersion';
+    case 'qr/invalid-json':
     case 'qr/bad-endpoint':
     case 'qr/bad-gateway-id':
     case 'qr/bad-host-name':
     case 'qr/bad-cert-sha256':
     case 'qr/bad-pairing-code':
     case 'qr/bad-expires-at':
-      return 'generic';
+      return 'badPayload';
   }
 }
 

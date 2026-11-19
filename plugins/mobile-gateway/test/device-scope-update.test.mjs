@@ -51,7 +51,8 @@ test('S2: unknown scope, wrong-kind scope, web:unlock and a bad body are all 400
     [{ remove: ['not:a:scope'] }, desktop, 'unknown-scope'],
     [{ add: ['harness:remote'] }, mobile, 'scope-not-for-kind'],
     [{ add: [WEB_UNLOCK_SCOPE] }, desktop, 'scope-not-updatable'],
-    [{ remove: [WEB_UNLOCK_SCOPE] }, desktop, 'scope-not-updatable'],
+    // Spec 021 rev 15: a desktop may DROP it (the repair), never add it — see the matrix below.
+    [{ remove: [WEB_UNLOCK_SCOPE] }, mobile, 'scope-not-updatable'],
     [{}, desktop, 'bad-request'],
     [{ add: 'sessions:read' }, desktop, 'bad-request'],
     [{ add: [42] }, desktop, 'bad-request'],
@@ -72,8 +73,22 @@ test('S2: unknown scope, wrong-kind scope, web:unlock and a bad body are all 400
   )
   for (const scope of DESKTOP_ONLY_SCOPES) assert.equal(scopesForKind('mobile').includes(scope), false, scope)
   for (const scope of CONTRACT_SCOPES) {
-    if (scope !== WEB_UNLOCK_SCOPE) assert.ok(scopesForKind('desktop').includes(scope), `${scope} must stay settable on a desktop`)
+    const settable = scope !== WEB_UNLOCK_SCOPE
+    assert.equal(scopesForKind('desktop').includes(scope), settable, `${scope} settable on a desktop: ${settable}`)
   }
+  // Spec 021 rev 15, the repair matrix for `web:unlock` itself:
+  //   desktop + remove -> ACCEPTED (the only way an owner can shed it without re-pairing)
+  //   desktop + add    -> refused above;  mobile + either direction -> refused above.
+  const repair = planScopeUpdate({
+    body: { remove: [WEB_UNLOCK_SCOPE] },
+    device: { kind: 'desktop', scopes: ['sessions:read', WEB_UNLOCK_SCOPE] },
+  })
+  assert.deepEqual(repair.removed, [WEB_UNLOCK_SCOPE], 'a desktop can shed the scope it can never use')
+  assert.deepEqual(repair.scopes, ['sessions:read'])
+  // A desktop without it has nothing to remove, and the request stays a no-op rather than an error.
+  assert.equal(planScopeUpdate({ body: { remove: [WEB_UNLOCK_SCOPE] }, device: desktop }).scopesChanged, false)
+  // And the scope still belongs to the web/mobile kind: a mobile record may hold it.
+  assert.equal(scopesForKind('mobile').includes(WEB_UNLOCK_SCOPE), true)
 })
 
 // ------------------------------------------------------------ registry persistence
@@ -265,7 +280,9 @@ test('S5: bad scope requests are 400 and leave the record alone', async (t) => {
   for (const [body, label] of [
     [{ add: ['not:a:scope'] }, 'unknown scope'],
     [{ add: [WEB_UNLOCK_SCOPE] }, 'web:unlock cannot be added'],
-    [{ remove: [WEB_UNLOCK_SCOPE] }, 'web:unlock cannot be removed'],
+    // Spec 021 rev 15: a desktop may remove it (S2 covers that repair), but a bad ADD from a
+    // kind that cannot hold it, and any change from a mobile record, stay 400.
+    [{ add: [WEB_UNLOCK_SCOPE], remove: ['sessions:read'] }, 'a mixed body still cannot add web:unlock'],
     [{}, 'nothing named'],
   ]) {
     const answer = await instance.post(route, body)

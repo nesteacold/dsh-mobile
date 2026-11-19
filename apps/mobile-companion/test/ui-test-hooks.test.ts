@@ -85,18 +85,25 @@ describe('pair screen hooks', () => {
     // and an unsupported host gets its own guidance box instead of the code form.
     assert.equal(count(ids, 'pair-otp-origin'), 1);
     assert.equal(count(ids, 'pair-web-unsupported'), 1);
+    // An 8-digit code pasted into "QR or code" lands on the code tab; this is the line that says so.
+    assert.equal(count(ids, 'pair-otp-detected'), 1);
     // Spec 032 amendment: the DEMO-ONLY diagnosis line (`code · stage=…`). Static and rendered once;
     // the panel gates it on `controller.demoMode`, so a shipped screen renders no such element.
     assert.equal(count(ids, 'pair-failure-detail'), 1);
     assert.deepEqual(ids.toSorted(), [
       'pair-failure-detail',
+      'pair-image-picker',
       'pair-manual-input',
       'pair-mode-code',
       'pair-mode-otp',
       'pair-otp-address',
+      'pair-otp-detected',
       'pair-otp-input',
       'pair-otp-origin',
       'pair-otp-submit',
+      // Spec 043: the bounded-window scan-failure hint and its retry action.
+      'pair-scan-retry',
+      'pair-scan-timeout',
       'pair-submit',
       'pair-web-unsupported',
     ]);

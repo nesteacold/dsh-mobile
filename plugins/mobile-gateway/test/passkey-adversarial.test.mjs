@@ -216,6 +216,10 @@ async function factory(t, config = {}) {
     requireHostApproval: false,
     allowedOrigins: [origin],
     ...config,
+  }, {
+    // Spec 045: this legacy suite exercises the native lock path; it sends a browser-style
+    // Origin to reach a passkey site, so it opts into the pre-045 lock wiring via a sealed seam.
+    testWebUnlockLegacyBrowserLock: true,
   })
   const sockets = []
   t.after(async () => {
@@ -473,14 +477,20 @@ test('WL-4 a replayed challenge is refused once it has been used (single use, bo
 // (3) The lock covers every family, including the ones dispatched before the scope gate
 // ===========================================================================
 
-test('WL-5 a locked desktop device cannot reach the bridge, the upload or the browser family around the gate', async (t) => {
+test('WL-5 a locked web device cannot reach the bridge, the upload or the browser family around the gate', async (t) => {
   const instance = await factory(t)
-  // A desktop holding web:unlock TOGETHER with the bridge, upload and browser scopes, so each of
-  // those families would otherwise be authorized: only the LOCK stands between it and the Host.
+  // Spec 021 rev 15: `web:unlock` is a WEB scope — a desktop may no longer hold it (holding it
+  // locked every desktop frame for good: measured 2026-11-14), so the device here is a `mobile`
+  // (the PWA's kind), which is also the only kind that can be locked at all. `harness:remote` is
+  // desktop-only, so the bridge probes below are answered by the LOCK gate (which runs first),
+  // never by the scope gate — that ordering is the invariant this case exists for, alongside the
+  // upload and browser families, whose scopes a `mobile` may hold.
   const web = await pairDevice(instance, 'wl-families-01', {
-    kind: 'desktop',
-    scopes: [...WEB_SCOPES, 'harness:remote', 'attachments:write', 'browser:control'],
+    kind: 'mobile',
+    scopes: [...WEB_SCOPES, 'attachments:write', 'browser:control'],
   })
+  assert.deepEqual(web.device.scopes, [...WEB_SCOPES, 'attachments:write', 'browser:control'])
+  assert.equal(web.hello.webLock, 'unregistered', 'a web device is armed locked')
   const since = instance.hostCalls.length
   const probes = [
     { type: 'remote-call', endpoint: 'session/list', args: {} },

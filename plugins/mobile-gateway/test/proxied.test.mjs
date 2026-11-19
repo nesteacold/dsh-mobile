@@ -528,7 +528,7 @@ function upgradeStatus(url, protocols, options = {}) {
         const listed = (await response.json()).pending.find((entry) => entry.id === proxied.requestId)
         assert.ok(listed !== undefined, 'the proxied request reached the pending list')
         assert.equal(listed.clientIp, '', 'a proxied request never reports the proxy as the client')
-        assert.equal(listed.name, '未命名设备', 'the rest of the record is unchanged')
+        assert.equal(listed.name, '', 'the rest of the record is unchanged: a client that reported no name is stored as "", never a placeholder')
         assert.equal(typeof listed.verificationCode, 'string', 'the owner still gets a code to compare')
       } finally {
         await closeSocket(proxied.ws, 'proxied OTP socket')
