@@ -31,12 +31,13 @@ describe('spec 050: formatProcessingElapsed', () => {
 });
 
 describe('spec 050: elapsed hook, label and animation composition', () => {
-  it('starts on processing and resets on phase null / sending / session switch', () => {
-    assert.match(SCREEN, /phase !== 'processing'[\s\S]{0,120}processingStart\.current = null/);
-    assert.match(SCREEN, /processingStart\.current\?\.sessionId !== sessionId/);
+  it('uses the controller clock (not a screen ref) and ticks from the observed start', () => {
+    assert.match(SCREEN, /controller\.processingSince\(sessionId, phase\)/);
+    assert.equal(SCREEN.includes('processingStart'), false, 'no screen-local start that a remount would lose');
     assert.match(SCREEN, /Date\.now\(\) - since/);
     assert.match(SCREEN, /setInterval\(tick, 1_000\)/);
     assert.match(SCREEN, /return \(\) => clearInterval\(timer\)/);
+    assert.match(SCREEN, /\[controller, phase, sessionId\]/);
   });
 
   it('shows the localized label with the elapsed value and keeps the same a11y hook', () => {
@@ -50,11 +51,14 @@ describe('spec 050: elapsed hook, label and animation composition', () => {
     }
   });
 
-  it('pulses only while processing, respects reduced motion, and uses fixed web chrome', () => {
+  it('breathes only a small dot while processing, respects reduced motion, and uses fixed web chrome', () => {
     assert.match(SCREEN, /Animated\.loop\(Animated\.sequence\(\[/);
     assert.match(SCREEN, /phase !== 'processing' \|\| reduceMotion/);
     assert.match(SCREEN, /AccessibilityInfo\.isReduceMotionEnabled/);
     assert.match(SCREEN, /opacity: phase === 'processing' && !reduceMotion \? pulse : 1/);
+    // The animated value is applied to the dot only; the label pill itself is a plain View.
+    assert.match(SCREEN, /\{\/\* Only this dot breathes; the label stays steady/);
+    assert.match(SCREEN, /toValue: 0\.7, duration: 900/);
     assert.match(SCREEN, /backgroundColor: isWeb \? chrome\.surface : colors\.surface/);
     assert.match(SCREEN, /color: isWeb \? chrome\.textMuted : colors\.textMuted/);
     assert.match(SCREEN, /<Animated\.View/);

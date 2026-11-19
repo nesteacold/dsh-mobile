@@ -20,10 +20,13 @@
 import { AppState, Platform, type AppStateStatus } from 'react-native';
 
 import { decideCompat, type CompatDecision } from './core/compat';
+import type { QuestionAnswer, QuestionCardState } from './core/questions';
+import { ProcessingClock } from './ui/processing-clock';
 
 import {
   ApprovalCards,
   CompanionClient,
+  QuestionCards,
   CoreError,
   DebugLog,
   DEFAULT_PAIR_APPROVAL_TIMEOUT_MS,
@@ -87,6 +90,7 @@ import {
   type PermissionOptionsResult,
 } from './core/permission-lower';
 import { PERMISSION_LOWER_CAPABILITY } from '@dsh-ext/mobile-protocol';
+import type { QuestionRequestedFrame, QuestionResolvedFrame } from '@dsh-ext/mobile-protocol';
 import { hasScheduleReadScope, readScheduleCatalog, readScheduleList, readScheduleView, type ScheduleCatalog, type ScheduleList, type ScheduleViewResult } from './core/schedules';
 import { hasStatsReadScope, readSessionStats, type SessionStatsRead } from './core/stats';
 import {
@@ -167,6 +171,9 @@ export interface ApprovalCardView {
   /** True when the card arrived as a `replay` of the subscribe backlog. */
   replay: boolean;
 }
+
+/** One human question card as the session screen renders it. */
+export interface QuestionCardView extends QuestionCardState {}
 
 /**
  * Spec 011 — the wire code a host returns when this device does not hold `sessions:author`. It is
@@ -412,6 +419,8 @@ export interface AppStateSnapshot {
   /** Approval cards of the open session (empty when none is open). */
   openSessionId: string | null;
   openApprovals: ApprovalCardView[];
+  /** Human question cards of the open session (spec 018). */
+  openQuestions: QuestionCardView[];
   history: HistoryMessage[];
   /** True once the opening page (even an empty one) has been answered, so the screen never flashes “No message yet” before it arrives. */
   historyLoaded: boolean;
@@ -788,6 +797,9 @@ export class AppController {
   };
   private readonly sessions = new SessionsStore();
   private readonly approvals = new ApprovalCards();
+  private readonly questions = new QuestionCards();
+  /** Per-session observed processing start; survives a screen remount, resets on turn end. */
+  private readonly processingClock = new ProcessingClock();
   private readonly history = new HistoryStore();
   /**
    * The persisted per-install id (`src/platform/install-id.ts`), cached synchronously for the
@@ -999,6 +1011,7 @@ export class AppController {
   private panelsSessionId: string | null = null;
   private panelsPanel: SessionPanel = EMPTY_SESSION_PANEL;
   private openApprovals: ApprovalCardView[] = [];
+  private openQuestions: QuestionCardView[] = [];
   private banner: BannerKind = 'none';
   private loading = true;
   private remoteControlOff = false;
@@ -2287,6 +2300,7 @@ export class AppController {
     this.panelsSessionId = null;
     this.panelsPanel = EMPTY_SESSION_PANEL;
     this.openApprovals = [];
+    this.openQuestions = [];
     this.historyLoaded = false;
     this.historyLoad = { loading: false, error: null };
     this.bump();
@@ -2743,6 +2757,10 @@ export class AppController {
     // Spec 037 §6: the cache and any in-flight ceremony belong to THIS socket. A socket change,
     // lock, revoke, re-pair or app background tears them down here; a late result is a no-op.
     this.passkeySteps.invalidate();
+    // Question cards belong to this socket; a reconnect gets its own backlog push.
+    this.questions.clear();
+    this.processingClock.clear();
+    this.openQuestions = [];
     // Projections belong to the connection that projected them: the next one sends its own baseline
     // (right after `hello`), so nothing from the old socket is folded into a new session list.
     this.forgetPanels();
@@ -3046,6 +3064,12 @@ export class AppController {
     });
     client.on('approvalResolved', (frame) => {
       if (current()) this.onApprovalResolved(frame);
+    });
+    client.on('questionRequested', (frame) => {
+      if (current()) this.onQuestionRequested(frame);
+    });
+    client.on('questionResolved', (frame) => {
+      if (current()) this.onQuestionResolved(frame);
     });
     client.on('event', (frame) => {
       if (!current()) return;
@@ -3456,6 +3480,18 @@ export class AppController {
     this.bump();
   }
 
+  private onQuestionRequested(frame: QuestionRequestedFrame): void {
+    this.questions.upsert(frame);
+    this.syncOpenQuestions();
+    this.bump();
+  }
+
+  private onQuestionResolved(frame: QuestionResolvedFrame): void {
+    this.questions.applyResolved(frame);
+    this.syncOpenQuestions();
+    this.bump();
+  }
+
   private onEvent(frame: Record<string, unknown>): void {
     const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId : null;
     const payload = frame.event as Record<string, unknown> | undefined;
@@ -3773,6 +3809,36 @@ export class AppController {
         replay: this.replayedRpcIds.has(state.rpcId),
       };
     });
+  }
+
+  /** Project the human question cards of the open session into the screen's view. */
+  private syncOpenQuestions(): void {
+    const sessionId = this.openSessionId;
+    this.openQuestions = sessionId === null ? [] : this.questions.forSession(sessionId).map((card) => card.snapshot);
+  }
+
+  /**
+   * Answer or skip one human question. A refusal receipt keeps the card visible with a notice;
+   * only a `question-resolved` push or an accepted answer settles it (spec 018 item 4).
+   */
+  async decideQuestion(rpcId: string, answers: QuestionAnswer[] = [], cancel = false): Promise<void> {
+    const sessionId = this.openSessionId;
+    const client = this.client;
+    if (sessionId === null || client === null || client.state !== 'ready') return;
+    const card = this.questions.get(sessionId, rpcId);
+    if (card === undefined) return;
+    await card.decide(answers, (type, params) =>
+      client.request(type as never, params, { allowNonOpType: true }), cancel);
+    this.syncOpenQuestions();
+    this.bump();
+  }
+
+  /**
+   * Spec 050: the timestamp when this client FIRST observed the current processing phase for a
+   * session. Navigation does not restart it; a non-processing phase does. Never a Host start time.
+   */
+  processingSince(sessionId: string, phase: 'sending' | 'processing' | null): number | null {
+    return this.processingClock.observe(sessionId, phase);
   }
 
   /** rpcIds seen with `replay: true` (subscribe backlog) — shown as "waiting" instead of new. */
@@ -4291,6 +4357,7 @@ export class AppController {
       needsDecision,
       openSessionId: this.openSessionId,
       openApprovals: this.openApprovals,
+      openQuestions: this.openQuestions,
       history: this.history.items,
       historyLoaded: this.historyLoaded,
       historyHasMore: this.history.page.hasMore,

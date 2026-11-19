@@ -63,7 +63,8 @@ import {
   X,
 } from 'lucide-react-native';
 
-import type { ApprovalCardView } from '../../src/app-state';
+import type { ApprovalCardView, QuestionCardView } from '../../src/app-state';
+import type { QuestionAnswer } from '../../src/core/questions';
 import { ATTACHMENTS_WRITE_SCOPE, admitClientUploadSize } from '../../src/core';
 import { isSubagentSession } from '../../src/core/sessions';
 import { isCurrentUpload, ownsUpload, shouldClearReceipt, type UploadIdentity } from '../../src/ui/conversation/upload-lifecycle';
@@ -554,25 +555,20 @@ export default function SessionScreen() {
     outgoing: snapshot.outgoing,
     running: session?.state === 'running',
   });
-  // Spec 050: elapsed time starts when THIS screen first observes processing for THIS session.
-  // Every reset (null, sending, session switch, ack/failure/turn end, reload) drops the start.
-  const processingStart = useRef<{ sessionId: string; since: number } | null>(null);
+  // Spec 050: the start belongs to the CONTROLLER, so leaving and reopening this session while
+  // the same turn is still processing does not restart the clock. A non-processing phase ends it.
   const [elapsedMs, setElapsedMs] = useState(0);
   useEffect(() => {
-    if (phase !== 'processing') {
-      processingStart.current = null;
+    const since = controller.processingSince(sessionId, phase);
+    if (since === null) {
       setElapsedMs(0);
       return;
     }
-    if (processingStart.current?.sessionId !== sessionId) {
-      processingStart.current = { sessionId, since: Date.now() };
-    }
-    const since = processingStart.current.since;
     const tick = () => setElapsedMs(Date.now() - since);
     tick();
     const timer = setInterval(tick, 1_000);
     return () => clearInterval(timer);
-  }, [phase, sessionId]);
+  }, [controller, phase, sessionId]);
 
   // Subtle liveness pulse only while processing; a static label remains when motion is reduced.
   const [reduceMotion, setReduceMotion] = useState(false);
@@ -590,8 +586,8 @@ export default function SessionScreen() {
       return;
     }
     const loop = Animated.loop(Animated.sequence([
-      Animated.timing(pulse, { toValue: 0.55, duration: 500, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
-      Animated.timing(pulse, { toValue: 1, duration: 500, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+      Animated.timing(pulse, { toValue: 0.7, duration: 900, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+      Animated.timing(pulse, { toValue: 1, duration: 900, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
     ]));
     loop.start();
     return () => loop.stop();
@@ -1096,10 +1092,13 @@ export default function SessionScreen() {
           <ChevronLeft size={24} color={chrome.text} accessibilityLabel={tr('common.back')} />
         </TouchableOpacity>
 
+        {/* Three zones like upstream ConversationTopBar: navigation | flexible title | actions.
+            The actions are flexShrink:0 so a long title/subline can never overlap a button. */}
         <View style={[styles.headerTitles, { marginHorizontal: space.sm }]}>
           <Text
             style={[type.subheading, { color: chrome.text }]}
             numberOfLines={1}
+            ellipsizeMode="tail"
             accessibilityRole="header"
             testID="session-title"
           >
@@ -1138,14 +1137,14 @@ export default function SessionScreen() {
             {/* Spec 019: the preset the Host projects for this session. Hidden — not drawn
                 disabled — without the `permission-lower` capability or without a projection. */}
             {permissionChip === null ? null : (
-              <>
-                <Text style={[type.captionSmall, { color: chrome.textFaint }]}>·</Text>
+              <View style={styles.headerChip} testID="session-permission-chip">
                 <PermissionChip preset={permissionChip.preset} hint={permissionChip.label} onPress={() => setPermissionSheetOpen(true)} />
-              </>
+              </View>
             )}
           </View>
         </View>
 
+        <View style={styles.headerActions}>
         {/* Spec 041 FR-3: a small context-usage ring beside "more". The value comes from the
             scoped `session-stats` read; with no reading it stays a neutral track, and a tap opens
             the stats sheet (which states the honest "unavailable" reason when the scope is absent). */}
@@ -1224,6 +1223,7 @@ export default function SessionScreen() {
         >
           <Ellipsis size={22} color={colors.text} accessibilityLabel={tr('session.more')} />
         </TouchableOpacity>
+        </View>
       </View>
 
       {/* Spec 018 item 5: the session's goal and checklist, pinned directly under the header and
@@ -1387,6 +1387,16 @@ export default function SessionScreen() {
           />
         ))}
 
+        {snapshot.openQuestions.map((card) => (
+          <QuestionCardView
+            key={`${card.sessionId}:${card.rpcId}`}
+            card={card}
+            tr={tr}
+            onSubmit={(answers) => void controller.decideQuestion(card.rpcId, answers)}
+            onSkip={() => void controller.decideQuestion(card.rpcId, [], true)}
+          />
+        ))}
+
         {snapshot.history.length === 0 ? (
           <View style={[styles.centerArea, { padding: space.xxxl }]}>
             {shouldShowNoMessage({
@@ -1504,7 +1514,7 @@ export default function SessionScreen() {
           </View>
         ) : null}
         {phaseLabel === null ? null : (
-          <Animated.View
+          <View
             accessible
             accessibilityRole="text"
             accessibilityLabel={phaseLabel}
@@ -1512,6 +1522,9 @@ export default function SessionScreen() {
             testID="session-progress-indicator"
             style={{
               alignSelf: 'flex-start',
+              flexDirection: 'row',
+              alignItems: 'center',
+              gap: space.xs,
               // Spec 050: fixed web chrome pair stays readable over the dark header/composer.
               backgroundColor: isWeb ? chrome.surface : colors.surface,
               borderColor: isWeb ? chrome.border : colors.border,
@@ -1521,11 +1534,18 @@ export default function SessionScreen() {
               marginBottom: space.xxs,
               paddingHorizontal: space.sm,
               paddingVertical: space.xxs,
-              opacity: phase === 'processing' && !reduceMotion ? pulse : 1,
             }}
           >
+            {/* Only this dot breathes; the label stays steady so the elapsed seconds never flicker. */}
+            <Animated.View style={{
+              width: 6,
+              height: 6,
+              borderRadius: radius.circle,
+              backgroundColor: colors.accent,
+              opacity: phase === 'processing' && !reduceMotion ? pulse : 1,
+            }} />
             <Text style={[type.captionSmall, { color: isWeb ? chrome.textMuted : colors.textMuted }]}>{phaseLabel}</Text>
-          </Animated.View>
+          </View>
         )}
         <GlassSurface
           style={[
@@ -2119,6 +2139,132 @@ function PromptSendState(props: { message: HistoryMessage }) {
   );
 }
 
+function QuestionCardView(props: {
+  card: QuestionCardView;
+  tr: Interpolate;
+  onSubmit: (answers: QuestionAnswer[]) => void;
+  onSkip: () => void;
+}) {
+  const { card, tr, onSubmit, onSkip } = props;
+  const { colors, type, space, radius } = useTheme();
+  const [selected, setSelected] = useState<Record<string, string[]>>({});
+  const [custom, setCustom] = useState('');
+  const busy = card.status === 'answering';
+  const decidable = card.status === 'pending';
+  const questions = card.questions;
+  const toggle = (id: string, label: string, multi: boolean) => {
+    setSelected((before) => {
+      const current = before[id] ?? [];
+      const next = current.includes(label) ? current.filter((item) => item !== label)
+        : (multi ? [...current, label] : [label]);
+      return { ...before, [id]: next };
+    });
+  };
+  const submit = () => {
+    const answers: QuestionAnswer[] = questions.map((question) => {
+      const id = String(question.id ?? '');
+      const labels = selected[id] ?? [];
+      return { id, selected: labels, ...(custom.trim() === '' ? {} : { custom: custom.trim() }) };
+    });
+    onSubmit(answers);
+  };
+  return (
+    <View
+      style={[
+        styles.card,
+        {
+          backgroundColor: colors.surfaceRaised,
+          borderColor: colors.accent,
+          borderWidth: StyleSheet.hairlineWidth,
+          borderRadius: radius.lg,
+          padding: space.lg,
+          gap: space.sm,
+          ...elevation(colors, 'card'),
+        },
+      ]}
+      testID={`question-card-${card.rpcId}`}
+    >
+      <Text style={[type.subheading, { color: colors.text }]}>{tr('question.title')}</Text>
+      {questions.map((question) => {
+        const id = String(question.id ?? '');
+        const header = typeof question.header === 'string' ? question.header : id;
+        const options = Array.isArray(question.options) ? question.options : [];
+        const multi = question.multiSelect === true;
+        return (
+          <View key={id} style={{ gap: space.xs }}>
+            <Text style={[type.bodySmall, { color: colors.text }]}>{tr('question.header', { header })}</Text>
+            {options.map((option, optionIndex) => {
+              const label = typeof (option as Record<string, unknown>)?.label === 'string'
+                ? String((option as Record<string, unknown>).label) : '';
+              if (label === '') return null;
+              const on = (selected[id] ?? []).includes(label);
+              return (
+                <TouchableOpacity
+                  key={label}
+                  style={[styles.decision, { borderRadius: radius.sm, minHeight: 44, paddingHorizontal: space.md,
+                    backgroundColor: on ? colors.accent : colors.surface, borderWidth: StyleSheet.hairlineWidth, borderColor: colors.border }]}
+                  disabled={!decidable || busy}
+                  onPress={() => toggle(id, label, multi)}
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: on, disabled: !decidable || busy }}
+                  accessibilityLabel={label}
+                  testID={`question-option-${card.rpcId}-${optionIndex}`}
+                >
+                  <Text style={[type.caption, { color: on ? colors.onAccent : colors.text }]}>{label}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        );
+      })}
+      <TextInput
+        style={[type.bodySmall, { color: colors.text, borderColor: colors.border, borderWidth: StyleSheet.hairlineWidth,
+          borderRadius: radius.sm, paddingHorizontal: space.sm, minHeight: 44 }]}
+        value={custom}
+        onChangeText={setCustom}
+        placeholder={tr('question.custom')}
+        editable={decidable && !busy}
+        accessibilityLabel={tr('question.custom')}
+        testID={`question-custom-${card.rpcId}`}
+      />
+      {card.notice !== undefined ? (
+        <Text style={[type.caption, { color: colors.danger }]} testID={`question-notice-${card.rpcId}`}>{card.notice}</Text>
+      ) : null}
+      {card.status === 'settled' ? (
+        <Text style={[type.caption, { color: colors.success }]}>{tr('question.sent')}</Text>
+      ) : null}
+      {card.status === 'already-decided' ? (
+        <Text style={[type.caption, { color: colors.textMuted }]}>{tr('question.resolved')}</Text>
+      ) : null}
+      {decidable ? (
+        <View style={{ flexDirection: 'row', gap: space.sm }}>
+          <TouchableOpacity
+            style={[styles.decision, { backgroundColor: colors.accent, borderRadius: radius.md, minHeight: 48, paddingHorizontal: space.lg }]}
+            disabled={busy}
+            onPress={submit}
+            accessibilityRole="button"
+            accessibilityLabel={tr('question.submit')}
+            testID={`question-submit-${card.rpcId}`}
+          >
+            <Text style={[type.button, { color: colors.onAccent }]}>{tr('question.submit')}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.decision, { backgroundColor: colors.surface, borderColor: colors.danger, borderWidth: StyleSheet.hairlineWidth,
+              borderRadius: radius.md, minHeight: 48, paddingHorizontal: space.lg }]}
+            disabled={busy}
+            onPress={onSkip}
+            accessibilityRole="button"
+            accessibilityLabel={tr('question.skip')}
+            testID={`question-skip-${card.rpcId}`}
+          >
+            <Text style={[type.button, { color: colors.danger }]}>{tr('question.skip')}</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
 function ApprovalCardView(props: {  card: ApprovalCardView;
   tr: Interpolate;
   focused: boolean;
@@ -2307,8 +2453,10 @@ const styles = StyleSheet.create({
   roundButton: { alignItems: 'center', justifyContent: 'center' },
   messageActions: { flexDirection: 'row', alignItems: 'center' },
   messageAction: { flexDirection: 'row', alignItems: 'center' },
-  headerTitles: { flex: 1 },
-  subline: { flexDirection: 'row', alignItems: 'center' },
+  headerTitles: { flex: 1, minWidth: 0 },
+  headerActions: { flexDirection: 'row', alignItems: 'center', flexShrink: 0 },
+  headerChip: { maxWidth: 132, flexShrink: 1, overflow: 'hidden' },
+  subline: { flexDirection: 'row', alignItems: 'center', minWidth: 0 },
   composerRow: { flexDirection: 'row', alignItems: 'center' },
   scrollBottom: { position: 'absolute', left: 0, right: 0, alignItems: 'flex-end', paddingRight: 16 },
   quote: { borderLeftWidth: 3 },

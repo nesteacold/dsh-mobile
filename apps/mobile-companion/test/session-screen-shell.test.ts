@@ -176,9 +176,30 @@ describe('theme discipline (P1-B2)', () => {
   it('reads every visual value from the theme hook', () => {
     // Screen, message row, approval card, prompt send-state line: each renderer asks the theme for its
     // values (the fourth renderer was added with the "đang gửi…" fix).
-    assert.equal(count(source, 'useTheme()'), 4);
+    assert.equal(count(source, 'useTheme()'), 5, 'the question card is theme-driven too');
     for (const token of ['colors.', 'type.', 'space.', 'radius.']) {
       assert.ok(count(source, token) > 5, `${token} is used throughout instead of raw numbers/colours`);
     }
+  });
+});
+
+describe('narrow header layout (three zones)', () => {
+  it('keeps navigation, flexible title and non-shrinking actions in separate zones', () => {
+    // Upstream ConversationTopBar: navigationIcon | weight(1) title | actions.
+    assert.match(source, /styles\.headerTitles/);
+    assert.match(source, /<View style=\{styles\.headerActions\}>/, 'actions are one zone');
+    assert.equal(count(source, 'headerActions'), 2, 'one wrapper + one style definition');
+    for (const hook of ['session-back', 'session-context-ring', 'session-permission-picker', 'session-more']) {
+      assert.equal(count(source, `testID="${hook}"`), 1, `${hook} is preserved`);
+    }
+  });
+
+  it('constrains title/subline so text cannot overlap the action buttons', () => {
+    assert.match(source, /headerTitles: \{ flex: 1, minWidth: 0 \}/);
+    assert.match(source, /headerActions: \{ flexDirection: 'row', alignItems: 'center', flexShrink: 0 \}/);
+    assert.match(source, /subline: \{ flexDirection: 'row', alignItems: 'center', minWidth: 0 \}/);
+    assert.match(source, /headerChip: \{ maxWidth: 132, flexShrink: 1, overflow: 'hidden' \}/);
+    assert.match(source, /ellipsizeMode="tail"/);
+    assert.match(source, /numberOfLines=\{1\}/);
   });
 });
