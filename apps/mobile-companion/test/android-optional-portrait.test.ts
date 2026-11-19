@@ -1,4 +1,4 @@
-/ Spec 048 — `./plugins/withAndroidOptionalPortrait`.
+// Spec 048 — `./plugins/withAndroidOptionalPortrait`.
 //
 // Expo turns `orientation: "portrait"` into a REQUIRED Android hardware feature, which Play reported
 // as restricting availability. This test drives the plugin's pure helper against Expo's parsed
