@@ -25,7 +25,7 @@ Config (`cordis.patch.yml`): `dataDir` (default `~/.dsh/devices-page`), `allowPu
 
 1. On the host to be controlled: Settings → Devices → turn on **Allow connections**, then choose the target BEFORE generating:
    - **Native iPhone / Android** (default): generates the existing v3 QR/long string (`mode: 'string'`, `kind: 'mobile'`). Scan the QR in the released native app or copy the full string; the expiry countdown and certificate pin travel with it. The native offer never asks for `web:unlock` (that passkey ceremony is web-only), and the Host approval can only narrow it — it cannot re-add the scope. Switching target clears the old QR/string.
-   - **Web / PWA (passkey)**: generates the 8-digit OTP plus a local PWA QR (`mode: 'otp'`, `kind: 'mobile'`), and keeps `web:unlock` so the web client can register/assert its passkey after approval.
+   - **Web / PWA** (legacy selector may still say “passkey”): generates the 8-digit OTP plus a local PWA QR (`mode: 'otp'`, `kind: 'mobile'`). The legacy `web:unlock` scope remains wire-compatible, but spec 045 removes the browser's second passkey gate: after Host approval the updated PWA does not require registration/assertion. Device credentials, scopes and revocation still apply.
    - **Computer (Desktop Remote)**: the original desktop OTP flow (`mode: 'otp'`, `kind: 'desktop'`), never `web:unlock`.
 2. On the controlling host: **Connect to other devices** → address (`192.168.1.20:3081`, from the other host's address chips) + paste the string → **Pair and connect**.
 3. Open the remote host → sessions → history → send a prompt; pending approvals show **Allow once / Reject**.
