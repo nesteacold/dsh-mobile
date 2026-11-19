@@ -4083,6 +4083,29 @@ export class HostRouter {
      * @type {Map<string, {timer: any, statuses: Map<string, boolean>, inFlight: boolean, token: number, abort?: AbortController}>}
      */
     const pendingRefreshes = new Map()
+    /**
+     * Cards whose session row has not been published to the native UI yet. DSH's
+     * question plugin keys a card by `ctx.sessions.scopeOf(owner)` and publishes it
+     * into that session's composer seat; a card that beats `api-session/added`
+     * lands under a session with no binding, so only the transcript's "Ask
+     * question · waiting" row is visible. Hold it until the row exists.
+     * @type {Map<string, object[]>} namespaced session id -> waterfall frames
+     */
+    const pendingCards = new Map()
+    /** Session ids whose `api-session/added` THIS stream already published. */
+    const announcedRows = new Set()
+    const rowKnown = (sessionId) => {
+      for (const rows of this.#retainedRows.values()) {
+        if (rows.some((row) => row?.sessionId === sessionId)) return true
+      }
+      return false
+    }
+    const flushCards = (sessionId) => {
+      const frames = pendingCards.get(sessionId)
+      if (!frames) return
+      pendingCards.delete(sessionId)
+      for (const frame of frames) this.#publishEvent(frame)
+    }
     const watchTokens = new Map()
     const tokenOf = (hostId) => watchTokens.get(hostId) ?? 0
     const bumpToken = (hostId) => { watchTokens.set(hostId, tokenOf(hostId) + 1) }
@@ -4098,6 +4121,7 @@ export class HostRouter {
         && watching.has(host.hostId) && tokenOf(host.hostId) === pending.token
       if (!isCurrent()) return
       let renamed
+      let committed = false
       const abort = new AbortController()
       const abortOnLifetime = () => abort.abort()
       lifetime.signal.addEventListener('abort', abortOnLifetime, { once: true })
@@ -4114,6 +4138,7 @@ export class HostRouter {
           return
         }
         renamed = value.items.map((row) => withoutRemoteCwd(this.#ingress(host.hostId, row, 'session/list row')))
+        committed = true
       } catch (error) {
         if (!isCurrent()) return
         // A refusal or a hostile row leaves the retained list alone: no phantom rows.
@@ -4123,27 +4148,45 @@ export class HostRouter {
         lifetime.signal.removeEventListener('abort', abortOnLifetime)
         if (pending.abort === abort) pending.abort = null
         if (pendingRefreshes.get(host.hostId) === pending) pendingRefreshes.delete(host.hostId)
+        if (!committed) {
+          // No row will be published: publish a still-held card anyway rather than
+          // lose a decision the user must make. The ordered path below is normal.
+          for (const sessionId of [...pendingCards.keys()]) {
+            if (sessionId.startsWith(`${HOST_PREFIX}${host.hostId}:`)) flushCards(sessionId)
+          }
+        }
       }
       // Check once more immediately before the commit: a reconnect can land while
       // the call resolves. No await follows, so this one guard covers the retained
       // update, added, removed and replayed status together.
       if (!isCurrent()) return
+      committed = true
       const before = new Set((this.#retainedRows.get(host.hostId) ?? [])
         .map((row) => row?.sessionId).filter((id) => typeof id === 'string'))
       const after = new Set(renamed.map((row) => row?.sessionId).filter((id) => typeof id === 'string'))
       this.#rememberRows(host.hostId, renamed)
       for (const row of renamed) {
-        if (before.has(row.sessionId)) continue
+        // A row already announced on this stream has a live binding. Re-adding it
+        // would rebuild that binding and dispose the composer shell, dropping an
+        // in-progress draft and its attachments (spec 048).
+        if (before.has(row.sessionId) || announcedRows.has(row.sessionId)) continue
+        announcedRows.add(row.sessionId)
         // The status was already published when the row did not exist; the native
-        // UI ignored it. Publish added first, then repeat the last known status
-        // so the running dot survives the row's arrival.
+        // UI ignored it. Publish added first, then the status, then any cards that
+        // were waiting for this row: the question card needs its session seat.
         this.#publishEvent({ type: 'emit', event: SESSION_ADDED_EVENT, args: [row] })
         if (pending.statuses.has(row.sessionId)) {
           this.#publishEvent({ type: 'emit', event: SESSION_STATUS_EVENT, args: [row.sessionId, pending.statuses.get(row.sessionId)] })
         }
+        flushCards(row.sessionId)
       }
       for (const id of before) {
         if (!after.has(id)) this.#publishEvent({ type: 'emit', event: SESSION_REMOVED_EVENT, args: [id] })
+      }
+      // Cards for a session the list did not name (e.g. a subagent) still have to
+      // reach the user; no `added` frame will follow, so publish them now.
+      for (const sessionId of [...pendingCards.keys()]) {
+        if (sessionId.startsWith(`${HOST_PREFIX}${host.hostId}:`)) flushCards(sessionId)
       }
     }
     const scheduleRefresh = (host, sessionId, running) => {
@@ -4173,7 +4216,18 @@ export class HostRouter {
       bumpToken(host.hostId)
       const onCard = (frame) => {
         const injected = this.#injectCard(host, frame)
-        if (injected) this.#publishEvent(injected)
+        if (!injected) return
+        if (rowKnown(injected.agentId)) {
+          this.#publishEvent(injected)
+          return
+        }
+        // No row yet: DSH would register the card under a session with no binding,
+        // so the composer never shows it. Ask for the real list row (the same
+        // coalesced refresh statuses use) and publish the card after `added`.
+        const held = pendingCards.get(injected.agentId)
+        if (held) held.push(injected)
+        else pendingCards.set(injected.agentId, [injected])
+        scheduleRefresh(host, injected.agentId, true)
       }
       const onResolved = (frame) => {
         for (const card of [...this.#cards.values()]) {
@@ -4267,6 +4321,10 @@ export class HostRouter {
           cancelRefresh(hostId)
           bumpToken(hostId)
           this.#withdrawHost(hostId)
+          const prefix = `${HOST_PREFIX}${hostId}:`
+          for (const sessionId of [...pendingCards.keys()]) {
+            if (sessionId.startsWith(prefix)) pendingCards.delete(sessionId)
+          }
           watching.get(hostId)?.()
           watching.delete(hostId)
         }
@@ -4281,6 +4339,8 @@ export class HostRouter {
       for (const source of watched) source.removeEventListener?.('abort', onAbort)
       unsubscribe?.()
       this.#eventSinks.delete(sink)
+      pendingCards.clear()
+      announcedRows.clear()
       for (const hostId of [...pendingRefreshes.keys()]) cancelRefresh(hostId)
       for (const hostId of watching.keys()) bumpToken(hostId)
       for (const detach of watching.values()) detach()

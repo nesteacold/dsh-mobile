@@ -123,6 +123,16 @@ function createHarness({ remotes = [], pending = () => [], dispatchRpc } = {}) {
       .map((remote) => ({ hostId: remote.hostId, hostName: remote.hostName, connection: remote.connection, online: true })),
     onHostsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener) },
     approvals: { pending: (hostId) => pending(hostId) },
+    // The cards in this suite belong to a session the controller already listed.
+    // Hydration makes that row known, so a card is published on arrival; the
+    // deferred-until-row path has its own test in host-router.test.mjs.
+    retention: {
+      list: () => remotes.map((remote) => ({ hostId: remote.hostId, sessions: [{
+        sessionId: namespaceId(remote.hostId, 's1'), updatedAt: 1, running: false, blank: false,
+        projections: { kind: 'sequenced', asOfSeq: 1, values: {} },
+      }] })),
+      setSessions() {}, setWorkspace() {}, removeHost() {},
+    },
     log: (line) => logs.push(line),
   })
   router.install()

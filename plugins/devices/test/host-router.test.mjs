@@ -1098,6 +1098,74 @@ test('an in-flight refresh resolved after disconnect+reconnect is stale and comm
   }
 })
 
+test('a question card waits for its session row, then keeps the exact waterfall frame', async () => {
+  // DSH's question plugin publishes a card into the session's composer seat. A card
+  // that beats `api-session/added` is filed under a session with no binding, so the
+  // remote window shows only the transcript's "Ask question · waiting" row.
+  const row = session('s1', 100)
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/list': { items: [row] } } })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  const { control, iterator } = await openEventsStream(harness)
+  const questions = [{ id: 'q1', header: 'Pick one', options: [{ label: 'a' }] }]
+  try {
+    pushed.emit('question', {
+      kind: 'question-requested', rpcId: 'q-1', sessionId: 's1', callId: 'call-1', questions,
+    })
+    const added = await nextFrame(iterator, 'row before card')
+    assert.equal(added.value.event, 'api-session/added', 'the row is published first')
+    assert.equal(added.value.args[0].sessionId, 'h:hostB:s1')
+    let card
+    for (;;) {
+      const next = await nextFrame(iterator, 'deferred card')
+      if (next.value?.type === 'waterfall') { card = next; break }
+    }
+    assert.equal(card.value.type, 'waterfall')
+    assert.deepEqual(Object.keys(card.value).sort(), ['agentId', 'event', 'eventId', 'request', 'type'],
+      'exactly the five keys the rc.1 client validator accepts')
+    assert.deepEqual(card.value, {
+      type: 'waterfall', event: 'user-questions/request', eventId: 'h:hostB:q-1', agentId: 'h:hostB:s1',
+      request: { questions, wait: { callId: 'call-1' } },
+    })
+    assert.equal(hostB.calls.filter((call) => call.endpoint === 'session/list').length, 1,
+      'one coalesced list refresh produced the row')
+    await iterator.return()
+  } finally {
+    harness.router.uninstall()
+    control.abort()
+  }
+})
+
+test('a known session is never re-added, even when a card and status arrive later', async () => {
+  // Re-publishing `api-session/added` for a bound session rebuilds its input shell
+  // and releases draft attachments. The row identity stays stable on every path.
+  const row = session('s1', 100)
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/list': { items: [row] } } })
+  const pushed = attachPusher(hostB)
+  const harness = createHarness({ remotes: [hostB] })
+  await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+  const before = listCalls(hostB).length
+  const { control, iterator } = await openEventsStream(harness)
+  const emitted = []
+  const pump = (async () => {
+    for await (const frame of iterator) {
+      if (typeof frame?.event === 'string' && frame.event.startsWith('api-session/')) emitted.push(frame)
+    }
+  })()
+  try {
+    pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 's1', running: true })
+    pushed.emit('question', { kind: 'question-requested', rpcId: 'q-2', sessionId: 's1', callId: 'call-2', questions: [] })
+    await new Promise((resolve) => setTimeout(resolve, 450))
+    assert.deepEqual(emitted.filter((frame) => frame.event === 'api-session/added'), [],
+      'no duplicate added frame for the already-known row')
+    assert.equal(listCalls(hostB).length, before, 'no extra list refresh for a known row')
+    harness.router.uninstall()
+  } finally {
+    control.abort()
+    await pump
+  }
+})
+
 test('malformed refresh rows are ignored whole: no events and no retained update', async () => {
   const badRows = [
     ['an empty object', {}],
