@@ -331,7 +331,8 @@ describe('pair screen source — the seam decides every submit', () => {
 
   it('takes only the code from a pairing link, never its address', () => {
     assert.match(source, /setOtpCode\(link\.otp\)/);
-    assert.equal(/link\.address/.test(source), false, 'the link address is never adopted');
+    // Spec 054: a native phone adopts `a`/`p`; a browser's applyPairLink keeps its native guard.
+    assert.match(source, /if \(Platform\.OS !== 'web'\) \{\s*setOtpAddress\(link\.address\);/);
     // The typed-address helper is native-only now: the browser never reaches it (the OTP connect
     // uses the seam's url), and the supported-page branch renders no such field.
     assert.equal(source.includes('const url = otpGatewayUrl('), false, 'the browser never dials a typed address');

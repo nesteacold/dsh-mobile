@@ -4,12 +4,13 @@
 //  - the address a phone can actually reach (`advertisedPairAddress`): when the gateway listener is
 //    loopback-only behind `tailscale serve`, the listener's own `127.0.0.1:30081`/`<host>:30081` is
 //    unreachable from another device; the served HTTPS origin (`<dnsName>:30443`) is;
-//  - the QR payload (`pairQrPayload`): `https://<pwa-origin>/pair#a=<address>&c=<otp>`. The code
-//    rides in the FRAGMENT, never the query: a fragment is not sent in the HTTP request, so it never
-//    reaches a server log or a Referer header. With no known PWA origin the QR holds plain text;
+//  - the QR payload (`pairQrPayload`): `https://<pwa-origin>/pair#a=<address>&c=<otp>&p=<pin>`. The
+//    code and pin ride in the FRAGMENT, never the query: a fragment is not sent in the HTTP request,
+//    so neither reaches a server log or a Referer header. With no known PWA origin the QR holds
+//    plain text;
 //  - an SVG rendering (`qrSvg`) from a vendored MIT encoder (lib/vendor/qrcode), fully local.
 //
-// Nothing here logs; the OTP only passes through `pairQrPayload`/`qrSvg` into the HTTP reply.
+// Nothing here logs; the OTP and pin only pass through `pairQrPayload`/`qrSvg` into the HTTP reply.
 
 import { createRequire } from 'node:module'
 import { execFile } from 'node:child_process'
@@ -76,18 +77,24 @@ export function advertisedPairAddress({ advertisedAddress, pwaOrigin, lanHost } 
 }
 
 /**
- * QR text. With a PWA origin: `https://<origin>/pair#a=<address>&c=<otp>`; without one: the plain
- * `address` and code on two lines (a camera shows it as text; nothing is opened).
- * @param {{pwaOrigin: string|null, address: string|null, otp: string}} input
+ * QR text. With a PWA origin: `https://<origin>/pair#a=<address>&c=<otp>&p=<pin>`; without one: the
+ * plain `address` and code on two lines (a camera shows it as text; nothing is opened).
+ * Spec 054: a native app needs `p` to pin the TLS leaf before it spends a proof; an omitted or
+ * malformed pin leaves it out, so a web link (which cannot pin) never carries a bogus fingerprint.
+ * @param {{pwaOrigin: string|null, address: string|null, otp: string, pin?: string}} input
  */
-export function pairQrPayload({ pwaOrigin, address, otp }) {
+export function pairQrPayload({ pwaOrigin, address, otp, pin }) {
   const code = String(otp ?? '').replace(/\D/g, '')
   if (!/^\d{8}$/.test(code)) throw new TypeError('otp must be 8 digits')
   const addr = typeof address === 'string' ? address.trim() : ''
+  const fingerprint = typeof pin === 'string' && /^[0-9a-f]{64}$/.test(pin.trim().toLowerCase())
+    ? pin.trim().toLowerCase()
+    : null
   if (pwaOrigin) {
     const params = new URLSearchParams()
     if (addr) params.set('a', addr)
     params.set('c', code)
+    if (fingerprint) params.set('p', fingerprint)
     return `${pwaOrigin}/pair#${params.toString()}`
   }
   return addr ? `${addr}\n${code}` : code

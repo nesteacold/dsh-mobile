@@ -1088,7 +1088,11 @@ export const plugin = {
           const pwaOrigin = resolvePwaOrigin({ pwaUrl: options.pwaUrl, dnsName })
           const address = advertisedPairAddress({ advertisedAddress: options.advertisedAddress, pwaOrigin, lanHost: body?.lanHost })
             ?? (typeof body?.fallbackAddress === 'string' && body.fallbackAddress ? body.fallbackAddress : null)
-          const payload = pairQrPayload({ pwaOrigin, address, otp })
+          // Spec 054: the pin travels from the offer to the native link's fragment. It is never in
+          // the query, the reply's URL text or a log: only the SVG payload carries it.
+          const pin = typeof body?.pin === 'string' && /^[0-9a-f]{64}$/i.test(body.pin.trim())
+            ? body.pin.trim().toLowerCase() : undefined
+          const payload = pairQrPayload({ pwaOrigin, address, otp, pin })
           sendJson(res, 200, { svg: qrSvg(payload), address, link: pwaOrigin !== null, pwaOrigin })
           return
         }

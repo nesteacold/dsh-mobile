@@ -137,7 +137,7 @@ describe('decoded QR still follows the existing submit path', () => {
     assert.equal(link.otp, '04291375');
     assert.equal(link.address, 'attacker.example.com:30081', 'the parser reports what the link said');
     assert.match(PANEL_SOURCE, /setOtpCode\(link\.otp\)/);
-    assert.equal(/link\.address/.test(PANEL_SOURCE), false, 'the address never reaches the app');
+    assert.match(PANEL_SOURCE, /if \(Platform\.OS !== 'web'\) \{\s*setOtpAddress\(link\.address\);/);
   });
 });
 

@@ -196,6 +196,31 @@ test("--worktree sees an untracked file that --all never looks at", () => {
   cleanup(root);
 });
 
+test("--worktree skips git-ignored artifacts that can never be published", () => {
+  const root = repo();
+  writeFileSync(join(root, "tools", "pii-private.txt"), `${PRIVATE_LITERAL}\n`);
+  writeFileSync(join(root, ".gitignore"), "artifacts/\n");
+  mkdirSync(join(root, "artifacts"), { recursive: true });
+  writeFileSync(join(root, "artifacts", "old.log"), "host " + PRIVATE_LITERAL + " was here\n");
+  const r = run(root, ["--worktree"]);
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.out, /scan-pii: clean/);
+  cleanup(root);
+});
+
+test("--worktree scans a force-added tracked file inside a git-ignored directory", () => {
+  const root = repo();
+  writeFileSync(join(root, "tools", "pii-private.txt"), `${PRIVATE_LITERAL}\n`);
+  writeFileSync(join(root, ".gitignore"), "artifacts/\n");
+  mkdirSync(join(root, "artifacts"), { recursive: true });
+  writeFileSync(join(root, "artifacts", "forced.log"), "host " + PRIVATE_LITERAL + " was here\n");
+  execFileSync("git", ["add", "-f", "artifacts/forced.log"], { cwd: root });
+  const r = run(root, ["--worktree"]);
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /artifacts\/forced\.log:1: hostname/);
+  cleanup(root);
+});
+
 test("--worktree skips dependency and build directories and stays inside the repository", () => {
   const root = repo();
   writeFileSync(join(root, "tools", "pii-private.txt"), `${PRIVATE_LITERAL}\n`);

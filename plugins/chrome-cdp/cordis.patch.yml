@@ -1,0 +1,16 @@
+# @dsh-ext/chrome-cdp bundle patch (spec 035).
+# Inserts one loader row. The plugin registers the model-facing `chrome_*` tools and the
+# `/dsh-chrome-cdp/*` routes the sidebar tab's host half talks to. It opens no listener of
+# its own, and it never launches Chrome: the browser has to be started by hand with
+# --remote-debugging-port on a loopback address (R1).
+- insert:
+    - id: chrome-cdp
+      name: '@dsh-ext/chrome-cdp'
+      config:
+        # One endpoint per Host, loopback literal only (R1). Anything else is refused at
+        # activation with a visible reason; the plugin never changes the owner's port.
+        endpoint: 'http://127.0.0.1:40222'
+        # v1 supports `never` only: the plugin never starts Chrome and never creates a profile.
+        launchPolicy: never
+        # Where chrome_screenshot writes. Absolute, empty = <DSH_HOME>/chrome-cdp (R8).
+        dataDir: ''

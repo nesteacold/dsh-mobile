@@ -125,7 +125,7 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     }
     if (route === '/mgw/gateway') { state.status.remoteControl.accepting = body.mode !== 'disabled'; return reply({ gatewayMode: body.mode }) }
     if (route === '/mgw/connection') return reply({ pairingRoute: body.route })
-    if (route === '/mgw/pair' && body.mode === 'otp') return reply({ mode: 'otp', otp: '12345678', pairing: { expiresAt: Date.now() + 590_000, kind: body.kind, scopes: body.scopes }, addresses: ['10.0.0.5:3081'] })
+    if (route === '/mgw/pair' && body.mode === 'otp') return reply({ mode: 'otp', otp: '12345678', certSha256: 'a'.repeat(64), pairing: { expiresAt: Date.now() + 590_000, kind: body.kind, scopes: body.scopes }, addresses: ['10.0.0.5:3081'] })
     if (route === '/mgw/pending') return reply({ pending: state.pending })
     if (/^\/mgw\/pending\/[^/]+\/(approve|reject)$/.test(route)) { state.pending = []; return reply({ approved: true }) }
     if (route === '/devices/pairings' && options.method === 'POST') { state.pairing = { id: 'p-1', state: 'connecting', address: body.address, verificationCode: null, error: null }; return reply({ pairing: state.pairing }, true) }
@@ -1326,39 +1326,23 @@ await check('pairing targets: native string (default), PWA OTP, desktop OTP; sta
   }
   const body = () => ui.calls.filter((call) => call.route === '/mgw/pair').pop().body
 
-  // 1. Native: v3 string/QR, mobile kind, no web:unlock, QR SVG + copyable string + expiry.
+  // 1. Spec 054: native now makes an OTP offer with the native scopes and an INLINE card; no dialog.
   await click(button(page, 'Generate pairing code'))
   const native = body()
   const observed = JSON.stringify(native)
-  assert.equal(native.mode, 'string', `native shape ${observed}`)
+  assert.equal(native.mode, 'otp', `native shape ${observed}`)
   assert.equal(native.kind, 'mobile', `native shape ${observed}`)
   assert.deepEqual([...native.scopes], [...nativeScopesFor()], `native scopes ${observed}`)
   assert.equal(native.scopes.includes('web:unlock'), false, 'native never asks for the web-only unlock')
-  assert.equal(byTestId('native-pairing-qr').length, 1, 'the gateway QR SVG is rendered')
-  assert.equal(byTestId('pairing-string').length, 1, 'the full copyable string is rendered')
+  assert.equal(byTestId('pair-offer').length, 1, 'the offer is an inline card')
+  assert.equal(byTestId('otp-code').length, 1, 'native shows the 8-digit code')
+  assert.equal(byTestId('pair-offer-pin').length, 1, 'the certificate pin is shown for native')
   assert.ok(text(page).includes(DICT.en.expiresIn), 'expiry is shown')
-  assert.equal(byTestId('otp-code').length, 0, 'native is not a bare OTP link')
-  // Decode the controlled payload with the released parser's exact shape rules (no logging).
-  const stringNode = byTestId('pairing-string')[0]
-  const flatten = (value) => Array.isArray(value) ? value.map(flatten).join('')
-    : typeof value === 'string' || typeof value === 'number' ? String(value)
-      : value && value.props ? flatten(value.props.children) : ''
-  const raw = flatten(stringNode.props.children)
-  const decoded = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
-  assert.equal(decoded.version, 3)
-  assert.equal(decoded.certSha256, NATIVE_PIN)
-  assert.match(decoded.certSha256, /^[0-9a-f]{64}$/, '64-lower-hex pin')
-  assert.match(decoded.pairingCode, /^[A-Za-z0-9_-]{43}$/, 'canonical 256-bit base64url code')
-  assert.match(decoded.gatewayId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
-  assert.ok(decoded.publicUrl.startsWith('wss://') && decoded.endpoints.every((url) => url.startsWith('wss://')))
-  assert.ok(decoded.expiresAt > Date.now() && decoded.expiresAt - Date.now() <= 300_000, 'fresh but inside the parser TTL')
-  assert.equal('web:unlock' in decoded, false, 'the QR payload is a v3 pairing string, never a PWA link')
-  assert.equal(nativeParserAccepts(raw), true, 'the released native parser accepts this QR')
+  assert.equal(byTestId('dshdev-dialog').length, 0, 'no dialog/backdrop')
 
   // 2. Switching target clears the stale native offer; PWA keeps OTP + web:unlock.
   await pick('pwa')
-  assert.equal(byTestId('pairing-string').length, 0, 'stale native string cleared')
-  assert.equal(byTestId('native-pairing-qr').length, 0, 'stale native QR cleared')
+  assert.equal(byTestId('pair-offer').length, 0, 'stale native offer cleared')
   await click(button(page, 'Generate pairing code'))
   const pwa = body()
   assert.equal(pwa.mode, 'otp')
@@ -1383,7 +1367,7 @@ await check('pairing targets: native string (default), PWA OTP, desktop OTP; sta
   page.unmount()
 })
 
-await check('OTP dialog: X only closes the dialog — the waiting request stays on the Host', async () => {
+await check('Inline offer: X only closes the card — the waiting request stays on the Host', async () => {
   const ui = load({ status: ONLINE })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
@@ -1394,7 +1378,7 @@ await check('OTP dialog: X only closes the dialog — the waiting request stays 
   await click(button(page, 'Generate pairing code'))
   await flush()
   assert.ok(find(page, (node) => node.props['data-testid'] === 'otp-code').length, 'the dialog is open')
-  assert.match(text(page), /Closing this dialog keeps the code/, 'the copy explains X is harmless')
+  assert.match(text(page), /code/, 'the card explains X is harmless')
   const before = ui.calls.length
   const close = find(page, (node) => node.props['aria-label'] === ui.api.testing.DICT.en.otpClose)[0]
   assert.ok(close, 'the close button exists')

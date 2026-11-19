@@ -66,6 +66,13 @@ const DYNAMIC_HOOKS = new Map<string, string>([
   ['approval-state-${card.approvalId}', 'a host approval id'],
   ['approval-approve-${card.approvalId}', 'a host approval id'],
   ['approval-reject-${card.approvalId}', 'a host approval id'],
+  // Spec 018 item 4: question cards keyed by the Host's rpcId, never by question text.
+  ['question-card-${card.rpcId}', 'a host question rpcId'],
+  ['question-option-${card.rpcId}-${optionIndex}', 'a host question rpcId and option index'],
+  ['question-custom-${card.rpcId}', 'a host question rpcId'],
+  ['question-notice-${card.rpcId}', 'a host question rpcId'],
+  ['question-submit-${card.rpcId}', 'a host question rpcId'],
+  ['question-skip-${card.rpcId}', 'a host question rpcId'],
   // Spec 018 item 3: one row per scheduled task, keyed by the task's own id (never a title).
   ['schedules-row-${row.id}', 'a host scheduled-task id'],
 ]);
@@ -100,6 +107,7 @@ describe('pair screen hooks', () => {
       'pair-otp-detected',
       'pair-otp-input',
       'pair-otp-origin',
+      'pair-otp-pin',
       'pair-otp-submit',
       // Spec 043: the bounded-window scan-failure hint and its retry action.
       'pair-scan-retry',
@@ -219,12 +227,14 @@ describe('pair screen: the one-time-code form on a phone', () => {
       source.slice(codeHandlerStart),
       RegExp("if \\(decision\\.kind !== 'otp'\\) \\{[\\s\\S]*?return;[\\s\\S]*?\\n" + '    }'.replace('}', '\\}')),
     );
-    assert.ok(source.slice(codeHandlerStart).includes("const { url, origin } = decision;"), 'the code handler dials the seam URL');
+    assert.ok(source.slice(codeHandlerStart).includes('url = decision.url'), 'the web code handler dials the seam URL');
+    assert.ok(source.slice(codeHandlerStart).includes('planNativeOtpSubmit(otpAddress, otpPin)'), 'the native handler validates address+pin');
     // The connect uses the seam's own `url`/`origin` — never `otpGatewayUrl(otpAddress)` — and it
     // comes after the `blocked` guard above, so a refused code never opens a socket.
     // The connect hands the controller the seam's own `url` (labelled with its `origin` as the name
     // shown while connecting) — never `otpGatewayUrl(otpAddress)`, the typed native field.
-    assert.ok(source.slice(codeHandlerStart).includes("controller.pair('', { otp: { otp: normalized.otp, url, gatewayName: origin } })"));
+    assert.ok(source.slice(codeHandlerStart).includes("controller.pair('', { otp: {"));
+    assert.ok(source.slice(codeHandlerStart).includes('certSha256: pin'));
     // And the seam itself: a supported page gets the code flow, a phone does not.
     assert.equal(planPairSubmit(planOtpAddress({ protocol: 'https:', host: 'host.example.ts.net:8443' }), true, false).kind, 'otp');
     assert.deepEqual(planPairSubmit(planOtpAddress(null), true, false), { kind: 'blocked', reason: 'otpNative' });

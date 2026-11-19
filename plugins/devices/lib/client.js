@@ -144,7 +144,7 @@ window.__ModuleLoader__.load({
         // Spec 050: three explicit targets. Native is the default: the released iOS/Android app
         // reads the v3 QR/long string and cannot perform the PWA passkey ceremony.
         otpKindNative: 'Native iPhone / Android',
-        otpKindNativeHint: 'The native mobile app scans this QR or copies the long string. It pins the Host certificate and never uses the web passkey; the web unlock scope is not granted.',
+        otpKindNativeHint: 'The native app scans this QR and pins the Host certificate shown below. It never uses the web passkey; the web unlock scope is not granted.',
         otpKindMobile: 'Web / PWA (passkey)',
         otpKindMobileHint: 'The web client registers a passkey right after you approve, which is what unlocks its session. Includes "Unlock the web client".',
         otpKindPwa: 'Web / PWA (passkey)',
@@ -249,7 +249,8 @@ window.__ModuleLoader__.load({
         planErrDisabled: 'Allow connections (and LAN access) must be on before the listen address can move.',
         otpTitle: 'Pairing code',
         otpHelp: 'Type this code on the other device together with this address. It works once, for 10 minutes, and you will still have to approve the request here.',
-        otpCloseHelp: 'Closing this dialog keeps the code and any waiting request on the Host.',
+        otpCloseHelp: 'Closing this card keeps the code and any waiting request on the Host.',
+        pairOfferPin: 'Certificate pin (native):',
         otpNew: 'Generate pairing code',
         otpClose: 'Close',
         otpQrAlt: 'Pairing QR code',
@@ -504,7 +505,7 @@ window.__ModuleLoader__.load({
         enableFirst: 'Hãy bật "Cho phép kết nối" trước.',
         otpKindLabel: 'Lần ghép đôi này dành cho',
         otpKindNative: 'iPhone / Android chính chủ',
-        otpKindNativeHint: 'Ứng dụng di động chính chủ quét mã QR hoặc sao chép chuỗi dài. Ứng dụng ghim chứng chỉ Host và không dùng passkey web; quyền mở khóa web không được cấp.',
+        otpKindNativeHint: 'Ứng dụng chính chủ quét mã QR này và ghim chứng chỉ Host hiển thị bên dưới. Ứng dụng không dùng passkey web; quyền mở khóa web không được cấp.',
         otpKindMobile: 'Web / PWA (passkey)',
         otpKindMobileHint: 'Web đăng ký passkey ngay sau khi bạn duyệt — đó là bước mở khóa phiên. Có kèm quyền "Mở khóa web".',
         otpKindPwa: 'PWA trên web (passkey)',
@@ -597,7 +598,8 @@ window.__ModuleLoader__.load({
         planErrDisabled: 'Cần bật Cho phép kết nối (và quyền truy cập LAN) trước khi đổi địa chỉ lắng nghe.',
         otpTitle: 'Mã ghép đôi',
         otpHelp: 'Nhập mã này trên thiết bị kia cùng với địa chỉ này. Chỉ dùng một lần, trong 10 phút, và bạn vẫn phải phê duyệt yêu cầu tại đây.',
-        otpCloseHelp: 'Đóng hộp này không huỷ mã hay yêu cầu đang chờ trên máy tính.',
+        otpCloseHelp: 'Đóng thẻ này không huỷ mã hay yêu cầu đang chờ trên máy tính.',
+        pairOfferPin: 'Ghim chứng chỉ (bản chính chủ):',
         otpNew: 'Tạo mã ghép đôi',
         otpClose: 'Đóng',
         otpQrAlt: 'Mã QR ghép đôi',
@@ -1203,18 +1205,24 @@ window.__ModuleLoader__.load({
     }
     const groupOtp = (otp) => String(otp || '').replace(/^(\d{4})(\d{4})$/, '$1 $2')
 
-    // Window 1: the one-time code, its countdown and the addresses to type.
+    // Spec 054: the generated pairing offer is an INLINE card on the Devices screen, not a dialog.
+    // The one-time code, its countdown, copy, QR and addresses are the same facts as before; for a
+    // native target the QR fragment also carries the certificate pin (`p=`) so the app can pin TLS.
     // The QR (lib/pair-qr.mjs, rendered locally on this Host) encodes
-    // https://<pwa>/pair#a=<address>&c=<code>: the fragment never reaches a server.
+    // https://<pwa>/pair#a=<address>&c=<code>&p=<pin>: the fragment never reaches a server.
     // `qr.address` is the address a phone can reach (behind `tailscale serve` the
     // listener's own loopback port is not), so it replaces the listener's list.
-    function OtpDialog({ offer, addresses, lanHost, onQr, onClose }) {
+    function PairOffer({ offer, addresses, lanHost, onQr, onClose, native = false }) {
       useLang()
       const [qr, setQr] = React.useState(null)
       // The × button is a display-only close: the code and any waiting request stay on the Host.
       React.useEffect(() => {
         let live = true
-        post('/devices/pair-qr', { otp: String(offer.otp), lanHost: lanHost || '', fallbackAddress: addresses[0] || '' })
+        post('/devices/pair-qr', { otp: String(offer.otp), lanHost: lanHost || '', fallbackAddress: addresses[0] || '',
+          // Spec 054: the native app pins this certificate before it spends the proof. Only a
+          // 64-hex pin is sent; the web card has no pin field and sends none.
+          ...(native && typeof offer.certSha256 === 'string' && /^[0-9a-f]{64}$/i.test(offer.certSha256)
+            ? { pin: offer.certSha256 } : {}) })
           .then((reply) => {
             if (!live || !reply) return
             if (typeof reply.svg === 'string') setQr(reply)
@@ -1227,7 +1235,10 @@ window.__ModuleLoader__.load({
         return () => { live = false }
       }, [offer.otp])
       const shown = qr && qr.address ? [qr.address] : addresses
-      return h(Dialog, { title: tr('otpTitle'), onClose },
+      return h('div', { className: 'dshdev-card', 'data-testid': 'pair-offer' },
+        h('div', { className: 'dshdev-row' },
+          h('h3', { className: 'dshdev-grow' }, tr('otpTitle')),
+          onClose ? h('button', { type: 'button', className: 'dshdev-btn', 'aria-label': tr('otpClose'), onClick: onClose }, '×') : null),
         qr ? h('div', { 'data-testid': 'otp-qr', style: { display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: 8 } },
           h('img', { alt: tr('otpQrAlt'), width: 200, height: 200, src: 'data:image/svg+xml;utf8,' + encodeURIComponent(qr.svg) }),
           h('div', { className: 'dshdev-muted' }, tr(qr.link ? 'otpQrHelp' : 'otpQrTextHelp'))) : null,
@@ -1235,7 +1246,12 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dshdev-row', style: { justifyContent: 'center', marginBottom: 8 } },
           h(Countdown, { expiresAt: offer.pairing.expiresAt }),
           h(CopyButton, { text: String(offer.otp) })),
-        h('div', { className: 'dshdev-muted', style: { marginBottom: 10 } }, tr('otpHelp'), h('br'), tr('otpCloseHelp')),
+        native && typeof offer.certSha256 === 'string' && /^[0-9a-f]{64}$/i.test(offer.certSha256)
+          ? h('div', { className: 'dshdev-row', style: { marginBottom: 8 }, 'data-testid': 'pair-offer-pin' },
+            h('span', { className: 'dshdev-muted' }, tr('pairOfferPin')),
+            h('code', { className: 'dshdev-pin', title: String(offer.certSha256) }, shortenHash(offer.certSha256)),
+            h(CopyButton, { text: String(offer.certSha256) })) : null,
+        h('div', { className: 'dshdev-muted', style: { marginBottom: 10 } }, tr('otpHelp')),
         h('h3', null, tr('address')),
         shown.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('noAddress'))
           : h('div', { className: 'dshdev-row', 'data-testid': 'otp-addresses' }, shown.map((address) =>
@@ -1852,17 +1868,14 @@ window.__ModuleLoader__.load({
         setBusy(true); setError('')
         setPairing(null); setOtpOffer(null)
         try {
-          if (otpTarget === 'native') {
-            // The released native app needs the existing v3 QR/long string with the certificate
-            // pin. `mode: 'string'` is the gateway's existing path; only the scopes differ from
-            // the PWA offer: no `web:unlock` (that passkey ceremony is web-only).
-            setPairing(await post('/mgw/pair', { mode: 'string', kind: 'mobile', scopes: nativeScopesFor() }))
-            return
-          }
-          const kind = otpTarget === 'pwa' ? 'mobile' : 'desktop'
+          // Spec 054: all three targets make an OTP offer on this same screen. For native the
+          // kind is `mobile` with the native scope set (no web:unlock); the QR carries the pin.
+          // A native re-pair/edit still uses the long string (see `generate` below).
+          const kind = otpTarget === 'desktop' ? 'desktop' : 'mobile'
           // The OTP offer asks for every scope its KIND can hold so the Host user can choose at
           // Approve (which defaults to Standard). PWA keeps `web:unlock`; desktop never gets it.
-          setOtpOffer(await post('/mgw/pair', { mode: 'otp', kind, scopes: gatewayScopesFor(kind) }))
+          setOtpOffer(await post('/mgw/pair', { mode: 'otp', kind,
+            scopes: otpTarget === 'native' ? nativeScopesFor() : gatewayScopesFor(kind) }))
         } catch (cause) { setError(cause.message) } finally { setBusy(false) }
       }
 
@@ -1940,7 +1953,7 @@ window.__ModuleLoader__.load({
               h('span', null, tr(entry.labelKey))))),
           h('div', { className: 'dshdev-muted' }, tr((OTP_KINDS.find((entry) => entry.kind === otpTarget) || OTP_KINDS[0]).hintKey)),
           !on ? h('div', { className: 'dshdev-muted' }, tr('enableFirst')) : null),
-        otpOffer ? h(OtpDialog, { offer: otpOffer, addresses, lanHost: status && status.lan ? status.lan.host : '',
+        otpOffer ? h(PairOffer, { offer: otpOffer, addresses, lanHost: status && status.lan ? status.lan.host : '', native: otpTarget === 'native',
           // Spec 029: the QR route's answer is the Host's own served origin, kept in the
           // background so closing the dialog does not forget the route this machine
           // is reachable through (the plan states it as a fact, never as a target).
@@ -4538,7 +4551,7 @@ window.__ModuleLoader__.load({
 
     exports.apply = apply
     exports.inject = inject
-    exports.testing = { DevicesPage, AllowTab, ConnectTab, AddressEditor, RemoteDetail, AddDeviceForm, AddDeviceDialog, OtpDialog, PendingRequests, ScopePicker, AdvancedLimits, ALL_SCOPES, SCOPE_PRESETS, RISKY_SCOPES, request, tr, DICT, setHostLanguage,
+    exports.testing = { DevicesPage, AllowTab, ConnectTab, AddressEditor, RemoteDetail, AddDeviceForm, AddDeviceDialog, OtpDialog: PairOffer, PairOffer, PendingRequests, ScopePicker, AdvancedLimits, ALL_SCOPES, SCOPE_PRESETS, RISKY_SCOPES, request, tr, DICT, setHostLanguage,
       // The flow strip's honesty rule, exported so the test can prove all three
       // states without depending on CSS.
       FlowStrip, flowState, connectedCount, localName,

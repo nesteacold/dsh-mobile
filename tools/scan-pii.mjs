@@ -205,6 +205,10 @@ function scanText(allow, privateRows, file, bytes, out) {
 // walk out of the repository.
 const WORKTREE_SKIP = new Set([".git", "node_modules", ".expo", ".expo-shared", "dist", "build", ".wiki-cache", ".dsh-wiki"]);
 const PRIVATE_REL = "tools/pii-private.txt";
+// --worktree exists to catch untracked files that could still be accidentally added, so it
+// must ignore exactly the same paths git ignores — otherwise a git-ignored artifact that can
+// never be published turns a green gate red. `git check-ignore` is authoritative here: it
+// honours .gitignore, .git/info/exclude and the global excludes in one place.
 function walkWorktree(dir, rel, out) {
   let entries;
   try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return out; }
@@ -227,8 +231,28 @@ let files = 0;
 
 if (opts.mode === "worktree") {
   // One blob per file, so a staged-but-older version of a working file cannot mask an edit.
-  for (const f of walkWorktree(root, "", [])) {
-    if (f === PRIVATE_REL) continue;
+  const worktreeFiles = walkWorktree(root, "", []).filter((f) => f !== PRIVATE_REL);
+  const tracked = new Set(git(["ls-files", "-z"]).split("\0").filter(Boolean));
+  const ignored = new Set();
+  for (let i = 0; i < worktreeFiles.length; i += 256) {
+    const batch = worktreeFiles.slice(i, i + 256);
+    // `check-ignore` exits 1 when none of the paths is ignored — normal here.
+    let listed;
+    try {
+      listed = execFileSync("git", ["check-ignore", "--stdin", "-z", "--no-index", "--"], {
+        cwd: root,
+        input: batch.join("\0") + "\0",
+        maxBuffer: 1 << 28,
+        encoding: "utf8",
+      });
+    } catch (error) {
+      if (error.status !== 1) throw error;
+      listed = error.stdout || "";
+    }
+    for (const name of listed.split("\0")) if (name) ignored.add(name);
+  }
+  for (const f of worktreeFiles) {
+    if (ignored.has(f) && !tracked.has(f)) continue;
     let bytes;
     try {
       bytes = readFileSync(join(root, f));

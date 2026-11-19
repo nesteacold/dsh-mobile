@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- DSH Orbit — concept A "Prompt in orbit".
+       Intent: the terminal prompt `>_` is the product; one tilted orbit with one satellite reads as
+       "your agent, circling, reached from the phone". One stroke weight, one satellite, so it holds
+       together at 60 px.
+       Geometry: mark box 288..736 (centre 512, diagonal corners at r=317 — inside the Android
+       adaptive 66% circle r=338 and far inside the iOS corner circle r=493). The orbit is one
+       continuous ellipse passing BEHIND the chevron, with navy gap halos on both sides so the ring
+       visibly goes under; its lower end is hidden behind the `_` bar.
+       Palette (src/ui/theme.ts brand): navy #06172B field, ocean #2E6BE6 orbit, mist #BFD6FF mark. -->
+  <g>
+    <!-- Orbit: rx 322 / ry 156 tilted -30deg, centre 512,620 — the chevron sits on its upper arc,
+         the `_` bar covers its lower end. It is an open ring, not a loop around the prompt: the far
+         side never crosses the mark, so nothing is hidden and nothing shows through. -->
+    <g transform="rotate(-30 512 620)">
+      <ellipse cx="512" cy="620" rx="322" ry="156" stroke="#2E6BE6" stroke-width="34" fill="none"/>
+    </g>
+    <!-- Gap halo: navy stroke ~48px wider than the chevron (gap ~24px) where the ring's upper end
+         tucks under it. -->
+    <path d="M 357 344 L 475 512 L 357 680" stroke="#06172B" stroke-width="140" stroke-linecap="round"
+          stroke-linejoin="round" fill="none"/>
+    <!-- Satellite: plain filled dot riding the orbit, beside the chevron tip. -->
+    <circle cx="742" cy="470" r="47" fill="#BFD6FF"/>
+    <!-- Prompt: 378 wide (37% of the icon), stroke 92 — the only high-contrast element. -->
+    <g fill="none" stroke="#BFD6FF" stroke-linecap="round" stroke-linejoin="round" stroke-width="92">
+      <path d="M 357 344 L 475 512 L 357 680"/>
+      <path d="M 533 682 L 695 682"/>
+    </g>
+  </g>
+</svg>

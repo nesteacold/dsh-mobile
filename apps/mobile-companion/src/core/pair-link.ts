@@ -15,6 +15,8 @@ export interface PairLink {
   address: string;
   /** The normalized 8-digit code. */
   otp: string;
+  /** The Host's certificate fingerprint (64 lowercase hex). Native only; web never adopts it. */
+  pin?: string;
 }
 
 const MAX_ADDRESS = 300;
@@ -36,7 +38,11 @@ export function parsePairHash(hash: string | null | undefined): PairLink | null 
   if (!normalized.ok) return null;
   const address = (params.get('a') ?? '').trim();
   if (address.length > MAX_ADDRESS || /[\s/?#@\\]/.test(address)) return null;
-  return { address, otp: normalized.otp };
+  // Spec 054: `p` is the certificate fingerprint, accepted ONLY as 64 lowercase hex. A malformed
+  // pin invalidates the whole link rather than being silently dropped into TOFU.
+  const pin = params.get('p');
+  if (pin !== null && !/^[0-9a-f]{64}$/.test(pin)) return null;
+  return { address, otp: normalized.otp, ...(pin === null ? {} : { pin }) };
 }
 
 /**

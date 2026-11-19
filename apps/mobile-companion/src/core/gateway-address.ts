@@ -102,6 +102,28 @@ export function planPairSubmit(
 }
 
 /**
+ * Spec 054 — the NATIVE one-time-code submit. The Host's pairing link carries `host:port` in `a`
+ * and its certificate fingerprint in `p`; BOTH are required before any socket is opened. The pin is
+ * never logged: only the wss URL and gateway name reach the controller.
+ */
+export function planNativeOtpSubmit(
+  address: string,
+  pin: string | undefined,
+): { kind: 'otp'; url: string; origin: string; pin: string } | { kind: 'blocked'; reason: 'address-required' | 'pin-required' | 'bad-address' } {
+  const host = typeof address === 'string' ? address.trim() : '';
+  // No scheme/path/query/userinfo/backslash; an OPTIONAL port is the only decoration allowed.
+  if (host === '' || /[\s/?#@\\]/.test(host)) return { kind: 'blocked', reason: 'bad-address' };
+  const hostPart = host.replace(/:\d+$/, '');
+  if (hostPart === '' || /[^A-Za-z0-9.-]/.test(hostPart)) return { kind: 'blocked', reason: 'bad-address' };
+  const port = host.slice(hostPart.length);
+  if (port !== '' && (!/^:\d+$/.test(port) || Number(port.slice(1)) > 65_535 || Number(port.slice(1)) < 1)) {
+    return { kind: 'blocked', reason: 'bad-address' };
+  }
+  if (typeof pin !== 'string' || !/^[0-9a-f]{64}$/.test(pin)) return { kind: 'blocked', reason: 'pin-required' };
+  return { kind: 'otp', url: `wss://${host}${GATEWAY_WS_PATH}`, origin: host, pin };
+}
+
+/**
  * Rewrite a pairing payload so the web build connects through the origin it was served from.
  *
  * `publicUrl` becomes the same-origin address (that is the one the app stores and reconnects to),

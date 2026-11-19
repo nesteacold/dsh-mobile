@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- DSH Orbit — concept B "Pair link".
+       Intent: the product is exactly two devices linked — a computer on the Host side, the phone in
+       your hand — joined by one orbit band (the pairing). The little `>_` inside the phone lives on
+       the phone itself: the phone is the console.
+       Geometry: mark box 148..886 x 380..772 (diagonal r=407, inside the iOS corner circle r=493)
+       and centred optically. Each device is a solid silhouette; the band is the lightest element, so
+       a small size drops the band first and keeps both devices readable. The computer screen and the
+       band are transparent, so one ground colour shows through both.
+       Palette (src/ui/theme.ts brand): navy #06172B field, ocean #2E6BE6 computer,
+       mist #BFD6FF phone + band. -->
+  <g>
+    <!-- Computer: monitor outline on a wide base; the title bar makes it a screen, not a box. -->
+    <rect x="182" y="430" width="328" height="266" rx="38" stroke="#2E6BE6" stroke-width="52" fill="none"/>
+    <path d="M 148 740 L 566 740" stroke="#2E6BE6" stroke-width="52" stroke-linecap="round" fill="none"/>
+    <path d="M 244 482 L 322 482" stroke="#2E6BE6" stroke-width="24" stroke-linecap="round" fill="none"/>
+    <!-- Link band: one closed orbit, threaded between the two devices; its ends are covered below. -->
+    <ellipse cx="512" cy="560" rx="286" ry="136" transform="rotate(-20 512 560)" stroke="#BFD6FF" stroke-width="30" fill="none"/>
+    <!-- Phone: solid body, screen and speaker cut out of it (no stroke weight to lose at 20 px). -->
+    <rect x="614" y="380" width="272" height="392" rx="62" fill="#BFD6FF"/>
+    <rect x="641" y="407" width="218" height="236" rx="24" fill="#06172B"/>
+    <rect x="712" y="682" width="76" height="24" rx="12" fill="#06172B"/>
+    <!-- `>_` on the phone screen: 148 wide, stroke 34. -->
+    <path d="M 676 452 L 722 523 L 676 594" stroke="#BFD6FF" stroke-width="34" stroke-linecap="round"
+          stroke-linejoin="round" fill="none"/>
+    <path d="M 748 597 L 809 597" stroke="#BFD6FF" stroke-width="34" stroke-linecap="round" fill="none"/>
+  </g>
+</svg>

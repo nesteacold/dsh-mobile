@@ -473,7 +473,7 @@ describe('AppController connection lifecycle (M5 / M6)', () => {
         hiddenOlderCount: 0,
         needsDecision: {},
         openSessionId: null,
-        openApprovals: [],
+        openApprovals: [], openQuestions: [],
         history: [],
         historyLoaded: false,
         historyHasMore: false,

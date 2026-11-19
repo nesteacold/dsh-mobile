@@ -21,7 +21,7 @@ import { CameraView, scanFromURLAsync, useCameraPermissions } from 'expo-camera'
 import * as ImagePicker from 'expo-image-picker';
 
 import type { AppController, AppStateSnapshot } from '../app-state';
-import { GATEWAY_WS_PATH, planOtpAddress, planPairSubmit } from '../core/gateway-address';
+import { GATEWAY_WS_PATH, planNativeOtpSubmit, planOtpAddress, planPairSubmit } from '../core/gateway-address';
 import { pairFailureDetail, pairFailureStageFromCode } from '../core/pair-failure';
 import { normalizeOtp, OTP_DIGITS } from '../core/pairing-otp';
 import { readWebLocation } from '../platform/web-location';
@@ -73,6 +73,8 @@ export function PairPanel(props: {
   const [otpDetected, setOtpDetected] = useState(false);
   // Native only: the supported-page branch never renders a typeable address (spec 031 §8).
   const [otpAddress, setOtpAddress] = useState('');
+  /** Spec 054: the certificate fingerprint from the native pairing link (never logged). */
+  const [otpPin, setOtpPin] = useState('');
   const [busy, setBusy] = useState(false);
   const [scanLocked, setScanLocked] = useState(false);
   // Spec 053 review: ONE synchronous acquisition gate for camera, photo and manual submit. State
@@ -139,6 +141,11 @@ export function PairPanel(props: {
     setMode('otp');
     setScanHintTimedOut(false);
     setOtpCode(link.otp);
+    // Spec 054: only a phone uses `a`/`p`; a browser keeps its own-origin route and ignores both.
+    if (Platform.OS !== 'web') {
+      setOtpAddress(link.address);
+      setOtpPin(link.pin ?? '');
+    }
     setOtpDetected(false);
     setFailure(null);
     setPrefilled(true);
@@ -209,8 +216,10 @@ export function PairPanel(props: {
           return;
         }
         const link = parsePairLinkUrl(raw);
-        // Spec 031 §8: one seam decides both flows, before any controller or socket exists.
-        const decision = planPairSubmit(web, Platform.OS === 'web', link !== null);
+        // Spec 054: a native OTP link MUST carry a pin. A bare one is refused by the same seam;
+        // a complete one is prefilled (address + code + pin) and still needs the user's tap.
+        const bareNativeLink = Platform.OS !== 'web' && link !== null && link.pin === undefined;
+        const decision = planPairSubmit(web, Platform.OS === 'web', link !== null && (Platform.OS === 'web' || bareNativeLink));
         if (decision.kind === 'blocked') {
           if (decision.reason === 'otpNative' && link !== null) applyPairLink(link);
           else setFailure(refusalKey(decision));
@@ -329,25 +338,43 @@ export function PairPanel(props: {
         setFailure(normalized.reason === 'otp/empty' ? 'pair.error.otpRequired' : 'pair.error.otpBadLength');
         return;
       }
-      // Spec 031 §8: a page that is not served from the gateway's tailnet HTTPS origin has no verified
-      // route to it, and no typed address is accepted as a fallback. Refuse before any socket exists.
-      const decision = planPairSubmit(web, Platform.OS === 'web', false);
-      if (decision.kind === 'blocked') {
-        setFailure(refusalKey(decision));
-        return;
+      let url: string;
+      let origin: string;
+      let pin: string | undefined;
+      if (Platform.OS === 'web') {
+        // Spec 031 §8: a page that is not served from the gateway's tailnet HTTPS origin has no
+        // verified route; no typed address is accepted as a fallback, and a/p from a link are ignored.
+        const decision = planPairSubmit(web, true, false);
+        if (decision.kind === 'blocked') {
+          setFailure(refusalKey(decision));
+          return;
+        }
+        if (decision.kind !== 'otp') {
+          setFailure('pair.error.otpNative');
+          return;
+        }
+        url = decision.url;
+        origin = decision.origin;
+      } else {
+        // Spec 054: a phone MUST have both the Host address and its certificate pin before any
+        // socket. The pure helper builds `wss://<address>/ws/mobile` and rejects malformed input.
+        const native = planNativeOtpSubmit(otpAddress, otpPin);
+        if (native.kind === 'blocked') {
+          setFailure('pair.error.addressPinRequired');
+          return;
+        }
+        url = native.url;
+        origin = native.origin;
+        pin = native.pin;
       }
-      if (decision.kind !== 'otp') {
-        // Native lands here (the seam answers `qr` off the web): an 8-digit code has no pin.
-        setFailure('pair.error.otpNative');
-        return;
-      }
-      const { url, origin } = decision;
       setBusy(true);
       setConnectingTo(origin);
-      // The pin is deliberately NOT supplied here: the OTP offer carries the fingerprint and the
-      // challenge states the leaf the proof is keyed to, which is the contract's trust-on-first-use
-      // for a code that cannot carry one. The controller stores what it adopted.
-      const result = await controller.pair('', { otp: { otp: normalized.otp, url, gatewayName: origin } });
+      // Spec 054: the pin is supplied on native from the pairing link (validated above); on web it
+      // is absent by design — the browser uses its own-origin certificate and never adopts `p`.
+      const result = await controller.pair('', { otp: {
+        otp: normalized.otp, url, gatewayName: origin,
+        ...(pin === undefined ? {} : { certSha256: pin }),
+      } });
       if (!gate.owns(lease)) return;
       // The code was spent either way; keep the field empty so a retry cannot resubmit it by accident.
       setOtpCode('');
@@ -364,7 +391,7 @@ export function PairPanel(props: {
         setBusy(false);
       }
     }
-  }, [busy, controller, onPaired, otpCode, web, refusalKey, gate]);
+  }, [busy, controller, onPaired, otpCode, otpAddress, otpPin, web, refusalKey, gate]);
 
   // A pairing failure the controller recorded outside `pair()` (close 4004, version gate).
   useEffect(() => {
@@ -494,6 +521,23 @@ export function PairPanel(props: {
                   />
                 </>
               )}
+              {Platform.OS !== 'web' ? (
+                <>
+                  <Text style={styles.section}>{tr('pair.otpPin')}</Text>
+                  <TextInput
+                    style={styles.input}
+                    testID="pair-otp-pin"
+                    value={otpPin}
+                    onChangeText={setOtpPin}
+                    placeholder={tr('pair.otpPinPlaceholder')}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    editable={!busy}
+                    textContentType="none"
+                    importantForAutofill="no"
+                  />
+                </>
+              ) : null}
               <Text style={styles.section}>{tr('pair.otpCode')}</Text>
               <TextInput
                 style={styles.otpInput}

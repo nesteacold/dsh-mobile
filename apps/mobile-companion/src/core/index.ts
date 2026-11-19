@@ -42,6 +42,8 @@ export type {
   ApprovalResponder,
   ApprovalSource,
 } from './approvals';
+export { QuestionCard, QuestionCards, MAX_QUESTION_CARDS } from './questions';
+export type { QuestionAnswer, QuestionCardState, QuestionCardStatus, QuestionResponder } from './questions';
 export { Outbox, defaultClientMsgId } from './outbox';
 export type { CancelItem, OutboxDeps, OutboxFrame, OutboxItem, OutboxStatus, PromptItem } from './outbox';
 export { HistoryStore, coerceHistoryMessage, coerceHistoryEvent, coerceHistoryEvents, isHostInjectedUserText, SKIPPED_HISTORY_EVENT_TYPES } from './history';

@@ -125,7 +125,8 @@ describe('pair screen source — a pasted code switches tabs, it never submits',
     // The branch only FILLS the tab. A phone and a foreign page are refused by the code tab's own
     // submit (its seam call + `refusalKey`), which is why this branch adds no third seam call there.
     assert.match(source, /case 'otpNative':\s*return 'pair\.error\.otpNative';/);
-    assert.match(source, /if \(decision\.kind !== 'otp'\) \{\s*\/\/[^\n]*\n\s*setFailure\('pair\.error\.otpNative'\);/, 'the code tab still refuses a phone before connecting');
+    // Spec 054: a phone now needs address+pin before any socket; a bare code is still refused.
+    assert.match(source, /setFailure\('pair\.error\.addressPinRequired'\)/, 'phone code still refused before connecting');
   });
 
   it('maps a non-payload to its own copy instead of the generic pairing failure', () => {

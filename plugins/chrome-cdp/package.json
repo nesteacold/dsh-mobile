@@ -1,0 +1,61 @@
+{
+  "name": "@dsh-ext/chrome-cdp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared control of the owner's Chrome over the DevTools protocol on loopback: numbered snapshots across OOPIFs, coordinate-free clicks, and a Chrome tab in the right sidebar. Approval follows the session preset (spec 035 R7); page content comes back as untrusted data. The plugin never launches Chrome.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.2-rc.3 <0.3.0-0",
+    "node": ">=24.9"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.0 || ^3.19.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "chrome",
+    "cdp",
+    "sidebar"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "the repository owner"
+  }
+}

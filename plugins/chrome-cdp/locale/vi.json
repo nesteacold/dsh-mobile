@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "title": "Chrome",
+    "description": "Điều khiển Chrome đang chạy trên máy này qua giao thức DevTools, và xem một tab ngay trong thanh bên."
+  },
+  "guide": {
+    "title": "Chrome",
+    "description": "Xem một tab Chrome qua CDP trên máy này"
+  },
+  "type": {
+    "label": "Chrome"
+  },
+  "picker": {
+    "label": "Tab Chrome",
+    "none": "Không thấy tab Chrome nào"
+  },
+  "toolbar": {
+    "back": "Quay lại",
+    "forward": "Tiến tới",
+    "reload": "Tải lại",
+    "go": "Mở",
+    "address": "Địa chỉ"
+  },
+  "view": {
+    "remote": "Tab Chrome này chỉ có trong cửa sổ ứng dụng cục bộ: CDP chỉ chạy trên loopback và không bao giờ mở cho người xem từ xa.",
+    "unreachable": "Không kết nối được Chrome CDP. Hãy chạy Chrome với --remote-debugging-port hoặc sửa endpoint trong cấu hình plugin.",
+    "noSecret": "Máy chủ chưa cấp khoá cầu nối cho cửa sổ này, nên khung xem đóng lại.",
+    "loading": "Đang tải tab…",
+    "failed": "Yêu cầu vừa rồi thất bại:"
+  }
+}

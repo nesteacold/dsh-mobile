@@ -482,6 +482,16 @@ export class FakeGateway {
     });
   }
 
+  /** Spec 018: push a human question card to every connection. */
+  pushQuestionRequested(frame: Record<string, unknown>): void {
+    this.broadcast({ kind: 'question-requested', ...frame });
+  }
+
+  /** Spec 018: push a question resolution to every connection. */
+  pushQuestionResolved(frame: Record<string, unknown>): void {
+    this.broadcast({ kind: 'question-resolved', ...frame });
+  }
+
   /** Push an `event` frame to every connection. */
   pushEvent(event: Record<string, unknown>): void {
     this.broadcast({ kind: 'event', ...event });

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none">
+  <title>Chrome CDP</title>
+  <circle cx="12" cy="12" r="9.25" stroke="currentColor" stroke-width="1.5" />
+  <circle cx="12" cy="12" r="3.4" fill="currentColor" />
+  <path d="M12 2.75h8.1M12 2.75 7.95 9.8M20.1 2.75 15.4 11.05M3.9 21.25 8.6 12.95M10.85 21.25H2.75"
+        stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+</svg>

@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "title": "Chrome",
+    "description": "Control the Chrome you run on this machine over the DevTools protocol, and watch one tab in the sidebar."
+  },
+  "guide": {
+    "title": "Chrome",
+    "description": "Show a Chrome tab over CDP on this machine"
+  },
+  "type": {
+    "label": "Chrome"
+  },
+  "picker": {
+    "label": "Chrome tab",
+    "none": "No Chrome tab detected"
+  },
+  "toolbar": {
+    "back": "Back",
+    "forward": "Forward",
+    "reload": "Reload",
+    "go": "Go",
+    "address": "Address"
+  },
+  "view": {
+    "remote": "This Chrome tab is only available in the local app window: CDP stays on loopback and is never exposed to a remote viewer.",
+    "unreachable": "Chrome CDP is not reachable. Start Chrome with --remote-debugging-port or fix the endpoint in the plugin config.",
+    "noSecret": "The host did not hand this window the bridge secret, so the view stays closed.",
+    "loading": "Loading the tab…",
+    "failed": "The last request failed:"
+  }
+}
