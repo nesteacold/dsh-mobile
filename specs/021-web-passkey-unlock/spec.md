@@ -1,5 +1,7 @@
 # 021 — Web passkey unlock (replaces DeepSeek-account web unlock)
 
+> Policy precedence (owner decision, spec 045): the browser/PWA second passkey lock described here is superseded and no longer required. Device credentials, scopes and revocation still apply. Retained wire names/services support legacy/non-browser compatibility; native platform biometrics and pinned pairing are unchanged.
+
 Owner decision 2026-11-12: the PWA (`https://<host>.ts.net:18443`) unlocks with a **passkey (WebAuthn)**
 bound to the paired web device. The requirement "the Host must be signed in to DeepSeek" is **removed
 entirely**. Packages: `packages/mobile-protocol` (contract, new revision), `plugins/mobile-gateway`,
@@ -57,3 +59,23 @@ Passkeys for native apps; sharing one passkey across several paired devices; acc
   rate limit, revocation clears record.
 - App: web lock screen with "Use passkey", registration after pairing, Lock button; unit tests.
 - Old DeepSeek-account web unlock code paths removed or unreachable, with tests updated.
+
+## Revision 15 — `web:unlock` is a web/mobile-only scope (2026-11-15)
+
+Referenced in code as "spec 021 rev 15". Measured bug: a `kind: desktop` device granted
+`web:unlock` (via the "full" preset) was locked forever, because only a browser can register a
+passkey; every remote-bridge frame was refused `auth/locked` and the client saw a stream-open
+timeout. Approved by the lead, same change as spec 025 amendment A1:
+
+- Contract (additive): `MOBILE_ONLY_SCOPES = ['web:unlock']` and `scopesForKind(kind)`; a
+  `kind: desktop` offer, grant or default never contains `web:unlock`.
+- The lock is armed only when the record holds `web:unlock` **and** its kind may hold it. Every
+  non-desktop kind (mobile, missing → mobile, web) keeps the lock until a passkey assertion,
+  unchanged; unknown explicit kinds are rejected at load.
+- Existing desktop records are repaired at load (scope dropped, logged, persisted atomically;
+  credential unchanged) and the owner may remove — never add — it on a desktop record (spec 025 A1).
+- A locked refusal echoes the frame's `streamId` as well as its `requestId`, so a client fails the
+  matching stream with `auth/locked` instead of timing out.
+- Acceptance adds: desktop offer from the "full" preset carries no `web:unlock`; a legacy desktop
+  record reaches the bridge; a mobile/web device with `web:unlock` is still locked until a passkey
+  assertion and re-locked on reconnect.

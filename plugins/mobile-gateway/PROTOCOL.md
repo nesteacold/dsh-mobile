@@ -1,5 +1,7 @@
 # dsh Mobile Gateway — 移动业务与传输协议参考
 
+> Fork policy precedence (spec 045): the PWA/browser second passkey gate is removed by owner decision. Any upstream/legacy examples below that require every browser socket to unlock are historical; device credentials, scopes and revocation remain enforced. Native v3 QR pairing requires certificate pinning and native offers exclude `web:unlock` (spec 050).
+
 移动端通过经过设备鉴权的 WebSocket 连接与 dsh 通信：订阅 agent 实时输出、发送文字和图片、处理 Human-in-the-loop 提问与操作审批、查询会话/工作区/历史、调整会话配置。本协议由持久化插件 `dsh-plugin-mobile-gateway` 实现。当前源码适配 DSH 0.2.2-rc.1 / Session format 4；移动端实时流接入见 [rc.2 接入说明](docs/dsh-rc2-mobile-integration.md)，插件管理见 [RC2 插件管理对接方案](docs/dsh-0.2.0-rc.2-plugin-management-mobile-integration.md)。
 
 DSH Remote 要求的 `peer` 由网关在 Host 内部创建并注入，身份沿用已配对设备的本机用户权限，生命周期随插件释放；移动端请求帧不增加 `peer` 字段，`dsh-mobile-v1` 协议不变。
@@ -1401,7 +1403,10 @@ history. Older gateways without the capability continue using one connection.
 
 ### 移动端设备名称
 
-移动端在 WebSocket 握手中通过 `X-DSH-Device-Name` 上报 UTF-8 设备名称的标准 Base64 编码；配对和凭据重连时均发送。网关不使用控制面板指定的名称，未上报时使用“未命名设备”。可信设备接口保留原始 `name`，并提供 `displayName`；同名设备显示编号后缀，例如“我的手机 (1)”“我的手机 (2)”。
+移动端在 WebSocket 握手中通过 `X-DSH-Device-Name` 上报 UTF-8 设备名称的标准 Base64 编码；配对和凭据重连时均发送。网关不使用控制面板指定的名称；客户端未上报时 `name` 保存为空字符串 `""`，网关不代填任何占位名称（旧存储中遗留的占位名 `未命名设备` 在加载时一次性转为 `""` 并回写）。可信设备接口保留原始 `name`，并提供 `displayName`；同名设备显示编号后缀，例如“我的手机 (1)”“我的手机 (2)”。`name` 为 `""` 时，控制面板显示本地化文案（vi「Thiết bị chưa đặt tên」/ en「Unnamed device」），Host 日志以 `(unnamed <id 前 8 位>)` 代替名称。
+
+
+---
 
 
 ## 官方语音输入（`speech-input-v1`）

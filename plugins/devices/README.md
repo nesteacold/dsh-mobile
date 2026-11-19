@@ -2,7 +2,7 @@
 
 A **Devices** page inside DSH Settings (Qoder-style), spec `specs/008-devices-page`. Private package, `engines.dsh: 0.2.2-rc.3`.
 
-- **Allow connections to this device** — switch the local `mobile-gateway` on/off (LAN), generate a `desktop` pairing code (copy + expiry countdown), see this device's addresses, list authorized devices, remove access, edit permissions. The switch position is remembered in the gateway state file, so it survives a plugin reload or a DSH restart; the off position is remembered too, and that is the kill switch. If the write fails the page says so and the position applies only until the session ends.
+- **Allow connections to this device** — switch the local `mobile-gateway` on/off (LAN), make a pairing offer for one of three explicit targets (spec 050: **Native iPhone/Android** default, **Web/PWA (passkey)**, **Computer / Desktop Remote**), see this device's addresses, list authorized devices, remove access, edit permissions. The switch position is remembered in the gateway state file, so it survives a plugin reload or a DSH restart; the off position is remembered too, and that is the kill switch. If the write fails the page says so and the position applies only until the session ends.
 - **Connect to other devices** — paste an address + pairing string from another Host; this Host dials it (pinned WSS), then lists its sessions, shows history, sends prompts and decides approvals.
 
 It needs `@dsh-ext/mobile-gateway` loaded in the same profile (the page drives its `/mgw/*` admin routes). It does not edit the gateway, DSH core, or the protocol package.
@@ -23,7 +23,10 @@ Config (`cordis.patch.yml`): `dataDir` (default `~/.dsh/devices-page`), `allowPu
 
 ## Usage
 
-1. On the host to be controlled: Settings → Devices → turn on **Allow connections** → **Generate pairing code** → Copy.
+1. On the host to be controlled: Settings → Devices → turn on **Allow connections**, then choose the target BEFORE generating:
+   - **Native iPhone / Android** (default): generates the existing v3 QR/long string (`mode: 'string'`, `kind: 'mobile'`). Scan the QR in the released native app or copy the full string; the expiry countdown and certificate pin travel with it. The native offer never asks for `web:unlock` (that passkey ceremony is web-only), and the Host approval can only narrow it — it cannot re-add the scope. Switching target clears the old QR/string.
+   - **Web / PWA (passkey)**: generates the 8-digit OTP plus a local PWA QR (`mode: 'otp'`, `kind: 'mobile'`), and keeps `web:unlock` so the web client can register/assert its passkey after approval.
+   - **Computer (Desktop Remote)**: the original desktop OTP flow (`mode: 'otp'`, `kind: 'desktop'`), never `web:unlock`.
 2. On the controlling host: **Connect to other devices** → address (`192.168.1.20:3081`, from the other host's address chips) + paste the string → **Pair and connect**.
 3. Open the remote host → sessions → history → send a prompt; pending approvals show **Allow once / Reject**.
 4. **Edit permissions** cannot change a paired device (the gateway has no scope-update route): it generates a new pairing code with the chosen scopes; the device must pair again, which closes its old sockets (4401, spec 005 T8).

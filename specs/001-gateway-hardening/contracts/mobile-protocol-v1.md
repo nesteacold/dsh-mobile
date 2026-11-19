@@ -1,5 +1,7 @@
 # Contract — `@dsh-ext/mobile-protocol` v1
 
+> Browser policy precedence (spec 045): browser/PWA sockets no longer require the historical second passkey lock. Statements below about mandatory locked browser sockets are historical, not current requirements. Existing passkey/grant wire names are retained for legacy/non-browser compatibility; credentials, device scopes, revocation and native certificate pinning remain enforced.
+
 Shared by `plugins/mobile-gateway` and `apps/mobile-companion`. Breaking change = v2.
 
 **Revision 2 (2026-11-09, lead)**: aligned with the upstream gateway wire format
@@ -63,7 +65,9 @@ QR/manual text = **unpadded base64url** of UTF-8 JSON (same encoding as upstream
    `push-v1` is added only when remote push is configured; `webPush` is added only while the owner has
    web push enabled (revision 15); `session-rename` and `session-archive` are
    added only when the device holds `sessions:author` (revision 11); `permission-lower` is added only
-   when the device holds `permission:lower` (revision 13). Revision 14 adds `webLock` **only** when the
+   when the device holds `permission:lower` (revision 13). The optional capability
+   `web-unlock-session.v1` is a CLIENT opt-in in `client-hello.capabilities` (revision 16): a client
+   that omits it keeps the revision 14 rule that every socket starts locked. Revision 14 adds `webLock` **only** when the
    device holds `web:unlock`: `"unregistered"` (no passkey on this device yet), `"locked"` (a passkey
    exists, this socket has not asserted yet) or `"unlocked"` (§14). Revision 15 adds
    `hello.webPush: { enabled, vapidPublicKey }` only while `webPush` is listed and the socket is not
@@ -776,6 +780,29 @@ Revoking the device on the Host deletes its passkey record and closes its socket
 credential is gone, as §3 says). Re-pairing the same installation with a new grant clears the old
 records with them.
 
+### 14.7 Opt-in web unlock session (revision 16)
+
+`WEB_UNLOCK_SESSION_CAPABILITY = 'web-unlock-session.v1'` is an OPTIONAL capability a client lists
+in `client-hello.capabilities` when it implements spec 036. No frame shape changes. A successful
+`passkey-assert` on an opted-in web device also stores a Host-authoritative grant
+`unlockGrant: { origin, grantedAt, expiresAt }` on that device's passkey record; `origin` is the
+exact `Origin` the asserting socket presented. `WEB_UNLOCK_SESSION_TTL_MS` is
+**24 × 60 × 60 × 1000 ms** (24 hours). A new socket on that device and origin may start `unlocked`
+while the grant is valid, without a new WebAuthn ceremony; a client that never advertised the
+capability keeps the revision 14 rule (every new socket locked, tab reload re-asserts). The grant
+is valid only while the device may hold `web:unlock`, still holds that scope, the passkey record
+exists, the socket's exact Origin is still accepted by that ingress, the time is before
+`expiresAt`, the device is not rate-limited, and the credential/passkey/authorization generation
+and origin policy are unchanged. Authorized inbound frames and outbound data sends slide
+`expiresAt` to `max(expiresAt, now + 24h)`; persistence is debounced at most once per 60 s, and
+an invalidation cancels any pending refresh and clears/persists the grant immediately. Explicit
+`passkey-lock` is device-wide (clears the grant, locks every socket and cancels in-flight
+challenges/approvals); expiry, revoke/forget, passkey change, scope/kind/credential change,
+auth/revoked, reauth-required, gateway-disabled, update-required, `onPasskeyChanged`, and
+ingress/origin-policy changes invalidate it as well. A stale assertion (challenge issued before
+such an invalidation) can never create a grant. Nothing about the grant, Origin, challenge or
+signature is logged as a secret: refusal logs carry codes only.
+
 ## Revision 15 (spec 026 web push, additive)
 
 Web Push for the PWA (`specs/026-web-push/spec.md`). Additive — `OPS` (§4) does not change, no type gains a
@@ -842,3 +869,16 @@ push for a session still sitting in the outbound queue replaces the older one.
 Body encryption is **RFC 8291** (`aes128gcm`, content coding `aes128gcm`) and authorization is **RFC
 8292 VAPID** (ES256 JWT), both built on `node:crypto` only — no new dependency (R4). The application
 server keypair is generated on first enable and stored with the Host's other owner-only secrets.
+
+## Revision 16 (spec 036 web unlock session, additive)
+
+Spec `036-web-unlock-session` adds an opt-in, Host-authoritative, rolling 24-hour unlock grant to
+the revision 14 passkey design (§14.7). `WEB_UNLOCK_SESSION_CAPABILITY = 'web-unlock-session.v1'`
+is listed by the client in `client-hello.capabilities`; `WEB_UNLOCK_SESSION_TTL_MS = 86400000`.
+There is no new frame, no new scope and no required capability: a client that does not opt in keeps
+revision 14 behaviour exactly (a new socket always starts `locked`). `WEB_LOCK_STATES[2]` may now
+mean "this socket asserted OR a valid Host-side grant was applied" for opted-in sockets; for all
+other sockets it keeps its revision 14 meaning. The grant lives only in the Host's owner-only
+passkey record, is sliding on authorized activity, and is invalidated by every authorization
+change or explicit Lock as detailed in §14.7.
+
