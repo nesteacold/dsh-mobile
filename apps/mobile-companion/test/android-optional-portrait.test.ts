@@ -1,4 +1,4 @@
-// Spec 048 — `./plugins/withAndroidOptionalPortrait`.
+/ Spec 048 — `./plugins/withAndroidOptionalPortrait`.
 //
 // Expo turns `orientation: "portrait"` into a REQUIRED Android hardware feature, which Play reported
 // as restricting availability. This test drives the plugin's pure helper against Expo's parsed
@@ -95,9 +95,9 @@ describe('spec 048 — optional Android portrait feature', () => {
     assert.equal(plugin.PLUGIN_NAME, 'dsh-android-optional-portrait');
   });
 
-  it('is registered after release signing with portrait orientation and versionCode 5', () => {
+  it('is registered after release signing with portrait orientation and versionCode 6', () => {
     assert.equal(APP_JSON.expo.orientation, 'portrait');
-    assert.equal(APP_JSON.expo.android?.versionCode, 5);
+    assert.equal(APP_JSON.expo.android?.versionCode, 6);
     assert.deepEqual((APP_JSON.expo.plugins ?? []).slice(-2), [
       './plugins/withAndroidReleaseSigning',
       './plugins/withAndroidOptionalPortrait',
