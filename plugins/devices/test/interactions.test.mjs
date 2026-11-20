@@ -74,6 +74,11 @@ function createFakeRemote(hostId, hostName, options = {}) {
   connection.state = 'online'
   connection.call = async (endpoint, args, callOptions) => {
     calls.push({ endpoint, args: clone(args), options: callOptions })
+    // Card tests run against a session the controller already listed on this generation.
+    if (endpoint === 'session/list' && options.replies?.['session/list'] === undefined) {
+      return { items: [{ sessionId: 's1', updatedAt: 1, running: false, blank: false,
+        projections: { kind: 'sequenced', asOfSeq: 1, values: {} } }] }
+    }
     const reply = options.replies?.[endpoint]
     if (reply instanceof Error) throw reply
     return typeof reply === 'function' ? reply(args) : clone(reply) ?? {}
@@ -161,6 +166,11 @@ async function openEvents(harness) {
   const ready = await nextFrame(iterator, '$events ready')
   assert.equal(ready.value.type, 'ready', 'the local stream must start with its own ready frame')
   assert.equal(ready.value.clientId, 'local-client')
+  // Prove the CURRENT connection generation has a fresh session/list answer. A stale retained
+  // row must never be enough to publish a card: the native binding may be gone after a reconnect.
+  await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+  for (const remote of harness.remotes ?? []) if (Array.isArray(remote.calls)) remote.calls.length = 0
+  if (harness.localCalls) harness.localCalls.length = 0
   return { control, iterator }
 }
 

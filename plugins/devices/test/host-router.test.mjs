@@ -975,8 +975,12 @@ test('a refreshed list withdraws a tagged id that disappeared', async () => {
     pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 's3', running: false })
     assert.deepEqual((await nextFrame(iterator, 'new status')).value,
       { type: 'emit', event: 'api-session/status', args: ['h:hostB:s3', false] })
-    const added = await nextFrame(iterator, 'added s3')
-    assert.deepEqual(added.value, { type: 'emit', event: 'api-session/added', args: [session('h:hostB:s3', 400)] })
+    // A new $events generation re-announces rows retained from the previous generation so DSH
+    // has a binding for them; the genuinely new s3 follows.
+    const addedS1 = await nextFrame(iterator, 're-announced s1')
+    assert.deepEqual(addedS1.value, { type: 'emit', event: 'api-session/added', args: [session('h:hostB:s1', 300)] })
+    const addedS3 = await nextFrame(iterator, 'added s3')
+    assert.deepEqual(addedS3.value, { type: 'emit', event: 'api-session/added', args: [session('h:hostB:s3', 400)] })
     assert.deepEqual((await nextFrame(iterator, 'repeated status')).value,
       { type: 'emit', event: 'api-session/status', args: ['h:hostB:s3', false] })
     const removed = await nextFrame(iterator, 'removed s2')
@@ -1136,6 +1140,92 @@ test('a question card waits for its session row, then keeps the exact waterfall 
   }
 })
 
+test('a stale retained row does NOT publish a card: only a fresh list answer does', async () => {
+  // #retainedRows survives a reconnect, but the native session controller may have lost the
+  // binding. A card published on that basis is dropped (only "Ask question · waiting" shows).
+  const row = session('s1', 100)
+  let listReply = { items: [row] }
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { get 'session/list'() { return listReply } } })
+  const pushed = attachPusher(hostB)
+  const events = []
+  const harness = createHarness({ remotes: [hostB], diagnostics: (event) => events.push(event) })
+  // Seed retention from a previous generation, then start a new $events stream (which drops
+  // freshness). The stale row alone must not make the card publishable.
+  await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    pushed.emit('question', { kind: 'question-requested', rpcId: 'q-stale', sessionId: 's1', callId: 'call-s', questions: [] })
+    assert.ok(events.some((event) => event.code === 'interaction.card' && event.stage === 'hold'),
+      'the card was held despite the stale retained row')
+    assert.equal(events.some((event) => event.code === 'interaction.card' && event.stage === 'publish'), false,
+      'no immediate publish from a stale row')
+
+    // A status-triggered fresh list answer on this generation re-announces the retained row and
+    // makes it bindable; the card flushes only after that added frame.
+    pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 's1', running: true })
+    await waitUntil(() => events.some((event) => event.code === 'interaction.card'
+      && event.stage === 'flush' && event.reason === 'list-answer'), 'card flushed after fresh list')
+    const addedFrames = []
+    for (let i = 0; i < 4; i += 1) {
+      const next = await frameWithin(iterator, 30)
+      if (next?.value?.event === 'api-session/added') addedFrames.push(next.value)
+    }
+    assert.equal(addedFrames.length, 1, 'the stale row is re-announced exactly once on the new stream')
+    assert.deepEqual(addedFrames[0].args, [session('h:hostB:s1', 100)])
+  } finally {
+    harness.router.uninstall()
+    control.abort()
+    await iterator.return()
+  }
+})
+
+test('an in-flight list answer from the previous generation cannot publish a held card', async () => {
+  // The fresh set is keyed by connection + generation; a late answer from a reconnect must not
+  // make a card publishable against a binding the native controller no longer has.
+  const row = session('s1', 100)
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/list': { items: [row] } } })
+  const pushed = attachPusher(hostB)
+  const events = []
+  const harness = createHarness({ remotes: [hostB], diagnostics: (event) => events.push(event) })
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    pushed.emit('question', { kind: 'question-requested', rpcId: 'q-old', sessionId: 's1', callId: 'call-old', questions: [] })
+    assert.ok(events.some((event) => event.code === 'interaction.card' && event.stage === 'hold'))
+    // Drop and reconnect the same host: watch() starts a NEW generation.
+    harness.disconnect('hostB')
+    harness.connect('hostB')
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    assert.equal(events.some((event) => event.code === 'interaction.card' && event.stage === 'flush'), false,
+      'no card was released by the old generation')
+  } finally {
+    harness.router.uninstall()
+    control.abort()
+    await iterator.return()
+  }
+})
+
+test('removing a host forgets its fresh rows (no stale binding proof)', async () => {
+  const row = session('s1', 100)
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { 'session/list': { items: [row] } } })
+  const harness = createHarness({ remotes: [hostB] })
+  const { control, iterator } = await openEventsStream(harness)
+  try {
+    await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    const status = harness.router.status()
+    assert.ok(status.hosts.some((host) => host.hostId === 'hostB'))
+    harness.disconnect('hostB')
+    harness.router.forgetHost('hostB')
+    const after = harness.router.status()
+    assert.ok(after.hosts.every((host) => host.hostId !== 'hostB') || !after.hosts.some((host) => host.online),
+      'the removed host is no longer a live binding source')
+  } finally {
+    harness.router.uninstall()
+    control.abort()
+    await iterator.return()
+  }
+})
+
 test('a known session is never re-added, even when a card and status arrive later', async () => {
   // Re-publishing `api-session/added` for a bound session rebuilds its input shell
   // and releases draft attachments. The row identity stays stable on every path.
@@ -1155,10 +1245,17 @@ test('a known session is never re-added, even when a card and status arrive late
   try {
     pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 's1', running: true })
     pushed.emit('question', { kind: 'question-requested', rpcId: 'q-2', sessionId: 's1', callId: 'call-2', questions: [] })
+    await waitUntil(() => emitted.some((frame) => frame.event === 'api-session/added'),
+      'the new stream re-announced the retained row')
+    assert.equal(emitted.filter((frame) => frame.event === 'api-session/added').length, 1,
+      'exactly one added frame on this stream')
+    // A second refresh on the SAME stream must not re-announce the already-bound row (spec 048).
+    pushed.emit('sessionStatus', { kind: 'session-status', sessionId: 's1', running: false })
     await new Promise((resolve) => setTimeout(resolve, 450))
-    assert.deepEqual(emitted.filter((frame) => frame.event === 'api-session/added'), [],
-      'no duplicate added frame for the already-known row')
-    assert.equal(listCalls(hostB).length, before, 'no extra list refresh for a known row')
+    assert.equal(emitted.filter((frame) => frame.event === 'api-session/added').length, 1,
+      'no duplicate added frame for an already-announced row')
+    assert.ok(listCalls(hostB).length - before <= 2,
+      'at most one coalesced refresh per generation')
     harness.router.uninstall()
   } finally {
     control.abort()

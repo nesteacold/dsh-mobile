@@ -209,6 +209,7 @@ export const ROUTING_DIAGNOSTIC_CODES = Object.freeze({
   FOLLOW_OPEN: 'follow.open',
   FOLLOW_FRAMES: 'follow.frames',
   FOLLOW_FALLBACK: 'follow.fallback',
+  CARD: 'interaction.card',
 })
 
 /** Mirrors package.json engines.dsh; DSH evaluates it with semver includePrerelease. */
@@ -1958,6 +1959,47 @@ export class HostRouter {
     try { this.#diagnostics({ ...event, at }) } catch { /* a sink failure is not a routing failure */ }
   }
 
+  /**
+   * Listeners told when a `session/list` answer has been returned on this router. Each listener
+   * owns the native `$events` generation: it re-announces rows not yet bound on THAT stream,
+   * which is the only proof a question card can be published safely.
+   * @type {Set<(hostId: string, rows: object[], statuses: Map<string, boolean>|null, connection: object) => void>}
+   */
+  #listAnswerListeners = new Set()
+
+  /**
+   * Row ids answered by the current connection generation, per host. REPLACED on every list
+   * answer (never appended) and deleted on host removal/uninstall, so an in-flight answer from
+   * an old generation can never top it up.
+   * @type {Map<string, {connection: object, ids: Set<string>}>}
+   */
+  #freshRowsByHost = new Map()
+
+  /** Bumped whenever a host's watcher (re)starts; identifies the native binding generation. */
+  #listGenerations = new Map()
+
+  /**
+   * Record a list answer; listeners decide how/when the native UI is told.
+   * `generation` is the watcher generation the answer was RECEIVED on, not the one
+   * current when a deferred notify finally runs — a reconnect in between must not
+   * make an old answer look fresh. Callers that answered asynchronously pass the
+   * generation they captured at answer time; synchronous callers take the current one.
+   */
+  #noteListAnswer(hostId, rows, connection, statuses = null, mode = 'list', generation = null) {
+    const list = Array.isArray(rows) ? rows : []
+    const answerGeneration = generation !== null ? generation : (this.#listGenerations.get(hostId) ?? 0)
+    const ids = new Set(list.map((row) => row?.sessionId).filter((id) => typeof id === 'string' && id !== ''))
+    this.#freshRowsByHost.set(hostId, { connection, generation: answerGeneration, ids })
+    for (const listener of [...this.#listAnswerListeners]) {
+      try { listener(hostId, list, statuses, connection, mode, answerGeneration) } catch { /* a stale listener must not break a list answer */ }
+    }
+  }
+
+  /** Forget list freshness for a host (disconnect/remove). */
+  #forgetFreshRows(hostId) {
+    this.#freshRowsByHost.delete(hostId)
+  }
+
   /** Hash the resolved (host-relative) key; an id never reaches a log or status. */
   #keyHash(hostId, sessionId) {
     if (typeof sessionId !== 'string' || sessionId === '') return null
@@ -2906,6 +2948,8 @@ export class HostRouter {
     const items = Array.isArray(local.value?.items) ? [...local.value.items] : []
     const hosts = this.#connectedHosts()
     const answered = new Set()
+    /** @type {Map<string, {connection: object, rows: object[], generation: number}>} */
+    const answers = new Map()
     const remote = await Promise.all(hosts.map(async (host) => {
       try {
         const value = await host.connection.call('session/list', args, { signal })
@@ -2920,6 +2964,9 @@ export class HostRouter {
         this.#hostErrors.delete(host.hostId)
         answered.add(host.hostId)
         this.#rememberRows(host.hostId, renamed)
+        // Captured now: the deferred notification below must be rejected if a
+        // reconnect replaces this host's watcher before DSH has processed the list.
+        answers.set(host.hostId, { connection: host.connection, rows: renamed, generation: this.#listGenerations.get(host.hostId) ?? 0 })
         return renamed
       } catch (error) {
         this.#noteHostError(host.hostId, error)
@@ -2940,7 +2987,19 @@ export class HostRouter {
     }
     // Stable sort: equal `updatedAt` keeps Local first, then host order.
     items.sort((a, b) => Number(b?.updatedAt ?? 0) - Number(a?.updatedAt ?? 0))
-    return { ...local, value: { ...(isPlainObject(local.value) ? local.value : {}), items } }
+    const merged = { ...local, value: { ...(isPlainObject(local.value) ? local.value : {}), items } }
+    // Tell the event stream only AFTER this merged answer has been handed back to the caller:
+    // a timer runs after DSH has processed the list and bound its rows, so card publication
+    // can never race ahead of the binding.
+    if (answers.size > 0) {
+      setTimeout(() => {
+        if (signal?.aborted) return
+        for (const [hostId, answer] of answers) {
+          this.#noteListAnswer(hostId, answer.rows, answer.connection, null, 'list', answer.generation)
+        }
+      }, 0)
+    }
+    return merged
   }
 
   /**
@@ -3021,6 +3080,8 @@ export class HostRouter {
     this.#retention?.removeHost(hostId)
     this.#retainedWorkspaces.delete(hostId)
     this.#retainedRows.delete(hostId)
+    this.#forgetFreshRows(hostId)
+    this.#listGenerations.delete(hostId)
     for (const record of [...this.#workspaceMerges]) {
       record.forward(record.state.dropHost(hostId))
     }
@@ -4094,18 +4155,48 @@ export class HostRouter {
     const pendingCards = new Map()
     /** Session ids whose `api-session/added` THIS stream already published. */
     const announcedRows = new Set()
+    /**
+     * Rows bound on THIS `$events` generation. A retained row from an older connection is not
+     * enough: DSH may have lost the binding, so a card published on that basis is dropped.
+     */
     const rowKnown = (sessionId) => {
-      for (const rows of this.#retainedRows.values()) {
-        if (rows.some((row) => row?.sessionId === sessionId)) return true
+      for (const [hostId, known] of this.#freshRowsByHost) {
+        if (known.connection && known.ids.has(sessionId)
+          && watchingConnections.get(hostId) === known.connection
+          && watchingGenerations.get(hostId) === known.generation) return true
       }
       return false
     }
-    const flushCards = (sessionId) => {
+    const flushCards = (sessionId, reason = 'row') => {
       const frames = pendingCards.get(sessionId)
       if (!frames) return
       pendingCards.delete(sessionId)
+      this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.CARD, stage: 'flush', reason })
       for (const frame of frames) this.#publishEvent(frame)
     }
+    /**
+     * A list answer is the proof a row is bindable, whether the binding came from the
+     * merged `session/list` answer DSH just processed or from an `added` frame this
+     * stream already emitted in `refreshSessions`. Either way the row is announced:
+     * a later refresh must not publish a duplicate `added` (spec 048) on THIS stream.
+     * Cards waiting for those rows are released on the next tick, after DSH bound them.
+     */
+    const onListAnswer = (hostId, rows, statuses, connection, mode, generation) => {
+      // An in-flight answer from a previous generation must never refill freshness.
+      if (watchingConnections.get(hostId) !== connection || watchingGenerations.get(hostId) !== generation) return
+      const bound = rows.map((row) => row?.sessionId).filter((id) => typeof id === 'string' && id !== '')
+      for (const id of bound) announcedRows.add(id)
+      // The list answer (and any added frame) is delivered before this timer, so DSH has bound
+      // the row by the time a held card is released.
+      setTimeout(() => {
+        if (lifetime.signal.aborted) return
+        for (const id of bound) flushCards(id, 'list-answer')
+      }, 0)
+    }
+    this.#listAnswerListeners.add(onListAnswer)
+    /** The connection object each watcher belongs to; the generation check for list answers. */
+    const watchingConnections = new Map()
+    const watchingGenerations = new Map()
     const watchTokens = new Map()
     const tokenOf = (hostId) => watchTokens.get(hostId) ?? 0
     const bumpToken = (hostId) => { watchTokens.set(hostId, tokenOf(hostId) + 1) }
@@ -4120,6 +4211,9 @@ export class HostRouter {
       const isCurrent = () => !lifetime.signal.aborted
         && watching.has(host.hostId) && tokenOf(host.hostId) === pending.token
       if (!isCurrent()) return
+      // The native binding generation this call belongs to. A reconnect can bump it
+      // while the call is in flight; the answer must not bind rows for the new stream.
+      const generation = this.#listGenerations.get(host.hostId) ?? 0
       let renamed
       let committed = false
       const abort = new AbortController()
@@ -4152,7 +4246,7 @@ export class HostRouter {
           // No row will be published: publish a still-held card anyway rather than
           // lose a decision the user must make. The ordered path below is normal.
           for (const sessionId of [...pendingCards.keys()]) {
-            if (sessionId.startsWith(`${HOST_PREFIX}${host.hostId}:`)) flushCards(sessionId)
+            if (sessionId.startsWith(`${HOST_PREFIX}${host.hostId}:`)) flushCards(sessionId, 'no-list')
           }
         }
       }
@@ -4166,27 +4260,30 @@ export class HostRouter {
       const after = new Set(renamed.map((row) => row?.sessionId).filter((id) => typeof id === 'string'))
       this.#rememberRows(host.hostId, renamed)
       for (const row of renamed) {
-        // A row already announced on this stream has a live binding. Re-adding it
-        // would rebuild that binding and dispose the composer shell, dropping an
-        // in-progress draft and its attachments (spec 048).
-        if (before.has(row.sessionId) || announcedRows.has(row.sessionId)) continue
+        // Spec 048 forbids a duplicate `added` ONLY on THIS stream: a row already
+        // announced here keeps its binding. A retained row from an older generation
+        // is NOT a binding — the native UI lost it on reconnect — so it still needs
+        // a fresh `added` frame to rebuild it. `onListAnswer` has already marked the
+        // rows this answer binds (including ones added above) as announced.
+        if (announcedRows.has(row.sessionId)) continue
         announcedRows.add(row.sessionId)
-        // The status was already published when the row did not exist; the native
-        // UI ignored it. Publish added first, then the status, then any cards that
-        // were waiting for this row: the question card needs its session seat.
         this.#publishEvent({ type: 'emit', event: SESSION_ADDED_EVENT, args: [row] })
         if (pending.statuses.has(row.sessionId)) {
           this.#publishEvent({ type: 'emit', event: SESSION_STATUS_EVENT, args: [row.sessionId, pending.statuses.get(row.sessionId)] })
         }
-        flushCards(row.sessionId)
       }
+      this.#noteListAnswer(host.hostId, renamed, host.connection, pending.statuses, 'refresh', generation)
       for (const id of before) {
         if (!after.has(id)) this.#publishEvent({ type: 'emit', event: SESSION_REMOVED_EVENT, args: [id] })
       }
-      // Cards for a session the list did not name (e.g. a subagent) still have to
-      // reach the user; no `added` frame will follow, so publish them now.
+      // Cards for a session the list did NOT name (e.g. a subagent) still have to
+      // reach the user; no `added` frame will follow, so publish them now. A listed
+      // row's cards wait for the deferred `list-answer` flush, after DSH has bound
+      // the `added` frame above.
       for (const sessionId of [...pendingCards.keys()]) {
-        if (sessionId.startsWith(`${HOST_PREFIX}${host.hostId}:`)) flushCards(sessionId)
+        if (!sessionId.startsWith(`${HOST_PREFIX}${host.hostId}:`)) continue
+        if (after.has(sessionId)) continue
+        flushCards(sessionId, 'absent-from-list')
       }
     }
     const scheduleRefresh = (host, sessionId, running) => {
@@ -4214,10 +4311,17 @@ export class HostRouter {
       // A reconnect reuses the connection object: this token is what tells an
       // answer to a call the previous watcher started from this watcher's calls.
       bumpToken(host.hostId)
+      // A (re)connected host's previous list answer belongs to the old native generation.
+      const generation = (this.#listGenerations.get(host.hostId) ?? 0) + 1
+      this.#listGenerations.set(host.hostId, generation)
+      this.#freshRowsByHost.delete(host.hostId)
+      watchingConnections.set(host.hostId, connection)
+      watchingGenerations.set(host.hostId, generation)
       const onCard = (frame) => {
         const injected = this.#injectCard(host, frame)
         if (!injected) return
         if (rowKnown(injected.agentId)) {
+          this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.CARD, stage: 'publish', reason: 'fresh-row' })
           this.#publishEvent(injected)
           return
         }
@@ -4226,7 +4330,10 @@ export class HostRouter {
         // coalesced refresh statuses use) and publish the card after `added`.
         const held = pendingCards.get(injected.agentId)
         if (held) held.push(injected)
-        else pendingCards.set(injected.agentId, [injected])
+        else {
+          pendingCards.set(injected.agentId, [injected])
+          this.#diagnose({ code: ROUTING_DIAGNOSTIC_CODES.CARD, stage: 'hold', reason: 'no-fresh-row' })
+        }
         scheduleRefresh(host, injected.agentId, true)
       }
       const onResolved = (frame) => {
@@ -4321,6 +4428,10 @@ export class HostRouter {
           cancelRefresh(hostId)
           bumpToken(hostId)
           this.#withdrawHost(hostId)
+          this.#forgetFreshRows(hostId)
+          this.#listGenerations.delete(hostId)
+          watchingConnections.delete(hostId)
+          watchingGenerations.delete(hostId)
           const prefix = `${HOST_PREFIX}${hostId}:`
           for (const sessionId of [...pendingCards.keys()]) {
             if (sessionId.startsWith(prefix)) pendingCards.delete(sessionId)
@@ -4339,10 +4450,17 @@ export class HostRouter {
       for (const source of watched) source.removeEventListener?.('abort', onAbort)
       unsubscribe?.()
       this.#eventSinks.delete(sink)
+      this.#listAnswerListeners.delete(onListAnswer)
       pendingCards.clear()
       announcedRows.clear()
       for (const hostId of [...pendingRefreshes.keys()]) cancelRefresh(hostId)
-      for (const hostId of watching.keys()) bumpToken(hostId)
+      for (const hostId of watching.keys()) {
+        bumpToken(hostId)
+        this.#forgetFreshRows(hostId)
+        this.#listGenerations.delete(hostId)
+        watchingConnections.delete(hostId)
+        watchingGenerations.delete(hostId)
+      }
       for (const detach of watching.values()) detach()
       this.#merges.delete(stop)
       stop()
