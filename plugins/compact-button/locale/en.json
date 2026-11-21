@@ -1,0 +1,4 @@
+{
+  "tooltip": "Context {percent}%, click to compact",
+  "draftNotEmpty": "Draft is not empty, clear it or type /compact"
+}

@@ -1,0 +1,14 @@
+{
+  "name": "@dsh-ext/compact-button",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Context pressure and manual compaction in the conversation composer (spec 059).",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": { ".": "./lib/index.js", "./client": "./lib/client.js", "./package.json": "./package.json" },
+  "files": ["lib", "locale", "cordis.patch.yml", "README.md"],
+  "scripts": { "build": "node scripts/build.mjs", "test": "node --test test/*.test.mjs" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" }, "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-conversation", "@deepseek-ai/dsh-client-locale"] } },
+  "engines": { "dsh": ">=0.2.2-rc.5 <0.3.0-0", "node": ">=24.9" },
+  "license": "MIT"
+}

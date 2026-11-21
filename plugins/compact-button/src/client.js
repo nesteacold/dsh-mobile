@@ -1,0 +1,53 @@
+window.__ModuleLoader__.load({
+  id: '@dsh-ext/compact-button',
+  factory(require) {
+    const React = require('react')
+    const h = React.createElement
+    /* LOGIC */
+    const locales = /* LOCALES */
+    const colors = {
+      neutral: 'var(--dsw-alias-label-tertiary, #888888)',
+      orange: 'var(--dsw-color-orange-500, #e58a24)',
+      red: 'var(--dsw-color-red-500, #e5484d)',
+    }
+    return {
+      inject: ['slots', 'locale'],
+      apply(ctx) {
+        function CompactButton({ useProjection, useInput, useSessionStatus, inputActions, sessionId }) {
+          const pressure = useProjection('contextPressure')
+          const input = useInput(state => state)
+          const status = useSessionStatus(snapshot => snapshot?.get?.(sessionId))
+          const language = React.useSyncExternalStore(
+            listener => ctx.locale.subscribe(listener), () => ctx.locale.getSnapshot().active)
+          const strings = locales[String(language).startsWith('vi') ? 'vi' : 'en']
+          const [notice, setNotice] = React.useState(false)
+          React.useEffect(() => { setNotice(false) }, [sessionId, input?.draft])
+          const value = percent(pressure)
+          const ready = typeof inputActions?.setDraft === 'function' && typeof inputActions?.submit === 'function'
+          const decision = clickDecision(input?.draft, !ready || isBusy(status, input))
+          if (value === null) return null
+          const title = strings.tooltip.replace('{percent}', value)
+          return h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+            h('button', {
+              type: 'button', title, 'aria-label': title, disabled: decision === 'disabled',
+              style: { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '1px 8px',
+                background: 'transparent', border: 'none', borderRadius: 'var(--dsw-radius-sm, 4px)',
+                font: 'inherit', fontVariantNumeric: 'tabular-nums', color: colors[band(value)],
+                cursor: decision === 'disabled' ? 'default' : 'pointer', opacity: decision === 'disabled' ? 0.5 : 1 },
+              onClick() {
+                if (decision === 'disabled') return
+                if (decision === 'refuse') { setNotice(true); return }
+                inputActions.setDraft('/compact')
+                inputActions.submit()
+              },
+            }, h('svg', { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', 'aria-hidden': true },
+              h('path', { d: 'M1 4h5V1M6 4 2 0M15 12h-5v3M10 12l4 4M2 9v5h5M14 7V2H9' })), `${value}%`),
+            notice && h('span', { role: 'status', style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary, #888888)' } }, strings.draftNotEmpty))
+        }
+        ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+          name: 'conversation.composer.dock', id: 'dsh-ext-compact-button', order: 5,
+        }, CompactButton))
+      },
+    }
+  },
+})
