@@ -28,7 +28,7 @@
     },
     "android": {
       "package": "com.dshext.companion",
-      "versionCode": 9,
+      "versionCode": 10,
       "predictiveBackGestureEnabled": false,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-foreground.png",
