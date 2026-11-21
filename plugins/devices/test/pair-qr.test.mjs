@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  advertisedPairAddress, normalizePwaOrigin, pairQrPayload, parseSelfDnsName, qrSvg, resolvePwaOrigin,
+  advertisedPairAddress, firstDirectAddress, normalizePwaOrigin, pairQrPayload, parseSelfDnsName, qrSvg, resolvePwaOrigin,
 } from '../lib/pair-qr.mjs'
 
 test('PWA origin: config wins, https only, else MagicDNS:30443, else null', () => {
@@ -13,12 +13,44 @@ test('PWA origin: config wins, https only, else MagicDNS:30443, else null', () =
   assert.equal(resolvePwaOrigin({}), null)
 })
 
-test('advertised address: config, else serve origin when loopback-bound, else null', () => {
-  assert.equal(advertisedPairAddress({ advertisedAddress: 'h.example:9', pwaOrigin: 'https://n.ts.net:30443', lanHost: '127.0.0.1' }), 'h.example:9')
-  assert.equal(advertisedPairAddress({ pwaOrigin: 'https://n.ts.net:30443', lanHost: '127.0.0.1' }), 'n.ts.net:30443')
-  assert.equal(advertisedPairAddress({ pwaOrigin: 'https://n.ts.net', lanHost: '::1' }), 'n.ts.net:30443')
-  assert.equal(advertisedPairAddress({ pwaOrigin: 'https://n.ts.net:30443', lanHost: '100.64.0.2' }), null)
-  assert.equal(advertisedPairAddress({ pwaOrigin: null, lanHost: '127.0.0.1' }), null)
+// The PWA/serve origin is never a direct address: its TLS leaf is the proxy's, so a
+// native/Desktop client that pins the listener's cert would fail with pin-mismatch.
+test('advertised address: configured direct address only; the PWA origin is never one', () => {
+  assert.equal(advertisedPairAddress({ advertisedAddress: 'h.example:9' }), 'h.example:9')
+  assert.equal(advertisedPairAddress({}), null)
+  assert.equal(advertisedPairAddress({ advertisedAddress: '' }), null)
+  assert.equal(advertisedPairAddress(), null)
+})
+
+// A pinning client can dial only a non-loopback, non-serve-port listener. The server applies
+// this to the candidates the client posts, so no card can advertise an undialable address.
+test('first direct address: loopback, serve port, credentials and plain schemes are refused', () => {
+  assert.equal(firstDirectAddress(['127.0.0.1:30081']), null)
+  assert.equal(firstDirectAddress(['n.ts.net:30443']), null)
+  assert.equal(firstDirectAddress(['wss://100.64.0.2:30081/ws/mobile']), '100.64.0.2:30081')
+  assert.equal(firstDirectAddress(['https://u:p@100.64.0.2:30081/']), null)
+  assert.equal(firstDirectAddress(['http://100.64.0.2:30081']), null)
+  assert.equal(firstDirectAddress(['localhost:30081', '100.64.0.2:30081']), '100.64.0.2:30081')
+  assert.equal(firstDirectAddress([]), null)
+  assert.equal(firstDirectAddress([undefined, null, 42]), null)
+})
+
+// Reviewer bypasses: the URL parser canonicalises these before the host check, so none can
+// be passed off as a remote listener. `::ffff:127.0.0.1:30081` is an invalid URL and is
+// skipped by the parser; its bracketed URL form is canonicalised and refused as mapped loopback.
+test('first direct address: non-canonical loopback and unspecified spellings are refused', () => {
+  for (const bypass of ['localhost.:30081', '::ffff:127.0.0.1:30081', '0x7f000001:30081',
+    '2130706433:30081', '0.0.0.0:30081', 'wss://[::ffff:127.0.0.1]:30081/x', 'wss://[::]:30081/x', 'wss://[::1]:30081/x']) {
+    assert.equal(firstDirectAddress([bypass]), null, `${bypass} is not a direct address`)
+  }
+  assert.equal(firstDirectAddress(['wss://[::ffff:127.255.0.1]:30081/x']), null,
+    'a mapped 127/8 address canonicalises to ::ffff:7fff:1 but stays loopback')
+  assert.equal(firstDirectAddress(['::ffff:127.0.0.1:30081']), null,
+    'a dotted mapped loopback is refused too')
+  assert.equal(firstDirectAddress(['wss://[fd7a:115c:a1e0::1]:30081/ws/mobile']), '[fd7a:115c:a1e0::1]:30081',
+    'a real IPv6 tailnet listener is accepted with its bracketed host:port shape')
+  // URL parser lowercases hosts: an uppercase DNS name is emitted lowercase (stable identity).
+  assert.equal(firstDirectAddress(['WSS://N.TS.NET:30081/ws/mobile']), 'n.ts.net:30081')
 })
 
 test('QR payload: OTP only in the fragment, never the query', () => {

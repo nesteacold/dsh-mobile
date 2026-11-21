@@ -24,13 +24,16 @@ import { resolveDshRuntimeVersion } from './dsh-runtime-version.mjs'
 import { createPromptOutbox } from './prompt-outbox.mjs'
 import { createRetentionStore, createSessionCache } from './session-cache.mjs'
 import { createUploadRoute } from './upload-route.mjs'
-import { advertisedPairAddress, pairQrPayload, qrSvg, resolvePwaOrigin, tailscaleDnsName } from './pair-qr.mjs'
+import { advertisedPairAddress, firstDirectAddress, pairQrPayload, qrSvg, resolvePwaOrigin, tailscaleDnsName } from './pair-qr.mjs'
 import { createGitRunner, createNpmCi, createSelfUpdater, defaultRepoRoot, handleSelfUpdateRoute } from './self-update.mjs'
 import {
   ensureOwnerOnlyDirectory, restrictToOwnerSync, setSecureFileLogger, writeSecretFile,
 } from './secure-file.mjs'
 
 const MAX_BODY_BYTES = 64 * 1024
+// A body is untrusted: cap the direct-address candidates so a hostile body cannot make
+// the route scan an unbounded list (the page normally posts only two or three URLs).
+const MAX_PAIR_DIRECT_CANDIDATES = 16
 const MAX_REMOTES = 32
 const MAX_APPROVALS_PER_REMOTE = 64
 const REMOTE_ID = /^[a-f0-9-]{36}$/
@@ -1086,8 +1089,17 @@ export const plugin = {
           if (!/^\d{8}$/.test(otp)) throw new RemoteInputError('otp must be 8 digits')
           const dnsName = await (options.tailscaleDnsName ?? tailscaleDnsName)()
           const pwaOrigin = resolvePwaOrigin({ pwaUrl: options.pwaUrl, dnsName })
-          const address = advertisedPairAddress({ advertisedAddress: options.advertisedAddress, pwaOrigin, lanHost: body?.lanHost })
-            ?? (typeof body?.fallbackAddress === 'string' && body.fallbackAddress ? body.fallbackAddress : null)
+          // `directAddresses` is an optional plugin option: host:port/URL strings the Host
+          // reports as directly dialable (e.g. its Tailscale URL). Configured candidates are
+          // tried FIRST, then the page's reported listener URLs, so a hostile body cannot
+          // outvote config. BOTH lists are filtered by the same firstDirectAddress rule
+          // (loopback/serve-port/wrong-scheme/junk refused), so extra entries cannot
+          // smuggle anything the config path could not. An empty candidate set yields
+          // `address: null` (the card then shows the no-direct copy). The route never
+          // consults pwaOrigin/dnsName for the direct address — those serve the PWA.
+          const candidates = (value) => (Array.isArray(value) ? value : []).slice(0, MAX_PAIR_DIRECT_CANDIDATES)
+          const address = advertisedPairAddress({ advertisedAddress: options.advertisedAddress })
+            ?? firstDirectAddress([...candidates(options.directAddresses), body?.fallbackAddress, ...candidates(body?.directAddresses)])
           // Spec 054: the pin travels from the offer to the native link's fragment. It is never in
           // the query, the reply's URL text or a log: only the SVG payload carries it.
           const pin = typeof body?.pin === 'string' && /^[0-9a-f]{64}$/i.test(body.pin.trim())

@@ -93,7 +93,24 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     if (fail[route]) return reply({ message: fail[route] }, false)
     if (route === '/mgw/status') return reply(state.status)
     // Spec 029: the pairing dialog's QR reply carries the Host's served origin.
-    if (route === '/devices/pair-qr' && options.method === 'POST') return reply(state.qrReply)
+    if (route === '/devices/pair-qr' && options.method === 'POST') {
+      // Mirrors the SERVER rule exactly: advertisedPairAddress config override, else
+      // firstDirectAddress over [fallbackAddress, ...body.directAddresses]. The route now
+      // reads the body list (finding 1), so this stub reads it too — loopback/serve-port
+      // candidates yield address:'' and the card must say so instead of showing them.
+      const loopback = (host) => /^(localhost|::1|127\.[\d.]+)$/i.test(String(host || '').replace(/^\[|\]$/g, ''))
+      const candidates = [body?.fallbackAddress, ...(Array.isArray(body?.directAddresses) ? body.directAddresses : [])]
+        .filter((value) => typeof value === 'string' && value)
+        .map((value) => { try { return /^[^\s/?#@]+:\d{1,5}$/.test(value) ? value : new URL(value).host } catch { return '' } })
+        .filter(Boolean)
+      const dialable = candidates.find((value) => {
+        const at = value.lastIndexOf(':')
+        return !loopback(value.slice(0, at)) && value.slice(at + 1) !== '30443'
+      })
+      if (dialable) return reply({ ...state.qrReply, address: dialable })
+      if (candidates.length > 0) return reply({ ...state.qrReply, address: '' })
+      return reply(state.qrReply)
+    }
     // Fresh row objects on every poll, the way JSON over HTTP really delivers them: React cannot
     // bail out of a re-render, so a test sees the rows the route persisted.
     if (route === '/mgw/devices') {
@@ -1364,6 +1381,110 @@ await check('pairing targets: native string (default), PWA OTP, desktop OTP; sta
   assert.deepEqual(nativeScopesFor(), scopesForKind('mobile').filter((scope) => scope !== 'web:unlock'))
   assert.deepEqual([...nativeScopesFor()], [...native.scopes])
   assert.equal(nativeScopesFor().filter((scope) => !scopesForKind('mobile').includes(scope)).length, 0)
+  page.unmount()
+})
+
+await check('Amendment A: PWA card shows the Host web origin host; native/desktop keep the direct listener address', async () => {
+  const qrReply = { svg: '<svg/>', address: 'n.ts.net:30081', pwaOrigin: 'https://n.ts.net:30443', link: true }
+  const ui = load({ status: ONLINE })
+  ui.state.qrReply = qrReply
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const radios = () => find(page, (node) => node.type === 'input' && node.props.type === 'radio')
+  const byTestId = (id) => find(page, (node) => node.props['data-testid'] === id)
+  const pick = async (target) => {
+    await act(async () => { radios().find((node) => node.props.value === target).props.onChange({ target: { checked: true, value: target } }) })
+  }
+  const shownAddresses = () => byTestId('otp-addresses').flatMap((node) => flattenChildren(node.props.children))
+  const flattenChildren = (value) => Array.isArray(value) ? value.flatMap(flattenChildren)
+    : value && value.props ? flattenChildren(value.props.children)
+      : typeof value === 'string' ? [value] : []
+
+  // PWA: host of pwaOrigin (30443), never the pinned listener (30081).
+  await pick('pwa')
+  await click(button(page, 'Generate pairing code'))
+  await flush()
+  assert.deepEqual(shownAddresses().filter((s) => s.includes('n.ts.net')), ['n.ts.net:30443'])
+  assert.ok(text(page).includes(ui.api.testing.DICT.en.pairOfferWebAddress), 'the web address is labelled')
+  assert.equal(text(page).includes(ui.api.testing.DICT.en.pairOfferDirectAddress), false, 'the direct label is not shown')
+
+  // Native: the direct qr.address stays (30081), with the direct label.
+  await pick('native')
+  await click(button(page, 'Generate pairing code'))
+  await flush()
+  assert.deepEqual(shownAddresses().filter((s) => s.includes('n.ts.net')), ['n.ts.net:30081'])
+  assert.ok(text(page).includes(ui.api.testing.DICT.en.pairOfferDirectAddress), 'the pinned direct address is labelled')
+  assert.equal(text(page).includes(ui.api.testing.DICT.en.pairOfferWebAddress), false)
+  page.unmount()
+})
+
+await check('no direct address: native/desktop never show the PWA origin or the loopback listener as the direct offer', async () => {
+  // Measured: a loopback-bound listener behind `tailscale serve` hands native/Desktop the
+  // serve origin under the pinned-listener label. That origin serves the proxy's cert, so
+  // pinning the listener's leaf fails with pin-mismatch. With no direct address the card
+  // must SAY so instead of falling back to the unreachable wss://127.0.0.1 list.
+  const status = { remoteControl: { enabled: true, accepting: true },
+    lan: { enabled: true, listening: true, host: '127.0.0.1', port: 30081, urls: ['wss://127.0.0.1:30081/ws/mobile'] },
+    tailscale: { addresses: [], urls: [] } }
+  const ui = load({ status })
+  // A deliberately non-empty address: the stub applies the server's firstDirectAddress
+  // filter to the POSTed candidates, so the card can only be right if FILTERING happened.
+  ui.state.qrReply = { svg: '<svg/>', address: 'n.ts.net:30443', pwaOrigin: 'https://n.ts.net:30443', link: true }
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const byTestId = (id) => find(page, (node) => node.props['data-testid'] === id)
+  const cardText = (node) => {
+    const walk = (value) => Array.isArray(value) ? value.map(walk).join(' ')
+      : value && value.props ? walk(value.props.children)
+        : typeof value === 'string' ? value : ''
+    return walk(node.props.children)
+  }
+  for (const target of ['native', 'desktop']) {
+    await act(async () => {
+      find(page, (node) => node.type === 'input' && node.props.type === 'radio' && node.props.value === target)[0]
+        .props.onChange({ target: { checked: true, value: target } })
+    })
+    await click(button(page, 'Generate pairing code'))
+    await flush()
+    const card = cardText(byTestId('pair-offer')[0])
+    assert.equal(card.includes('n.ts.net:30443'), false, `${target}: the PWA origin is not shown as a direct address`)
+    assert.ok(card.includes(ui.api.testing.DICT.en.pairOfferNoDirectAddress), `${target}: the no-direct reason is shown`)
+    assert.ok(card.includes(ui.api.testing.DICT.en.pairOfferPwaNotDirect), `${target}: the PWA-not-direct reason is shown`)
+    assert.equal(byTestId('otp-addresses').length, 0, `${target}: no address chips`)
+    assert.equal(card.includes('wss://127.0.0.1:30081/ws/mobile'), false,
+      `${target}: the loopback listener is not offered as an address`)
+    const offerPost = ui.calls.filter((call) => call.route === '/devices/pair-qr' && call.method === 'POST').at(-1)
+    assert.deepEqual(offerPost.body.directAddresses, ['127.0.0.1:30081'],
+      `${target}: the client sends the direct candidates for the server to filter`)
+  }
+  page.unmount()
+})
+
+await check('a tailnet listener URL is offered as the direct address even when the LAN bind is loopback', async () => {
+  const status = { remoteControl: { enabled: true, accepting: true },
+    lan: { enabled: true, listening: true, host: '127.0.0.1', port: 30081, urls: ['wss://127.0.0.1:30081/ws/mobile'] },
+    tailscale: { addresses: ['100.64.0.2'], urls: ['wss://100.64.0.2:30081/ws/mobile'] } }
+  const ui = load({ status })
+  ui.state.qrReply = { svg: '<svg/>', address: '', pwaOrigin: null, link: false }
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  await act(async () => {
+    find(page, (node) => node.type === 'input' && node.props.type === 'radio' && node.props.value === 'native')[0]
+      .props.onChange({ target: { checked: true, value: 'native' } })
+  })
+  await click(button(page, 'Generate pairing code'))
+  await flush()
+  const flat = (value) => Array.isArray(value) ? value.flatMap(flat)
+    : value && value.props ? flat(value.props.children)
+      : typeof value === 'string' ? [value] : []
+  const chips = find(page, (node) => node.props['data-testid'] === 'otp-addresses').flatMap((node) => flat(node.props.children))
+  assert.deepEqual(chips.filter((chip) => chip.includes(':') || chip.includes('wss')), ['100.64.0.2:30081'],
+    'only the reachable tailnet listener is shown')
+  assert.equal(chips.includes('wss://127.0.0.1:30081/ws/mobile'), false, 'the loopback URL is not a chip')
+  assert.equal(text(page).includes(ui.api.testing.DICT.en.pairOfferNoDirectAddress), false, 'no no-direct note')
+  const offerPost = ui.calls.filter((call) => call.route === '/devices/pair-qr' && call.method === 'POST').at(-1)
+  assert.deepEqual(offerPost.body.directAddresses, ['127.0.0.1:30081', '100.64.0.2:30081'],
+    'LAN URLs stay first, tailscale URLs follow, de-duplicated')
   page.unmount()
 })
 

@@ -1,9 +1,9 @@
 // Pairing-code QR (Devices "Pairing code" dialog).
 //
 // The dialog shows an 8-digit one-time code and "This device's address". This module adds:
-//  - the address a phone can actually reach (`advertisedPairAddress`): when the gateway listener is
-//    loopback-only behind `tailscale serve`, the listener's own `127.0.0.1:30081`/`<host>:30081` is
-//    unreachable from another device; the served HTTPS origin (`<dnsName>:30443`) is;
+//  - the address a pinning client can actually reach (`advertisedPairAddress`): only a configured
+//    direct listener address. The PWA/serve origin is NOT one — its TLS leaf is the reverse proxy's,
+//    not the listener's pin, so a native app or Desktop Remote pairing through it fails pin-mismatch;
 //  - the QR payload (`pairQrPayload`): `https://<pwa-origin>/pair#a=<address>&c=<otp>&p=<pin>`. The
 //    code and pin ride in the FRAGMENT, never the query: a fragment is not sent in the HTTP request,
 //    so neither reaches a server log or a Referer header. With no known PWA origin the QR holds
@@ -28,6 +28,21 @@ export const DEFAULT_SERVE_PORT = 30443
 const isLoopbackHost = (host) => {
   const value = String(host || '').replace(/^\[|\]$/g, '').toLowerCase()
   return value === 'localhost' || value === '::1' || /^127\./.test(value)
+}
+
+/**
+ * A superset of `isLoopbackHost`: also refuses unspecified and IPv4-mapped loopback forms.
+ * `new URL()` canonicalises `0x7f000001` / `2130706433` to `127.0.0.1`, `localhost.` to
+ * `localhost`, and `[::ffff:127.x.y.z]` to `::ffff:7fXX:*` across the whole 127/8 mapped
+ * range, so those non-canonical spellings cannot slip past as a "direct" address on a
+ * remote machine. Keep `isLoopbackHost` intact for its existing callers
+ * (normalizePwaOrigin/resolvePwaOrigin behavior must not move).
+ */
+const isUnreachableHost = (host) => {
+  const value = String(host || '').replace(/^\[|\]$/g, '').toLowerCase().replace(/\.$/, '')
+  return isLoopbackHost(value)
+    || value === '0.0.0.0' || value === '::' || value === ''
+    || /^::ffff:(127(?:\.[0-9]{1,3}){3}|7f[0-9a-f]{2}:[0-9a-f]{1,4})$/i.test(value)
 }
 
 /**
@@ -59,19 +74,57 @@ export function resolvePwaOrigin({ pwaUrl, dnsName } = {}) {
 }
 
 /**
- * The address to show and encode. `advertisedAddress` config wins; otherwise, when the gateway is
- * loopback-bound (it sits behind `tailscale serve`) the PWA origin's host:port is the reachable
- * one; otherwise null (the caller keeps the listener's own addresses).
- * @param {{advertisedAddress?: string, pwaOrigin?: string|null, lanHost?: string|null}} input
+ * The direct listener address to show and encode: the configured `advertisedAddress`, or null.
+ * A configured address is the OWNER's explicit choice and is passed through even when it names
+ * the serve origin (that owner then carries that origin's pin knowingly) — config is not
+ * overridden here. The PWA/serve origin is NEVER inferred as a direct address: a pinning
+ * client would dial it with the reverse proxy's certificate, not the listener leaf whose
+ * SHA-256 the offer pins, so every native/Desktop pairing would fail with `pin-mismatch`.
+ * @param {{advertisedAddress?: string}} input
  * @returns {string|null}
  */
-export function advertisedPairAddress({ advertisedAddress, pwaOrigin, lanHost } = {}) {
+export function advertisedPairAddress({ advertisedAddress } = {}) {
   if (typeof advertisedAddress === 'string' && /^[^\s/?#@]+:\d{1,5}$/.test(advertisedAddress.trim())) {
     return advertisedAddress.trim()
   }
-  if (pwaOrigin && isLoopbackHost(lanHost)) {
-    const url = new URL(pwaOrigin)
-    return `${url.hostname}:${url.port || DEFAULT_SERVE_PORT}`
+  return null
+}
+
+/** Whether a port is the `tailscale serve` origin (never a direct listener port). */
+const isServeOriginPort = (port) => String(port) === String(DEFAULT_SERVE_PORT)
+
+/**
+ * First DIRECT listener address from `candidates` (`host:port` or a full https:/wss: URL), or null.
+ * A pinning client can dial only a non-loopback host on a non-serve port whose certificate is the
+ * listener leaf. Credentials are refused (never hand a secret to a card), plain http is refused,
+ * loopback/unspecified (incl. numeric and trailing-dot spellings) is refused, and the serve port
+ * is refused (different TLS leaf). Every candidate is normalised through the URL parser before
+ * those checks, then reduced to `host:port` (IPv6 keeps brackets) so a URL's path/query never
+ * leaks into the offer. Junk entries are ignored, not fatal.
+ * @param {unknown[]} candidates
+ * @returns {string|null}
+ */
+export function firstDirectAddress(candidates) {
+  for (const entry of Array.isArray(candidates) ? candidates : []) {
+    if (typeof entry !== 'string') continue
+    const raw = entry.trim()
+    if (!raw) continue
+    // Normalise EVERY candidate through the URL parser first. It canonicalises numeric
+    // and trailing-dot loopback spellings that a regex would let through, and gives the
+    // bracketed hostname an IPv6 form needs (`url.hostname` includes the brackets).
+    let url
+    try {
+      url = /^[^\s/?#@]+:\d{1,5}$/.test(raw) ? new URL(`wss://${raw}`) : new URL(raw)
+    } catch { continue }
+    if (url.protocol !== 'https:' && url.protocol !== 'wss:') continue
+    if (url.username || url.password) continue
+    const host = url.hostname
+    const port = url.port
+    if (!host || !port) continue // a direct listener always names its port; never invent one
+    if (isUnreachableHost(host) || isServeOriginPort(port)) continue
+    // `url.hostname` keeps IPv6 brackets, so the output stays a reconstructible
+    // `[ipv6]:port`; for IPv4/DNS it is the plain lowercased `host:port`.
+    return `${host}:${port}`
   }
   return null
 }

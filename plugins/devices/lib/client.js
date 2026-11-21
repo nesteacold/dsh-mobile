@@ -251,6 +251,12 @@ window.__ModuleLoader__.load({
         otpHelp: 'Type this code on the other device together with this address. It works once, for 10 minutes, and you will still have to approve the request here.',
         otpCloseHelp: 'Closing this card keeps the code and any waiting request on the Host.',
         pairOfferPin: 'Certificate pin (native):',
+        // Amendment A: the two address kinds look different to the owner. The browser reaches this
+        // Host through its own HTTPS page; a phone/Remote dials the pinned listener directly.
+        pairOfferWebAddress: "This Host's web address (browser connects here)",
+        pairOfferDirectAddress: 'Direct gateway address (pinned listener)',
+        pairOfferNoDirectAddress: 'No reusable direct gateway address: this Host’s listener is loopback-only. Set its listen address (lanHost) to a LAN or Tailscale address of this machine, or pair with this code from a device on this machine.',
+        pairOfferPwaNotDirect: 'This Host’s web address is shown above for the browser only: it serves a different TLS certificate, so a native app or Desktop Remote cannot pin it.',
         otpNew: 'Generate pairing code',
         otpClose: 'Close',
         otpQrAlt: 'Pairing QR code',
@@ -600,6 +606,10 @@ window.__ModuleLoader__.load({
         otpHelp: 'Nhập mã này trên thiết bị kia cùng với địa chỉ này. Chỉ dùng một lần, trong 10 phút, và bạn vẫn phải phê duyệt yêu cầu tại đây.',
         otpCloseHelp: 'Đóng thẻ này không huỷ mã hay yêu cầu đang chờ trên máy tính.',
         pairOfferPin: 'Ghim chứng chỉ (bản chính chủ):',
+        pairOfferWebAddress: 'Địa chỉ web của máy này (trình duyệt kết nối qua đây)',
+        pairOfferDirectAddress: 'Địa chỉ gateway trực tiếp (listener được ghim)',
+        pairOfferNoDirectAddress: 'Không có địa chỉ gateway trực tiếp dùng lại được: listener của máy này chỉ lắng nghe trên localhost. Hãy đặt địa chỉ lắng nghe (lanHost) thành địa chỉ LAN hoặc Tailscale của máy này, hoặc ghép đôi bằng mã này từ một thiết bị trên chính máy này.',
+        pairOfferPwaNotDirect: 'Địa chỉ web của máy này chỉ được hiển thị ở trên cho trình duyệt: địa chỉ đó dùng chứng chỉ TLS khác, nên ứng dụng native hay Remote Desktop không thể ghim chứng chỉ của listener.',
         otpNew: 'Tạo mã ghép đôi',
         otpClose: 'Đóng',
         otpQrAlt: 'Mã QR ghép đôi',
@@ -1210,15 +1220,17 @@ window.__ModuleLoader__.load({
     // native target the QR fragment also carries the certificate pin (`p=`) so the app can pin TLS.
     // The QR (lib/pair-qr.mjs, rendered locally on this Host) encodes
     // https://<pwa>/pair#a=<address>&c=<code>&p=<pin>: the fragment never reaches a server.
-    // `qr.address` is the address a phone can reach (behind `tailscale serve` the
-    // listener's own loopback port is not), so it replaces the listener's list.
-    function PairOffer({ offer, addresses, lanHost, onQr, onClose, native = false }) {
+    // `qr.address` is the direct listener address a pinning client dials; it replaces the
+    // listener list ONLY when one exists. With a loopback-only listener there is no reusable
+    // direct address — the PWA origin serves a different TLS leaf and the loopback listener
+    // is unreachable off this machine, so neither may be shown to native/Desktop.
+    function PairOffer({ offer, addresses, lanHost, onQr, onClose, native = false, target = 'native' }) {
       useLang()
       const [qr, setQr] = React.useState(null)
       // The × button is a display-only close: the code and any waiting request stay on the Host.
       React.useEffect(() => {
         let live = true
-        post('/devices/pair-qr', { otp: String(offer.otp), lanHost: lanHost || '', fallbackAddress: addresses[0] || '',
+        post('/devices/pair-qr', { otp: String(offer.otp), lanHost: lanHost || '', fallbackAddress: addresses[0] || '', directAddresses: addresses,
           // Spec 054: the native app pins this certificate before it spends the proof. Only a
           // 64-hex pin is sent; the web card has no pin field and sends none.
           ...(native && typeof offer.certSha256 === 'string' && /^[0-9a-f]{64}$/i.test(offer.certSha256)
@@ -1234,7 +1246,21 @@ window.__ModuleLoader__.load({
           .catch(() => { /* the code and address still show; the QR is an extra */ })
         return () => { live = false }
       }, [offer.otp])
-      const shown = qr && qr.address ? [qr.address] : addresses
+      // Amendment A — DISPLAY ONLY. The browser pairs through this Host's HTTPS origin (the PWA
+      // ignores `a=` in the fragment), so a PWA card must not advertise the direct listener's
+      // `host:30081`. Native/Desktop keep that direct address. Neither the QR payload nor the pin
+      // changes: this only chooses what the card labels and shows.
+      const webAddress = target === 'pwa' && qr && qr.pwaOrigin
+        ? (() => { try { return new URL(qr.pwaOrigin).host } catch { return null } })()
+        : null
+      const addressLabel = webAddress ? 'pairOfferWebAddress' : 'pairOfferDirectAddress'
+      // A pinning client needs a REAL direct address. Never substitute the PWA origin (different
+      // TLS leaf → pin-mismatch) or the loopback listener list (unreachable off this machine).
+      // The SERVER filters loopback/serve-port candidates, so an empty qr.address means
+      // "nothing a pinning client can dial" — not "the client forgot to send candidates".
+      const direct = qr && typeof qr.address === 'string' && qr.address.trim() ? qr.address : null
+      const noDirect = target !== 'pwa' && !direct
+      const shown = webAddress ? [webAddress] : noDirect ? [] : (direct ? [direct] : addresses)
       return h('div', { className: 'dshdev-card', 'data-testid': 'pair-offer' },
         h('div', { className: 'dshdev-row' },
           h('h3', { className: 'dshdev-grow' }, tr('otpTitle')),
@@ -1252,10 +1278,16 @@ window.__ModuleLoader__.load({
             h('code', { className: 'dshdev-pin', title: String(offer.certSha256) }, shortenHash(offer.certSha256)),
             h(CopyButton, { text: String(offer.certSha256) })) : null,
         h('div', { className: 'dshdev-muted', style: { marginBottom: 10 } }, tr('otpHelp')),
-        h('h3', null, tr('address')),
-        shown.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('noAddress'))
-          : h('div', { className: 'dshdev-row', 'data-testid': 'otp-addresses' }, shown.map((address) =>
-            h('span', { key: address, className: 'dshdev-chip' }, address, h(CopyButton, { text: address })))))
+        h('h3', null, tr(addressLabel)),
+        noDirect
+          ? h('div', { 'data-testid': 'pair-offer-no-direct' },
+            h('div', { className: 'dshdev-muted' }, tr('pairOfferNoDirectAddress')),
+            qr && qr.pwaOrigin
+              ? h('div', { className: 'dshdev-muted', 'data-testid': 'pair-offer-pwa-not-direct' }, tr('pairOfferPwaNotDirect'))
+              : null)
+          : shown.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('noAddress'))
+            : h('div', { className: 'dshdev-row', 'data-testid': 'otp-addresses' }, shown.map((address) =>
+              h('span', { key: address, className: 'dshdev-chip' }, address, h(CopyButton, { text: address })))))
     }
 
     // Every desktop scope, safest first. client.js is a plain script (it cannot
@@ -1906,8 +1938,17 @@ window.__ModuleLoader__.load({
         return merged
       })
 
-      const addresses = (status && status.lan && status.lan.listening ? status.lan.urls || [] : [])
-        .map((url) => { try { return new URL(url).host } catch { return '' } }).filter(Boolean)
+      // Direct candidates for the pinning card: the LAN listener's URLs FIRST (nothing that
+      // works today moves out of slot 0), then the URLs the gateway reported for its Tailscale
+      // interface. A loopback-only bind leaves lan.urls unusable off this machine, but a
+      // tailnet URL can still reach the SAME pinned listener. Dedupe; the server filters
+      // loopback/serve-port candidates (see firstDirectAddress in lib/pair-qr.mjs).
+      const directCandidates = [
+        ...(status && status.lan && status.lan.listening ? status.lan.urls || [] : []),
+        ...(status && status.tailscale ? status.tailscale.urls || [] : []),
+      ]
+      const addresses = [...new Set(directCandidates
+        .map((url) => { try { return new URL(url).host } catch { return '' } }).filter(Boolean))]
 
       // The listener state the first card states: the same bind /mgw/status reports,
       // so the row cannot disagree with the "Listening on" card further down.
@@ -1953,7 +1994,7 @@ window.__ModuleLoader__.load({
               h('span', null, tr(entry.labelKey))))),
           h('div', { className: 'dshdev-muted' }, tr((OTP_KINDS.find((entry) => entry.kind === otpTarget) || OTP_KINDS[0]).hintKey)),
           !on ? h('div', { className: 'dshdev-muted' }, tr('enableFirst')) : null),
-        otpOffer ? h(PairOffer, { offer: otpOffer, addresses, lanHost: status && status.lan ? status.lan.host : '', native: otpTarget === 'native',
+        otpOffer ? h(PairOffer, { offer: otpOffer, addresses, lanHost: status && status.lan ? status.lan.host : '', native: otpTarget === 'native', target: otpTarget,
           // Spec 029: the QR route's answer is the Host's own served origin, kept in the
           // background so closing the dialog does not forget the route this machine
           // is reachable through (the plan states it as a fact, never as a target).
