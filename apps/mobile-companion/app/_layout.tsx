@@ -13,6 +13,9 @@ import * as Linking from 'expo-linking';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { AppController, type AppStateSnapshot, type WebLockSnapshot } from '../src/app-state';
+import { shouldKeepAwake } from '../src/core/keep-awake';
+import { keepAwakeAdapter } from '../src/platform/keep-awake';
+import { loadKeepAwakePreference, subscribeKeepAwakePreference } from '../src/ui/keep-awake-preference';
 import { parseSessionDeepLink, type UpdateRequired } from '../src/core';
 import { lockAction, unlockCopyKey } from '../src/core/web-lock';
 import { StartupSequence, type StartupStatus } from '../src/core/startup';
@@ -33,6 +36,45 @@ import { ThemeProvider, hit, paletteFor, resolveColorScheme, type Palette } from
 import { loadFontScale } from '../src/ui/font-scale-store';
 
 type GateStatus = 'checking' | 'locked' | 'unlocked' | 'unavailable';
+
+/**
+ * Spec 062 — keeps the screen awake only while the app can prove a live session is running.
+ * It renders nothing and lives inside AppProvider so it can read the same snapshot as the screens.
+ * The adapters serialize every activate/deactivate in one chain, so the last queued decision wins.
+ */
+function KeepAwakeBridge({ gate, foreground }: { gate: GateStatus; foreground: boolean }) {
+  const { snapshot } = useApp();
+  // `null` until storage resolves: a saved OFF must never produce a brief activate blip at mount.
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void loadKeepAwakePreference().then((on) => { if (alive) setEnabled(on); });
+    const unsubscribe = subscribeKeepAwakePreference((on) => { if (alive) setEnabled(on); });
+    return () => { alive = false; unsubscribe(); };
+  }, []);
+
+  const hasRunningSession = snapshot.sessions.some((session) => session.state === 'running');
+  const webLockUnlocked = snapshot.webLock === null || snapshot.webLock.state === 'unlocked';
+  useEffect(() => {
+    if (enabled === null) return;
+    const active = shouldKeepAwake({
+      enabled,
+      gateUnlocked: gate === 'unlocked' && webLockUnlocked,
+      foreground,
+      connection: snapshot.connection,
+      sessions: hasRunningSession ? snapshot.sessions : [],
+    });
+    // Both adapters serialize calls; changing any input enqueues the newer decision after the old.
+    void (active ? keepAwakeAdapter.activate() : keepAwakeAdapter.deactivate()).catch(() => {});
+  }, [enabled, gate, webLockUnlocked, foreground, snapshot.connection, hasRunningSession]);
+
+  useEffect(() => () => {
+    void keepAwakeAdapter.deactivate();
+  }, []);
+
+  return null;
+}
 
 export default function RootLayout() {
   /**
@@ -144,6 +186,7 @@ export default function RootLayout() {
   // app was unlocked leaves `unlocked` true until the new credential arrives; a background event
   // during that window must not let the mirror effect below reopen the gate on a hidden page.
   const foregroundRef = useRef(true);
+  const [foreground, setForeground] = useState(true);
   /**
    * Cold start: `controller.start()` loads the stored host asynchronously and `unlock()` only
    * connects a host that is already installed, so an unlock that races the start reads the
@@ -267,11 +310,21 @@ export default function RootLayout() {
       // the attempt while the system biometric/passcode sheet is open (iOS reports it there).
       if (next === 'active') {
         foregroundRef.current = true;
+        setForeground(true);
         attempts.setForeground(true);
+        return;
+      }
+      // Spec 062: visibility for keep-awake is stricter than the credential boundary below.
+      // `inactive` must NOT cancel the unlock attempt (iOS reports it during the system sheet),
+      // but it is not a foreground page that should hold a wake lock either.
+      if (next === 'inactive') {
+        foregroundRef.current = false;
+        setForeground(false);
         return;
       }
       if (next !== 'background') return;
       foregroundRef.current = false;
+      setForeground(false);
       attempts.setForeground(false);
       // M5: locking is a credential boundary, not only a visual one — the controller stops
       // the reconnect loop and closes the socket (its token-bearing closure is released).
@@ -290,6 +343,18 @@ export default function RootLayout() {
     });
     return () => subscription.remove();
   }, [attempts, controller, isWeb]);
+
+  useEffect(() => {
+    if (!isWeb || typeof document === 'undefined') return;
+    const sync = (): void => {
+      const visible = document.visibilityState === 'visible';
+      foregroundRef.current = visible;
+      setForeground(visible);
+    };
+    sync();
+    document.addEventListener('visibilitychange', sync);
+    return () => document.removeEventListener('visibilitychange', sync);
+  }, [isWeb]);
 
   useEffect(() => {
     // Spec 032: `demoGate === null` means the screenshot decision has not resolved yet, and the
@@ -409,6 +474,7 @@ export default function RootLayout() {
         />
       ) : (
         <AppProvider controller={controller} snapshot={snapshot} tr={tr} locale={locale}>
+          <KeepAwakeBridge gate={gate} foreground={foreground} />
           {isWeb && (startupStatus === 'failed' || startupStatus === 'idle' || startupStatus === 'starting') ? (
             <View style={styles.startupNotice} testID="web-startup-notice">
               <Text style={[styles.message, { color: startupStatus === 'failed' ? palette.warning : palette.textMuted }]}>

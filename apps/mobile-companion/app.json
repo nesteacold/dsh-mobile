@@ -2,7 +2,7 @@
   "expo": {
     "name": "DSH Orbit",
     "slug": "dsh-mobile",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "dshcompanion",
@@ -14,7 +14,7 @@
     },
     "ios": {
       "bundleIdentifier": "com.dshext.companion",
-      "supportsTablet": false,"buildNumber": "4",
+      "supportsTablet": false,"buildNumber": "5",
       "infoPlist": {
         "NSCameraUsageDescription": "DSH Orbit uses the camera only to scan the pairing QR code shown on your computer.",
         "NSFaceIDUsageDescription": "DSH Orbit uses Face ID to unlock so your paired credential stays protected.",
@@ -28,7 +28,7 @@
     },
     "android": {
       "package": "com.dshext.companion",
-      "versionCode": 6,
+      "versionCode": 7,
       "predictiveBackGestureEnabled": false,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-foreground.png",

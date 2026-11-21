@@ -101,6 +101,10 @@ export type MessageKey =
   | 'notify.iosNote'
   | 'settings.fontSize'
   | 'settings.fontSizeHint'
+  | 'settings.alwaysOn'
+  | 'settings.alwaysOnOn'
+  | 'settings.alwaysOnOff'
+  | 'settings.alwaysOnHint'
   // Session authoring: workspace picker, new session, model/mode row (spec 011 revision 7).
   | 'authoring.connecting'
   | 'authoring.reconnecting'
@@ -557,6 +561,10 @@ const en = {
   'notify.iosNote': 'On iPhone and iPad, notifications work only after adding this app to the Home Screen.',
   'settings.fontSize': 'Text size',
   'settings.fontSizeHint': 'Applies to this app only.',
+  'settings.alwaysOn': 'Always on',
+  'settings.alwaysOnOn': 'On',
+  'settings.alwaysOnOff': 'Off',
+  'settings.alwaysOnHint': 'Keeps the screen awake only while a session is running and this computer is connected.',
   // While the socket is not `ready` the app must say so — never diagnose a permission problem it
   // cannot know about yet (the Vietnamese/light review caught it accusing the host mid-connect).
   'authoring.connecting': 'Connecting to this computer…',
@@ -973,6 +981,10 @@ const vi = {
   'notify.iosNote': 'Trên iPhone và iPad, thông báo chỉ hoạt động sau khi thêm ứng dụng vào Màn hình chính.',
   'settings.fontSize': 'Cỡ chữ',
   'settings.fontSizeHint': 'Chỉ áp dụng cho ứng dụng này.',
+  'settings.alwaysOn': 'Luôn sáng',
+  'settings.alwaysOnOn': 'Bật',
+  'settings.alwaysOnOff': 'Tắt',
+  'settings.alwaysOnHint': 'Giữ màn hình sáng chỉ khi có phiên đang chạy và máy tính này còn kết nối.',
   'authoring.connecting': 'Đang kết nối tới máy tính…',
   'authoring.reconnecting': 'Đang kết nối lại tới máy tính…',
   'home.loadingSessions': 'Đang tải phiên…',

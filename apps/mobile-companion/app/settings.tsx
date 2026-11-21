@@ -19,6 +19,7 @@ import { useApp } from './_layout';
 import { Card, Divider, Screen, SectionLabel, StatusDot } from '../src/ui/components/ui';
 import { FONT_SCALES, space, useTheme } from '../src/ui/theme';
 import { saveFontScale } from '../src/ui/font-scale-store';
+import { loadKeepAwakePreference, saveKeepAwakePreference } from '../src/ui/keep-awake-preference';
 import { disableWebPush, enableWebPush, isWebPushSubscribed, isWebPushSupported } from '../src/platform/web-push';
 import type { WebPushOutcome } from '../src/core/web-push';
 
@@ -27,6 +28,8 @@ export default function SettingsScreen() {
   const router = useRouter();
   const { colors, type, settingsType, radius, fontScale, setFontScale } = useTheme();
   const [busy, setBusy] = useState(false);
+  const [alwaysOn, setAlwaysOn] = useState(true);
+  const [alwaysOnLoaded, setAlwaysOnLoaded] = useState(false);
 
   const host = snapshot.activeHost;
   /**
@@ -36,6 +39,21 @@ export default function SettingsScreen() {
    */
   const canReadSchedules = controller.hasReadScope('schedule:read');
   // Spec 045: the web-only "Lock now" action is gone. The PWA has no lock gate.
+  useEffect(() => {
+    let live = true;
+    void loadKeepAwakePreference().then((on) => {
+      if (!live) return;
+      setAlwaysOn(on);
+      setAlwaysOnLoaded(true);
+    });
+    return () => { live = false; };
+  }, []);
+  const toggleAlwaysOn = (): void => {
+    if (!alwaysOnLoaded) return;
+    const next = !alwaysOn;
+    setAlwaysOn(next);
+    void saveKeepAwakePreference(next);
+  };
 
   /**
    * Spec 026 (R6/R7): web push toggle. Drawn only on web where the browser supports push and the Host
@@ -216,6 +234,33 @@ export default function SettingsScreen() {
               <Text style={[settingsType.item, { color: colors.text, flex: 1 }]}>{tr('privacy.title')}</Text>
               <ChevronRight size={20} color={colors.textMuted} accessibilityLabel={tr('privacy.title')} />
             </Pressable>
+          </Card>
+        </View>
+      </View>
+
+      <View style={styles.group}>
+        <SectionLabel style={{ paddingHorizontal: space.xl }}>{tr('settings.alwaysOn')}</SectionLabel>
+        <View style={{ paddingHorizontal: space.xl, paddingTop: space.sm }}>
+          <Card>
+            <Pressable
+              testID="settings-always-on"
+              accessibilityRole="switch"
+              accessibilityState={{ checked: alwaysOn, disabled: !alwaysOnLoaded }}
+              accessibilityLabel={tr('settings.alwaysOn')}
+              disabled={!alwaysOnLoaded}
+              onPress={toggleAlwaysOn}
+              style={({ pressed }) => [styles.row, (pressed || !alwaysOnLoaded) && styles.pressed]}
+            >
+              <Text testID="settings-always-on-label" style={[settingsType.item, { color: colors.text, flex: 1 }]}>
+                {tr('settings.alwaysOn')}
+              </Text>
+              <Text testID="settings-always-on-value" style={[settingsType.item, { color: colors.accent }]}>
+                {alwaysOn ? tr('settings.alwaysOnOn') : tr('settings.alwaysOnOff')}
+              </Text>
+            </Pressable>
+            <Text style={[settingsType.description, { color: colors.textMuted, paddingHorizontal: space.md, paddingBottom: space.sm }]}>
+              {tr('settings.alwaysOnHint')}
+            </Text>
           </Card>
         </View>
       </View>

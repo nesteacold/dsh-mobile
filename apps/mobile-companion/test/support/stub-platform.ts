@@ -21,6 +21,8 @@ const STUBS: Record<string, string> = {
   'expo-crypto': 'expo-crypto.stub.ts',
   'expo-local-authentication': 'expo-local-authentication.stub.ts',
   'expo-notifications': 'expo-notifications.stub.ts',
+  // Spec 062: keep-awake is imported by the root layout through the native platform adapter.
+  'expo-keep-awake': 'expo-keep-awake.stub.ts',
   'expo-linking': 'expo-linking.stub.ts',
   'expo-router': 'expo-router.stub.ts',
   'expo-status-bar': 'expo-status-bar.stub.ts',
