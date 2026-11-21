@@ -95,9 +95,9 @@ describe('spec 048 — optional Android portrait feature', () => {
     assert.equal(plugin.PLUGIN_NAME, 'dsh-android-optional-portrait');
   });
 
-  it('is registered after release signing with portrait orientation and versionCode 10', () => {
+  it('is registered after release signing with portrait orientation and versionCode 11', () => {
     assert.equal(APP_JSON.expo.orientation, 'portrait');
-    assert.equal(APP_JSON.expo.android?.versionCode, 10);
+    assert.equal(APP_JSON.expo.android?.versionCode, 11);
     assert.deepEqual((APP_JSON.expo.plugins ?? []).slice(-2), [
       './plugins/withAndroidReleaseSigning',
       './plugins/withAndroidOptionalPortrait',
